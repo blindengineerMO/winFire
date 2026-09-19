@@ -66,3 +66,12 @@ test('WinRM and agent firewall scripts restore old rules after partial removal',
     assert.deepEqual(outcome.rules,[{DisplayName:'A',LocalPort:'3389'},{DisplayName:'B',LocalPort:'5985'}])
   }
 })
+
+test('agent readback returns normalized managed firewall rules', {skip:!hasPwsh},()=>{
+  const script=agentScript.replace('[Console]::In.ReadToEnd()',`'${JSON.stringify({group:'WinFireSecure:test',readOnly:true})}'`)
+  const result=spawnSync('pwsh',['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(`${mocks}\n${script}`,'utf16le').toString('base64')],{encoding:'utf8'})
+  assert.equal(result.status,0,result.stderr)
+  const output=JSON.parse(result.stdout.trim().split('\n').at(-1))
+  assert.equal(output.rules.length,2)
+  assert.deepEqual(output.rules.map(rule=>[rule.name,rule.direction,rule.localPort]),[['A','in','3389'],['B','in','5985']])
+})

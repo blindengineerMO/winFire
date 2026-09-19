@@ -29,6 +29,7 @@ try {
   if(!['winrm','winrms'].includes(probe.body.transport))throw new Error(`WinRM was not detected: ${probe.body.transport}`)
   const raw=await remote(dbModule.one('SELECT * FROM nodes WHERE id=?',node.body.id),'rights')
   const lines=Array.isArray(raw)?raw:[raw].filter(Boolean)
+  if(!lines.length)throw new Error('Logon-rights export returned no data; baseline was not collected')
   console.log(JSON.stringify({transport:probe.body.transport,rightTypes:lines.length,names:lines.map(line=>String(line).split('=')[0].trim())}))
 } finally {
   database?.close()

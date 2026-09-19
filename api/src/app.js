@@ -18,6 +18,7 @@ import {agentPkiReady} from './agentPki.js'
 import {normalizeWindowsEvent} from './eventNormalizer.js'
 import {deliverInvite,deliverVerification,inviteLink} from './mailer.js'
 import {saveAvatar,readAvatar,removeAvatar} from './avatar.js'
+import {readDirectoryComputers,testDirectoryConnection} from './directory.js'
 
 export const app=express()
 app.disable('x-powered-by')
@@ -30,10 +31,27 @@ const wrap=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next)
 const body=(schema,req)=>schema.parse(req.body)
 const reqId=req=>String(req.params.id)
 const notFound=(res,label='Record')=>res.status(404).json({error:`${label} not found`})
-const publicNode=node=>node && ({...node,failures:Number(node.failures),facts:parse(node.snapshot_json)})
+const latestTraining=nodeId=>one('SELECT id,mode,status,started_at,ends_at,generated_policy_id,last_error FROM learning_sessions WHERE node_id=? ORDER BY started_at DESC,rowid DESC LIMIT 1',nodeId)
+const publicNode=node=>node && ({...node,failures:Number(node.failures),facts:parse(node.snapshot_json),ad:parse(node.ad_snapshot_json),training:latestTraining(node.id)||null})
 const canUseCredential=(user,credential)=>credential&&(user.role==='owner'||user.role==='admin'||credential.owner_user_id===user.id||credential.visibility==='team'&&credential.team_id&&credential.team_id===user.team_id)
 function getNode(idValue) {return one('SELECT * FROM nodes WHERE id=?',idValue)}
 function getPolicy(idValue) {return one('SELECT * FROM policies WHERE id=?',idValue)}
+function trainingDays() {return Number(one("SELECT value FROM app_settings WHERE key='new_host_training_days'")?.value||30)}
+const directorySettings=()=>one("SELECT * FROM directory_connections WHERE id='default'")
+const publicDirectory=settings=>settings&&({url:settings.url||'',baseDn:settings.base_dn||'',bindCredentialId:settings.bind_credential_id||null,nodeCredentialId:settings.node_credential_id||null,enabled:!!settings.enabled,syncIntervalMinutes:settings.sync_interval_minutes,lastSyncedAt:settings.last_synced_at,lastSyncAttemptAt:settings.last_sync_attempt_at,lastSyncStatus:settings.last_sync_status,lastSyncError:settings.last_sync_error,lastSyncCount:settings.last_sync_count})
+function directoryCredential(settings) {
+  const credential=one('SELECT * FROM credentials WHERE id=?',settings.bind_credential_id)
+  if(!credential)throw Object.assign(new Error('Directory bind credential is missing'),{status:400})
+  return {username:credential.username,password:openSealed(credential.encrypted_blob).password}
+}
+function startTraining(node,days,mode,actorId=null) {
+  if(one("SELECT id FROM learning_sessions WHERE node_id=? AND status IN ('active','review','applying','apply-failed')",node.id))throw Object.assign(new Error('Finish the current learning session before starting another'),{status:409})
+  const sessionId=id(),endsAt=new Date(Date.now()+days*864e5).toISOString()
+  run('INSERT INTO learning_sessions(id,node_id,ends_at,status,mode) VALUES(?,?,?,?,?)',sessionId,node.id,endsAt,'active',mode)
+  run("UPDATE nodes SET firewall_state='learning' WHERE id=?",node.id)
+  audit(actorId,'learning.start','node',node.id,null,{sessionId,endsAt,days,mode})
+  return {id:sessionId,nodeId:node.id,endsAt,days,mode,status:'active'}
+}
 async function requestEmailVerification(user,email,actorId) {
   if(!process.env.SMTP_HOST)throw Object.assign(new Error('Email verification requires SMTP configuration'),{status:503})
   if(email!==user.email&&one('SELECT id FROM users WHERE email=?',email))throw Object.assign(new Error('An account already uses this email'),{status:409})
@@ -300,6 +318,83 @@ api.delete('/teams/:id/members/:userId',requireRole('admin'),(req,res)=>{
 })
 api.get('/roles',(_req,res)=>res.json([{id:'owner',name:'Owner'},{id:'admin',name:'Admin'},{id:'editor',name:'Policy Editor'},{id:'auditor',name:'Auditor'}]))
 api.get('/audit',requireRole('auditor'),(req,res)=>res.json(all('SELECT * FROM audit_log ORDER BY at DESC LIMIT 500')))
+api.get('/settings/training',(_req,res)=>res.json({newHostTrainingDays:trainingDays()}))
+api.patch('/settings/training',requireRole('admin'),(req,res)=>{
+  const {newHostTrainingDays}=body(z.object({newHostTrainingDays:z.number().int().min(1).max(365)}),req)
+  const before=trainingDays()
+  run("UPDATE app_settings SET value=? WHERE key='new_host_training_days'",String(newHostTrainingDays))
+  audit(req.user.id,'training.settings.update','app-settings','new_host_training_days',{days:before},{days:newHostTrainingDays})
+  res.json({newHostTrainingDays})
+})
+api.get('/settings/directory',requireRole('admin'),(_req,res)=>res.json(publicDirectory(directorySettings())))
+api.patch('/settings/directory',requireRole('admin'),(req,res)=>{
+  const data=body(z.object({
+    url:z.string().url().refine(value=>{const parsed=new URL(value);return parsed.protocol==='ldaps:'&&!parsed.username&&!parsed.password&&parsed.pathname==='/'},{message:'Use an ldaps:// server URL without embedded credentials'}),
+    baseDn:z.string().min(3).max(512).refine(value=>/(^|,)\s*DC=/i.test(value),{message:'Search base must include a DC component'}),
+    bindCredentialId:z.string().min(1),nodeCredentialId:z.string().nullable().optional(),enabled:z.boolean().default(false),syncIntervalMinutes:z.number().int().min(5).max(1440).default(60)
+  }),req)
+  for(const credentialId of [data.bindCredentialId,data.nodeCredentialId].filter(Boolean)){
+    const credential=one('SELECT * FROM credentials WHERE id=?',credentialId)
+    if(!credential||!canUseCredential(req.user,credential))return res.status(400).json({error:'Selected directory credential is unavailable'})
+  }
+  const before=publicDirectory(directorySettings())
+  run("UPDATE directory_connections SET url=?,base_dn=?,bind_credential_id=?,node_credential_id=?,enabled=?,sync_interval_minutes=? WHERE id='default'",data.url,data.baseDn,data.bindCredentialId,data.nodeCredentialId||null,Number(data.enabled),data.syncIntervalMinutes)
+  audit(req.user.id,'directory.settings.update','directory','default',before,{...data,bindCredentialId:data.bindCredentialId,nodeCredentialId:data.nodeCredentialId||null})
+  res.json(publicDirectory(directorySettings()))
+})
+api.post('/directory/test',requireRole('admin'),wrap(async(req,res)=>{
+  const settings=directorySettings()
+  if(!settings?.url||!settings.base_dn)throw Object.assign(new Error('Configure the directory connection first'),{status:400})
+  const result=await testDirectoryConnection(settings,directoryCredential(settings))
+  audit(req.user.id,'directory.test','directory','default',null,{connected:result.connected})
+  res.json(result)
+}))
+let directorySyncInFlight=false
+export async function syncDirectory(actorId=null,clientFactory=undefined) {
+  if(directorySyncInFlight)throw Object.assign(new Error('Directory sync is already running'),{status:409})
+  directorySyncInFlight=true
+  try {
+  const settings=directorySettings()
+  if(!settings?.enabled)throw Object.assign(new Error('Directory sync is disabled'),{status:409})
+  if(!settings.url||!settings.base_dn)throw Object.assign(new Error('Directory connection is incomplete'),{status:400})
+  run("UPDATE directory_connections SET last_sync_attempt_at=?,last_sync_status='running',last_sync_error=NULL WHERE id='default'",now())
+  try {
+    const computers=await readDirectoryComputers(settings,directoryCredential(settings),clientFactory)
+    const seenAt=now(),stats={found:computers.length,created:0,updated:0,missing:0}
+    db.transaction(()=>{
+      run('UPDATE nodes SET ad_missing=1 WHERE ad_guid IS NOT NULL')
+      for(const computer of computers){
+        let node=one('SELECT * FROM nodes WHERE ad_guid=?',computer.guid)
+        if(!node)node=one('SELECT * FROM nodes WHERE fqdn=? COLLATE NOCASE AND ad_guid IS NULL',computer.fqdn)
+        if(!node){const matches=all('SELECT * FROM nodes WHERE hostname=? COLLATE NOCASE AND ad_guid IS NULL',computer.name);if(matches.length===1)node=matches[0]}
+        if(node){
+          const hasFacts=!!one('SELECT 1 FROM node_facts WHERE node_id=?',node.id)
+          run('UPDATE nodes SET hostname=?,fqdn=?,ad_guid=?,ad_sid=?,ad_dn=?,ad_snapshot_json=?,ad_last_seen_at=?,ad_enabled=?,ad_missing=0,inventory_source=?,os_version=?,os_build=? WHERE id=?',computer.name,computer.fqdn,computer.guid,computer.sid,computer.dn,json(computer),seenAt,Number(computer.enabled),node.inventory_source.startsWith('manual')?'manual+ad':'ad',hasFacts?node.os_version:computer.operatingSystem||node.os_version,hasFacts?node.os_build:computer.operatingSystemVersion||node.os_build,node.id)
+          if(computer.enabled&&node.firewall_state==='unmanaged'&&!one('SELECT 1 FROM learning_sessions WHERE node_id=?',node.id))startTraining(node,trainingDays(),'auto',actorId)
+          stats.updated++
+        } else {
+          const nodeId=id()
+          run("INSERT INTO nodes(id,hostname,fqdn,os_version,os_build,inventory_source,ad_guid,ad_sid,ad_dn,ad_snapshot_json,ad_last_seen_at,ad_enabled,ad_missing,firewall_state) VALUES(?,?,?,?,?,'ad',?,?,?,?,?,?,0,?)",nodeId,computer.name,computer.fqdn,computer.operatingSystem||null,computer.operatingSystemVersion||null,computer.guid,computer.sid,computer.dn,json(computer),seenAt,Number(computer.enabled),computer.enabled?'enforcing':'unmanaged')
+          node=getNode(nodeId)
+          if(computer.enabled)startTraining(node,trainingDays(),'auto',actorId)
+          audit(actorId,'directory.node.import','node',nodeId,null,{guid:computer.guid,fqdn:computer.fqdn})
+          stats.created++
+        }
+        if(settings.node_credential_id&&!one('SELECT 1 FROM credential_assignments WHERE credential_id=? AND node_id=?',settings.node_credential_id,node.id))run('INSERT INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,NULL)',settings.node_credential_id,node.id)
+      }
+      stats.missing=one('SELECT COUNT(*) n FROM nodes WHERE ad_guid IS NOT NULL AND ad_missing=1')?.n||0
+      run("UPDATE directory_connections SET last_synced_at=?,last_sync_status='success',last_sync_error=NULL,last_sync_count=? WHERE id='default'",seenAt,stats.found)
+      audit(actorId,'directory.sync','directory','default',null,stats)
+    })()
+    return stats
+  } catch(error) {
+    run("UPDATE directory_connections SET last_sync_status='failed',last_sync_error=? WHERE id='default'",error.message.slice(0,2000))
+    audit(actorId,'directory.sync.failed','directory','default',null,{error:error.message})
+    throw error
+  }
+  } finally {directorySyncInFlight=false}
+}
+api.post('/directory/sync',requireRole('admin'),wrap(async(req,res)=>res.json(await syncDirectory(req.user.id))))
 
 const visibleCredentials=user=>user.role==='owner'||user.role==='admin' ? all('SELECT id,name,type,username,owner_user_id,visibility,team_id,priority,created_at FROM credentials ORDER BY priority,name') : all(`SELECT id,name,type,username,owner_user_id,visibility,team_id,priority,created_at FROM credentials WHERE owner_user_id=? OR (visibility='team' AND team_id=?) ORDER BY priority,name`,user.id,user.team_id)
 api.get('/credentials',(req,res)=>res.json(visibleCredentials(req.user)))
@@ -329,26 +424,43 @@ api.post('/credentials/:id/test',requireRole('editor'),wrap(async(req,res)=>{
   if(!node)return notFound(res,'Node')
   const credential=one('SELECT * FROM credentials WHERE id=?',reqId(req));if(!credential)return notFound(res,'Credential')
   if(!canUseCredential(req.user,credential))return res.status(403).json({error:'Insufficient permission'})
-  const assigned=one('SELECT 1 FROM credential_assignments WHERE credential_id=? AND node_id=?',credential.id,node.id)
+  const assigned=one('SELECT 1 FROM credential_assignments WHERE credential_id=? AND (node_id=? OR node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?))',credential.id,node.id,node.id)
   if(!assigned)return res.status(400).json({error:'Assign credential to node first'})
-  try {await remote(node,'facts');res.json({success:true})}catch(error){res.json({success:false,error:error.message})}
+  try {const account=await remote(node,'auth',{}, {credentialId:credential.id});res.json({success:true,account})}catch(error){res.json({success:false,error:error.message})}
 }))
 
 api.get('/nodes',(_req,res)=>res.json(all('SELECT n.*,f.snapshot_json FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id ORDER BY n.created_at DESC').map(publicNode)))
 api.post('/nodes',requireRole('editor'),wrap(async(req,res)=>{
   const data=body(z.object({hostname:z.string().min(1),fqdn:z.string().optional(),ip:z.string().optional(),connectionMode:z.enum(['agentless','agent']).default('agentless'),credentialIds:z.array(z.string()).default([])}),req)
   if(data.credentialIds.some(credentialId=>!canUseCredential(req.user,one('SELECT * FROM credentials WHERE id=?',credentialId))))return res.status(403).json({error:'Credential unavailable'})
-  const nodeId=id();run('INSERT INTO nodes(id,hostname,fqdn,ip,connection_mode) VALUES(?,?,?,?,?)',nodeId,data.hostname,data.fqdn||null,data.ip||null,data.connectionMode)
-  for(const credentialId of data.credentialIds)run('INSERT OR IGNORE INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,NULL)',credentialId,nodeId)
-  audit(req.user.id,'node.create','node',nodeId,null,data)
-  const node=getNode(nodeId);const dns=await lookupDns(node);res.status(201).json({...node,dns})
+  const nodeId=id(),days=trainingDays()
+  const training=db.transaction(()=>{
+    run('INSERT INTO nodes(id,hostname,fqdn,ip,connection_mode) VALUES(?,?,?,?,?)',nodeId,data.hostname,data.fqdn||null,data.ip||null,data.connectionMode)
+    for(const credentialId of data.credentialIds)run('INSERT OR IGNORE INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,NULL)',credentialId,nodeId)
+    audit(req.user.id,'node.create','node',nodeId,null,data)
+    return startTraining(getNode(nodeId),days,'auto',req.user.id)
+  })()
+  const node=getNode(nodeId),dns=await lookupDns(node);res.status(201).json({...node,dns,training})
 }))
-api.get('/nodes/:id',(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json({...node,facts:parse(one('SELECT snapshot_json FROM node_facts WHERE node_id=?',node.id)?.snapshot_json),dns:one('SELECT * FROM dns_lookups WHERE node_id=?',node.id)})})
+api.get('/nodes/:id',(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json({...node,ad:parse(node.ad_snapshot_json),training:latestTraining(node.id)||null,facts:parse(one('SELECT snapshot_json FROM node_facts WHERE node_id=?',node.id)?.snapshot_json),dns:one('SELECT * FROM dns_lookups WHERE node_id=?',node.id)})})
+api.post('/nodes/:id/training',requireRole('editor'),(req,res)=>{
+  const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
+  const {durationDays}=body(z.object({durationDays:z.number().int().min(1).max(365)}),req)
+  const session=db.transaction(()=>startTraining(node,durationDays,'auto',req.user.id))()
+  res.status(201).json(session)
+})
 api.patch('/nodes/:id',requireRole('editor'),(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');const data=body(z.object({hostname:z.string().min(1).optional(),fqdn:z.string().nullable().optional(),ip:z.string().nullable().optional(),connectionMode:z.enum(['agentless','agent']).optional()}),req);run('UPDATE nodes SET hostname=?,fqdn=?,ip=?,connection_mode=? WHERE id=?',data.hostname||node.hostname,data.fqdn===undefined?node.fqdn:data.fqdn,data.ip===undefined?node.ip:data.ip,data.connectionMode||node.connection_mode,node.id);audit(req.user.id,'node.update','node',node.id,node,data);res.json(getNode(node.id))})
 api.delete('/nodes/:id',requireRole('admin'),(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');run('DELETE FROM nodes WHERE id=?',node.id);audit(req.user.id,'node.delete','node',node.id,node,null);res.status(204).end()})
 api.post('/nodes/:id/probe',requireRole('editor'),wrap(async(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json(await probeNode(node))}))
 api.get('/nodes/:id/facts',(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json(parse(one('SELECT snapshot_json FROM node_facts WHERE node_id=?',node.id)?.snapshot_json)||{})})
 api.post('/nodes/:id/facts/refresh',requireRole('editor'),wrap(async(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');const facts=await collectFacts(node);audit(req.user.id,'node.facts.refresh','node',node.id,null,facts);res.json(facts)}))
+api.get('/nodes/:id/firewall-rules',wrap(async(req,res)=>{
+  const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
+  if(node.connection_mode==='agent')return res.status(409).json({error:'Live rule inventory requires a WinRM node'})
+  const {offset,limit}=z.object({offset:z.coerce.number().int().min(0).default(0),limit:z.coerce.number().int().min(1).max(200).default(100)}).parse(req.query)
+  const result=await remote(node,'all_rules',{offset,limit})
+  res.json({total:Number(result?.total||0),offset,rules:Array.isArray(result?.rules)?result.rules:result?.rules?[result.rules]:[]})
+}))
 api.get('/nodes/:id/dns',(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json(one('SELECT * FROM dns_lookups WHERE node_id=?',node.id)||{})})
 api.post('/nodes/:id/dns/refresh',requireRole('editor'),wrap(async(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json(await lookupDns(node))}))
 api.get('/node-groups',(_req,res)=>res.json(all('SELECT * FROM node_groups ORDER BY name')))
@@ -414,15 +526,27 @@ export async function runDriftCheck(data={},actorId=null) {
     if(!version)continue
     const desired=parse(version.rules_compiled_json)||[]
     for(const node of assignedNodes(policy.id).filter(item=>!data.nodeId||item.id===data.nodeId)){
-      let status='unknown',diff=null,error=null
+      if(node.connection_mode==='agent'){
+        const pending=one(`SELECT d.* FROM policy_drift_checks d JOIN agent_jobs j ON json_extract(j.payload_json,'$.driftCheckId')=d.id WHERE d.node_id=? AND d.policy_id=? AND d.version_id=? AND d.status='pending' AND j.status IN ('queued','leased') ORDER BY datetime(d.checked_at) DESC LIMIT 1`,node.id,policy.id,version.id)
+        if(pending){checks.push({id:pending.id,policyId:policy.id,versionId:version.id,nodeId:node.id,status:'pending',diff:null,error:null,checkedAt:pending.checked_at,reused:true});continue}
+      }
+      let status='unknown',diff=null,error=null,agent=null
       try {
-        if(node.connection_mode==='agent')throw new Error('Agent firewall readback is not available')
-        const observed=await remote(node,'rules',{group:`WinFireSecure:${policy.id}`})
-        diff=diffRules(desired,Array.isArray(observed)?observed:observed?[observed]:[])
-        status=diff.add.length||diff.remove.length?'drift':'in-sync'
+        if(node.connection_mode==='agent'){
+          agent=one('SELECT * FROM agents WHERE id=? AND revoked_at IS NULL',node.agent_id)
+          if(!agent)throw new Error('No active enrolled agent for firewall readback')
+          status='pending'
+        } else {
+          const observed=await remote(node,'rules',{group:`WinFireSecure:${policy.id}`})
+          diff=diffRules(desired,Array.isArray(observed)?observed:observed?[observed]:[])
+          status=diff.add.length||diff.remove.length?'drift':'in-sync'
+        }
       } catch(cause){error=cause.message}
       const check={id:id(),policyId:policy.id,versionId:version.id,nodeId:node.id,status,diff,error,checkedAt:now()}
-      run('INSERT INTO policy_drift_checks(id,policy_id,version_id,node_id,status,diff_json,error,checked_at) VALUES(?,?,?,?,?,?,?,?)',check.id,check.policyId,check.versionId,check.nodeId,check.status,json(check.diff),check.error,check.checkedAt)
+      db.transaction(()=>{
+        run('INSERT INTO policy_drift_checks(id,policy_id,version_id,node_id,status,diff_json,error,checked_at) VALUES(?,?,?,?,?,?,?,?)',check.id,check.policyId,check.versionId,check.nodeId,check.status,json(check.diff),check.error,check.checkedAt)
+        if(status==='pending')run('INSERT INTO agent_jobs(id,agent_id,type,payload_json) VALUES(?,?,?,?)',id(),agent.id,'policy.read',json({driftCheckId:check.id,policyId:policy.id,versionId:version.id,group:`WinFireSecure:${policy.id}`}))
+      })()
       checks.push(check)
     }
   }
@@ -490,7 +614,7 @@ function driftSummaryByNode() {
     statuses.push(byPair.get(`${assignment.node_id}:${assignment.policy_id}`)||'unchecked')
     byNode.set(assignment.node_id,statuses)
   }
-  return new Map([...byNode].map(([nodeId,statuses])=>[nodeId,statuses.includes('drift')?'drift':statuses.includes('unknown')?'unknown':statuses.includes('unchecked')?'unchecked':'in-sync']))
+  return new Map([...byNode].map(([nodeId,statuses])=>[nodeId,statuses.includes('drift')?'drift':statuses.includes('unknown')?'unknown':statuses.includes('pending')?'pending':statuses.includes('unchecked')?'unchecked':'in-sync']))
 }
 function report(name) {
   if(name==='inventory')return all(`SELECT n.id,n.hostname,n.fqdn,n.ip,n.os_version,n.os_build,n.status,n.last_seen_at,n.connection_mode,f.snapshot_json,d.forward_result,d.reverse_result,d.mismatch FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id LEFT JOIN dns_lookups d ON d.node_id=n.id ORDER BY n.hostname`)
@@ -549,6 +673,7 @@ api.get('/logon-rights',(req,res)=>res.json(all('SELECT * FROM logon_rights WHER
 api.post('/logon-rights/baseline',requireRole('admin'),wrap(async(req,res)=>{
   const {nodeId}=body(z.object({nodeId:z.string()}),req),node=getNode(nodeId);if(!node)return notFound(res,'Node')
   const raw=await remote(node,'rights'),lines=Array.isArray(raw)?raw:[raw].filter(Boolean)
+  if(!lines.length)throw Object.assign(new Error('Logon-rights export returned no data; baseline was not collected'),{status:502})
   const rights=[];for(const line of lines){const [name,accounts]=String(line).split('=');for(const account of (accounts||'').split(',').map(s=>s.trim()).filter(Boolean)){const rightId=id();run('INSERT INTO logon_rights(id,node_id,account_sid,logon_type,right_assignment,source,baseline,created_by) VALUES(?,?,?,?,?,?,1,?)',rightId,node.id,account,name.trim(),'allow','secedit',req.user.id);rights.push({id:rightId,account,logonType:name.trim()})}}
   audit(req.user.id,'logon-rights.baseline','node',node.id,null,{count:rights.length});res.status(201).json(rights)
 }))
@@ -570,10 +695,10 @@ api.post('/logs/ingest',requireRole('editor'),(req,res)=>{
 export async function pullLogs(nodeId,actorId=null,maxPages=5) {
   const node=getNode(nodeId);if(!node)throw Object.assign(new Error('Node not found'),{status:404})
   let cursor=one('SELECT MAX(record_id) n FROM log_events WHERE node_id=?',nodeId)?.n||0
-  let inserted=0,pages=0
+  let inserted=0,pages=0,caughtUp=false
   for(;pages<maxPages;pages++){
     const raw=await remote(node,'events',{after:cursor}),events=Array.isArray(raw)?raw:[raw].filter(Boolean)
-    if(!events.length)break
+    if(!events.length){caughtUp=true;break}
     db.transaction(()=>{for(const event of events){
       const item=normalizeWindowsEvent(event)
       const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,program,account_sid,event_time,event_type,logon_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),nodeId,item.recordId,item.eventId,item.action,item.protocol,item.srcIp,item.srcPort,item.dstIp,item.dstPort,item.direction,item.program,item.accountSid,item.eventTime,item.eventType,item.logonType)
@@ -582,24 +707,31 @@ export async function pullLogs(nodeId,actorId=null,maxPages=5) {
     const next=Number(events.at(-1).RecordId)
     if(next<=cursor)break
     cursor=next
-    if(events.length<500){pages++;break}
+    if(events.length<500){caughtUp=true;pages++;break}
   }
-  audit(actorId,'logs.pull','node',nodeId,null,{inserted,pages,lastRecordId:cursor})
-  return {inserted,pages,lastRecordId:cursor}
+  audit(actorId,'logs.pull','node',nodeId,null,{inserted,pages,lastRecordId:cursor,caughtUp})
+  return {inserted,pages,lastRecordId:cursor,caughtUp}
 }
 api.post('/logs/pull',requireRole('editor'),wrap(async(req,res)=>{
   const {nodeId}=body(z.object({nodeId:z.string()}),req)
   res.json(await pullLogs(nodeId,req.user.id))
 }))
-api.get('/learning-sessions',(_req,res)=>res.json(all('SELECT * FROM learning_sessions ORDER BY started_at DESC')))
+api.get('/learning-sessions',(req,res)=>res.json(all('SELECT * FROM learning_sessions WHERE (? IS NULL OR node_id=?) ORDER BY started_at DESC,rowid DESC LIMIT 500',req.query.nodeId||null,req.query.nodeId||null)))
 api.post('/learning-sessions',requireRole('editor'),(req,res)=>{
   const {nodeId,durationHours}=body(z.object({nodeId:z.string(),durationHours:z.number().min(1).max(720).default(24)}),req),node=getNode(nodeId)
   if(!node)return notFound(res,'Node')
-  if(one("SELECT id FROM learning_sessions WHERE node_id=? AND status='active'",nodeId))return res.status(409).json({error:'Node already learning'})
-  const sessionId=id(),ends=new Date(Date.now()+durationHours*360e4).toISOString()
-  run('INSERT INTO learning_sessions(id,node_id,ends_at,status) VALUES(?,?,?,?)',sessionId,nodeId,ends,'active')
-  run('UPDATE nodes SET firewall_state=? WHERE id=?','learning',nodeId)
-  audit(req.user.id,'learning.start','node',nodeId,null,{sessionId,ends});res.status(201).json({id:sessionId,nodeId,endsAt:ends})
+  const active=one("SELECT * FROM learning_sessions WHERE node_id=? AND status='active'",nodeId)
+  if(active?.mode==='manual')return res.status(409).json({error:'Node already learning'})
+  if(!active&&one("SELECT id FROM learning_sessions WHERE node_id=? AND status IN ('review','applying','apply-failed')",nodeId))return res.status(409).json({error:'Finish the current learning session before starting another'})
+  const endsAt=new Date(Date.now()+durationHours*360e4).toISOString()
+  const sessionId=active?.id||id()
+  db.transaction(()=>{
+    if(active)run("UPDATE learning_sessions SET mode='manual',ends_at=?,last_error=NULL WHERE id=?",endsAt,sessionId)
+    else run("INSERT INTO learning_sessions(id,node_id,ends_at,status,mode) VALUES(?,?,?,'active','manual')",sessionId,nodeId,endsAt)
+    run("UPDATE nodes SET firewall_state='learning' WHERE id=?",nodeId)
+    audit(req.user.id,active?'learning.switch-to-manual':'learning.start','node',nodeId,null,{sessionId,endsAt,durationHours,mode:'manual'})
+  })()
+  res.status(201).json({id:sessionId,nodeId,endsAt,mode:'manual',status:'active'})
 })
 export function finalizeLearning(sessionId,actorId=null) {
   const session=one('SELECT * FROM learning_sessions WHERE id=?',sessionId)
@@ -607,15 +739,21 @@ export function finalizeLearning(sessionId,actorId=null) {
   if(!['active','expired'].includes(session.status))throw Object.assign(new Error('Session already finalized'),{status:409})
   const endAt=new Date(Math.min(Date.now(),Date.parse(session.ends_at))).toISOString()
   const observations=db.prepare("SELECT DISTINCT direction,dst_port,protocol,src_ip,dst_ip FROM log_events WHERE node_id=? AND datetime(COALESCE(event_time,received_at)) BETWEEN datetime(?) AND datetime(?) AND action='allow' AND dst_port BETWEEN 1 AND 65535 AND protocol IN ('TCP','UDP') AND direction IN ('in','out')")
-  const flows=[]
+  const keyFor=(direction,protocol,port,address)=>[direction,String(protocol).toUpperCase(),String(port),String(address).toLowerCase()].join('|')
+  const existing=all(`SELECT DISTINCT v.rules_compiled_json FROM policy_versions v JOIN policies p ON p.current_version_id=v.id JOIN policy_assignments a ON a.policy_id=p.id WHERE a.node_id=? OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?)`,session.node_id,session.node_id)
+  const known=new Set(existing.flatMap(row=>(parse(row.rules_compiled_json)||[]).filter(rule=>rule.action==='allow').map(rule=>keyFor(rule.direction,rule.protocol,rule.direction==='in'?rule.localPort:rule.remotePort,rule.remoteAddress))))
+  const flows=[];const seen=new Set()
   for(const event of observations.iterate(session.node_id,session.started_at,endAt)){
     const remoteAddress=event.direction==='in'?event.src_ip:event.dst_ip
     if(!isIP(remoteAddress||''))continue
+    const key=keyFor(event.direction,event.protocol,event.dst_port,remoteAddress)
+    if(known.has(key)||seen.has(key))continue
+    seen.add(key)
     flows.push({...event,remoteAddress})
     if(flows.length>500)throw Object.assign(new Error('Learning proposal exceeds 500 distinct flows; narrow the session before finalizing'),{status:409})
   }
   if(!flows.length){
-    db.transaction(()=>{run("UPDATE learning_sessions SET status='empty' WHERE id=?",session.id);run("UPDATE nodes SET firewall_state='review' WHERE id=?",session.node_id);audit(actorId,'learning.empty','node',session.node_id,null,{sessionId:session.id})})()
+    db.transaction(()=>{run("UPDATE learning_sessions SET status='empty',last_error=NULL WHERE id=?",session.id);run('UPDATE nodes SET firewall_state=? WHERE id=?',session.mode==='auto'?'enforcing':'review',session.node_id);audit(actorId,'learning.empty','node',session.node_id,null,{sessionId:session.id,mode:session.mode})})()
     return {status:'empty',ruleCount:0}
   }
   const policyId=id(),versionId=id(),nodes=flows.map((event,i)=>({id:`learned-${i}`,type:'allow',position:{x:80+(i%4)*180,y:80+Math.floor(i/4)*100},data:{name:`Learned ${event.protocol} ${event.dst_port} ${event.direction}`,localPort:event.direction==='in'?String(event.dst_port):'Any',remotePort:event.direction==='out'?String(event.dst_port):'Any',protocol:event.protocol,remoteAddress:event.remoteAddress,direction:event.direction}}))
@@ -623,33 +761,70 @@ export function finalizeLearning(sessionId,actorId=null) {
   db.transaction(()=>{
     run('INSERT INTO policies(id,name,description,owner_user_id,current_version_id) VALUES(?,?,?,?,?)',policyId,`Learned ${one('SELECT hostname FROM nodes WHERE id=?',session.node_id)?.hostname||'node'}`,`Generated from learning session ${session.id}`,actorId,versionId)
     run('INSERT INTO policy_versions(id,policy_id,version_no,graph_json,rules_compiled_json,created_by,comment) VALUES(?,?,?,?,?,?,?)',versionId,policyId,1,json(graph),json(rules),actorId,'Learning proposal, review before applying')
-    run("UPDATE learning_sessions SET status='review',generated_policy_id=? WHERE id=?",policyId,session.id)
+    run("UPDATE learning_sessions SET status='review',generated_policy_id=?,last_error=NULL WHERE id=?",policyId,session.id)
     run("UPDATE nodes SET firewall_state='review' WHERE id=?",session.node_id)
-    audit(actorId,'learning.finalize','node',session.node_id,null,{policyId,observations:flows.length})
+    audit(actorId,'learning.finalize','node',session.node_id,null,{policyId,observations:flows.length,mode:session.mode})
   })()
   return {policyId,versionId,ruleCount:rules.length,status:'review'}
 }
-api.post('/learning-sessions/:id/finalize',requireRole('editor'),(req,res)=>res.json(finalizeLearning(reqId(req),req.user.id)))
-api.post('/learning-sessions/:id/approve',requireRole('editor'),wrap(async(req,res)=>{
+api.post('/learning-sessions/:id/finalize',requireRole('editor'),(req,res)=>{
   const session=one('SELECT * FROM learning_sessions WHERE id=?',reqId(req))
   if(!session)return notFound(res,'Learning session')
-  if(!['review','apply-failed'].includes(session.status))return res.status(409).json({error:'Session is not awaiting approval'})
+  if(session.mode==='auto')return res.status(409).json({error:'Automatic training finalizes at its scheduled end'})
+  res.json(finalizeLearning(session.id,req.user.id))
+})
+export async function approveLearning(sessionId,actorId=null) {
+  const session=one('SELECT * FROM learning_sessions WHERE id=?',sessionId)
+  if(!session)throw Object.assign(new Error('Learning session not found'),{status:404})
+  if(!['review','apply-failed'].includes(session.status))throw Object.assign(new Error('Session is not awaiting approval'),{status:409})
   const policy=getPolicy(session.generated_policy_id),node=getNode(session.node_id)
-  if(!policy||!node)return res.status(409).json({error:'Learning proposal or node is missing'})
+  if(!policy||!node)throw Object.assign(new Error('Learning proposal or node is missing'),{status:409})
   const rules=parse(one('SELECT rules_compiled_json FROM policy_versions WHERE id=?',policy.current_version_id)?.rules_compiled_json)||[]
   const conflicts=assignmentConflicts(policy.id,rules,[node])
-  if(conflicts.length)return rejectConflicts(res,conflicts)
+  if(conflicts.length)throw Object.assign(new Error('Conflicting firewall rules on assigned nodes'),{status:409,conflicts})
   db.transaction(()=>{
-    if(!one('SELECT id FROM policy_assignments WHERE policy_id=? AND node_id=?',policy.id,node.id))run('INSERT INTO policy_assignments(id,policy_id,node_id,assigned_by) VALUES(?,?,?,?)',id(),policy.id,node.id,req.user.id)
-    run("UPDATE learning_sessions SET status='applying' WHERE id=?",session.id)
-    audit(req.user.id,'learning.approve','node',node.id,null,{sessionId:session.id,policyId:policy.id})
+    if(!one('SELECT id FROM policy_assignments WHERE policy_id=? AND node_id=?',policy.id,node.id))run('INSERT INTO policy_assignments(id,policy_id,node_id,assigned_by) VALUES(?,?,?,?)',id(),policy.id,node.id,actorId)
+    run("UPDATE learning_sessions SET status='applying',last_attempt_at=?,last_error=NULL WHERE id=?",now(),session.id)
+    audit(actorId,session.mode==='auto'?'learning.auto-apply':'learning.approve','node',node.id,null,{sessionId:session.id,policyId:policy.id})
   })()
-  const results=await applyPolicy(policy,req.user.id)
+  const results=await applyPolicy(policy,actorId)
   const status=results.every(result=>result.status==='success')?'enforced':results.some(result=>result.status==='failed')?'apply-failed':'applying'
-  run('UPDATE learning_sessions SET status=? WHERE id=?',status,session.id)
-  run('UPDATE nodes SET firewall_state=? WHERE id=?',status==='enforced'?'enforcing':'review',node.id)
-  res.json({status,results})
-}))
+  run('UPDATE learning_sessions SET status=?,last_error=? WHERE id=?',status,results.find(result=>result.status==='failed')?.error||null,session.id)
+  run('UPDATE nodes SET firewall_state=? WHERE id=?',status==='enforced'?'enforcing':status==='applying'?'applying':'review',node.id)
+  return {status,results}
+}
+api.post('/learning-sessions/:id/approve',requireRole('editor'),wrap(async(req,res)=>res.json(await approveLearning(reqId(req),req.user.id))))
+
+export async function processDueTraining(limit=25) {
+  const cutoff=now(),retryBefore=new Date(Date.now()-60*60*1000).toISOString()
+  const due=all("SELECT id,node_id,status FROM learning_sessions WHERE mode='auto' AND ((status='active' AND ends_at<=? AND (last_attempt_at IS NULL OR last_attempt_at<=?)) OR (status IN ('review','apply-failed') AND (last_attempt_at IS NULL OR last_attempt_at<=?))) ORDER BY ends_at LIMIT ?",cutoff,retryBefore,retryBefore,limit)
+  const results=[]
+  for(const session of due){
+    try {
+      if(session.status==='active'){
+        const node=getNode(session.node_id)
+        if(!node)throw new Error('Node is missing')
+        if(node.connection_mode==='agent'){
+          const agent=one('SELECT last_checkin_at FROM agents WHERE id=? AND revoked_at IS NULL',node.agent_id)
+          if(!agent?.last_checkin_at||Date.parse(agent.last_checkin_at)<Date.now()-5*60_000)throw new Error('Agent is not online to confirm training telemetry')
+        } else {
+          if(!['winrm','winrms'].includes(node.transport))throw new Error('No working event collection transport; probe the node before training can finish')
+          const collection=await pullLogs(node.id)
+          if(!collection.caughtUp)throw new Error('Security event backlog remains; training will finish after collection catches up')
+        }
+        const finalized=finalizeLearning(session.id)
+        if(finalized.status==='empty'){results.push({sessionId:session.id,status:'empty'});continue}
+      }
+      const applied=await approveLearning(session.id)
+      results.push({sessionId:session.id,status:applied.status})
+    } catch(error) {
+      run('UPDATE learning_sessions SET last_error=?,last_attempt_at=? WHERE id=?',error.message,now(),session.id)
+      audit(null,'learning.auto-failed','node',session.node_id,null,{sessionId:session.id,error:error.message})
+      results.push({sessionId:session.id,status:'failed',error:error.message})
+    }
+  }
+  return results
+}
 
 api.get('/rpc-filters',(_req,res)=>res.json(all('SELECT * FROM rpc_filter_rules ORDER BY label')))
 api.post('/rpc-filters',requireRole('admin'),(req,res)=>{

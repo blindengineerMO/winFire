@@ -12,14 +12,37 @@ $ErrorActionPreference = 'Stop'
 $argsData = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd())) | ConvertFrom-Json
 $operation = '__OPERATION__'
 $result = switch ($operation) {
+  'auth' { [Security.Principal.WindowsIdentity]::GetCurrent().Name }
   'facts' {
+    $computer = Get-CimInstance Win32_ComputerSystem
+    $osInfo = Get-CimInstance Win32_OperatingSystem
+    $biosInfo = Get-CimInstance Win32_BIOS
+    $adapters = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' | ForEach-Object {
+      [pscustomobject]@{description=$_.Description;macAddress=$_.MACAddress;ipAddresses=@($_.IPAddress);subnets=@($_.IPSubnet);gateways=@($_.DefaultIPGateway);dnsServers=@($_.DNSServerSearchOrder);dnsDomain=$_.DNSDomain;dnsSuffixes=@($_.DNSDomainSuffixSearchOrder);dhcpEnabled=$_.DHCPEnabled;dhcpServer=$_.DHCPServer}
+    })
+    $lastUser=$null; $machineGuid=$null; $machineSid=$null
+    try {$lastUser=(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI' -ErrorAction Stop).LastLoggedOnUser} catch {}
+    try {$machineGuid=(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography' -ErrorAction Stop).MachineGuid} catch {}
+    try {$admin=Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True AND SID LIKE '%-500'" | Select-Object -First 1; if($admin){$machineSid=$admin.SID -replace '-500$',''}} catch {}
     [pscustomobject]@{
-      computer = Get-CimInstance Win32_ComputerSystem | Select-Object Name,Model,Manufacturer
-      bios = Get-CimInstance Win32_BIOS | Select-Object SerialNumber
-      os = Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber
+      computer = $computer | Select-Object Name,Model,Manufacturer,Domain,PartOfDomain,UserName
+      bios = $biosInfo | Select-Object SerialNumber
+      os = $osInfo | Select-Object Caption,Version,BuildNumber,OSArchitecture,InstallDate,LastBootUpTime
+      identity = [pscustomobject]@{machineGuid=$machineGuid;localMachineSid=$machineSid;domainJoined=[bool]$computer.PartOfDomain;domainName=$computer.Domain;sessionLogonServer=$env:LOGONSERVER;currentInteractiveUser=$computer.UserName;lastLoggedOnUser=$lastUser}
+      network = $adapters
+      dnsSuffixes = @($adapters | ForEach-Object { @($_.dnsSuffixes)+@($_.dnsDomain) } | Where-Object { $_ } | Select-Object -Unique)
       firewall = @(Get-NetFirewallProfile | Select-Object Name,Enabled,DefaultInboundAction,DefaultOutboundAction)
       service = Get-Service MpsSvc | Select-Object Status
     }
+  }
+  'all_rules' {
+    $offset=[Math]::Max(0,[int]$argsData.offset); $limit=[Math]::Min(200,[Math]::Max(1,[int]$argsData.limit))
+    $total=(Get-NetFirewallRule | Measure-Object).Count
+    $page=@(Get-NetFirewallRule | Select-Object -Skip $offset -First $limit | ForEach-Object {
+      $r=$_; $p=$r | Get-NetFirewallPortFilter; $a=$r | Get-NetFirewallAddressFilter; $app=$r | Get-NetFirewallApplicationFilter
+      [pscustomobject]@{name=$r.Name;displayName=$r.DisplayName;group=$r.Group;enabled=[bool]($r.Enabled -eq 'True');action=[string]$r.Action;direction=[string]$r.Direction;profile=[string]$r.Profile;protocol=[string]$p.Protocol;localPort=[string]$p.LocalPort;remotePort=[string]$p.RemotePort;remoteAddress=[string]$a.RemoteAddress;program=[string]$app.Program;source=[string]$r.PolicyStoreSourceType}
+    })
+    [pscustomobject]@{total=$total;offset=$offset;rules=$page}
   }
   'rules' {
     @(Get-NetFirewallRule -Group $argsData.group -ErrorAction SilentlyContinue | ForEach-Object {
@@ -87,7 +110,7 @@ $result | ConvertTo-Json -Depth 12 -Compress
 def main():
     payload = json.load(sys.stdin)
     operation = payload['operation']
-    if operation not in {'facts', 'rules', 'apply', 'events', 'rights'}:
+    if operation not in {'auth', 'facts', 'all_rules', 'rules', 'apply', 'events', 'rights'}:
         raise ValueError('Unsupported operation')
     host = payload['host']
     secure = payload.get('transport') == 'winrms'
@@ -119,6 +142,8 @@ def main():
     if status != 0:
         raise RuntimeError(stderr.decode('utf-8', 'replace').strip() or f'WinRM exited {status}')
     output = stdout.decode('utf-8-sig').strip()
+    if operation == 'rights' and (not output or output == 'null'):
+        raise RuntimeError('Logon-rights export returned no data; baseline was not collected')
     print(output or 'null')
 
 

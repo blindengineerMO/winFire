@@ -19,6 +19,7 @@ const {classifyVerification}=await import('../src/verifier.js')
 const {bootstrap}=await import('../src/security.js')
 const {db}=await import('../src/db.js')
 const {recordNodeSuccess,recordNodeTransportFailure}=await import('../src/connector.js')
+const {processDueTraining}=await import('../src/app.js')
 const request=supertest(app)
 await bootstrap()
 test.after(()=>{db.close();fs.rmSync(dir,{recursive:true,force:true})})
@@ -190,6 +191,7 @@ test('learning proposals preserve traffic direction and require approval before 
   db.prepare('INSERT INTO agents(id,node_id,cert_thumbprint,cert_expires_at,version) VALUES(?,?,?,?,?)').run(agentId,node.body.id,'TEST',new Date(Date.now()+864e5).toISOString(),'test')
   db.prepare('UPDATE nodes SET agent_id=? WHERE id=?').run(agentId,node.body.id)
   const started=await auth(request.post('/api/v1/learning-sessions')).send({nodeId:node.body.id,durationHours:24}).expect(201)
+  assert.equal(started.body.mode,'manual')
   const insert=db.prepare('INSERT INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,dst_ip,dst_port,direction) VALUES(?,?,?,?,?,?,?,?,?,?)')
   insert.run(crypto.randomUUID(),node.body.id,1001,5156,'allow','TCP','10.0.0.5','192.0.2.10',443,'out')
   insert.run(crypto.randomUUID(),node.body.id,1002,5156,'allow','TCP','192.0.2.20','10.0.0.5',3389,'in')
@@ -207,6 +209,97 @@ test('learning proposals preserve traffic direction and require approval before 
   assert.equal(approved.body.status,'applying')
   assert.equal(db.prepare('SELECT COUNT(*) n FROM agent_jobs WHERE agent_id=?').get(agentId).n,1)
   await auth(request.post(`/api/v1/learning-sessions/${started.body.id}/approve`)).send({}).expect(409)
+})
+
+test('new hosts train automatically, then retraining adds only unseen allow rules',async()=>{
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@example.test',password:'test-password-12345'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
+  await auth(request.patch('/api/v1/settings/training')).send({newHostTrainingDays:7}).expect(200)
+  const node=await auth(request.post('/api/v1/nodes')).send({hostname:'automatic-training',ip:'127.0.0.1',connectionMode:'agent'}).expect(201)
+  assert.equal(node.body.firewall_state,'learning')
+  assert.equal(node.body.training.mode,'auto')
+  assert.ok(Math.abs(Date.parse(node.body.training.endsAt)-Date.now()-7*864e5)<60_000)
+  const agentId=crypto.randomUUID()
+  db.prepare('INSERT INTO agents(id,node_id,cert_thumbprint,cert_expires_at,version,last_checkin_at) VALUES(?,?,?,?,?,?)').run(agentId,node.body.id,'TRAINING-TEST',new Date(Date.now()+864e5).toISOString(),'test',new Date().toISOString())
+  db.prepare('UPDATE nodes SET agent_id=? WHERE id=?').run(agentId,node.body.id)
+  const firstId=node.body.training.id
+  db.prepare('UPDATE learning_sessions SET started_at=?,ends_at=? WHERE id=?').run(new Date(Date.now()-60_000).toISOString(),new Date(Date.now()-1000).toISOString(),firstId)
+  const event=db.prepare('INSERT INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,dst_ip,dst_port,direction,event_time) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
+  event.run(crypto.randomUUID(),node.body.id,2001,5156,'allow','TCP','192.0.2.10','127.0.0.1',3389,'in',new Date(Date.now()-30_000).toISOString())
+  const firstSweep=await processDueTraining()
+  assert.ok(firstSweep.some(result=>result.sessionId===firstId&&result.status==='applying'))
+  const first=db.prepare('SELECT * FROM learning_sessions WHERE id=?').get(firstId)
+  assert.equal(first.status,'applying')
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM policy_assignments WHERE policy_id=? AND node_id=?').get(first.generated_policy_id,node.body.id).n,1)
+  db.prepare("UPDATE learning_sessions SET status='enforced' WHERE id=?").run(firstId)
+  db.prepare("UPDATE nodes SET firewall_state='enforcing' WHERE id=?").run(node.body.id)
+  const retry=await auth(request.post(`/api/v1/nodes/${node.body.id}/training`)).send({durationDays:2}).expect(201)
+  assert.equal(retry.body.mode,'auto')
+  await auth(request.post(`/api/v1/nodes/${node.body.id}/training`)).send({durationDays:2}).expect(409)
+  db.prepare('UPDATE learning_sessions SET started_at=?,ends_at=? WHERE id=?').run(new Date(Date.now()-60_000).toISOString(),new Date(Date.now()-1000).toISOString(),retry.body.id)
+  event.run(crypto.randomUUID(),node.body.id,2002,5156,'allow','TCP','192.0.2.10','127.0.0.1',3389,'in',new Date(Date.now()-30_000).toISOString())
+  event.run(crypto.randomUUID(),node.body.id,2003,5156,'allow','TCP','127.0.0.1','192.0.2.20',443,'out',new Date(Date.now()-30_000).toISOString())
+  const secondSweep=await processDueTraining()
+  assert.ok(secondSweep.some(result=>result.sessionId===retry.body.id&&result.status==='applying'))
+  const second=db.prepare('SELECT * FROM learning_sessions WHERE id=?').get(retry.body.id)
+  assert.notEqual(second.generated_policy_id,first.generated_policy_id)
+  const rules=JSON.parse(db.prepare('SELECT rules_compiled_json FROM policy_versions WHERE policy_id=?').get(second.generated_policy_id).rules_compiled_json)
+  assert.deepEqual(rules.map(rule=>[rule.direction,rule.remotePort,rule.remoteAddress]),[['out','443','192.0.2.20']])
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM policy_assignments WHERE node_id=? AND policy_id IN (?,?)').get(node.body.id,first.generated_policy_id,second.generated_policy_id).n,2)
+  await auth(request.patch('/api/v1/settings/training')).send({newHostTrainingDays:30}).expect(200)
+})
+
+test('automatic training remains pending without a working log transport and ends cleanly with no traffic',async()=>{
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@example.test',password:'test-password-12345'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
+  const unreachable=await auth(request.post('/api/v1/nodes')).send({hostname:'unprobed-training',ip:'127.0.0.1'}).expect(201)
+  db.prepare('UPDATE learning_sessions SET ends_at=? WHERE id=?').run(new Date(Date.now()-1000).toISOString(),unreachable.body.training.id)
+  const failed=await processDueTraining()
+  assert.ok(failed.some(result=>result.sessionId===unreachable.body.training.id&&result.status==='failed'))
+  const pending=db.prepare('SELECT status,last_error FROM learning_sessions WHERE id=?').get(unreachable.body.training.id)
+  assert.equal(pending.status,'active')
+  assert.match(pending.last_error,/No working event collection transport/)
+  const agentNode=await auth(request.post('/api/v1/nodes')).send({hostname:'quiet-training',connectionMode:'agent'}).expect(201)
+  db.prepare('UPDATE learning_sessions SET ends_at=? WHERE id=?').run(new Date(Date.now()-1000).toISOString(),agentNode.body.training.id)
+  const offline=await processDueTraining()
+  assert.ok(offline.some(result=>result.sessionId===agentNode.body.training.id&&result.status==='failed'))
+  assert.match(db.prepare('SELECT last_error FROM learning_sessions WHERE id=?').get(agentNode.body.training.id).last_error,/Agent is not online/)
+  const agentId=crypto.randomUUID()
+  db.prepare('INSERT INTO agents(id,node_id,cert_thumbprint,cert_expires_at,version,last_checkin_at) VALUES(?,?,?,?,?,?)').run(agentId,agentNode.body.id,'QUIET-TEST',new Date(Date.now()+864e5).toISOString(),'test',new Date().toISOString())
+  db.prepare('UPDATE nodes SET agent_id=? WHERE id=?').run(agentId,agentNode.body.id)
+  db.prepare('UPDATE learning_sessions SET last_attempt_at=NULL WHERE id=?').run(agentNode.body.training.id)
+  const quiet=await processDueTraining()
+  assert.ok(quiet.some(result=>result.sessionId===agentNode.body.training.id&&result.status==='empty'))
+  assert.equal(db.prepare('SELECT firewall_state FROM nodes WHERE id=?').get(agentNode.body.id).firewall_state,'enforcing')
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM policy_assignments WHERE node_id=?').get(agentNode.body.id).n,0)
+})
+
+test('due WinRM training collects logs, applies learned rules, and marks the host enforced',async()=>{
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@example.test',password:'test-password-12345'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
+  const credential=await auth(request.post('/api/v1/credentials')).send({name:'Training transport',type:'local',username:'training-user',password:'transport-test-password'}).expect(201)
+  const node=await auth(request.post('/api/v1/nodes')).send({hostname:'training-winrm',ip:'127.0.0.1',credentialIds:[credential.body.id]}).expect(201)
+  db.prepare("UPDATE nodes SET transport='winrm' WHERE id=?").run(node.body.id)
+  db.prepare('UPDATE learning_sessions SET started_at=?,ends_at=? WHERE id=?').run(new Date(Date.now()-60_000).toISOString(),new Date(Date.now()-1000).toISOString(),node.body.training.id)
+  db.prepare('INSERT INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,dst_ip,dst_port,direction,event_time) VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(crypto.randomUUID(),node.body.id,3001,5156,'allow','TCP','192.0.2.50','127.0.0.1',8443,'in',new Date(Date.now()-30_000).toISOString())
+  const stub=path.join(dir,'training-transport')
+  const rulesFile=path.join(dir,'training-rules.json')
+  fs.writeFileSync(stub,`#!/usr/bin/env node
+const fs=require('fs');let text='';process.stdin.on('data',part=>text+=part);process.stdin.on('end',()=>{const input=JSON.parse(text);const file=process.env.WINFIRE_TEST_RULES_FILE;const existing=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):[];let result;if(input.operation==='events')result=[];else if(input.operation==='rules')result=existing.filter(rule=>rule.group===input.args.group);else if(input.operation==='apply'){const remove=new Set(input.args.remove);const next=existing.filter(rule=>!remove.has(rule.name)).concat(input.args.add);fs.writeFileSync(file,JSON.stringify(next));result={applied:true}}else throw Error('Unexpected operation');process.stdout.write(JSON.stringify(result))})
+`,{mode:0o700})
+  const priorPython=process.env.WINRM_PYTHON,priorRules=process.env.WINFIRE_TEST_RULES_FILE
+  process.env.WINRM_PYTHON=stub;process.env.WINFIRE_TEST_RULES_FILE=rulesFile
+  try {
+    const results=await processDueTraining()
+    assert.ok(results.some(result=>result.sessionId===node.body.training.id&&result.status==='enforced'))
+    assert.equal(db.prepare('SELECT firewall_state FROM nodes WHERE id=?').get(node.body.id).firewall_state,'enforcing')
+    const rules=JSON.parse(fs.readFileSync(rulesFile,'utf8'))
+    assert.deepEqual(rules.map(rule=>[rule.direction,rule.localPort,rule.remoteAddress]),[['in','8443','192.0.2.50']])
+    assert.equal(db.prepare('SELECT status FROM policy_apply_runs WHERE node_id=? ORDER BY started_at DESC LIMIT 1').get(node.body.id).status,'success')
+  } finally {
+    if(priorPython===undefined)delete process.env.WINRM_PYTHON;else process.env.WINRM_PYTHON=priorPython
+    if(priorRules===undefined)delete process.env.WINFIRE_TEST_RULES_FILE;else process.env.WINFIRE_TEST_RULES_FILE=priorRules
+  }
 })
 
 test('group policy assignments count in coverage and compliance',async()=>{
@@ -234,7 +327,7 @@ test('drift checks record unknown agent state and appear in coverage',async()=>{
   const checked=await auth(request.post('/api/v1/drift/checks')).send({nodeId:node.body.id,policyId:policy.body.id}).expect(201)
   assert.equal(checked.body.checks.length,1)
   assert.equal(checked.body.checks[0].status,'unknown')
-  assert.match(checked.body.checks[0].error,/Agent firewall readback/)
+  assert.match(checked.body.checks[0].error,/firewall readback/)
   const listing=await auth(request.get(`/api/v1/drift/checks?nodeId=${node.body.id}`)).expect(200)
   assert.equal(listing.body[0].status,'unknown')
   const coverage=await auth(request.get('/api/v1/reports/coverage')).expect(200)
@@ -341,6 +434,32 @@ test('private vault credentials cannot be attached by another editor',async()=>{
   await ownerAuth(request.post('/api/v1/users')).send({email:'editor@example.test',password:'editor-password-123',role:'editor'}).expect(201)
   const editor=await request.post('/api/v1/auth/login').send({email:'editor@example.test',password:'editor-password-123'}).expect(200)
   await request.post('/api/v1/nodes').set('Authorization',`Bearer ${editor.body.accessToken}`).send({hostname:'lab-host',credentialIds:[secret.body.id]}).expect(403)
+})
+
+test('credential test authenticates only the selected direct or group credential',async()=>{
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@example.test',password:'test-password-12345'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
+  const good=await auth(request.post('/api/v1/credentials')).send({name:'Good auth',type:'local',username:'good-user',password:'good-password'}).expect(201)
+  const bad=await auth(request.post('/api/v1/credentials')).send({name:'Bad auth',type:'local',username:'bad-user',password:'bad-password',priority:1}).expect(201)
+  const node=await auth(request.post('/api/v1/nodes')).send({hostname:'auth-test.local',credentialIds:[good.body.id]}).expect(201)
+  const group=await auth(request.post('/api/v1/node-groups')).send({name:'Auth test group'}).expect(201)
+  await auth(request.post(`/api/v1/node-groups/${group.body.id}/members`)).send({nodeId:node.body.id}).expect(200)
+  await auth(request.post(`/api/v1/credentials/${bad.body.id}/assignments`)).send({nodeGroupId:group.body.id}).expect(201)
+  db.prepare('UPDATE nodes SET transport=? WHERE id=?').run('winrm',node.body.id)
+  const stub=path.join(dir,'auth-transport')
+  fs.writeFileSync(stub,'#!/usr/bin/env node\nlet data="";process.stdin.on("data",x=>data+=x);process.stdin.on("end",()=>{const p=JSON.parse(data);if(p.operation!=="auth"||p.username!=="good-user"){process.stderr.write("Invalid credential");process.exitCode=1}else process.stdout.write(JSON.stringify(p.username))})\n',{mode:0o700})
+  const previous=process.env.WINRM_PYTHON
+  process.env.WINRM_PYTHON=stub
+  try {
+    const tested=await auth(request.post(`/api/v1/credentials/${good.body.id}/test`)).send({nodeId:node.body.id}).expect(200)
+    assert.deepEqual(tested.body,{success:true,account:'good-user'})
+    const rejected=await auth(request.post(`/api/v1/credentials/${bad.body.id}/test`)).send({nodeId:node.body.id}).expect(200)
+    assert.equal(rejected.body.success,false)
+    assert.match(rejected.body.error,/Invalid credential/)
+  } finally {
+    if(previous===undefined)delete process.env.WINRM_PYTHON
+    else process.env.WINRM_PYTHON=previous
+  }
 })
 
 test('TOTP enrollment gates login and can be disabled',async()=>{

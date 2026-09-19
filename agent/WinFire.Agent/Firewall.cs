@@ -25,6 +25,10 @@ public static class Firewall
           })
         }
         $existing=@(ReadManaged)
+        if($payload.readOnly) {
+          [pscustomobject]@{rules=@($existing | Select-Object name,action,direction,protocol,localPort,remotePort,remoteAddress,program,profile)} | ConvertTo-Json -Depth 6 -Compress
+          return
+        }
         function SameRule($left,$right) {
           foreach($field in @('name','action','direction','protocol','localPort','remotePort','remoteAddress','program','profile')) {
             $leftValue=if($field -eq 'remotePort' -and !$left.$field){'Any'}else{[string]$left.$field}
@@ -59,7 +63,15 @@ public static class Firewall
         [pscustomobject]@{add=@($toAdd | ForEach-Object name);remove=@($toRemove | ForEach-Object name)} | ConvertTo-Json -Depth 6 -Compress
         """;
 
-    public static async Task<JsonElement> ApplyAsync(JsonElement payload, CancellationToken cancellationToken)
+    public static Task<JsonElement> ApplyAsync(JsonElement payload, CancellationToken cancellationToken) => RunAsync(payload, cancellationToken);
+
+    public static Task<JsonElement> ReadAsync(JsonElement payload, CancellationToken cancellationToken)
+    {
+        if (!payload.TryGetProperty("group", out var group)) throw new InvalidDataException("Policy read job has no firewall group");
+        return RunAsync(JsonSerializer.SerializeToElement(new { group = group.GetString(), readOnly = true }), cancellationToken);
+    }
+
+    private static async Task<JsonElement> RunAsync(JsonElement payload, CancellationToken cancellationToken)
     {
         if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("Windows Firewall is required");
         if (!payload.TryGetProperty("group", out var group) || !group.GetString()!.StartsWith("WinFireSecure:", StringComparison.Ordinal))

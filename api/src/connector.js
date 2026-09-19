@@ -74,7 +74,21 @@ try {
     param($operation,$argsData)
     $ErrorActionPreference='Stop'
     switch($operation) {
-      'facts' { [pscustomobject]@{computer=Get-CimInstance Win32_ComputerSystem | Select-Object Name,Model,Manufacturer; bios=Get-CimInstance Win32_BIOS | Select-Object SerialNumber; os=Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber; firewall=Get-NetFirewallProfile | Select-Object Name,Enabled,DefaultInboundAction,DefaultOutboundAction; service=Get-Service MpsSvc | Select-Object Status} }
+      'auth' { [Security.Principal.WindowsIdentity]::GetCurrent().Name }
+      'facts' {
+        $computer=Get-CimInstance Win32_ComputerSystem; $osInfo=Get-CimInstance Win32_OperatingSystem; $biosInfo=Get-CimInstance Win32_BIOS
+        $adapters=@(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' | ForEach-Object { [pscustomobject]@{description=$_.Description;macAddress=$_.MACAddress;ipAddresses=@($_.IPAddress);subnets=@($_.IPSubnet);gateways=@($_.DefaultIPGateway);dnsServers=@($_.DNSServerSearchOrder);dnsDomain=$_.DNSDomain;dnsSuffixes=@($_.DNSDomainSuffixSearchOrder);dhcpEnabled=$_.DHCPEnabled;dhcpServer=$_.DHCPServer} })
+        $lastUser=$null; $machineGuid=$null; $machineSid=$null
+        try {$lastUser=(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Authentication\\LogonUI' -ErrorAction Stop).LastLoggedOnUser} catch {}
+        try {$machineGuid=(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography' -ErrorAction Stop).MachineGuid} catch {}
+        try {$admin=Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True AND SID LIKE '%-500'" | Select-Object -First 1; if($admin){$machineSid=$admin.SID -replace '-500$',''}} catch {}
+        [pscustomobject]@{computer=$computer | Select-Object Name,Model,Manufacturer,Domain,PartOfDomain,UserName;bios=$biosInfo | Select-Object SerialNumber;os=$osInfo | Select-Object Caption,Version,BuildNumber,OSArchitecture,InstallDate,LastBootUpTime;identity=[pscustomobject]@{machineGuid=$machineGuid;localMachineSid=$machineSid;domainJoined=[bool]$computer.PartOfDomain;domainName=$computer.Domain;sessionLogonServer=$env:LOGONSERVER;currentInteractiveUser=$computer.UserName;lastLoggedOnUser=$lastUser};network=$adapters;dnsSuffixes=@($adapters | ForEach-Object { @($_.dnsSuffixes)+@($_.dnsDomain) } | Where-Object { $_ } | Select-Object -Unique);firewall=@(Get-NetFirewallProfile | Select-Object Name,Enabled,DefaultInboundAction,DefaultOutboundAction);service=Get-Service MpsSvc | Select-Object Status}
+      }
+      'all_rules' {
+        $offset=[Math]::Max(0,[int]$argsData.offset); $limit=[Math]::Min(200,[Math]::Max(1,[int]$argsData.limit)); $total=(Get-NetFirewallRule | Measure-Object).Count
+        $page=@(Get-NetFirewallRule | Select-Object -Skip $offset -First $limit | ForEach-Object { $r=$_; $p=$r | Get-NetFirewallPortFilter; $a=$r | Get-NetFirewallAddressFilter; $app=$r | Get-NetFirewallApplicationFilter; [pscustomobject]@{name=$r.Name;displayName=$r.DisplayName;group=$r.Group;enabled=[bool]($r.Enabled -eq 'True');action=[string]$r.Action;direction=[string]$r.Direction;profile=[string]$r.Profile;protocol=[string]$p.Protocol;localPort=[string]$p.LocalPort;remotePort=[string]$p.RemotePort;remoteAddress=[string]$a.RemoteAddress;program=[string]$app.Program;source=[string]$r.PolicyStoreSourceType} })
+        [pscustomobject]@{total=$total;offset=$offset;rules=$page}
+      }
       'rules' { @(Get-NetFirewallRule -Group $argsData.group -ErrorAction SilentlyContinue | ForEach-Object { $r=$_; $p=$r | Get-NetFirewallPortFilter; $a=$r | Get-NetFirewallAddressFilter; $app=$r | Get-NetFirewallApplicationFilter; [pscustomobject]@{name=$r.DisplayName;group=$r.Group;action=([string]$r.Action).ToLower();direction=$(if($r.Direction -eq 'Inbound'){'in'}else{'out'});protocol=[string]$p.Protocol;localPort=[string]$p.LocalPort;remotePort=[string]$p.RemotePort;remoteAddress=[string]$a.RemoteAddress;program=[string]$app.Program;profile=[string]$r.Profile} }) }
   'apply' {
     $old=@(Get-NetFirewallRule -Group $argsData.group -ErrorAction SilentlyContinue | Where-Object { $argsData.remove -contains $_.DisplayName } | ForEach-Object {
@@ -108,16 +122,16 @@ try {
   $result | ConvertTo-Json -Depth 12 -Compress
 } finally { Remove-PSSession $session }
 `
-function nodeCredential(nodeId) {
-  const rows=all(`SELECT DISTINCT c.* FROM credentials c JOIN credential_assignments a ON a.credential_id=c.id WHERE a.node_id=? OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?) ORDER BY c.priority`,nodeId,nodeId)
+function nodeCredential(nodeId,credentialId) {
+  const rows=all(`SELECT DISTINCT c.* FROM credentials c JOIN credential_assignments a ON a.credential_id=c.id WHERE (a.node_id=? OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?)) AND (? IS NULL OR c.id=?) ORDER BY c.priority`,nodeId,nodeId,credentialId||null,credentialId||null)
   if (!rows.length) throw new Error('No credential assigned to node')
   return rows.map(row=>({...row,secret:openSealed(row.encrypted_blob)}))
 }
-export async function remote(node,operation,args={}) {
+export async function remote(node,operation,args={},options={}) {
   if(node.transport==='wmi')throw new Error('WMI/DCOM transport is detected but authenticated WMI operations are not implemented')
   const host=node.fqdn || node.ip || node.hostname
   let lastError
-  for (const credential of nodeCredential(node.id)) {
+  for (const credential of nodeCredential(node.id,options.credentialId)) {
     const input={host,transport:node.transport||'winrm',username:credential.username,password:credential.secret.password,operation,args}
     const attempts=operation==='apply'?1:2
     for(let attempt=0;attempt<attempts;attempt++){
@@ -158,6 +172,12 @@ export async function collectFacts(node) {
   run('INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET snapshot_json=excluded.snapshot_json,collected_at=excluded.collected_at',node.id,JSON.stringify(facts),now())
   run('UPDATE nodes SET os_version=?,os_build=?,last_seen_at=?,status=? WHERE id=?',facts?.os?.Version||null,facts?.os?.BuildNumber||null,now(),'reachable',node.id)
   return facts
+}
+export async function enrichNode(node) {
+  if(node.connection_mode==='agent')throw new Error('Agent nodes require agent-reported facts')
+  const probe=await probeNode(node)
+  if(!['winrm','winrms'].includes(probe.transport))throw new Error('No working WinRM transport for inventory collection')
+  return collectFacts(one('SELECT * FROM nodes WHERE id=?',node.id))
 }
 export async function lookupDns(node) {
   let forward=[],reverse=[]

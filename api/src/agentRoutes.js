@@ -6,10 +6,12 @@ import {db,one,all,run,id,now,audit,json,parse} from './db.js'
 import {hashToken} from './security.js'
 import {agentPkiReady,signAgentCsr} from './agentPki.js'
 import {normalizeWindowsEvent} from './eventNormalizer.js'
+import {diffRules} from './connector.js'
 
 export const agentRoutes=express.Router()
 const wrap=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next)
 const enrollLimit=rateLimit({windowMs:15*60*1000,limit:20,standardHeaders:'draft-8',legacyHeaders:false})
+const readRuleSchema=z.array(z.object({name:z.string(),action:z.string(),direction:z.string(),protocol:z.string(),localPort:z.string(),remotePort:z.string(),remoteAddress:z.string(),program:z.string(),profile:z.string()})).max(1000)
 
 function requireAgent(req,res,next) {
   if(!req.socket.encrypted||!req.socket.authorized)return res.status(401).json({error:'Trusted client certificate required'})
@@ -73,6 +75,11 @@ agentRoutes.get('/:id/jobs',requireAgent,(req,res)=>{
       run("UPDATE agent_jobs SET status='failed',error='Job lease expired after five attempts',finished_at=?,lease_token=NULL WHERE id=?",now(),job.id)
       const payload=parse(job.payload_json)||{}
       if(payload.applyRunId)run("UPDATE policy_apply_runs SET status='failed',error='Agent did not complete job after five attempts',finished_at=? WHERE id=?",now(),payload.applyRunId)
+      if(payload.driftCheckId)run("UPDATE policy_drift_checks SET status='unknown',error='Agent did not complete readback after five attempts',checked_at=? WHERE id=?",now(),payload.driftCheckId)
+      if(payload.policyId){
+        const learning=one("SELECT id FROM learning_sessions WHERE generated_policy_id=? AND node_id=? AND status='applying'",payload.policyId,req.agent.node_id)
+        if(learning){run("UPDATE learning_sessions SET status='apply-failed',last_error='Agent did not complete the apply job' WHERE id=?",learning.id);run("UPDATE nodes SET firewall_state='review' WHERE id=?",req.agent.node_id)}
+      }
       audit(null,'agent.job.abandoned','agent-job',job.id,null,{agentId:req.agent.id,attempts:job.attempt_count})
     }
     const available=all("SELECT * FROM agent_jobs WHERE agent_id=? AND ((status='queued') OR (status='leased' AND lease_until<?)) AND attempt_count<5 ORDER BY created_at LIMIT 10",req.agent.id,now())
@@ -86,18 +93,33 @@ agentRoutes.get('/:id/jobs',requireAgent,(req,res)=>{
 })
 
 agentRoutes.post('/:id/jobs/:jobId/result',requireAgent,(req,res)=>{
-  const data=z.object({leaseToken:z.string().min(20),success:z.boolean(),diff:z.any().optional(),error:z.string().max(2000).optional()}).parse(req.body)
+  const data=z.object({leaseToken:z.string().min(20),success:z.boolean(),diff:z.any().optional(),result:z.any().optional(),error:z.string().max(2000).optional()}).parse(req.body)
   const job=one('SELECT * FROM agent_jobs WHERE id=? AND agent_id=?',req.params.jobId,req.agent.id)
   if(!job)return res.status(404).json({error:'Job not found'})
   if(job.status!=='leased'||job.lease_until<=now()||job.lease_token!==data.leaseToken)return res.status(409).json({error:'Job lease expired or superseded'})
   const status=data.success?'success':'failed',payload=parse(job.payload_json)||{}
   db.transaction(()=>{
-    run('UPDATE agent_jobs SET status=?,result_json=?,error=?,finished_at=?,lease_until=NULL,lease_token=NULL WHERE id=?',status,json(data.diff||null),data.error||null,now(),job.id)
+    run('UPDATE agent_jobs SET status=?,result_json=?,error=?,finished_at=?,lease_until=NULL,lease_token=NULL WHERE id=?',status,json(data.result||data.diff||null),data.error||null,now(),job.id)
     if(payload.applyRunId)run('UPDATE policy_apply_runs SET status=?,diff_json=?,error=?,finished_at=? WHERE id=?',status,json(data.diff||null),data.error||null,now(),payload.applyRunId)
+    if(payload.driftCheckId){
+      const check=one('SELECT * FROM policy_drift_checks WHERE id=? AND node_id=?',payload.driftCheckId,req.agent.node_id)
+      if(check){
+        let driftStatus='unknown',driftDiff=null,driftError=data.error||'Agent firewall readback failed'
+        const current=one('SELECT current_version_id FROM policies WHERE id=?',check.policy_id)
+        const observed=readRuleSchema.safeParse(data.result?.rules)
+        if(data.success&&current?.current_version_id===check.version_id&&observed.success){
+          const expected=parse(one('SELECT rules_compiled_json FROM policy_versions WHERE id=?',check.version_id)?.rules_compiled_json)||[]
+          driftDiff=diffRules(expected,observed.data)
+          driftStatus=driftDiff.add.length||driftDiff.remove.length?'drift':'in-sync'
+          driftError=null
+        } else if(data.success)driftError='Agent readback was invalid or the policy version changed'
+        run('UPDATE policy_drift_checks SET status=?,diff_json=?,error=?,checked_at=? WHERE id=?',driftStatus,json(driftDiff),driftError,now(),check.id)
+      }
+    }
     if(payload.policyId){
       const learning=one("SELECT id FROM learning_sessions WHERE generated_policy_id=? AND node_id=? AND status='applying'",payload.policyId,req.agent.node_id)
       if(learning){
-        run('UPDATE learning_sessions SET status=? WHERE id=?',data.success?'enforced':'apply-failed',learning.id)
+        run('UPDATE learning_sessions SET status=?,last_error=? WHERE id=?',data.success?'enforced':'apply-failed',data.success?null:data.error||'Agent apply failed',learning.id)
         run('UPDATE nodes SET firewall_state=? WHERE id=?',data.success?'enforcing':'review',req.agent.node_id)
         audit(null,data.success?'learning.enforced':'learning.apply.failed','node',req.agent.node_id,null,{sessionId:learning.id,jobId:job.id})
       }

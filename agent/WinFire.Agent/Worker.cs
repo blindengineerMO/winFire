@@ -47,16 +47,26 @@ public sealed class Worker(ILogger<Worker> logger) : BackgroundService
     {
         try
         {
-            if (job.Type != "policy.apply") throw new InvalidOperationException($"Unsupported job type: {job.Type}");
-            var diff = await Firewall.ApplyAsync(job.Payload, cancellationToken);
-            using var response = await client.PostAsJsonAsync($"api/v1/agents/{config.AgentId}/jobs/{job.Id}/result",
-                new { leaseToken = job.LeaseToken, success = true, diff }, JsonOptions, cancellationToken);
-            response.EnsureSuccessStatusCode();
-            logger.LogInformation("Applied policy job {JobId}", job.Id);
+            HttpResponseMessage response;
+            if (job.Type == "policy.apply")
+            {
+                var diff = await Firewall.ApplyAsync(job.Payload, cancellationToken);
+                response = await client.PostAsJsonAsync($"api/v1/agents/{config.AgentId}/jobs/{job.Id}/result",
+                    new { leaseToken = job.LeaseToken, success = true, diff }, JsonOptions, cancellationToken);
+            }
+            else if (job.Type == "policy.read")
+            {
+                var result = await Firewall.ReadAsync(job.Payload, cancellationToken);
+                response = await client.PostAsJsonAsync($"api/v1/agents/{config.AgentId}/jobs/{job.Id}/result",
+                    new { leaseToken = job.LeaseToken, success = true, result }, JsonOptions, cancellationToken);
+            }
+            else throw new InvalidOperationException($"Unsupported job type: {job.Type}");
+            using (response) response.EnsureSuccessStatusCode();
+            logger.LogInformation("Completed agent job {JobId}", job.Id);
         }
         catch (Exception error) when (error is not OperationCanceledException)
         {
-            logger.LogError(error, "Policy job {JobId} failed", job.Id);
+            logger.LogError(error, "Agent job {JobId} failed", job.Id);
             using var response = await client.PostAsJsonAsync($"api/v1/agents/{config.AgentId}/jobs/{job.Id}/result",
                 new { leaseToken = job.LeaseToken, success = false, error = error.Message[..Math.Min(error.Message.Length, 2000)] }, JsonOptions, cancellationToken);
             response.EnsureSuccessStatusCode();
