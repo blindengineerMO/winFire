@@ -1,7 +1,7 @@
 ![Header](assets/headerWinFire.png)
 
 # WinFire Secure
-Micro-Segmentation made easy. Why pay expensive vendors like Cisco, CrowdStrike, or Zero Networks for zero trust when it can be done for free...
+Micro-Segmentation made easy. Why pay expensive vendors for zero trust when it can be done for free...
 
 WinFire is a control plane for Windows Firewall policy authoring, inventory, verification, log review, and identity segmentation configuration. This repository is an early implementation, **not a completed enforcement product**.
 
@@ -75,6 +75,8 @@ npm start
 
 `npm start` builds the Vue app, starts Express, serves the UI and `/api/v1` on the same `PORT` (default 3000), and creates `data/winfire.db` and `data/secrets.json` on first run. Knex applies schema migrations before the API listens. The first run prints a random owner password to the terminal. To choose credentials, set `BOOTSTRAP_EMAIL` and `BOOTSTRAP_PASSWORD` before the first start. Keep `data/secrets.json` backed up and private: losing it makes encrypted vault records and existing refresh tokens unusable. The data directory is ignored by Git.
 
+For a local demo, `npm start` also ensures an admin account at **`admin@winfire.local` / `WinFireDemo!2026`**. Its password is stable on every startup. Set `BOOTSTRAP_ADMIN_EMAIL` and `BOOTSTRAP_ADMIN_PASSWORD` to change the credentials; startup updates the same marked account and revokes its existing sessions when they change. Set `BOOTSTRAP_ADMIN_ENABLED=false` to suspend it. The account is disabled by default when `NODE_ENV=production` unless `BOOTSTRAP_ADMIN_ENABLED=true` is set explicitly. Do not enable a known demo password on a public deployment. `.env.example` documents the variables; export them in the shell or deployment environment because `npm start` does not automatically load that file.
+
 For development, use `npm run dev:api` and `npm run dev:web` in separate terminals; Vite proxies `/api` to Express. Run `npm test` and `npm run build` before deployment.
 
 On Linux, run `npm run setup:winrm` once to install the Python WSMan transport in `.venv`. The Docker image includes this transport and `rpcclient`. On Windows, the connector uses PowerShell remoting directly. The Python transport follows the [pywinrm project](https://github.com/diyan/pywinrm) because [Microsoft does not support WSMan remoting from current non-Windows PowerShell](https://learn.microsoft.com/en-us/powershell/scripting/security/remoting/wsman-remoting-in-powershell).
@@ -82,11 +84,21 @@ On Linux, run `npm run setup:winrm` once to install the Python WSMan transport i
 ## Current capabilities
 
 - Owner bootstrap, Argon2 password verification, optional TOTP login, JWT access tokens, rotating refresh tokens, immediate session revocation after password changes or admin action, protected owner role, invitations, role gates, login rate limits and account lockout.
+- Administration → Access manages audited read and write grants for policies, node groups, and credential metadata. Owner, admin, editor, and auditor role gates resolve through database role permissions. Policy and group lists respect resource grants; credential use and rotation require write access, while a read grant reveals metadata only.
 - Envelope encrypted credential records with write-only passwords; node inventory, DNS lookups and connection port probes.
+- The Credential vault UI can attach a stored credential to an existing node or group, run a read-only authentication test against an assigned WinRM node, and rotate its write-only password. Assignment validates the target and treats a repeat request as already assigned.
 - LDAPS computer discovery with scheduled and manual sync, AD GUID/SID and account status in inventory, and automatic WinRM fact collection for credentialed new nodes. AD test/sync requires an LDAPS endpoint with a certificate trusted by the control plane and a vault credential with directory read access.
+
+For Active Directory discovery, the domain controller needs an LDAPS certificate with a private key, Server Authentication usage, and a DNS name matching the configured URL. Install it in the Local Computer or NTDS Personal store, and trust its issuing CA on the control plane (for example through `NODE_EXTRA_CA_CERTS`). The control plane keeps certificate verification enabled and reports DNS, connection, certificate, and bind failures in Administration → Directory. See [Microsoft's LDAPS certificate requirements](https://learn.microsoft.com/en-us/troubleshoot/windows-server/active-directory/enable-ldap-over-ssl-3rd-certification-authority).
+
+Administration → Directory also offers an optional LDAP 389 fallback. It is **off by default**. An administrator must type `ALLOW LDAP 389` to approve that server and bind credential; changing the server or selected credential, or changing the selected credential's username or password, requires fresh approval. The fallback is attempted only when the LDAPS connection or handshake is unavailable, never when certificate validation fails or a completed bind/search fails. LDAP 389 uses a simple bind and sends the credential without TLS, so use a dedicated read-only directory account on a trusted network. Every approval, revocation and fallback sync is audited. A domain controller requiring LDAP signing will reject this cleartext bind; in that case configure LDAPS instead. See [Microsoft's LDAP signing behavior](https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/ldap-signing).
 - Account profile avatars stored outside the database with PNG, JPEG and WebP signature and size checks.
+- Account notification preferences by event and channel, a personal in-app inbox, and queued email/webhook alerts for new drift, verifier failures, denied MFA challenges, and agent offline transitions. Email requires a verified account and SMTP. The shared webhook destination comes from `NOTIFICATION_WEBHOOK_URL` and must use HTTPS; deliveries retry up to five times. Without a configured channel destination, pending deliveries wait for configuration.
+- Administration can suspend or delete operators and revoke their sessions. Self-service password changes verify the current password and invalidate existing sessions.
+- Account settings can save a system, Hacker, or Enterprise theme; a browser-only override applies immediately without changing the account preference. The Enterprise layout uses the supplied dashboard, asset, activity, and policy screenshots in `docs/` as visual references, with WinFire branding and live control-plane data.
 - Vue Flow policy authoring, live port/address/program validation, connected port/address/profile scopes, local and remote port rules, immutable versions, graph and rule diff, recall, node and group assignment conflict checks, audited apply runs, read-only WinRM drift checks, and a remote PowerShell WinRM adapter. Schedule and MFA Gate nodes are rejected at compile time until their enforcement services exist.
-- TCP based verifier with pass/fail/inconclusive evidence, managed deny-rule confirmation, coverage/inventory/compliance/verification reports with CSV/PDF exports, dashboard, log search and WinRM Security event pull.
+- TCP based verifier with pass/fail/inconclusive evidence, managed deny-rule confirmation, badges on nodes and policies, coverage/inventory/DNS/compliance/verification reports with CSV/PDF exports, dashboard trends, full event search filters, and WinRM Security event pull. Inventory exports flatten model, BIOS serial, firewall service and profile state instead of including a raw facts blob.
+- Administration settings control event retention and the DNS refresh interval. The hourly retention job removes expired events, and a batched DNS sweep refreshes node lookups every 15 minutes when due. DNS reports flag missing PTR records and forward or reverse mismatches.
 - Learning sessions that propose a policy version for operator review and require explicit approval before application; segment and MFA challenge records; logon-rights baseline read; C# agent enrollment, certificate renewal, revocation, queued policy jobs, and Security event shipment with a persisted cursor.
 - Hourly scheduled verifier and drift sweeps plus WinRM event pulls for configured nodes; adjust with `SWEEP_INTERVAL_MINUTES`. Transient transport errors move nodes through degraded and unreachable states with retry backoff; scheduled checks retry when the backoff expires. Enrolled agent nodes receive readback jobs for drift checks; the Windows agent runtime still needs live validation.
 
@@ -124,3 +136,10 @@ openssl req -new -x509 -key /secure/agent-ca.key -passin env:AGENT_CA_PASSPHRASE
 ```
 
 The server certificate should be issued by a CA trusted on the Windows nodes. To test enrollment, create a node and token in Administration, then run the signed installer from an elevated PowerShell session with the published executable and server URL. The token expires after 15 minutes and cannot be reused. The Windows agent polls for policy jobs every 30 seconds; push, event streaming, and MFA gating are not yet implemented.
+
+## New Enterprise Theme Added - Unlock under Administration --> Security
+
+![ScreenShot1](assets/dashboardEnterprise.png)
+![ScreenShot2](assets/admin.png)
+![ScreenShot3](assets/assetsView.png)
+![ScreenShot4](assets/PolicyStudio.png)

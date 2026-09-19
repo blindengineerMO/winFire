@@ -19,6 +19,9 @@ import {normalizeWindowsEvent} from './eventNormalizer.js'
 import {deliverInvite,deliverVerification,inviteLink} from './mailer.js'
 import {saveAvatar,readAvatar,removeAvatar} from './avatar.js'
 import {readDirectoryComputers,testDirectoryConnection} from './directory.js'
+import {observabilitySettings} from './maintenance.js'
+import {resourceRecord,canReadResource,canWriteResource} from './access.js'
+import {emitNotification,notificationSummary,preferenceKeys} from './notifications.js'
 
 export const app=express()
 app.disable('x-powered-by')
@@ -32,13 +35,20 @@ const body=(schema,req)=>schema.parse(req.body)
 const reqId=req=>String(req.params.id)
 const notFound=(res,label='Record')=>res.status(404).json({error:`${label} not found`})
 const latestTraining=nodeId=>one('SELECT id,mode,status,started_at,ends_at,generated_policy_id,last_error FROM learning_sessions WHERE node_id=? ORDER BY started_at DESC,rowid DESC LIMIT 1',nodeId)
-const publicNode=node=>node && ({...node,failures:Number(node.failures),facts:parse(node.snapshot_json),ad:parse(node.ad_snapshot_json),training:latestTraining(node.id)||null})
-const canUseCredential=(user,credential)=>credential&&(user.role==='owner'||user.role==='admin'||credential.owner_user_id===user.id||credential.visibility==='team'&&credential.team_id&&credential.team_id===user.team_id)
+const latestVerification=nodeId=>one('SELECT status,reason,run_at FROM verifier_results WHERE node_id=? ORDER BY run_at DESC,rowid DESC LIMIT 1',nodeId)||null
+function policyVerification(policyId){
+  const latest=one('SELECT run_id FROM verifier_results WHERE policy_id=? ORDER BY run_at DESC,rowid DESC LIMIT 1',policyId)
+  if(!latest)return null
+  const checks=all('SELECT status FROM verifier_results WHERE policy_id=? AND run_id=?',policyId,latest.run_id)
+  return checks.some(check=>check.status==='fail')?'fail':checks.some(check=>check.status==='inconclusive')?'inconclusive':checks.length?'pass':null
+}
+const publicNode=node=>node && ({...node,failures:Number(node.failures),facts:parse(node.snapshot_json),ad:parse(node.ad_snapshot_json),training:latestTraining(node.id)||null,verification:latestVerification(node.id)})
+const canUseCredential=(user,credential)=>credential&&(user.role==='owner'||user.role==='admin'||credential.owner_user_id===user.id||credential.visibility==='team'&&credential.team_id&&credential.team_id===user.team_id||canWriteResource(user,'credential',credential))
 function getNode(idValue) {return one('SELECT * FROM nodes WHERE id=?',idValue)}
 function getPolicy(idValue) {return one('SELECT * FROM policies WHERE id=?',idValue)}
 function trainingDays() {return Number(one("SELECT value FROM app_settings WHERE key='new_host_training_days'")?.value||30)}
 const directorySettings=()=>one("SELECT * FROM directory_connections WHERE id='default'")
-const publicDirectory=settings=>settings&&({url:settings.url||'',baseDn:settings.base_dn||'',bindCredentialId:settings.bind_credential_id||null,nodeCredentialId:settings.node_credential_id||null,enabled:!!settings.enabled,syncIntervalMinutes:settings.sync_interval_minutes,lastSyncedAt:settings.last_synced_at,lastSyncAttemptAt:settings.last_sync_attempt_at,lastSyncStatus:settings.last_sync_status,lastSyncError:settings.last_sync_error,lastSyncCount:settings.last_sync_count})
+const publicDirectory=settings=>settings&&({url:settings.url||'',baseDn:settings.base_dn||'',bindCredentialId:settings.bind_credential_id||null,nodeCredentialId:settings.node_credential_id||null,enabled:!!settings.enabled,syncIntervalMinutes:settings.sync_interval_minutes,allowLdapFallback:!!settings.allow_ldap_fallback,ldapFallbackApprovedBy:settings.ldap_fallback_approved_by||null,ldapFallbackApprovedAt:settings.ldap_fallback_approved_at||null,lastTransport:settings.last_transport||null,lastSyncedAt:settings.last_synced_at,lastSyncAttemptAt:settings.last_sync_attempt_at,lastSyncStatus:settings.last_sync_status,lastSyncError:settings.last_sync_error,lastSyncCount:settings.last_sync_count})
 function directoryCredential(settings) {
   const credential=one('SELECT * FROM credentials WHERE id=?',settings.bind_credential_id)
   if(!credential)throw Object.assign(new Error('Directory bind credential is missing'),{status:400})
@@ -173,6 +183,15 @@ api.get('/avatars/:id',(req,res)=>{
 
 api.use('/agents',agentRoutes)
 api.use(auth)
+api.get('/notifications',(req,res)=>res.json(notificationSummary(req.user.id)))
+api.patch('/notifications/:id/read',(req,res)=>{
+  const result=run('UPDATE notifications SET read_at=COALESCE(read_at,?) WHERE id=? AND user_id=?',now(),reqId(req),req.user.id)
+  return result.changes?res.json({ok:true}):notFound(res,'Notification')
+})
+api.post('/notifications/read-all',(req,res)=>{
+  run('UPDATE notifications SET read_at=? WHERE user_id=? AND read_at IS NULL',now(),req.user.id)
+  res.json(notificationSummary(req.user.id))
+})
 api.post('/auth/email-verification/request',wrap(async(req,res)=>{
   if(req.user.email_verified)return res.status(409).json({error:'Email is already verified'})
   res.json(await requestEmailVerification(req.user,req.user.email,req.user.id))
@@ -248,9 +267,10 @@ api.post('/users/:id/revoke-sessions',requireRole('admin'),(req,res)=>{
 })
 api.patch('/users/:id/profile',wrap(async(req,res)=>{
   if(reqId(req)!==req.user.id && !['owner','admin'].includes(req.user.role))return res.status(403).json({error:'Insufficient permission'})
-  const data=body(z.object({theme:z.enum(['system','dark','light']).optional(),notificationPrefs:z.record(z.string(),z.boolean()).optional(),email:z.email().optional(),password:z.string().min(12).optional()}),req)
+  const data=body(z.object({theme:z.enum(['system','hacker','enterprise','dark','light']).optional(),notificationPrefs:z.record(z.string(),z.boolean()).refine(value=>Object.keys(value).every(key=>preferenceKeys.includes(key)),'Unknown notification preference').optional(),email:z.email().optional(),password:z.string().min(12).optional(),currentPassword:z.string().optional()}),req)
   const user=one('SELECT * FROM users WHERE id=?',reqId(req));if(!user)return notFound(res)
   if(user.role==='owner'&&req.user.role!=='owner')return res.status(403).json({error:'Only an owner can manage owner accounts'})
+  if(data.password&&user.id===req.user.id&&(!data.currentPassword||!await argon2.verify(user.password_hash,data.currentPassword)))return res.status(401).json({error:'Current password is incorrect'})
   const emailChangeRequested=!!(data.email&&data.email.toLowerCase()!==user.email)
   if(emailChangeRequested)await requestEmailVerification(user,data.email.toLowerCase(),req.user.id)
   if(data.password){run('UPDATE users SET password_hash=?,session_version=session_version+1 WHERE id=?',await argon2.hash(data.password),user.id);run('UPDATE refresh_tokens SET revoked_at=? WHERE user_id=?',now(),user.id)}
@@ -317,6 +337,43 @@ api.delete('/teams/:id/members/:userId',requireRole('admin'),(req,res)=>{
   res.status(204).end()
 })
 api.get('/roles',(_req,res)=>res.json([{id:'owner',name:'Owner'},{id:'admin',name:'Admin'},{id:'editor',name:'Policy Editor'},{id:'auditor',name:'Auditor'}]))
+api.get('/access/users',requireRole('editor'),(req,res)=>res.json(all('SELECT id,email,role FROM users WHERE suspended=0 AND id<>? ORDER BY email',req.user.id)))
+api.get('/access/resources',requireRole('editor'),(req,res)=>{
+  const resources=[
+    ...all('SELECT id,name,owner_user_id FROM policies').map(item=>({...item,type:'policy'})),
+    ...all('SELECT id,name,owner_user_id FROM node_groups').map(item=>({...item,type:'node_group'})),
+    ...all('SELECT id,name,owner_user_id FROM credentials').map(item=>({...item,type:'credential'}))
+  ]
+  res.json(resources.filter(item=>canWriteResource(req.user,item.type,item)).map(({id,name,type})=>({id,name,type})).sort((a,b)=>a.type.localeCompare(b.type)||a.name.localeCompare(b.name)))
+})
+const resourceType=z.enum(['policy','node_group','credential'])
+api.get('/access/grants',requireRole('editor'),(req,res)=>{
+  const {type,resourceId}=z.object({type:resourceType,resourceId:z.string().min(1)}).parse(req.query)
+  const resource=resourceRecord(type,resourceId);if(!resource)return notFound(res,'Resource')
+  if(!canWriteResource(req.user,type,resource))return res.status(403).json({error:'Insufficient permission'})
+  res.json(all('SELECT g.id,g.grantee_user_id,g.permission,g.created_at,u.email FROM resource_grants g JOIN users u ON u.id=g.grantee_user_id WHERE g.resource_type=? AND g.resource_id=? ORDER BY u.email',type,resourceId))
+})
+api.post('/access/grants',requireRole('editor'),(req,res)=>{
+  const data=body(z.object({type:resourceType,resourceId:z.string().min(1),userId:z.string().min(1),permission:z.enum(['read','write'])}),req)
+  const resource=resourceRecord(data.type,data.resourceId);if(!resource)return notFound(res,'Resource')
+  if(!canWriteResource(req.user,data.type,resource))return res.status(403).json({error:'Insufficient permission'})
+  const grantee=one('SELECT id,role,suspended FROM users WHERE id=?',data.userId);if(!grantee)return notFound(res,'User')
+  if(grantee.suspended)return res.status(400).json({error:'Cannot grant access to a suspended user'})
+  if(data.permission==='write'&&grantee.role==='auditor')return res.status(400).json({error:'Auditors cannot receive write grants'})
+  const grantId=id()
+  db.transaction(()=>{
+    run('INSERT INTO resource_grants(id,resource_type,resource_id,grantee_user_id,permission,created_by) VALUES(?,?,?,?,?,?) ON CONFLICT(resource_type,resource_id,grantee_user_id) DO UPDATE SET permission=excluded.permission,created_by=excluded.created_by',grantId,data.type,data.resourceId,data.userId,data.permission,req.user.id)
+    audit(req.user.id,'resource.grant','resource',data.resourceId,null,{type:data.type,userId:data.userId,permission:data.permission})
+  })()
+  res.status(201).json({type:data.type,resourceId:data.resourceId,userId:data.userId,permission:data.permission})
+})
+api.delete('/access/grants/:id',requireRole('editor'),(req,res)=>{
+  const grant=one('SELECT * FROM resource_grants WHERE id=?',reqId(req));if(!grant)return notFound(res,'Grant')
+  const resource=resourceRecord(grant.resource_type,grant.resource_id);if(!resource)return notFound(res,'Resource')
+  if(!canWriteResource(req.user,grant.resource_type,resource))return res.status(403).json({error:'Insufficient permission'})
+  db.transaction(()=>{run('DELETE FROM resource_grants WHERE id=?',grant.id);audit(req.user.id,'resource.grant.revoke','resource',grant.resource_id,{type:grant.resource_type,userId:grant.grantee_user_id,permission:grant.permission},null)})()
+  res.status(204).end()
+})
 api.get('/audit',requireRole('auditor'),(req,res)=>res.json(all('SELECT * FROM audit_log ORDER BY at DESC LIMIT 500')))
 api.get('/settings/training',(_req,res)=>res.json({newHostTrainingDays:trainingDays()}))
 api.patch('/settings/training',requireRole('admin'),(req,res)=>{
@@ -326,27 +383,48 @@ api.patch('/settings/training',requireRole('admin'),(req,res)=>{
   audit(req.user.id,'training.settings.update','app-settings','new_host_training_days',{days:before},{days:newHostTrainingDays})
   res.json({newHostTrainingDays})
 })
+api.get('/settings/observability',requireRole('admin'),(_req,res)=>res.json(observabilitySettings()))
+api.patch('/settings/observability',requireRole('admin'),(req,res)=>{
+  const data=body(z.object({logRetentionDays:z.number().int().min(1).max(3650),dnsRefreshHours:z.number().int().min(1).max(720)}),req)
+  const before=observabilitySettings()
+  db.transaction(()=>{
+    run("UPDATE app_settings SET value=? WHERE key='log_retention_days'",String(data.logRetentionDays))
+    run("UPDATE app_settings SET value=? WHERE key='dns_refresh_hours'",String(data.dnsRefreshHours))
+    audit(req.user.id,'observability.settings.update','app-settings','observability',before,data)
+  })()
+  res.json(observabilitySettings())
+})
 api.get('/settings/directory',requireRole('admin'),(_req,res)=>res.json(publicDirectory(directorySettings())))
 api.patch('/settings/directory',requireRole('admin'),(req,res)=>{
   const data=body(z.object({
-    url:z.string().url().refine(value=>{const parsed=new URL(value);return parsed.protocol==='ldaps:'&&!parsed.username&&!parsed.password&&parsed.pathname==='/'},{message:'Use an ldaps:// server URL without embedded credentials'}),
+    url:z.string().url().refine(value=>{const parsed=new URL(value);return parsed.protocol==='ldaps:'&&!parsed.username&&!parsed.password&&parsed.pathname==='/'&&!parsed.search&&!parsed.hash},{message:'Use an ldaps:// server URL without embedded credentials or query parameters'}),
     baseDn:z.string().min(3).max(512).refine(value=>/(^|,)\s*DC=/i.test(value),{message:'Search base must include a DC component'}),
-    bindCredentialId:z.string().min(1),nodeCredentialId:z.string().nullable().optional(),enabled:z.boolean().default(false),syncIntervalMinutes:z.number().int().min(5).max(1440).default(60)
+    bindCredentialId:z.string().min(1),nodeCredentialId:z.string().nullable().optional(),enabled:z.boolean().default(false),syncIntervalMinutes:z.number().int().min(5).max(1440).default(60),allowLdapFallback:z.boolean().optional(),ldapFallbackApproval:z.string().optional()
   }),req)
   for(const credentialId of [data.bindCredentialId,data.nodeCredentialId].filter(Boolean)){
     const credential=one('SELECT * FROM credentials WHERE id=?',credentialId)
     if(!credential||!canUseCredential(req.user,credential))return res.status(400).json({error:'Selected directory credential is unavailable'})
   }
-  const before=publicDirectory(directorySettings())
-  run("UPDATE directory_connections SET url=?,base_dn=?,bind_credential_id=?,node_credential_id=?,enabled=?,sync_interval_minutes=? WHERE id='default'",data.url,data.baseDn,data.bindCredentialId,data.nodeCredentialId||null,Number(data.enabled),data.syncIntervalMinutes)
-  audit(req.user.id,'directory.settings.update','directory','default',before,{...data,bindCredentialId:data.bindCredentialId,nodeCredentialId:data.nodeCredentialId||null})
+  const prior=directorySettings(),before=publicDirectory(prior)
+  const allowLdapFallback=data.allowLdapFallback===undefined?!!prior.allow_ldap_fallback:data.allowLdapFallback
+  const scopeChanged=data.url!==prior.url||data.bindCredentialId!==prior.bind_credential_id
+  const needsApproval=allowLdapFallback&&(!prior.allow_ldap_fallback||!prior.ldap_fallback_approved_at||scopeChanged)
+  if(needsApproval&&data.ldapFallbackApproval!=='ALLOW LDAP 389')return res.status(400).json({error:'Administrator approval is required: type ALLOW LDAP 389 to permit an unencrypted bind when LDAPS is unavailable'})
+  const approvedAt=needsApproval?now():allowLdapFallback?prior.ldap_fallback_approved_at:null
+  const approvedBy=needsApproval?req.user.id:allowLdapFallback?prior.ldap_fallback_approved_by:null
+  db.transaction(()=>{
+    run("UPDATE directory_connections SET url=?,base_dn=?,bind_credential_id=?,node_credential_id=?,enabled=?,sync_interval_minutes=?,allow_ldap_fallback=?,ldap_fallback_approved_by=?,ldap_fallback_approved_at=?,last_transport=CASE WHEN ? THEN NULL ELSE last_transport END,last_sync_status=CASE WHEN ? THEN NULL ELSE last_sync_status END,last_sync_error=CASE WHEN ? THEN NULL ELSE last_sync_error END WHERE id='default'",data.url,data.baseDn,data.bindCredentialId,data.nodeCredentialId||null,Number(data.enabled),data.syncIntervalMinutes,Number(allowLdapFallback),approvedBy,approvedAt,Number(scopeChanged),Number(scopeChanged),Number(scopeChanged))
+    if(needsApproval)audit(req.user.id,'directory.ldap_fallback.approve','directory','default',null,{url:data.url,bindCredentialId:data.bindCredentialId,approvedAt})
+    if(prior.allow_ldap_fallback&&!allowLdapFallback)audit(req.user.id,'directory.ldap_fallback.revoke','directory','default',null,{url:data.url})
+    audit(req.user.id,'directory.settings.update','directory','default',before,{url:data.url,baseDn:data.baseDn,bindCredentialId:data.bindCredentialId,nodeCredentialId:data.nodeCredentialId||null,enabled:data.enabled,syncIntervalMinutes:data.syncIntervalMinutes,allowLdapFallback})
+  })()
   res.json(publicDirectory(directorySettings()))
 })
 api.post('/directory/test',requireRole('admin'),wrap(async(req,res)=>{
   const settings=directorySettings()
   if(!settings?.url||!settings.base_dn)throw Object.assign(new Error('Configure the directory connection first'),{status:400})
   const result=await testDirectoryConnection(settings,directoryCredential(settings))
-  audit(req.user.id,'directory.test','directory','default',null,{connected:result.connected})
+  audit(req.user.id,'directory.test','directory','default',null,{connected:result.connected,transport:result.transport,fallbackUsed:result.fallbackUsed})
   res.json(result)
 }))
 let directorySyncInFlight=false
@@ -359,8 +437,8 @@ export async function syncDirectory(actorId=null,clientFactory=undefined) {
   if(!settings.url||!settings.base_dn)throw Object.assign(new Error('Directory connection is incomplete'),{status:400})
   run("UPDATE directory_connections SET last_sync_attempt_at=?,last_sync_status='running',last_sync_error=NULL WHERE id='default'",now())
   try {
-    const computers=await readDirectoryComputers(settings,directoryCredential(settings),clientFactory)
-    const seenAt=now(),stats={found:computers.length,created:0,updated:0,missing:0}
+    const {computers,transport}=await readDirectoryComputers(settings,directoryCredential(settings),clientFactory)
+    const seenAt=now(),stats={found:computers.length,created:0,updated:0,missing:0,transport,fallbackUsed:transport==='ldap'}
     db.transaction(()=>{
       run('UPDATE nodes SET ad_missing=1 WHERE ad_guid IS NOT NULL')
       for(const computer of computers){
@@ -383,7 +461,7 @@ export async function syncDirectory(actorId=null,clientFactory=undefined) {
         if(settings.node_credential_id&&!one('SELECT 1 FROM credential_assignments WHERE credential_id=? AND node_id=?',settings.node_credential_id,node.id))run('INSERT INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,NULL)',settings.node_credential_id,node.id)
       }
       stats.missing=one('SELECT COUNT(*) n FROM nodes WHERE ad_guid IS NOT NULL AND ad_missing=1')?.n||0
-      run("UPDATE directory_connections SET last_synced_at=?,last_sync_status='success',last_sync_error=NULL,last_sync_count=? WHERE id='default'",seenAt,stats.found)
+      run("UPDATE directory_connections SET last_synced_at=?,last_sync_status='success',last_sync_error=NULL,last_sync_count=?,last_transport=? WHERE id='default'",seenAt,stats.found,transport)
       audit(actorId,'directory.sync','directory','default',null,stats)
     })()
     return stats
@@ -396,7 +474,7 @@ export async function syncDirectory(actorId=null,clientFactory=undefined) {
 }
 api.post('/directory/sync',requireRole('admin'),wrap(async(req,res)=>res.json(await syncDirectory(req.user.id))))
 
-const visibleCredentials=user=>user.role==='owner'||user.role==='admin' ? all('SELECT id,name,type,username,owner_user_id,visibility,team_id,priority,created_at FROM credentials ORDER BY priority,name') : all(`SELECT id,name,type,username,owner_user_id,visibility,team_id,priority,created_at FROM credentials WHERE owner_user_id=? OR (visibility='team' AND team_id=?) ORDER BY priority,name`,user.id,user.team_id)
+const visibleCredentials=user=>(user.role==='owner'||user.role==='admin' ? all('SELECT id,name,type,username,owner_user_id,visibility,team_id,priority,created_at FROM credentials ORDER BY priority,name') : all(`SELECT id,name,type,username,owner_user_id,visibility,team_id,priority,created_at FROM credentials WHERE owner_user_id=? OR (visibility='team' AND team_id=?) OR EXISTS (SELECT 1 FROM resource_grants g WHERE g.resource_type='credential' AND g.resource_id=credentials.id AND g.grantee_user_id=?) ORDER BY priority,name`,user.id,user.team_id,user.id)).map(credential=>({...credential,canWrite:canWriteResource(user,'credential',credential)}))
 api.get('/credentials',(req,res)=>res.json(visibleCredentials(req.user)))
 api.post('/credentials',requireRole('editor'),(req,res)=>{
   const data=body(z.object({name:z.string().min(1),type:z.enum(['local','domain']),username:z.string().min(1),password:z.string().min(1),visibility:z.enum(['private','team']).default('private'),teamId:z.string().optional(),priority:z.number().int().default(100)}),req)
@@ -405,18 +483,33 @@ api.post('/credentials',requireRole('editor'),(req,res)=>{
 })
 api.patch('/credentials/:id',requireRole('editor'),(req,res)=>{
   const credential=one('SELECT * FROM credentials WHERE id=?',reqId(req));if(!credential)return notFound(res)
-  if(credential.owner_user_id!==req.user.id && !['owner','admin'].includes(req.user.role))return res.status(403).json({error:'Insufficient permission'})
+  if(!canWriteResource(req.user,'credential',credential))return res.status(403).json({error:'Insufficient permission'})
   const data=body(z.object({name:z.string().min(1).optional(),username:z.string().min(1).optional(),password:z.string().min(1).optional(),priority:z.number().int().optional()}),req)
-  run('UPDATE credentials SET name=?,username=?,encrypted_blob=?,priority=? WHERE id=?',data.name||credential.name,data.username||credential.username,data.password?seal({password:data.password}):credential.encrypted_blob,data.priority??credential.priority,credential.id)
-  audit(req.user.id,'credential.rotate','credential',credential.id,null,{rotated:!!data.password});res.json({id:credential.id,name:data.name||credential.name})
+  db.transaction(()=>{
+    run('UPDATE credentials SET name=?,username=?,encrypted_blob=?,priority=? WHERE id=?',data.name||credential.name,data.username||credential.username,data.password?seal({password:data.password}):credential.encrypted_blob,data.priority??credential.priority,credential.id)
+    if(data.password||data.username&&data.username!==credential.username){
+      const directory=directorySettings()
+      if(directory?.bind_credential_id===credential.id&&directory.allow_ldap_fallback&&directory.ldap_fallback_approved_at){
+        run("UPDATE directory_connections SET ldap_fallback_approved_by=NULL,ldap_fallback_approved_at=NULL WHERE id='default'")
+        audit(req.user.id,'directory.ldap_fallback.revoke','directory','default',null,{reason:'bind_credential_changed',bindCredentialId:credential.id})
+      }
+    }
+    audit(req.user.id,'credential.rotate','credential',credential.id,null,{rotated:!!data.password})
+  })()
+  res.json({id:credential.id,name:data.name||credential.name})
 })
-api.delete('/credentials/:id',requireRole('editor'),(req,res)=>{const credential=one('SELECT * FROM credentials WHERE id=?',reqId(req));if(!credential)return notFound(res);if(credential.owner_user_id!==req.user.id&&!['owner','admin'].includes(req.user.role))return res.status(403).json({error:'Insufficient permission'});run('DELETE FROM credentials WHERE id=?',credential.id);audit(req.user.id,'credential.delete','credential',credential.id,null,null);res.status(204).end()})
+api.delete('/credentials/:id',requireRole('editor'),(req,res)=>{const credential=one('SELECT * FROM credentials WHERE id=?',reqId(req));if(!credential)return notFound(res);if(!canWriteResource(req.user,'credential',credential))return res.status(403).json({error:'Insufficient permission'});db.transaction(()=>{run("DELETE FROM resource_grants WHERE resource_type='credential' AND resource_id=?",credential.id);run('DELETE FROM credentials WHERE id=?',credential.id);audit(req.user.id,'credential.delete','credential',credential.id,null,null)})();res.status(204).end()})
 api.post('/credentials/:id/assignments',requireRole('editor'),(req,res)=>{
   const credential=one('SELECT * FROM credentials WHERE id=?',reqId(req));if(!credential)return notFound(res)
   if(!canUseCredential(req.user,credential))return res.status(403).json({error:'Insufficient permission'})
   const data=body(z.object({nodeId:z.string().optional(),nodeGroupId:z.string().optional()}),req)
-  if(!data.nodeId&&!data.nodeGroupId)return res.status(400).json({error:'nodeId or nodeGroupId required'})
-  run('INSERT OR IGNORE INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,?)',reqId(req),data.nodeId||null,data.nodeGroupId||null)
+  if(Number(!!data.nodeId)+Number(!!data.nodeGroupId)!==1)return res.status(400).json({error:'Specify exactly one nodeId or nodeGroupId'})
+  if(data.nodeId&&!getNode(data.nodeId))return notFound(res,'Node')
+  const targetGroup=data.nodeGroupId?one('SELECT * FROM node_groups WHERE id=?',data.nodeGroupId):null
+  if(data.nodeGroupId&&!targetGroup)return notFound(res,'Node group')
+  if(targetGroup&&!canWriteResource(req.user,'node_group',targetGroup))return res.status(403).json({error:'Insufficient permission for node group'})
+  if(one('SELECT 1 FROM credential_assignments WHERE credential_id=? AND node_id IS ? AND node_group_id IS ?',credential.id,data.nodeId||null,data.nodeGroupId||null))return res.json({ok:true,alreadyAssigned:true})
+  run('INSERT INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,?)',reqId(req),data.nodeId||null,data.nodeGroupId||null)
   audit(req.user.id,'credential.assign','credential',reqId(req),null,data);res.status(201).json({ok:true})
 })
 api.post('/credentials/:id/test',requireRole('editor'),wrap(async(req,res)=>{
@@ -442,7 +535,7 @@ api.post('/nodes',requireRole('editor'),wrap(async(req,res)=>{
   })()
   const node=getNode(nodeId),dns=await lookupDns(node);res.status(201).json({...node,dns,training})
 }))
-api.get('/nodes/:id',(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json({...node,ad:parse(node.ad_snapshot_json),training:latestTraining(node.id)||null,facts:parse(one('SELECT snapshot_json FROM node_facts WHERE node_id=?',node.id)?.snapshot_json),dns:one('SELECT * FROM dns_lookups WHERE node_id=?',node.id)})})
+api.get('/nodes/:id',(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json({...node,ad:parse(node.ad_snapshot_json),training:latestTraining(node.id)||null,verification:latestVerification(node.id),facts:parse(one('SELECT snapshot_json FROM node_facts WHERE node_id=?',node.id)?.snapshot_json),dns:one('SELECT * FROM dns_lookups WHERE node_id=?',node.id)})})
 api.post('/nodes/:id/training',requireRole('editor'),(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
   const {durationDays}=body(z.object({durationDays:z.number().int().min(1).max(365)}),req)
@@ -463,12 +556,13 @@ api.get('/nodes/:id/firewall-rules',wrap(async(req,res)=>{
 }))
 api.get('/nodes/:id/dns',(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json(one('SELECT * FROM dns_lookups WHERE node_id=?',node.id)||{})})
 api.post('/nodes/:id/dns/refresh',requireRole('editor'),wrap(async(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json(await lookupDns(node))}))
-api.get('/node-groups',(_req,res)=>res.json(all('SELECT * FROM node_groups ORDER BY name')))
-api.post('/node-groups',requireRole('editor'),(req,res)=>{const {name}=body(z.object({name:z.string().min(1)}),req),groupId=id();run('INSERT INTO node_groups(id,name) VALUES(?,?)',groupId,name);audit(req.user.id,'node-group.create','node-group',groupId,null,{name});res.status(201).json({id:groupId,name})})
+api.get('/node-groups',(req,res)=>res.json(all('SELECT * FROM node_groups ORDER BY name').filter(group=>canReadResource(req.user,'node_group',group))))
+api.post('/node-groups',requireRole('editor'),(req,res)=>{const {name}=body(z.object({name:z.string().min(1)}),req),groupId=id();run('INSERT INTO node_groups(id,name,owner_user_id) VALUES(?,?,?)',groupId,name,req.user.id);audit(req.user.id,'node-group.create','node-group',groupId,null,{name});res.status(201).json({id:groupId,name,owner_user_id:req.user.id})})
 api.post('/node-groups/:id/members',requireRole('editor'),(req,res)=>{
   const {nodeId}=body(z.object({nodeId:z.string()}),req),node=getNode(nodeId),group=one('SELECT * FROM node_groups WHERE id=?',reqId(req))
   if(!node)return notFound(res,'Node')
   if(!group)return notFound(res,'Node group')
+  if(!canWriteResource(req.user,'node_group',group))return res.status(403).json({error:'Insufficient permission for node group'})
   const assigned=all(`SELECT DISTINCT p.id,p.name,v.rules_compiled_json FROM policies p JOIN policy_assignments a ON a.policy_id=p.id JOIN policy_versions v ON v.id=p.current_version_id WHERE a.node_group_id=?`,group.id)
   const conflicts=[]
   for(const policy of assigned)conflicts.push(...assignmentConflicts(policy.id,parse(policy.rules_compiled_json)||[],[node]))
@@ -478,12 +572,13 @@ api.post('/node-groups/:id/members',requireRole('editor'),(req,res)=>{
   audit(req.user.id,'node-group.member','node-group',group.id,null,{nodeId});res.json({ok:true})
 })
 
-api.get('/policies',(_req,res)=>res.json(all('SELECT p.*,v.version_no FROM policies p LEFT JOIN policy_versions v ON v.id=p.current_version_id ORDER BY p.created_at DESC')))
+api.get('/policies',(req,res)=>res.json(all('SELECT p.*,v.version_no FROM policies p LEFT JOIN policy_versions v ON v.id=p.current_version_id ORDER BY p.created_at DESC').filter(policy=>canReadResource(req.user,'policy',policy)).map(policy=>({...policy,verificationStatus:policyVerification(policy.id)}))))
 api.post('/policies',requireRole('editor'),(req,res)=>{const data=body(z.object({name:z.string().min(1),description:z.string().default('')}),req),policyId=id();run('INSERT INTO policies(id,name,description,owner_user_id) VALUES(?,?,?,?)',policyId,data.name,data.description,req.user.id);audit(req.user.id,'policy.create','policy',policyId,null,data);res.status(201).json(getPolicy(policyId))})
-api.get('/policies/:id',(req,res)=>{const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy');res.json({...policy,versions:all('SELECT id,version_no,created_at,comment FROM policy_versions WHERE policy_id=? ORDER BY version_no DESC',policy.id),assignments:all('SELECT * FROM policy_assignments WHERE policy_id=?',policy.id)})})
-api.get('/policies/:id/versions',(req,res)=>{if(!getPolicy(reqId(req)))return notFound(res,'Policy');res.json(all('SELECT * FROM policy_versions WHERE policy_id=? ORDER BY version_no DESC',reqId(req)).map(v=>({...v,graph:parse(v.graph_json),rules:parse(v.rules_compiled_json)})))})
+api.get('/policies/:id',(req,res)=>{const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy');if(!canReadResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});res.json({...policy,versions:all('SELECT id,version_no,created_at,comment FROM policy_versions WHERE policy_id=? ORDER BY version_no DESC',policy.id),assignments:all('SELECT * FROM policy_assignments WHERE policy_id=?',policy.id)})})
+api.get('/policies/:id/versions',(req,res)=>{const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy');if(!canReadResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});res.json(all('SELECT * FROM policy_versions WHERE policy_id=? ORDER BY version_no DESC',policy.id).map(v=>({...v,graph:parse(v.graph_json),rules:parse(v.rules_compiled_json)})))})
 api.post('/policies/:id/versions',requireRole('editor'),(req,res)=>{
   const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy')
+  if(!canWriteResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'})
   const data=body(z.object({graph:graphSchema,comment:z.string().default('')}),req),rules=compilePolicy(data.graph,policy.id),versionId=id()
   const conflicts=assignmentConflicts(policy.id,rules,assignedNodes(policy.id))
   if(conflicts.length)return rejectConflicts(res,conflicts)
@@ -491,10 +586,12 @@ api.post('/policies/:id/versions',requireRole('editor'),(req,res)=>{
   db.transaction(()=>{run('INSERT INTO policy_versions(id,policy_id,version_no,graph_json,rules_compiled_json,created_by,comment) VALUES(?,?,?,?,?,?,?)',versionId,policy.id,last+1,json(data.graph),json(rules),req.user.id,data.comment);run('UPDATE policies SET current_version_id=? WHERE id=?',versionId,policy.id);audit(req.user.id,'policy.version.create','policy',policy.id,null,{versionId,versionNo:last+1,rules})})()
   res.status(201).json({id:versionId,versionNo:last+1,rules})
 })
-api.post('/policies/:id/versions/:versionId/recall',requireRole('editor'),wrap(async(req,res)=>{const policy=getPolicy(reqId(req)),version=one('SELECT * FROM policy_versions WHERE id=? AND policy_id=?',req.params.versionId,reqId(req));if(!policy||!version)return notFound(res,'Version');const conflicts=assignmentConflicts(policy.id,parse(version.rules_compiled_json)||[],assignedNodes(policy.id));if(conflicts.length)return rejectConflicts(res,conflicts);run('UPDATE policies SET current_version_id=? WHERE id=?',version.id,policy.id);audit(req.user.id,'policy.recall','policy',policy.id,{versionId:policy.current_version_id},{versionId:version.id});res.json({versionId:version.id,results:await applyPolicy(getPolicy(policy.id),req.user.id)})}))
-api.post('/policies/:id/assignments',requireRole('editor'),(req,res)=>{const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy');if(one("SELECT id FROM learning_sessions WHERE generated_policy_id=? AND status IN ('review','apply-failed')",policy.id))return res.status(409).json({error:'Approve the learning proposal before assigning it'});const data=body(z.object({nodeId:z.string().optional(),nodeGroupId:z.string().optional()}),req);if(Number(!!data.nodeId)+Number(!!data.nodeGroupId)!==1)return res.status(400).json({error:'Specify exactly one nodeId or nodeGroupId'});const targets=data.nodeId?[getNode(data.nodeId)].filter(Boolean):all('SELECT n.* FROM nodes n JOIN node_group_members m ON m.node_id=n.id WHERE m.group_id=?',data.nodeGroupId);if(data.nodeId&&!targets.length)return notFound(res,'Node');if(data.nodeGroupId&&!one('SELECT id FROM node_groups WHERE id=?',data.nodeGroupId))return notFound(res,'Node group');const rules=parse(one('SELECT rules_compiled_json FROM policy_versions WHERE id=?',policy.current_version_id)?.rules_compiled_json)||[];const conflicts=assignmentConflicts(policy.id,rules,targets);if(conflicts.length)return rejectConflicts(res,conflicts);const assignmentId=id();run('INSERT INTO policy_assignments(id,policy_id,node_id,node_group_id,assigned_by) VALUES(?,?,?,?,?)',assignmentId,policy.id,data.nodeId||null,data.nodeGroupId||null,req.user.id);audit(req.user.id,'policy.assign','policy',policy.id,null,data);res.status(201).json({id:assignmentId,...data})})
-api.post('/policies/:id/apply',requireRole('editor'),wrap(async(req,res)=>{const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy');if(one("SELECT id FROM learning_sessions WHERE generated_policy_id=? AND status IN ('review','apply-failed')",policy.id))return res.status(409).json({error:'Approve the learning proposal before applying it'});res.json({results:await applyPolicy(policy,req.user.id)})}))
+api.post('/policies/:id/versions/:versionId/recall',requireRole('editor'),wrap(async(req,res)=>{const policy=getPolicy(reqId(req)),version=one('SELECT * FROM policy_versions WHERE id=? AND policy_id=?',req.params.versionId,reqId(req));if(!policy||!version)return notFound(res,'Version');if(!canWriteResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});const conflicts=assignmentConflicts(policy.id,parse(version.rules_compiled_json)||[],assignedNodes(policy.id));if(conflicts.length)return rejectConflicts(res,conflicts);run('UPDATE policies SET current_version_id=? WHERE id=?',version.id,policy.id);audit(req.user.id,'policy.recall','policy',policy.id,{versionId:policy.current_version_id},{versionId:version.id});res.json({versionId:version.id,results:await applyPolicy(getPolicy(policy.id),req.user.id)})}))
+api.post('/policies/:id/assignments',requireRole('editor'),(req,res)=>{const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy');if(!canWriteResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});if(one("SELECT id FROM learning_sessions WHERE generated_policy_id=? AND status IN ('review','apply-failed')",policy.id))return res.status(409).json({error:'Approve the learning proposal before assigning it'});const data=body(z.object({nodeId:z.string().optional(),nodeGroupId:z.string().optional()}),req);if(Number(!!data.nodeId)+Number(!!data.nodeGroupId)!==1)return res.status(400).json({error:'Specify exactly one nodeId or nodeGroupId'});const targets=data.nodeId?[getNode(data.nodeId)].filter(Boolean):all('SELECT n.* FROM nodes n JOIN node_group_members m ON m.node_id=n.id WHERE m.group_id=?',data.nodeGroupId);if(data.nodeId&&!targets.length)return notFound(res,'Node');const targetGroup=data.nodeGroupId?one('SELECT * FROM node_groups WHERE id=?',data.nodeGroupId):null;if(data.nodeGroupId&&!targetGroup)return notFound(res,'Node group');if(targetGroup&&!canWriteResource(req.user,'node_group',targetGroup))return res.status(403).json({error:'Insufficient permission for node group'});const rules=parse(one('SELECT rules_compiled_json FROM policy_versions WHERE id=?',policy.current_version_id)?.rules_compiled_json)||[];const conflicts=assignmentConflicts(policy.id,rules,targets);if(conflicts.length)return rejectConflicts(res,conflicts);const assignmentId=id();run('INSERT INTO policy_assignments(id,policy_id,node_id,node_group_id,assigned_by) VALUES(?,?,?,?,?)',assignmentId,policy.id,data.nodeId||null,data.nodeGroupId||null,req.user.id);audit(req.user.id,'policy.assign','policy',policy.id,null,data);res.status(201).json({id:assignmentId,...data})})
+api.post('/policies/:id/apply',requireRole('editor'),wrap(async(req,res)=>{const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy');if(!canWriteResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});if(one("SELECT id FROM learning_sessions WHERE generated_policy_id=? AND status IN ('review','apply-failed')",policy.id))return res.status(409).json({error:'Approve the learning proposal before applying it'});res.json({results:await applyPolicy(policy,req.user.id)})}))
 api.get('/policies/:id/diff',(req,res)=>{
+  const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy')
+  if(!canReadResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'})
   const a=one('SELECT * FROM policy_versions WHERE id=? AND policy_id=?',req.query.from,reqId(req)),b=one('SELECT * FROM policy_versions WHERE id=? AND policy_id=?',req.query.to,reqId(req))
   if(!a||!b)return notFound(res,'Version')
   const left=parse(a.rules_compiled_json)||[],right=parse(b.rules_compiled_json)||[]
@@ -543,10 +640,12 @@ export async function runDriftCheck(data={},actorId=null) {
         }
       } catch(cause){error=cause.message}
       const check={id:id(),policyId:policy.id,versionId:version.id,nodeId:node.id,status,diff,error,checkedAt:now()}
+      const previous=one('SELECT status FROM policy_drift_checks WHERE policy_id=? AND node_id=? AND version_id=? ORDER BY checked_at DESC,rowid DESC LIMIT 1',policy.id,node.id,version.id)?.status
       db.transaction(()=>{
         run('INSERT INTO policy_drift_checks(id,policy_id,version_id,node_id,status,diff_json,error,checked_at) VALUES(?,?,?,?,?,?,?,?)',check.id,check.policyId,check.versionId,check.nodeId,check.status,json(check.diff),check.error,check.checkedAt)
         if(status==='pending')run('INSERT INTO agent_jobs(id,agent_id,type,payload_json) VALUES(?,?,?,?)',id(),agent.id,'policy.read',json({driftCheckId:check.id,policyId:policy.id,versionId:version.id,group:`WinFireSecure:${policy.id}`}))
       })()
+      if(status==='drift'&&previous!=='drift')emitNotification({eventKey:`drift:${check.id}`,category:'policy_drift',title:'Policy drift detected',body:`${policy.name} differs from the firewall rules on ${node.hostname}.`,entityType:'node',entityId:node.id})
       checks.push(check)
     }
   }
@@ -573,7 +672,9 @@ async function verifyOne(node,policy,rule,runId,actualRules) {
   const evidence=supported?classifyVerification(rule,probe.status,managedRulePresent):{status:'inconclusive',reason:'Only single-port inbound TCP rules have a network probe'}
   const expected=rule.action==='allow'?'open':'closed',actual=probe?.status==='open'?'open':probe?.status||'not-probed'
   const result={id:id(),runId,nodeId:node.id,policyId:policy.id,port,proto:rule.protocol,expected,actual,probeStatus:probe?.status||null,managedRulePresent,latencyMs:Date.now()-started,...evidence,passed:evidence.status==='inconclusive'?null:evidence.status==='pass'}
+  const previous=one('SELECT status FROM verifier_results WHERE node_id=? AND policy_id=? AND port IS ? AND proto=? AND expected=? ORDER BY run_at DESC,rowid DESC LIMIT 1',node.id,policy.id,port,rule.protocol,expected)?.status
   run('INSERT INTO verifier_results(id,run_id,node_id,policy_id,port,proto,expected,actual,latency_ms,passed,status,reason,probe_status,managed_rule_present) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',result.id,runId,node.id,policy.id,port,rule.protocol,expected,actual,result.latencyMs,result.passed===null?null:Number(result.passed),result.status,result.reason,result.probeStatus,result.managedRulePresent===null?null:Number(result.managedRulePresent))
+  if(result.status==='fail'&&previous!=='fail')emitNotification({eventKey:`verifier:${result.id}`,category:'verifier_failure',title:'Firewall verification failed',body:`${policy.name} on ${node.hostname}: ${rule.protocol} ${port||'rule'} — ${result.reason}.`,entityType:'node',entityId:node.id})
   return result
 }
 export async function runVerification(data={},actorId=null) {
@@ -617,7 +718,19 @@ function driftSummaryByNode() {
   return new Map([...byNode].map(([nodeId,statuses])=>[nodeId,statuses.includes('drift')?'drift':statuses.includes('unknown')?'unknown':statuses.includes('pending')?'pending':statuses.includes('unchecked')?'unchecked':'in-sync']))
 }
 function report(name) {
-  if(name==='inventory')return all(`SELECT n.id,n.hostname,n.fqdn,n.ip,n.os_version,n.os_build,n.status,n.last_seen_at,n.connection_mode,f.snapshot_json,d.forward_result,d.reverse_result,d.mismatch FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id LEFT JOIN dns_lookups d ON d.node_id=n.id ORDER BY n.hostname`)
+  if(name==='inventory')return all(`SELECT n.id,n.hostname,n.fqdn,n.ip,n.os_version,n.os_build,n.status,n.last_seen_at,n.connection_mode,n.inventory_source,n.ad_enabled,n.ad_missing,n.firewall_state,f.snapshot_json,f.collected_at,(SELECT status FROM policy_apply_runs WHERE node_id=n.id ORDER BY started_at DESC,rowid DESC LIMIT 1) last_apply_status,(SELECT finished_at FROM policy_apply_runs WHERE node_id=n.id ORDER BY started_at DESC,rowid DESC LIMIT 1) last_apply_at,(SELECT status FROM verifier_results WHERE node_id=n.id ORDER BY run_at DESC,rowid DESC LIMIT 1) last_verify_status FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id ORDER BY n.hostname`).map(({snapshot_json,...row})=>{
+    const facts=parse(snapshot_json)||{}
+    const profiles=Array.isArray(facts.firewall)?facts.firewall:facts.firewall?[facts.firewall]:[]
+    return {...row,model:facts.computer?.Model||null,manufacturer:facts.computer?.Manufacturer||null,bios_serial:facts.bios?.SerialNumber||null,firewall_service:facts.service?.Status||null,firewall_profiles:profiles.map(profile=>`${profile.Name}: ${profile.Enabled?'on':'off'}`).join(', ')||null}
+  })
+  if(name==='dns')return all(`SELECT n.id,n.hostname,n.fqdn,n.ip,d.forward_result,d.reverse_result,d.mismatch,d.checked_at FROM nodes n LEFT JOIN dns_lookups d ON d.node_id=n.id ORDER BY n.hostname`).map(row=>{
+    const forward=parse(row.forward_result)||[],reverse=parse(row.reverse_result)||[]
+    const expected=String(row.fqdn||row.hostname).toLowerCase().replace(/\.$/,'')
+    const ptrMissing=!!(row.ip&&!reverse.length)
+    const ptrMismatch=!!(reverse.length&&!reverse.some(name=>String(name).toLowerCase().replace(/\.$/,'')===expected))
+    const forwardMismatch=!!(row.ip&&forward.length&&!forward.some(address=>address.address===row.ip))
+    return {id:row.id,hostname:row.hostname,fqdn:row.fqdn,ip:row.ip,forward_addresses:forward.map(address=>address.address).join(', '),reverse_names:reverse.join(', '),ptr_missing:ptrMissing,ptr_mismatch:ptrMismatch,forward_mismatch:forwardMismatch,mismatch:ptrMissing||ptrMismatch||forwardMismatch,checked_at:row.checked_at}
+  })
   if(name==='coverage'){
     const drift=driftSummaryByNode()
     return all(`SELECT n.id,n.hostname,n.status,COUNT(DISTINCT a.policy_id) AS policy_count,(SELECT status FROM policy_apply_runs WHERE node_id=n.id ORDER BY started_at DESC LIMIT 1) AS last_apply_status,(SELECT passed FROM verifier_results WHERE node_id=n.id ORDER BY run_at DESC LIMIT 1) AS last_verify_passed FROM nodes n LEFT JOIN policy_assignments a ON a.node_id=n.id OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=n.id) GROUP BY n.id ORDER BY n.hostname`).map(row=>({...row,drift_status:drift.get(row.id)||null}))
@@ -639,7 +752,7 @@ function exportReport(req,res,name,data) {
   }
   res.json(data)
 }
-for(const name of ['inventory','coverage','compliance','verification'])api.get(`/reports/${name}`,(req,res)=>exportReport(req,res,name,report(name)))
+for(const name of ['inventory','dns','coverage','compliance','verification'])api.get(`/reports/${name}`,(req,res)=>exportReport(req,res,name,report(name)))
 api.get('/reports/dashboard',(_req,res)=>{
   const total=one('SELECT COUNT(*) n FROM nodes').n, reachable=one("SELECT COUNT(*) n FROM nodes WHERE status='reachable'").n
   const policies=one('SELECT COUNT(*) n FROM policies').n, failed=one("SELECT COUNT(*) n FROM policy_apply_runs WHERE status='failed'").n
@@ -647,7 +760,11 @@ api.get('/reports/dashboard',(_req,res)=>{
   const agentCutoff=new Date(Date.now()-120_000).toISOString()
   const agents=one('SELECT COUNT(*) total,COALESCE(SUM(CASE WHEN revoked_at IS NULL AND last_checkin_at>=? THEN 1 ELSE 0 END),0) online FROM agents',agentCutoff)
   const denied=all("SELECT dst_port,COUNT(*) count FROM log_events WHERE action='block' GROUP BY dst_port ORDER BY count DESC LIMIT 6")
-  res.json({totalNodes:total,reachableNodes:reachable,agentsOnline:agents.online,agentsOffline:agents.total-agents.online,policies,failedApplies:failed,verifierPassRate:checks.n?Math.round(checks.passed/checks.n*100):null,verifierInconclusive:checks.inconclusive,deniedPorts:denied})
+  const verifierTrend=all("SELECT date(run_at) day,COUNT(passed) decisive,SUM(CASE WHEN passed=1 THEN 1 ELSE 0 END) passed FROM verifier_results WHERE datetime(run_at)>=datetime('now','-14 days') GROUP BY date(run_at) ORDER BY day").map(row=>({day:row.day,decisive:row.decisive,passRate:row.decisive?Math.round(row.passed/row.decisive*100):null}))
+  const mfaTrend=all("SELECT date(resolved_at) day,SUM(CASE WHEN status='approved' THEN 1 ELSE 0 END) approved,SUM(CASE WHEN status='denied' THEN 1 ELSE 0 END) denied FROM mfa_challenges WHERE datetime(resolved_at)>=datetime('now','-14 days') GROUP BY date(resolved_at) ORDER BY day")
+  const coverage=report('coverage')
+  const compliant=coverage.filter(row=>row.policy_count>0&&row.drift_status==='in-sync'&&row.last_apply_status==='success'&&row.last_verify_passed===1).length
+  res.json({totalNodes:total,reachableNodes:reachable,agentsOnline:agents.online,agentsOffline:agents.total-agents.online,policies,failedApplies:failed,verifierPassRate:checks.n?Math.round(checks.passed/checks.n*100):null,verifierInconclusive:checks.inconclusive,deniedPorts:denied,compliantNodes:compliant,fleetCompliancePct:total?Math.round(compliant/total*100):null,verifierTrend,mfaTrend})
 })
 
 api.get('/segments',(_req,res)=>res.json(all('SELECT * FROM identity_segments ORDER BY created_at DESC')))
@@ -666,7 +783,7 @@ api.post('/segments/:id/challenges',requireRole('editor'),(req,res)=>{
 api.post('/segments/:id/challenges/:challengeId/resolve',requireRole('admin'),(req,res)=>{
   const challenge=one('SELECT * FROM mfa_challenges WHERE id=? AND segment_id=?',req.params.challengeId,reqId(req));if(!challenge)return notFound(res,'Challenge')
   if(challenge.status!=='pending'||challenge.expires_at<now())return res.status(409).json({error:'Challenge expired or already resolved'})
-  const data=body(z.object({approved:z.boolean()}),req);run('UPDATE mfa_challenges SET status=?,resolved_at=? WHERE id=?',data.approved?'approved':'denied',now(),challenge.id);audit(req.user.id,'mfa.challenge.resolve','challenge',challenge.id,{status:'pending'},{approved:data.approved});res.json({ok:true})
+  const data=body(z.object({approved:z.boolean()}),req);run('UPDATE mfa_challenges SET status=?,resolved_at=? WHERE id=?',data.approved?'approved':'denied',now(),challenge.id);audit(req.user.id,'mfa.challenge.resolve','challenge',challenge.id,{status:'pending'},{approved:data.approved});if(!data.approved)emitNotification({eventKey:`mfa:${challenge.id}`,category:'mfa_challenge_failure',title:'MFA challenge denied',body:`The challenge for ${challenge.user_upn} on segment ${one('SELECT name FROM identity_segments WHERE id=?',challenge.segment_id)?.name||challenge.segment_id} was denied.`,entityType:'challenge',entityId:challenge.id});res.json({ok:true})
 })
 
 api.get('/logon-rights',(req,res)=>res.json(all('SELECT * FROM logon_rights WHERE (? IS NULL OR node_id=?) ORDER BY at DESC LIMIT 500',req.query.nodeId||null,req.query.nodeId||null)))
@@ -679,11 +796,17 @@ api.post('/logon-rights/baseline',requireRole('admin'),wrap(async(req,res)=>{
 }))
 
 api.get('/logs/search',(req,res)=>{
+  const query=z.object({
+    nodeId:z.string().optional(),action:z.enum(['allow','block','success','failure']).optional(),direction:z.enum(['in','out']).optional(),
+    program:z.string().max(1024).optional(),challengeId:z.string().max(128).optional(),
+    port:z.coerce.number().int().min(1).max(65535).optional(),from:z.iso.datetime({local:true,offset:true}).optional(),to:z.iso.datetime({local:true,offset:true}).optional()
+  }).parse(req.query)
+  if(query.from&&query.to&&new Date(query.from)>new Date(query.to))return res.status(400).json({error:'From must be earlier than To'})
   const filters=[],args=[]
-  for(const [query,column] of [['nodeId','node_id'],['action','action'],['direction','direction'],['program','program'],['challengeId','challenge_id']])if(req.query[query]){filters.push(`${column}=?`);args.push(req.query[query])}
-  if(req.query.port){filters.push('dst_port=?');args.push(Number(req.query.port))}
-  if(req.query.from){filters.push('datetime(COALESCE(event_time,received_at))>=datetime(?)');args.push(req.query.from)}
-  if(req.query.to){filters.push('datetime(COALESCE(event_time,received_at))<=datetime(?)');args.push(req.query.to)}
+  for(const [key,column] of [['nodeId','node_id'],['action','action'],['direction','direction'],['program','program'],['challengeId','challenge_id']])if(query[key]){filters.push(`${column}=?`);args.push(query[key])}
+  if(query.port){filters.push('dst_port=?');args.push(query.port)}
+  if(query.from){filters.push('datetime(COALESCE(event_time,received_at))>=datetime(?)');args.push(query.from)}
+  if(query.to){filters.push('datetime(COALESCE(event_time,received_at))<=datetime(?)');args.push(query.to)}
   res.json(all(`SELECT * FROM log_events ${filters.length?'WHERE '+filters.join(' AND '):''} ORDER BY datetime(COALESCE(event_time,received_at)) DESC LIMIT 1000`,...args))
 })
 api.post('/logs/ingest',requireRole('editor'),(req,res)=>{

@@ -7,6 +7,7 @@ import {hashToken} from './security.js'
 import {agentPkiReady,signAgentCsr} from './agentPki.js'
 import {normalizeWindowsEvent} from './eventNormalizer.js'
 import {diffRules} from './connector.js'
+import {emitNotification} from './notifications.js'
 
 export const agentRoutes=express.Router()
 const wrap=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next)
@@ -114,6 +115,8 @@ agentRoutes.post('/:id/jobs/:jobId/result',requireAgent,(req,res)=>{
           driftError=null
         } else if(data.success)driftError='Agent readback was invalid or the policy version changed'
         run('UPDATE policy_drift_checks SET status=?,diff_json=?,error=?,checked_at=? WHERE id=?',driftStatus,json(driftDiff),driftError,now(),check.id)
+        const previous=one("SELECT status FROM policy_drift_checks WHERE policy_id=? AND node_id=? AND version_id=? AND id<>? ORDER BY checked_at DESC,rowid DESC LIMIT 1",check.policy_id,check.node_id,check.version_id,check.id)?.status
+        if(driftStatus==='drift'&&previous!=='drift')emitNotification({eventKey:`drift:${check.id}`,category:'policy_drift',title:'Policy drift detected',body:`${one('SELECT name FROM policies WHERE id=?',check.policy_id)?.name||'Policy'} differs from the firewall rules on ${one('SELECT hostname FROM nodes WHERE id=?',check.node_id)?.hostname||check.node_id}.`,entityType:'node',entityId:check.node_id})
       }
     }
     if(payload.policyId){

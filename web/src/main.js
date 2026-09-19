@@ -15,6 +15,8 @@ import VerifyEmail from './views/VerifyEmail.vue'
 import {session} from './lib/api.js'
 import '@mdi/font/css/materialdesignicons.css'
 import './styles.scss'
+import './enterprise.scss'
+import './notifications.scss'
 
 const routes=[
   {path:'/login',component:Login,meta:{public:true}},

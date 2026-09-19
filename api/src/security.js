@@ -44,6 +44,50 @@ export async function bootstrap() {
   console.log(`WinFire first login: ${email} / ${password}`)
   console.log('Set BOOTSTRAP_EMAIL and BOOTSTRAP_PASSWORD before first start to choose your own credentials.')
 }
+export async function ensureBootstrapAdmin() {
+  const marker=one("SELECT user_id FROM bootstrap_accounts WHERE kind='demo-admin'")
+  const enabled=!['0','false','no'].includes(String(process.env.BOOTSTRAP_ADMIN_ENABLED??(process.env.NODE_ENV==='production'?'false':'true')).toLowerCase())
+  if(!enabled){
+    if(marker){
+      const user=one('SELECT id,suspended FROM users WHERE id=?',marker.user_id)
+      if(user&&!user.suspended)db.transaction(()=>{
+        run('UPDATE users SET suspended=1,session_version=session_version+1 WHERE id=?',user.id)
+        run('UPDATE refresh_tokens SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL',now(),user.id)
+        audit(null,'bootstrap.admin.disabled','user',user.id,null,null)
+      })()
+    }
+    return
+  }
+  const email=String(process.env.BOOTSTRAP_ADMIN_EMAIL||'admin@winfire.local').trim().toLowerCase()
+  const password=process.env.BOOTSTRAP_ADMIN_PASSWORD||'WinFireDemo!2026'
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))throw new Error('BOOTSTRAP_ADMIN_EMAIL must be a valid email address')
+  if(password.length<12)throw new Error('BOOTSTRAP_ADMIN_PASSWORD must contain at least 12 characters')
+  const user=marker?one('SELECT * FROM users WHERE id=?',marker.user_id):null
+  if(!user){
+    if(one('SELECT id FROM users WHERE email=?',email))throw new Error('BOOTSTRAP_ADMIN_EMAIL is already used by another account')
+    const userId=id(),passwordHash=await argon2.hash(password)
+    db.transaction(()=>{
+      run('INSERT INTO users(id,email,password_hash,role,email_verified) VALUES(?,?,?,?,1)',userId,email,passwordHash,'admin')
+      run("INSERT INTO user_profiles(user_id,theme) VALUES(?,'enterprise')",userId)
+      run('INSERT INTO bootstrap_accounts(kind,user_id) VALUES(?,?)','demo-admin',userId)
+      audit(null,'bootstrap.admin.created','user',userId,null,{email,role:'admin'})
+    })()
+  }else{
+    const conflict=one('SELECT id FROM users WHERE email=? AND id<>?',email,user.id)
+    if(conflict)throw new Error('BOOTSTRAP_ADMIN_EMAIL is already used by another account')
+    const passwordMatches=await argon2.verify(user.password_hash,password)
+    const changed=!passwordMatches||user.email!==email||user.role!=='admin'||!!user.suspended||!!user.totp_secret||!user.email_verified
+    if(changed){
+      const passwordHash=passwordMatches?user.password_hash:await argon2.hash(password)
+      db.transaction(()=>{
+        run('UPDATE users SET email=?,password_hash=?,role=?,suspended=0,totp_secret=NULL,email_verified=1,failed_attempts=0,locked_until=NULL,session_version=session_version+1 WHERE id=?',email,passwordHash,'admin',user.id)
+        run('UPDATE refresh_tokens SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL',now(),user.id)
+        audit(null,'bootstrap.admin.reconciled','user',user.id,{email:user.email,role:user.role},{email,role:'admin',passwordChanged:!passwordMatches})
+      })()
+    }
+  }
+  console.log(`Demo admin ready: ${email}. Set BOOTSTRAP_ADMIN_EMAIL, BOOTSTRAP_ADMIN_PASSWORD, or BOOTSTRAP_ADMIN_ENABLED to change it.`)
+}
 export function issueAccess(user) { return jwt.sign({sub:user.id,role:user.role,sv:user.session_version},jwtSecret,{expiresIn:'15m',issuer:'winfire'}) }
 export function verifyAccess(token) { return jwt.verify(token,jwtSecret,{issuer:'winfire'}) }
 export function issueRefresh(userId) {
@@ -74,5 +118,5 @@ export function auth(req,res,next) {
     req.user = user; next()
   } catch { res.status(401).json({error:'Invalid or expired token'}) }
 }
-const rank = {auditor:0,editor:1,admin:2,owner:3}
-export const requireRole = role => (req,res,next) => rank[req.user?.role] >= rank[role] ? next() : res.status(403).json({error:'Insufficient permission'})
+const rolePermission={auditor:'portal.read',editor:'portal.edit',admin:'portal.admin',owner:'portal.owner'}
+export const requireRole = role => (req,res,next) => one('SELECT 1 FROM role_permissions WHERE role_id=? AND permission_id=?',req.user?.role||'',rolePermission[role]||'') ? next() : res.status(403).json({error:'Insufficient permission'})

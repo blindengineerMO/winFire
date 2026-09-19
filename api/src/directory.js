@@ -48,21 +48,67 @@ export function normalizeDirectoryComputer(entry,baseDn) {
 }
 
 const defaultClientFactory=options=>new Client(options)
-const makeClient=(config,clientFactory)=>clientFactory({url:config.url,connectTimeout:10000,timeout:30000,tlsOptions:{minVersion:'TLSv1.2'}})
+const makeClient=(config,clientFactory)=>clientFactory({url:config.url,connectTimeout:10000,timeout:30000,...(new URL(config.url).protocol==='ldaps:'?{tlsOptions:{minVersion:'TLSv1.2'}}:{})})
+const fallbackCodes=new Set(['ECONNREFUSED','ETIMEDOUT','ECONNRESET','EPIPE','EHOSTUNREACH','ENETUNREACH'])
+const ldapFallbackUrl=ldapsUrl=>{const url=new URL(ldapsUrl);url.protocol='ldap:';url.port='389';return url.toString()}
+export function ldapFallbackUsername(username,baseDn){
+  const separator=username.indexOf('\\')
+  if(separator<1||separator===username.length-1||username.indexOf('\\',separator+1)!==-1)return username
+  const suffix=[...String(baseDn).matchAll(/(?:^|,)\s*DC=([^,]+)/gi)].map(match=>match[1]).join('.')
+  return suffix?`${username.slice(separator+1)}@${suffix}`:username
+}
+class DirectoryBindFailure extends Error {
+  constructor(cause){super(cause.message,{cause});this.code=cause.code}
+}
+
+async function runWithDirectory(config,credential,operation,clientFactory){
+  async function attempt(url){
+    const client=makeClient({...config,url},clientFactory)
+    try{
+      try{await client.bind(new URL(url).protocol==='ldap:'?ldapFallbackUsername(credential.username,config.base_dn):credential.username,credential.password)}
+      catch(error){throw new DirectoryBindFailure(error)}
+      return await operation(client)
+    }finally{try{await client.unbind()}catch{}}
+  }
+  try{return {value:await attempt(config.url),transport:'ldaps'}}
+  catch(primaryError){
+    const cause=primaryError instanceof DirectoryBindFailure?primaryError.cause:primaryError
+    if(config.allow_ldap_fallback&&config.ldap_fallback_approved_at&&primaryError instanceof DirectoryBindFailure&&fallbackCodes.has(String(cause?.code||''))){
+      const url=ldapFallbackUrl(config.url)
+      try{return {value:await attempt(url),transport:'ldap'}}
+      catch(fallbackError){throw directoryConnectionError(fallbackError instanceof DirectoryBindFailure?fallbackError.cause:fallbackError,url)}
+    }
+    throw directoryConnectionError(cause,config.url)
+  }
+}
+
+export function directoryConnectionError(error,url) {
+  const host=new URL(url).hostname
+  const plain=new URL(url).protocol==='ldap:'
+  const code=String(error?.code||'')
+  const message=String(error?.message||'')
+  const unavailable=description=>Object.assign(new Error(`${description} (${host}).`),{status:503,cause:error})
+  if(['ENOTFOUND','EAI_AGAIN'].includes(code))return unavailable('The directory host could not be resolved; check the server name and DNS')
+  if(['ECONNREFUSED','ETIMEDOUT','EHOSTUNREACH','ENETUNREACH'].includes(code))return unavailable(`The directory ${plain?'LDAP 389':'LDAPS'} endpoint is unreachable; check TCP ${plain?'389':'636'} and the network path`)
+  if(['ECONNRESET','EPIPE'].includes(code))return unavailable(plain?'The LDAP 389 connection was reset':'The LDAPS connection was reset; check that the domain controller has a valid Server Authentication certificate with a private key and is listening on TCP 636')
+  if(['UNABLE_TO_VERIFY_LEAF_SIGNATURE','SELF_SIGNED_CERT_IN_CHAIN','DEPTH_ZERO_SELF_SIGNED_CERT','CERT_HAS_EXPIRED','ERR_TLS_CERT_ALTNAME_INVALID'].includes(code)||/certificate verify failed|unable to verify|self.signed certificate|certificate has expired/i.test(message))return unavailable('The LDAPS certificate could not be validated; trust its issuing CA on the control plane and use the certificate DNS name')
+  if(plain&&(code==='8'||code==='13'||/strong authentication required|confidentiality required|LDAP Result Code: (8|13)/i.test(message)))return unavailable('The domain controller rejected unencrypted LDAP 389; its signing or confidentiality policy requires a protected bind. Configure LDAPS instead')
+  if(code==='49'||/invalid credentials|LDAP Result Code: 49/i.test(message))return Object.assign(new Error('The directory rejected the bind credential; check its username and password'),{status:400,cause:error})
+  if(code==='52'||/LDAP Result Code: 52/i.test(message))return unavailable('The directory service is unavailable for LDAP; check Active Directory Domain Services and its LDAPS certificate')
+  return error
+}
 
 export async function testDirectoryConnection(config,credential,clientFactory=defaultClientFactory) {
-  const client=makeClient(config,clientFactory)
-  try {
-    await client.bind(credential.username,credential.password)
+  const result=await runWithDirectory(config,credential,async client=>{
     const result=await client.search(config.base_dn,{scope:'base',filter:'(objectClass=*)',attributes:['distinguishedName'],sizeLimit:1})
-    return {connected:true,baseDn:config.base_dn,entries:result.searchEntries.length}
-  } finally {try{await client.unbind()}catch{}}
+    return result.searchEntries.length
+  },clientFactory)
+  return {connected:true,baseDn:config.base_dn,entries:result.value,transport:result.transport,fallbackUsed:result.transport==='ldap'}
 }
 
 export async function readDirectoryComputers(config,credential,clientFactory=defaultClientFactory) {
-  const client=makeClient(config,clientFactory),computers=[]
-  try {
-    await client.bind(credential.username,credential.password)
+  const result=await runWithDirectory(config,credential,async client=>{
+    const computers=[]
     for await(const page of client.searchPaginated(config.base_dn,{scope:'sub',filter:'(&(objectCategory=computer)(objectClass=computer))',attributes:directoryAttributes,explicitBufferAttributes:['objectGUID','objectSid'],paged:{pageSize:500},timeLimit:30})){
       for(const entry of page.searchEntries){
         const computer=normalizeDirectoryComputer(entry,config.base_dn)
@@ -71,5 +117,6 @@ export async function readDirectoryComputers(config,credential,clientFactory=def
       }
     }
     return computers
-  } finally {try{await client.unbind()}catch{}}
+  },clientFactory)
+  return {computers:result.value,transport:result.transport}
 }

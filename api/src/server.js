@@ -4,15 +4,18 @@ import {fileURLToPath} from 'node:url'
 import express from 'express'
 import https from 'node:https'
 import {app,runVerification,runDriftCheck,pullLogs,finalizeLearning,processDueTraining,syncDirectory} from './app.js'
-import {bootstrap} from './security.js'
+import {bootstrap,ensureBootstrapAdmin} from './security.js'
 import {all,one,run,now,audit} from './db.js'
 import {agentTlsOptions} from './agentPki.js'
 import {sweepAgentHealth} from './agentHealth.js'
 import {collectFacts,enrichNode} from './connector.js'
+import {pruneOldEvents,refreshDueDns} from './maintenance.js'
+import {deliverPendingNotifications} from './notifications.js'
 
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..')
 const dist=path.join(root,'web/dist')
 await bootstrap()
+await ensureBootstrapAdmin()
 if(fs.existsSync(dist)){
   app.use(express.static(dist))
   app.get(/^(?!\/api\/).*/,(_req,res)=>res.sendFile(path.join(dist,'index.html')))
@@ -62,9 +65,19 @@ async function sweepDirectory(){
 setTimeout(sweepDirectory,2000).unref()
 const directoryTimer=setInterval(sweepDirectory,5*60_000)
 directoryTimer.unref()
+let dnsRunning=false
+async function sweepDns(){
+  if(dnsRunning)return
+  dnsRunning=true
+  try{await refreshDueDns()}
+  catch(error){console.error('DNS refresh sweep failed:',error)}
+  finally{dnsRunning=false}
+}
+setTimeout(sweepDns,5000).unref()
+const dnsTimer=setInterval(sweepDns,15*60_000)
+dnsTimer.unref()
 const timer=setInterval(()=>{
-  const retention=Math.max(1,Number(process.env.LOG_RETENTION_DAYS||90))
-  run('DELETE FROM log_events WHERE datetime(received_at)<datetime(?)',new Date(Date.now()-retention*864e5).toISOString())
+  pruneOldEvents()
   for(const session of all("SELECT id FROM learning_sessions WHERE status='active' AND ends_at<?",now())){
     try {finalizeLearning(session.id)}
     catch(error){audit(null,'learning.finalize.failed','learning-session',session.id,null,{error:error.message})}
@@ -73,6 +86,15 @@ const timer=setInterval(()=>{
 timer.unref()
 const agentHealth=setInterval(()=>sweepAgentHealth(),60_000)
 agentHealth.unref()
+let notificationsRunning=false
+const notificationTimer=setInterval(async()=>{
+  if(notificationsRunning)return
+  notificationsRunning=true
+  try{await deliverPendingNotifications()}
+  catch(error){console.error('Notification delivery failed:',error)}
+  finally{notificationsRunning=false}
+},30_000)
+notificationTimer.unref()
 let jobsRunning=false
 const jobs=setInterval(async()=>{
   if(jobsRunning)return

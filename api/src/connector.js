@@ -183,9 +183,13 @@ export async function lookupDns(node) {
   let forward=[],reverse=[]
   try {forward=await dns.lookup(node.fqdn || node.hostname,{all:true})} catch {}
   if (node.ip) try {reverse=await dns.reverse(node.ip)} catch {}
-  const mismatch=!!(reverse.length && !reverse.some(name=>name.toLowerCase().replace(/\.$/,'') === (node.fqdn || node.hostname).toLowerCase()))
+  const expected=(node.fqdn||node.hostname).toLowerCase().replace(/\.$/,'')
+  const ptrMissing=!!(node.ip&&!reverse.length)
+  const ptrMismatch=!!(reverse.length&&!reverse.some(name=>name.toLowerCase().replace(/\.$/,'')===expected))
+  const forwardMismatch=!!(node.ip&&forward.length&&!forward.some(address=>address.address===node.ip))
+  const mismatch=ptrMissing||ptrMismatch||forwardMismatch
   run('INSERT INTO dns_lookups(node_id,forward_result,reverse_result,mismatch,checked_at) VALUES(?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET forward_result=excluded.forward_result,reverse_result=excluded.reverse_result,mismatch=excluded.mismatch,checked_at=excluded.checked_at',node.id,JSON.stringify(forward),JSON.stringify(reverse),Number(mismatch),now())
-  return {forward,reverse,mismatch}
+  return {forward,reverse,mismatch,ptrMissing,ptrMismatch,forwardMismatch}
 }
 export function diffRules(desired,actual) {
   const comparable=r=>JSON.stringify([r.name,r.action,r.direction==='inbound'?'in':r.direction==='outbound'?'out':r.direction,r.protocol,r.localPort,r.remotePort||'Any',r.remoteAddress,r.program,r.profile].map(x=>String(x).toLowerCase()))

@@ -1,0 +1,116 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import supertest from 'supertest'
+
+const dir=fs.mkdtempSync(path.join(os.tmpdir(),'winfire-observability-test-'))
+process.env.DATA_DIR=dir
+process.env.BOOTSTRAP_EMAIL='owner@observability.test'
+process.env.BOOTSTRAP_PASSWORD='observability-test-password'
+const {app}=await import('../src/app.js')
+const {bootstrap}=await import('../src/security.js')
+const {db}=await import('../src/db.js')
+const {pruneOldEvents,refreshDueDns}=await import('../src/maintenance.js')
+await bootstrap()
+const request=supertest(app)
+test.after(()=>{db.close();fs.rmSync(dir,{recursive:true,force:true})})
+
+test('log filters, retention and scheduled DNS refresh use saved settings',async()=>{
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@observability.test',password:'observability-test-password'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
+  const node=await auth(request.post('/api/v1/nodes')).send({hostname:'localhost',ip:'127.0.0.1'}).expect(201)
+  const read=await auth(request.get('/api/v1/settings/observability')).expect(200)
+  assert.deepEqual(read.body,{logRetentionDays:90,dnsRefreshHours:24})
+  await auth(request.patch('/api/v1/settings/observability')).send({logRetentionDays:0,dnsRefreshHours:24}).expect(400)
+  await auth(request.patch('/api/v1/settings/observability')).send({logRetentionDays:30,dnsRefreshHours:12}).expect(200)
+  const event=db.prepare('INSERT INTO log_events(id,node_id,record_id,event_id,action,protocol,dst_port,direction,program,challenge_id,event_time,received_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
+  event.run('old-log',node.body.id,1,5157,'block','TCP',3389,'in','C:\\Old.exe','old-challenge','2026-07-01T12:00:00.000Z','2026-09-19T13:00:00.000Z')
+  event.run('new-log',node.body.id,2,5156,'allow','TCP',443,'out','C:\\New.exe','new-challenge','2026-09-19T12:30:00.000Z','2026-09-19T13:00:00.000Z')
+  const result=await auth(request.get('/api/v1/logs/search').query({nodeId:node.body.id,action:'allow',direction:'out',program:'C:\\New.exe',challengeId:'new-challenge',port:443,from:'2026-09-19T12:00:00.000Z',to:'2026-09-19T13:00:00.000Z'})).expect(200)
+  assert.deepEqual(result.body.map(row=>row.id),['new-log'])
+  await auth(request.get('/api/v1/logs/search').query({port:99999})).expect(400)
+  await auth(request.get('/api/v1/logs/search').query({from:'2026-09-20T00:00:00.000Z',to:'2026-09-19T00:00:00.000Z'})).expect(400)
+  assert.equal(pruneOldEvents(new Date('2026-09-19T13:00:00.000Z')),1)
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM log_events').get().n,1)
+  assert.equal(await refreshDueDns(new Date('2026-09-19T13:00:00.000Z'),1),0)
+  db.prepare('UPDATE dns_lookups SET checked_at=? WHERE node_id=?').run('2026-09-18T00:00:00.000Z',node.body.id)
+  assert.equal(await refreshDueDns(new Date('2026-09-19T13:00:00.000Z'),1),1)
+  assert.ok(db.prepare('SELECT checked_at FROM dns_lookups WHERE node_id=?').get(node.body.id).checked_at>'2026-09-18T00:00:00.000Z')
+  db.prepare('UPDATE dns_lookups SET forward_result=?,reverse_result=? WHERE node_id=?').run(JSON.stringify([{address:'192.0.2.15',family:4}]),JSON.stringify(['unrelated.example.test']),node.body.id)
+  const dns=await auth(request.get('/api/v1/reports/dns')).expect(200)
+  const dnsRow=dns.body.find(row=>row.id===node.body.id)
+  assert.equal(dnsRow.forward_mismatch,true)
+  assert.equal(dnsRow.ptr_mismatch,true)
+  assert.equal(dnsRow.ptr_missing,false)
+  db.prepare('INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?)').run(node.body.id,JSON.stringify({computer:{Model:'Virtual Machine',Manufacturer:'Example'},bios:{SerialNumber:'SERIAL-01'},service:{Status:'Running'},firewall:[{Name:'Domain',Enabled:true}]}),'2026-09-19T13:00:00.000Z')
+  const inventory=await auth(request.get('/api/v1/reports/inventory')).expect(200)
+  const inventoryRow=inventory.body.find(row=>row.id===node.body.id)
+  assert.equal(inventoryRow.model,'Virtual Machine')
+  assert.equal(inventoryRow.bios_serial,'SERIAL-01')
+  assert.equal(inventoryRow.firewall_profiles,'Domain: on')
+  assert.equal('snapshot_json' in inventoryRow,false)
+})
+
+test('suspending a user invalidates access and owner deletion removes the account',async()=>{
+  const owner=await request.post('/api/v1/auth/login').send({email:'owner@observability.test',password:'observability-test-password'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${owner.body.accessToken}`)
+  const user=await auth(request.post('/api/v1/users')).send({email:'operator@observability.test',password:'operator-test-password',role:'editor'}).expect(201)
+  const operator=await request.post('/api/v1/auth/login').send({email:'operator@observability.test',password:'operator-test-password'}).expect(200)
+  await auth(request.patch(`/api/v1/users/${user.body.id}`)).send({suspended:true}).expect(200)
+  await request.get('/api/v1/auth/me').set('Authorization',`Bearer ${operator.body.accessToken}`).expect(401)
+  await auth(request.delete(`/api/v1/users/${user.body.id}`)).expect(204)
+  assert.equal(db.prepare('SELECT id FROM users WHERE id=?').get(user.body.id),undefined)
+})
+
+test('dashboard reports verifier and MFA decision trends',async()=>{
+  const owner=await request.post('/api/v1/auth/login').send({email:'owner@observability.test',password:'observability-test-password'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${owner.body.accessToken}`)
+  const at=new Date().toISOString(),day=at.slice(0,10)
+  db.prepare('INSERT INTO verifier_runs(id,status,started_at) VALUES(?,?,?)').run('trend-run','complete',at)
+  db.prepare('INSERT INTO verifier_results(id,run_id,port,proto,expected,actual,passed,status,run_at) VALUES(?,?,?,?,?,?,?,?,?)').run('trend-check','trend-run',443,'TCP','open','open',1,'pass',at)
+  db.prepare('INSERT INTO mfa_challenges(id,status,resolved_at) VALUES(?,?,?)').run('trend-mfa','approved',at)
+  const dashboard=await auth(request.get('/api/v1/reports/dashboard')).expect(200)
+  assert.equal(dashboard.body.verifierTrend.find(row=>row.day===day)?.passRate,100)
+  assert.equal(dashboard.body.mfaTrend.find(row=>row.day===day)?.approved,1)
+  assert.equal(dashboard.body.verifierPassRate,100)
+})
+
+test('self-service password changes require the current password and revoke prior sessions',async()=>{
+  const owner=await request.post('/api/v1/auth/login').send({email:'owner@observability.test',password:'observability-test-password'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${owner.body.accessToken}`)
+  await auth(request.patch(`/api/v1/users/${owner.body.user.id}/profile`)).send({currentPassword:'wrong-password',password:'new-observability-password'}).expect(401)
+  await auth(request.patch(`/api/v1/users/${owner.body.user.id}/profile`)).send({currentPassword:'observability-test-password',password:'new-observability-password'}).expect(200)
+  await auth(request.get('/api/v1/auth/me')).expect(401)
+  await request.post('/api/v1/auth/login').send({email:'owner@observability.test',password:'new-observability-password'}).expect(200)
+})
+
+test('node and policy inventory surface the latest verifier result',async()=>{
+  const owner=await request.post('/api/v1/auth/login').send({email:'owner@observability.test',password:'new-observability-password'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${owner.body.accessToken}`)
+  const node=await auth(request.post('/api/v1/nodes')).send({hostname:'badge-node'}).expect(201)
+  const policy=await auth(request.post('/api/v1/policies')).send({name:'Badge policy'}).expect(201)
+  const at=new Date().toISOString()
+  db.prepare('INSERT INTO verifier_runs(id,status,started_at) VALUES(?,?,?)').run('badge-run','complete',at)
+  db.prepare('INSERT INTO verifier_results(id,run_id,node_id,policy_id,port,proto,expected,actual,passed,status,reason,run_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)').run('badge-check','badge-run',node.body.id,policy.body.id,3389,'TCP','closed','open',0,'fail','Unexpected open port',at)
+  const nodes=await auth(request.get('/api/v1/nodes')).expect(200)
+  assert.equal(nodes.body.find(row=>row.id===node.body.id)?.verification?.status,'fail')
+  const detail=await auth(request.get(`/api/v1/nodes/${node.body.id}`)).expect(200)
+  assert.equal(detail.body.verification.reason,'Unexpected open port')
+  const policies=await auth(request.get('/api/v1/policies')).expect(200)
+  assert.equal(policies.body.find(row=>row.id===policy.body.id)?.verificationStatus,'fail')
+})
+
+test('credential assignment validates targets and is idempotent',async()=>{
+  const owner=await request.post('/api/v1/auth/login').send({email:'owner@observability.test',password:'new-observability-password'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${owner.body.accessToken}`)
+  const credential=await auth(request.post('/api/v1/credentials')).send({name:'Reader',type:'domain',username:'reader@example.test',password:'vault-test-secret'}).expect(201)
+  const node=await auth(request.post('/api/v1/nodes')).send({hostname:'credential-target'}).expect(201)
+  await auth(request.post(`/api/v1/credentials/${credential.body.id}/assignments`)).send({nodeId:node.body.id,nodeGroupId:'missing'}).expect(400)
+  await auth(request.post(`/api/v1/credentials/${credential.body.id}/assignments`)).send({nodeId:'missing'}).expect(404)
+  await auth(request.post(`/api/v1/credentials/${credential.body.id}/assignments`)).send({nodeId:node.body.id}).expect(201)
+  const repeated=await auth(request.post(`/api/v1/credentials/${credential.body.id}/assignments`)).send({nodeId:node.body.id}).expect(200)
+  assert.equal(repeated.body.alreadyAssigned,true)
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM credential_assignments WHERE credential_id=? AND node_id=?').get(credential.body.id,node.body.id).n,1)
+})
