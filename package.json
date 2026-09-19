@@ -1,0 +1,48 @@
+{
+  "name": "winfire-secure",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "web",
+    "packages/shared"
+  ],
+  "scripts": {
+    "build": "npm run build -w web",
+    "build:agent": "dotnet publish agent/WinFire.Agent/WinFire.Agent.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o agent/dist/win-x64",
+    "start": "npm run build && node api/src/server.js",
+    "dev:api": "node --watch api/src/server.js",
+    "dev:web": "npm run dev -w web",
+    "setup:winrm": "python3 -m venv .venv && .venv/bin/pip install -r api/sidecar/requirements.txt",
+    "test": "node --test api/test/*.test.js",
+    "test:winrm:live": "node api/test/live_winrm_smoke.mjs",
+    "test:winrm:rights": "node api/test/live_rights_read.mjs",
+    "audit:deps": "npm audit --omit=dev --audit-level=high"
+  },
+  "dependencies": {
+    "argon2": "^0.44.0",
+    "better-sqlite3": "^12.2.0",
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.0.1",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "knex": "^3.1.0",
+    "moment": "^2.30.1",
+    "nodemailer": "^10.0.10",
+    "pdfkit": "^0.17.1",
+    "ws": "^8.18.3",
+    "zod": "^4.0.5"
+  },
+  "devDependencies": {
+    "supertest": "^7.1.4"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.11.1": true,
+    "argon2@0.44.0": true,
+    "esbuild@0.28.2": true
+  }
+}

@@ -1,0 +1,32 @@
+name: Check
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  build-test-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - run: dotnet build agent/WinFire.Agent/WinFire.Agent.csproj -c Release
+      - run: npm audit --audit-level=high
+      - run: docker build -t winfire-secure:ci .
+      - uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: winfire-secure:ci
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL,HIGH

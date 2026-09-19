@@ -1,0 +1,16 @@
+node_modules/
+web/dist/
+data/
+.env
+*.log
+*.db
+*.db-*
+agent/**/bin/
+agent/**/obj/
+agent/dist/
+.playwright-cli/
+.venv/
+__pycache__/
+*.pyc
+PLAN.md
+IMPLEMENTATION_STATUS.md

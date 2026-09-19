@@ -1,0 +1,10 @@
+node_modules
+data
+.git
+.playwright-cli
+web/dist
+.venv
+agent/**/bin
+agent/**/obj
+agent/dist
+**/__pycache__
