@@ -4,14 +4,16 @@ import dns from 'node:dns/promises'
 import fs from 'node:fs'
 import path from 'node:path'
 import {fileURLToPath} from 'node:url'
-import {all, one, run, parse, now, audit} from './db.js'
+import {all, one, run, parse, now, audit, id} from './db.js'
 import {openSealed} from './security.js'
 import {breakGlassFunctions} from './breakGlassScript.js'
 import {jitAccessFunctions} from './jitAccessScript.js'
 import {mfaPromptFunctions} from './mfaPromptScript.js'
 import {assertManagementAccess} from './managementGuard.js'
+import {emitNotification} from './notifications.js'
 
 const timeoutMs = 40000
+const lsaRightsFunctions=fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../sidecar/lsa_rights.ps1'),'utf8')
 const pause=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds))
 const transientError=error=>/timed?\s*out|timeout|ECONNRESET|ECONNREFUSED|Max retries exceeded|unreachable/i.test(error?.message||'')
 export function recordNodeSuccess(nodeId,probeStatus=null) {
@@ -19,11 +21,15 @@ export function recordNodeSuccess(nodeId,probeStatus=null) {
   else run("UPDATE nodes SET failures=0,status='reachable',next_retry_at=NULL,last_seen_at=? WHERE id=?",now(),nodeId)
 }
 export function recordNodeTransportFailure(nodeId) {
-  const node=one('SELECT failures FROM nodes WHERE id=?',nodeId)
+  const node=one('SELECT failures,hostname,status FROM nodes WHERE id=?',nodeId)
   if(!node)return
   const failures=(node.failures||0)+1
   const delay=Math.min(30*60_000,60_000*2**Math.min(failures-1,10))
   run('UPDATE nodes SET failures=?,status=?,next_retry_at=? WHERE id=?',failures,failures>=3?'unreachable':'degraded',new Date(Date.now()+delay).toISOString(),nodeId)
+  if(failures>=3&&node.status!=='unreachable'){
+    audit(null,'node.unreachable','node',nodeId,{status:node.status,failures:node.failures},{status:'unreachable',failures})
+    emitNotification({eventKey:`node-unreachable:${nodeId}:${id()}`,category:'node_unreachable',title:'Node unreachable',body:`${node.hostname||nodeId} failed ${failures} consecutive management connections.`,entityType:'node',entityId:nodeId})
+  }
 }
 export function tcpProbe(host, port, timeout=2500) {
   return new Promise(resolve => {
@@ -89,10 +95,22 @@ try {
     ${breakGlassFunctions}
     ${jitAccessFunctions}
     __WINFIRE_PROMPT_FUNCTIONS__
+    # __WINFIRE_LSA_RIGHTS__
     switch($operation) {
       'prompt_browser' { Open-WinFireMfaPortal $argsData }
       'prompt_session' { @(Get-WinFireActiveSession) }
       'auth' { [Security.Principal.WindowsIdentity]::GetCurrent().Name }
+      'tcp_probe' {
+        $client=[System.Net.Sockets.TcpClient]::new();$watch=[Diagnostics.Stopwatch]::StartNew();$status='unreachable'
+        try {
+          $task=$client.ConnectAsync([string]$argsData.host,[int]$argsData.port)
+          if($task.Wait([Math]::Min(5000,[Math]::Max(250,[int]$argsData.timeoutMs)))){$status='open'}else{$status='timeout'}
+        } catch {
+          $cause=$_.Exception;while($cause.InnerException){$cause=$cause.InnerException}
+          if($cause -is [System.Net.Sockets.SocketException] -and $cause.SocketErrorCode -eq [System.Net.Sockets.SocketError]::ConnectionRefused){$status='refused'}
+        } finally {$watch.Stop();$client.Dispose()}
+        [pscustomobject]@{status=$status;latencyMs=$watch.ElapsedMilliseconds}
+      }
       'facts' {
         $computer=Get-CimInstance Win32_ComputerSystem; $osInfo=Get-CimInstance Win32_OperatingSystem; $biosInfo=Get-CimInstance Win32_BIOS
         $adapters=@(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' | ForEach-Object { [pscustomobject]@{description=$_.Description;macAddress=$_.MACAddress;ipAddresses=@($_.IPAddress);subnets=@($_.IPSubnet);gateways=@($_.DefaultIPGateway);dnsServers=@($_.DNSServerSearchOrder);dnsDomain=$_.DNSDomain;dnsSuffixes=@($_.DNSDomainSuffixSearchOrder);dhcpEnabled=$_.DHCPEnabled;dhcpServer=$_.DHCPServer} })
@@ -140,7 +158,7 @@ try {
       'jit_start' { Start-WinFireJitAccess $argsData }
       'jit_end' { End-WinFireJitAccess $argsData }
       'audit_policy_enable' { $before=Get-WinFireAuditPolicy; if($before.successEnabled -and $before.failureEnabled){$before}else{try{auditpol /set '/subcategory:{0CCE9226-69AE-11D9-BED3-505054503030}' /success:enable /failure:enable | Out-Null; if($LASTEXITCODE -ne 0){throw "auditpol update failed with exit code $LASTEXITCODE"}; $after=Get-WinFireAuditPolicy; if(-not ($after.successEnabled -and $after.failureEnabled)){throw 'Audit policy readback did not confirm success and failure auditing'}; $after}catch{$cause=$_.Exception.Message; $successArg=if($before.successEnabled){'/success:enable'}else{'/success:disable'}; $failureArg=if($before.failureEnabled){'/failure:enable'}else{'/failure:disable'}; auditpol /set '/subcategory:{0CCE9226-69AE-11D9-BED3-505054503030}' $successArg $failureArg | Out-Null; if($LASTEXITCODE -ne 0){throw "Audit policy update failed: $cause; rollback failed with exit code $LASTEXITCODE"}; $restored=Get-WinFireAuditPolicy; if($restored.settingValue -ne $before.settingValue){throw "Audit policy update failed: $cause; rollback readback differs from prior state"}; throw "Audit policy update failed: $cause; prior state restored"}} }
-      'rights' { $file=Join-Path $env:TEMP ('winfire-'+[guid]::NewGuid().ToString()+'.inf'); try {secedit /export /mergedpolicy /cfg $file /areas USER_RIGHTS | Out-Null; if($LASTEXITCODE -ne 0){throw "secedit export failed with exit code $LASTEXITCODE"}; $content=@(Get-Content $file); $rights=@($content | Where-Object {$_ -match '^\\s*Se\\w*LogonRight\\s*='}); if(!$rights.Count){throw "secedit export contained no logon rights across $($content.Count) lines"}; $rights} finally {Remove-Item $file -Force -ErrorAction SilentlyContinue} }
+      'rights' { @(Get-WinFireLogonRights) }
       default { throw 'Unsupported operation' }
     }
   }
@@ -167,7 +185,8 @@ export async function remote(node,operation,args={},options={}) {
     const attempts=mutating?1:2
     for(let attempt=0;attempt<attempts;attempt++){
       try {
-        const result=process.platform==='win32' ? await pwsh(remoteScript.replace('__WINFIRE_PROMPT_FUNCTIONS__',operation.startsWith('prompt_')?mfaPromptFunctions:''),input) : await pywinrm(input)
+        const script=remoteScript.replace('__WINFIRE_PROMPT_FUNCTIONS__',operation.startsWith('prompt_')?mfaPromptFunctions:'').replace('# __WINFIRE_LSA_RIGHTS__',operation==='rights'?lsaRightsFunctions:'')
+        const result=process.platform==='win32' ? await pwsh(script,input) : await pywinrm(input)
         recordNodeSuccess(node.id,input.transport==='winrms'?'winrms-authenticated':'winrm-authenticated')
         return result
       }

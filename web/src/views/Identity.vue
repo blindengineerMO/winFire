@@ -8,6 +8,7 @@ import {useRoute} from 'vue-router'
 const route=useRoute()
 
 const segments=ref([]),accessSegments=ref([]),grants=ref([]),nodes=ref([]),groups=ref([]),policies=ref([]),rights=ref([]),challenges=ref([])
+const challengePage=ref(1),challengeTotal=ref(0),challengePages=ref(1),challengeStatus=ref(''),challengeSegmentId=ref(''),challengeNodeId=ref(''),challengeProvider=ref(''),challengeUser=ref(''),challengeBusy=ref(false)
 const portalBrand=ref({companyName:'WinFire Secure',imageUrl:null})
 const error=ref(''),message=ref(''),formOpen=ref(false),manageOpen=ref(false),targetKind=ref('node')
 const form=ref({name:'',nodeId:'',nodeGroupId:'',policyId:null,port:3389,accountSid:'',sourceIp:'',ttlMinutes:240,failOpen:false,mode:'agentless',mfaProvider:'totp',portalEnabled:true,autoPromptEnabled:false})
@@ -21,9 +22,28 @@ async function load(){
   try{
     const [allSegments,eligible,activeGrants,allNodes,allGroups,allPolicies,allRights,branding]=await Promise.all([api('/segments'),api('/segments/access'),api('/segments/access/grants'),api('/nodes'),api('/node-groups'),api('/policies'),api('/logon-rights'),api('/portal-branding')])
     segments.value=allSegments;accessSegments.value=eligible;grants.value=activeGrants;nodes.value=allNodes;groups.value=allGroups;policies.value=allPolicies;rights.value=allRights;portalBrand.value=branding
-    const results=await Promise.all(segments.value.map(item=>api(`/segments/${item.id}/challenges`)))
-    challenges.value=results.flat();error.value=''
+    await loadChallenges();error.value=''
   }catch(cause){error.value=cause.message}
+}
+async function loadChallenges(){
+  challengeBusy.value=true
+  try{
+    const query=new URLSearchParams({page:String(challengePage.value),pageSize:'10'})
+    if(challengeStatus.value)query.set('status',challengeStatus.value)
+    if(challengeSegmentId.value)query.set('segmentId',challengeSegmentId.value)
+    if(challengeNodeId.value)query.set('nodeId',challengeNodeId.value)
+    if(challengeProvider.value)query.set('provider',challengeProvider.value)
+    if(challengeUser.value.trim())query.set('userUpn',challengeUser.value.trim())
+    const result=await api(`/mfa/challenges/search?${query}`)
+    challenges.value=result.items;challengeTotal.value=result.total;challengePages.value=Math.max(1,result.totalPages)
+  }catch(cause){error.value=cause.message}
+  finally{challengeBusy.value=false}
+}
+function searchChallenges(){challengePage.value=1;loadChallenges()}
+function moveChallengePage(next){if(next<1||next>challengePages.value||challengeBusy.value)return;challengePage.value=next;loadChallenges()}
+function challengeConnection(challenge){
+  try{const connection=JSON.parse(challenge.connection_5tuple||'null');return connection?.srcIp&&connection?.dstPort?`${connection.srcIp} → TCP ${connection.dstPort}`:null}
+  catch{return null}
 }
 async function create(){
   try{
@@ -68,7 +88,14 @@ onMounted(async()=>{
   }
   const code=String(route.query.code||''),state=String(route.query.state||''),entraError=String(route.query.error_description||route.query.error||'')
   if(code||state||entraError)window.history.replaceState({},'',window.location.pathname)
-  if(entraError){error.value=`Entra sign-in failed: ${entraError.slice(0,300)}`;return}
+  if(entraError){
+    const errorCode=String(route.query.error||'')
+    if(state&&/^[A-Za-z0-9_]{1,64}$/.test(errorCode)){
+      try{await api('/segments/entra/cancel',{method:'POST',body:{state,error:errorCode}});await loadChallenges()}
+      catch(cause){error.value=cause.message;return}
+    }
+    error.value=`Entra sign-in failed: ${entraError.slice(0,300)}`;return
+  }
   if(code&&state){accessBusy.value=true;try{accessResult.value=await api('/segments/entra/complete',{method:'POST',body:{code,state}});message.value='Entra MFA complete. Retry your connection now.';await load()}catch(cause){error.value=cause.message}finally{accessBusy.value=false}}
 })
 </script>
@@ -96,8 +123,10 @@ onMounted(async()=>{
         <div v-for="segment in segments" :key="segment.id" class="segment-row"><div class="segment-icon"><i class="mdi mdi-shield-lock-outline"></i></div><div><strong>{{segment.name}}</strong><small>{{segment.node_group_id?groups.find(group=>group.id===segment.node_group_id)?.name||segment.node_group_id:nodes.find(node=>node.id===segment.node_id)?.hostname||segment.node_id}} · TCP {{segment.port}} · {{segment.ttl_minutes}} min · {{segment.mfa_provider==='totp'?'Authenticator':'Entra'}} · {{segment.portal_enabled?'Portal on':'Portal off'}} · {{segment.auto_prompt_enabled?'Browser prompt on':'Browser prompt off'}}</small></div><button v-if="canManage" class="button small secondary" @click="openManage(segment)">Manage</button></div>
         <div v-if="!segments.length" class="empty-side">No identity segments configured.</div>
       </section>
-      <section class="panel glass"><div class="panel-title"><div><span class="eyebrow">MFA TRAIL</span><h2>Challenges</h2></div><span class="count-chip">{{challenges.length}}</span></div>
-        <div v-for="challenge in challenges.slice(0,10)" :key="challenge.id" class="segment-row"><div class="segment-icon"><i class="mdi mdi-account-key-outline"></i></div><div><strong>{{challenge.user_upn}}</strong><small>{{new Date(challenge.challenged_at).toLocaleString()}}</small></div><span class="status" :class="challenge.status">{{challenge.status}}</span></div><div v-if="!challenges.length" class="empty-side">No MFA challenges recorded.</div>
+      <section class="panel glass"><div class="panel-title"><div><span class="eyebrow">MFA TRAIL</span><h2>Challenges</h2></div><span class="count-chip">{{challengeTotal}}</span></div>
+        <div class="challenge-filters"><select v-model="challengeSegmentId" aria-label="Filter challenges by segment" @change="searchChallenges"><option value="">All segments</option><option v-for="segment in segments" :key="segment.id" :value="segment.id">{{segment.name}}</option></select><select v-model="challengeNodeId" aria-label="Filter challenges by node" @change="searchChallenges"><option value="">All nodes</option><option v-for="node in nodes" :key="node.id" :value="node.id">{{node.hostname}}</option></select><select v-model="challengeProvider" aria-label="Filter challenges by provider" @change="searchChallenges"><option value="">All providers</option><option value="totp">Authenticator</option><option value="entra">Entra</option><option value="manual">Manual</option></select><select v-model="challengeStatus" aria-label="Filter challenges by result" @change="searchChallenges"><option value="">All results</option><option value="pending">Pending</option><option value="approved">Approved</option><option value="denied">Denied</option><option value="expired">Expired</option></select><input v-model="challengeUser" aria-label="Search challenge user" placeholder="Search user" @keyup.enter="searchChallenges"><button class="button small secondary" :disabled="challengeBusy" @click="searchChallenges">Search</button></div>
+        <div v-for="challenge in challenges" :key="challenge.id" class="segment-row"><div class="segment-icon"><i class="mdi mdi-account-key-outline"></i></div><div><strong>{{challenge.user_upn}}</strong><small>{{challenge.segment_name||challenge.segment_id}} · {{challenge.node_name||challenge.node_id}} · {{challenge.provider||'Unknown provider'}} · {{new Date(challenge.challenged_at).toLocaleString()}}</small><small v-if="challengeConnection(challenge)">{{challengeConnection(challenge)}}</small><small v-if="challenge.resolved_at">Resolved {{new Date(challenge.resolved_at).toLocaleString()}}</small><small v-if="challenge.failure_reason">{{challenge.failure_reason}}</small></div><span class="status" :class="challenge.status">{{challenge.status}}</span></div><div v-if="!challenges.length" class="empty-side">{{challengeBusy?'Loading challenges…':'No MFA challenges match these filters.'}}</div>
+        <div v-if="challengeTotal>10" class="challenge-pages"><span>Page {{challengePage}} of {{challengePages}}</span><div><button class="button small secondary" :disabled="challengePage<=1||challengeBusy" @click="moveChallengePage(challengePage-1)">Previous</button><button class="button small secondary" :disabled="challengePage>=challengePages||challengeBusy" @click="moveChallengePage(challengePage+1)">Next</button></div></div>
       </section>
     </div>
     <section class="panel glass"><div class="panel-title"><div><span class="eyebrow">WINDOWS LSA</span><h2>Logon rights baseline</h2></div><select v-if="canManage" @change="baseline($event.target.value);$event.target.value=''" aria-label="Collect node baseline"><option value="">Collect from node…</option><option v-for="node in nodes" :key="node.id" :value="node.id">{{node.hostname}}</option></select></div><div class="table-wrap"><table><thead><tr><th>NODE</th><th>ACCOUNT SID</th><th>LOGON TYPE</th><th>ASSIGNMENT</th><th>RECORDED</th></tr></thead><tbody><tr v-for="right in rights.slice(0,100)" :key="right.id"><td>{{nodes.find(node=>node.id===right.node_id)?.hostname||right.node_id}}</td><td class="mono">{{right.account_sid}}</td><td class="mono">{{right.logon_type}}</td><td>{{right.right_assignment}}</td><td>{{new Date(right.at).toLocaleString()}}</td></tr><tr v-if="!rights.length"><td colspan="5" class="empty-table">No baselines collected yet.</td></tr></tbody></table></div></section>
@@ -110,4 +139,9 @@ onMounted(async()=>{
 .portal-panel{margin-bottom:1rem}.portal-panel p{max-width:900px}.portal-form{grid-template-columns:repeat(auto-fit,minmax(200px,1fr));align-items:end}.portal-form .form-actions{margin:0}.segment-row>div:nth-child(2){flex:1;min-width:0}
 .portal-brand-header{display:flex;align-items:center;gap:12px;min-width:0}.portal-brand-image{width:58px;height:50px;object-fit:contain;flex:none}
 .portal-company-name{display:block;font-size:.75rem;letter-spacing:.03em;color:var(--muted);margin-bottom:3px}
+.challenge-filters{display:flex;flex-wrap:wrap;gap:.5rem;padding:.75rem 1rem;border-bottom:1px solid var(--border)}
+.challenge-filters select,.challenge-filters input{flex:1 1 120px;min-width:0}
+.challenge-pages{display:flex;align-items:center;justify-content:space-between;gap:.7rem;padding:.7rem 1rem;border-top:1px solid var(--border);font-size:.8rem}
+.challenge-pages>div{display:flex;gap:.5rem}
+@media(max-width:620px){.challenge-pages{flex-wrap:wrap}}
 </style>

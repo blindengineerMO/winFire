@@ -14,6 +14,7 @@ const {bootstrap}=await import('../src/security.js')
 const {db}=await import('../src/db.js')
 const {emitNotification,deliverPendingNotifications}=await import('../src/notifications.js')
 const {sweepAgentHealth}=await import('../src/agentHealth.js')
+const {recordNodeTransportFailure,recordNodeSuccess}=await import('../src/connector.js')
 await bootstrap()
 const request=supertest(app)
 test.after(()=>{db.close();fs.rmSync(dir,{recursive:true,force:true})})
@@ -49,6 +50,21 @@ test('agent offline sweep emits one alert per offline transition',async()=>{
   assert.equal(sweepAgentHealth(),1)
   assert.equal(sweepAgentHealth(),0)
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM notifications WHERE category='agent_offline' AND entity_id=?").get(nodeId).count,1)
+})
+
+test('agentless transport failures alert once per unreachable transition and recover',()=>{
+  const nodeId='notification-winrm-node'
+  db.prepare("INSERT INTO nodes(id,hostname,connection_mode,status) VALUES(?,?,'agentless','reachable')").run(nodeId,'winrm-host')
+  for(let i=0;i<3;i++)recordNodeTransportFailure(nodeId)
+  assert.equal(db.prepare('SELECT status,failures,next_retry_at FROM nodes WHERE id=?').get(nodeId).status,'unreachable')
+  assert.equal(db.prepare("SELECT COUNT(DISTINCT event_key) count FROM notifications WHERE category='node_unreachable' AND entity_id=?").get(nodeId).count,1)
+  recordNodeTransportFailure(nodeId)
+  assert.equal(db.prepare("SELECT COUNT(DISTINCT event_key) count FROM notifications WHERE category='node_unreachable' AND entity_id=?").get(nodeId).count,1)
+  recordNodeSuccess(nodeId)
+  recordNodeTransportFailure(nodeId)
+  recordNodeTransportFailure(nodeId)
+  recordNodeTransportFailure(nodeId)
+  assert.equal(db.prepare("SELECT COUNT(DISTINCT event_key) count FROM notifications WHERE category='node_unreachable' AND entity_id=?").get(nodeId).count,2)
 })
 
 test('HTTPS webhook deliveries retry failures and send the saved event',async()=>{

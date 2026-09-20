@@ -3,7 +3,7 @@ import {ref,watch} from 'vue'
 import {api,session} from '../lib/api.js'
 
 const props=defineProps({me:{type:Object,default:null}})
-const categories=[['policy_drift','Policy drift'],['verifier_failure','Verifier failure'],['mfa_challenge_failure','MFA challenge failure'],['agent_offline','Agent offline']]
+const categories=[['policy_drift','Policy drift'],['verifier_failure','Verifier failure'],['mfa_challenge_failure','MFA challenge failure'],['agent_offline','Agent offline'],['node_unreachable','Node unreachable']]
 const channels=[['in_app','In app'],['email','Email'],['webhook','Webhook']]
 const preferences=ref({}),saving=ref(false),error=ref(''),message=ref('')
 watch(()=>props.me?.profile?.notification_prefs,value=>{

@@ -8,6 +8,7 @@ import Policies from './views/Policies.vue'
 import Reports from './views/Reports.vue'
 import Logs from './views/Logs.vue'
 import Identity from './views/Identity.vue'
+import MfaPrompt from './views/MfaPrompt.vue'
 import Administration from './views/Administration.vue'
 import Login from './views/Login.vue'
 import AcceptInvite from './views/AcceptInvite.vue'
@@ -22,6 +23,8 @@ const routes=[
   {path:'/login',component:Login,meta:{public:true}},
   {path:'/accept-invite',component:AcceptInvite,meta:{public:true}},
   {path:'/verify-email',component:VerifyEmail,meta:{public:true}},
+  {path:'/mfa/callback',component:MfaPrompt,meta:{public:true}},
+  {path:'/mfa/:promptId',component:MfaPrompt,meta:{public:true}},
   {path:'/',component:Dashboard},
   {path:'/inventory',component:Inventory},
   {path:'/policies',component:Policies},

@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import supertest from 'supertest'
-import {guidFromDirectory,sidFromDirectory,normalizeDirectoryComputer,testDirectoryConnection,directoryConnectionError,ldapFallbackUsername} from '../src/directory.js'
+import {guidFromDirectory,sidFromDirectory,normalizeDirectoryComputer,testDirectoryConnection,authenticateDirectoryUser,directoryConnectionError,ldapFallbackUsername} from '../src/directory.js'
 
 const dir=fs.mkdtempSync(path.join(os.tmpdir(),'winfire-directory-test-'))
 process.env.DATA_DIR=dir
@@ -32,6 +32,20 @@ test('AD binary identifiers and computer attributes normalize correctly',()=>{
   assert.equal(normalizeDirectoryComputer({...computer('srv02'),'dNSHostName':null},'DC=example,DC=test').fqdn,'srv02.example.test')
   assert.equal(ldapFallbackUsername('EXAMPLE\\reader','OU=Servers,DC=example,DC=test'),'reader@example.test')
   assert.equal(ldapFallbackUsername('reader@other.test','DC=example,DC=test'),'reader@other.test')
+})
+
+test('interactive AD authentication binds the user over LDAPS and never uses approved LDAP fallback',async()=>{
+  const config={enabled:1,url:'ldaps://dc.example.test:636/',allow_ldap_fallback:1,ldap_fallback_approved_at:new Date().toISOString()}
+  const seen=[]
+  const factory=options=>{seen.push(options);return {async bind(username,password){seen.push([username,password])},async unbind(){seen.push('unbind')}}}
+  assert.deepEqual(await authenticateDirectoryUser(config,'operator@example.test','test-password',factory),{authenticated:true,transport:'ldaps'})
+  assert.equal(seen[0].url,config.url)
+  assert.equal(seen[0].tlsOptions.minVersion,'TLSv1.2')
+  assert.deepEqual(seen[1],['operator@example.test','test-password'])
+  assert.equal(seen[2],'unbind')
+  await assert.rejects(authenticateDirectoryUser({...config,url:'ldap://dc.example.test:389/'},'operator@example.test','test-password',()=>{throw new Error('LDAP client should not be created')}),error=>error.status===503&&/LDAPS/.test(error.message))
+  const invalidFactory=()=>({async bind(){throw Object.assign(new Error('LDAP Result Code: 49'),{code:'49'})},async unbind(){}})
+  await assert.rejects(authenticateDirectoryUser(config,'operator@example.test','bad-password',invalidFactory),error=>error.status===401&&/Invalid directory credentials/.test(error.message))
 })
 
 test('directory settings use vault credentials and sync AD as the first inventory source',async()=>{

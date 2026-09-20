@@ -1,6 +1,9 @@
 const publicRoutes=new Set([
   'GET /health','GET /openapi.json','POST /auth/login','POST /auth/refresh',
   'POST /invites/accept','POST /auth/verify-email','GET /avatars/{id}',
+  'GET /portal-branding','GET /portal-branding/image',
+  'GET /mfa/prompts/{id}','POST /mfa/prompts/{id}/totp','POST /mfa/prompts/{id}/entra/start',
+  'POST /mfa/entra/complete','POST /mfa/entra/cancel',
   'POST /agents/enroll'
 ])
 

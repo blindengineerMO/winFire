@@ -19,7 +19,7 @@ import {normalizeWindowsEvent} from './eventNormalizer.js'
 import {isLoopbackEvent} from './eventPattern.js'
 import {deliverInvite,deliverVerification,inviteLink} from './mailer.js'
 import {saveAvatar,readAvatar,removeAvatar} from './avatar.js'
-import {readDirectoryComputers,testDirectoryConnection} from './directory.js'
+import {readDirectoryComputers,testDirectoryConnection,authenticateDirectoryUser} from './directory.js'
 import {observabilitySettings} from './maintenance.js'
 import {resourceRecord,canReadResource,canWriteResource} from './access.js'
 import {emitNotification,notificationSummary,preferenceKeys} from './notifications.js'
@@ -31,6 +31,7 @@ import {entraConfigured,startEntraAuthentication,completeEntraAuthentication} fr
 import {portalBranding,setPortalCompanyName,savePortalImage,readPortalImage,removePortalImage} from './portalBranding.js'
 import {assertManagementAccess} from './managementGuard.js'
 import {mfaPromptSettings} from './mfaPromptSettings.js'
+import {createMfaChallenge,resolveMfaChallenge} from './mfaChallenges.js'
 
 export const app=express()
 app.disable('x-powered-by')
@@ -187,6 +188,7 @@ async function applyPolicy(policy,actorId=null,targetNodes=null,context={}) {
 api.get('/health',(req,res)=>res.json({status:'ok',service:'winfire',time:now()}))
 api.get('/openapi.json',(_req,res)=>res.json(buildOpenApi(api,agentRoutes)))
 const loginLimit=rateLimit({windowMs:15*60*1000,limit:Number(process.env.AUTH_RATE_LIMIT||20),standardHeaders:'draft-8',legacyHeaders:false})
+const publicMfaLimit=rateLimit({windowMs:15*60*1000,limit:10,standardHeaders:'draft-8',legacyHeaders:false})
 api.post('/auth/login',loginLimit,wrap(async(req,res)=>{
   const {email,password,totp}=body(z.object({email:z.email(),password:z.string().min(1),totp:z.string().optional()}),req)
   const user=one('SELECT * FROM users WHERE email=?',email.toLowerCase())
@@ -251,6 +253,90 @@ api.get('/portal-branding/image',(_req,res)=>{
   const image=readPortalImage()
   if(!image)return notFound(res,'Portal image')
   res.set('Cache-Control','public, max-age=300').type(image.mimeType).send(image.bytes)
+})
+
+function livePublicPrompt(req,promptId){
+  if(!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(promptId))throw Object.assign(new Error('MFA request is unavailable or expired'),{status:404})
+  const prompt=one('SELECT * FROM mfa_prompt_events WHERE id=?',promptId)
+  if(!prompt||prompt.status!=='opened'||prompt.expires_at<=now()||prompt.source_ip!==normalizeSourceIp(req.ip))throw Object.assign(new Error('MFA request is unavailable or expired'),{status:404})
+  const segment=one('SELECT * FROM identity_segments WHERE id=?',prompt.segment_id)
+  if(!segment?.portal_enabled||segment.mode!=='agentless')throw Object.assign(new Error('MFA request is unavailable or expired'),{status:404})
+  return {prompt,segment}
+}
+function portalIdentity(email,segment){
+  const user=one('SELECT * FROM users WHERE email=?',email.toLowerCase())
+  if(!user||user.suspended||!user.email_verified||user.locked_until&&user.locked_until>now()||!(parse(segment.allowed_upns)||[]).includes(email.toLowerCase()))throw Object.assign(new Error('This account cannot authorize the request'),{status:403})
+  return user
+}
+api.get('/mfa/prompts/:id',(req,res)=>{
+  const {prompt,segment}=livePublicPrompt(req,req.params.id)
+  const target=one('SELECT hostname FROM nodes WHERE id=?',prompt.target_node_id)
+  const source=prompt.source_node_id?one('SELECT hostname FROM nodes WHERE id=?',prompt.source_node_id):null
+  const sourceEvent=prompt.source_node_id&&prompt.source_event_record_id?one('SELECT program FROM log_events WHERE node_id=? AND record_id=?',prompt.source_node_id,prompt.source_event_record_id):null
+  const directory=directorySettings()
+  res.set('Cache-Control','no-store').json({id:prompt.id,target:target?.hostname||'Protected resource',source:source?.hostname||prompt.source_ip,sourceIp:prompt.source_ip,sessionUser:prompt.opened_user||null,sessionId:prompt.opened_session_id??null,program:sourceEvent?.program?.slice(0,512)||null,port:segment.port,protocol:segment.port===3389?'RDP':segment.port===22?'SSH':'TCP',provider:segment.mfa_provider,providerAvailable:segment.mfa_provider==='entra'?entraConfigured():!!(directory?.enabled&&String(directory.url||'').startsWith('ldaps://')),expiresAt:prompt.expires_at,ttlMinutes:segment.ttl_minutes,branding:portalBranding()})
+})
+api.post('/mfa/prompts/:id/totp',publicMfaLimit,wrap(async(req,res)=>{
+  const {prompt,segment}=livePublicPrompt(req,req.params.id)
+  if(segment.mfa_provider!=='totp')return res.status(409).json({error:'This request uses Microsoft sign-in'})
+  const {email,password,code}=body(z.object({email:z.email(),password:z.string().min(1).max(512),code:z.string().regex(/^\d{6}$/)}),req)
+  const challengeId=createMfaChallenge({nodeId:prompt.target_node_id,userUpn:email.toLowerCase(),segmentId:segment.id,connection:{srcIp:prompt.source_ip,dstPort:segment.port,protocol:'TCP'},provider:'totp',promptId:prompt.id})
+  let user=null
+  try{
+    user=portalIdentity(email,segment)
+    if(!user.totp_secret)throw Object.assign(new Error('Enroll an authenticator in your WinFire profile before using this request'),{status:403})
+    await authenticateDirectoryUser(directorySettings(),email,password)
+    const counter=matchingTotpCounter(openSealed(user.totp_secret).secret,code)
+    if(counter===null)throw Object.assign(new Error('Invalid directory credentials or authenticator code'),{status:401})
+    const consumed=run('INSERT INTO mfa_totp_replay(user_id,last_counter) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET last_counter=excluded.last_counter WHERE excluded.last_counter>mfa_totp_replay.last_counter',user.id,counter)
+    if(consumed.changes!==1)throw Object.assign(new Error('Authenticator code was already used; wait for a new code'),{status:401})
+    run('UPDATE users SET failed_attempts=0,locked_until=NULL WHERE id=?',user.id)
+    req.user=user
+    const {node,sourceIp}=portalTarget(req,segment,prompt.target_node_id)
+    res.status(201).json(await grantPortalAccess(req,segment,node,sourceIp,'totp',prompt.id,challengeId))
+  }catch(error){
+    if(user&&error.status===401){const attempts=user.failed_attempts+1;run('UPDATE users SET failed_attempts=?,locked_until=? WHERE id=?',attempts,attempts>=5?new Date(Date.now()+15*60_000).toISOString():null,user.id)}
+    resolveMfaChallenge(challengeId,'denied',{actorId:user?.id||null,reason:error.status===401?'Invalid directory credentials or authenticator code':error.message})
+    throw error
+  }
+}))
+api.post('/mfa/prompts/:id/entra/start',publicMfaLimit,wrap(async(req,res)=>{
+  const {prompt,segment}=livePublicPrompt(req,req.params.id)
+  if(segment.mfa_provider!=='entra')return res.status(409).json({error:'This request uses an authenticator code'})
+  if(!entraConfigured())return res.status(503).json({error:'Microsoft sign-in is not configured'})
+  const flow=await startEntraAuthentication({redirectPath:'/mfa/callback'})
+  livePublicPrompt(req,prompt.id)
+  const expiresAt=new Date(Math.min(Date.now()+5*60_000,Date.parse(prompt.expires_at))).toISOString()
+  db.transaction(()=>{
+    const challengeId=createMfaChallenge({nodeId:prompt.target_node_id,userUpn:prompt.opened_user||'Unverified Microsoft user',segmentId:segment.id,connection:{srcIp:prompt.source_ip,dstPort:segment.port,protocol:'TCP'},provider:'entra',promptId:prompt.id,expiresAt})
+    run('INSERT INTO mfa_public_entra_flows(state_hash,prompt_id,source_ip,sealed_checks,challenge_id,expires_at) VALUES(?,?,?,?,?,?)',hashToken(flow.state),prompt.id,prompt.source_ip,seal({verifier:flow.verifier,nonce:flow.nonce}),challengeId,expiresAt)
+  })()
+  res.set('Cache-Control','no-store').json({authorizationUrl:flow.url})
+}))
+api.post('/mfa/entra/complete',publicMfaLimit,wrap(async(req,res)=>{
+  const {code,state}=body(z.object({code:z.string().min(8).max(4096),state:z.string().min(16).max(512)}),req)
+  const flow=one('SELECT * FROM mfa_public_entra_flows WHERE state_hash=?',hashToken(state))
+  if(!flow||flow.used_at||flow.expires_at<=now()||flow.source_ip!==normalizeSourceIp(req.ip))return res.status(401).json({error:'Microsoft sign-in expired or was already used'})
+  const reserved=run('UPDATE mfa_public_entra_flows SET used_at=? WHERE state_hash=? AND used_at IS NULL',now(),flow.state_hash)
+  if(reserved.changes!==1)return res.status(401).json({error:'Microsoft sign-in was already used'})
+  try{
+    const {prompt,segment}=livePublicPrompt(req,flow.prompt_id)
+    const identity=await completeEntraAuthentication({code,state,...openSealed(flow.sealed_checks),redirectPath:'/mfa/callback'})
+    run('UPDATE mfa_challenges SET user_upn=? WHERE id=?',identity.email,flow.challenge_id)
+    const user=portalIdentity(identity.email,segment)
+    req.user=user
+    const {node,sourceIp}=portalTarget(req,segment,prompt.target_node_id)
+    res.status(201).json(await grantPortalAccess(req,segment,node,sourceIp,'entra',prompt.id,flow.challenge_id))
+  }catch(error){resolveMfaChallenge(flow.challenge_id,'denied',{reason:'Microsoft sign-in or access authorization failed'});throw error}
+}))
+api.post('/mfa/entra/cancel',publicMfaLimit,(req,res)=>{
+  const {state,error}=body(z.object({state:z.string().min(16).max(512),error:z.string().regex(/^[A-Za-z0-9_]{1,64}$/)}),req)
+  const flow=one('SELECT * FROM mfa_public_entra_flows WHERE state_hash=?',hashToken(state))
+  if(!flow||flow.used_at||flow.expires_at<=now()||flow.source_ip!==normalizeSourceIp(req.ip))return res.status(401).json({error:'Microsoft sign-in expired or was already used'})
+  const reserved=run('UPDATE mfa_public_entra_flows SET used_at=? WHERE state_hash=? AND used_at IS NULL',now(),flow.state_hash)
+  if(reserved.changes!==1)return res.status(401).json({error:'Microsoft sign-in was already used'})
+  resolveMfaChallenge(flow.challenge_id,'denied',{reason:`Microsoft sign-in returned ${error}`})
+  res.json({ok:true})
 })
 
 api.use('/agents',agentRoutes)
@@ -1093,21 +1179,34 @@ api.get('/drift/checks',(req,res)=>{
   res.json(all(`SELECT * FROM policy_drift_checks ${filters.length?'WHERE '+filters.join(' AND '):''} ORDER BY datetime(checked_at) DESC LIMIT 500`,...args).filter(row=>visible.has(row.policy_id)).map(row=>({...row,diff:parse(row.diff_json)})))
 })
 
-async function verifyOne(node,policy,rule,runId,actualRules) {
+async function verifyOne(node,policy,rule,runId,actualRules,vantageNode=null) {
   const singleTcpPort=rule.direction==='in' && rule.protocol==='TCP' && /^\d{1,5}$/.test(String(rule.localPort))
   const port=singleTcpPort?Number(rule.localPort):null
   const supported=port!==null && port>=1 && port<=65535
-  const started=Date.now(),probe=supported?await tcpProbe(node.ip||node.fqdn||node.hostname,port,1500):null
+  const started=Date.now()
+  let probe=null,probeError=null
+  if(supported){
+    if(vantageNode?.id===node.id)probeError='The verifier peer is the target node; choose another peer for a network-path check'
+    else if(vantageNode){
+      try{
+        probe=await remote(vantageNode,'tcp_probe',{host:node.ip||node.fqdn||node.hostname,port,timeoutMs:1500})
+        if(!['open','refused','timeout','unreachable'].includes(probe?.status))throw new Error('Verifier peer returned invalid probe evidence')
+      }catch(error){probe=null;probeError=`Verifier peer unavailable: ${error.message}`}
+    }else probe=await tcpProbe(node.ip||node.fqdn||node.hostname,port,1500)
+  }
   const managedRulePresent=actualRules===null?null:hasManagedRule(rule,actualRules)
-  const evidence=supported?classifyVerification(rule,probe.status,managedRulePresent):{status:'inconclusive',reason:'Only single-port inbound TCP rules have a network probe'}
+  const evidence=probeError?{status:'inconclusive',reason:probeError}:supported?classifyVerification(rule,probe.status,managedRulePresent):{status:'inconclusive',reason:'Only single-port inbound TCP rules have a network probe'}
   const expected=rule.action==='allow'?'open':'closed',actual=probe?.status==='open'?'open':probe?.status||'not-probed'
-  const result={id:id(),runId,nodeId:node.id,policyId:policy.id,port,proto:rule.protocol,expected,actual,probeStatus:probe?.status||null,managedRulePresent,latencyMs:Date.now()-started,...evidence,passed:evidence.status==='inconclusive'?null:evidence.status==='pass'}
+  const result={id:id(),runId,nodeId:node.id,policyId:policy.id,vantageNodeId:vantageNode?.id||null,port,proto:rule.protocol,expected,actual,probeStatus:probe?.status||null,managedRulePresent,latencyMs:Date.now()-started,...evidence,passed:evidence.status==='inconclusive'?null:evidence.status==='pass'}
   const previous=one('SELECT status FROM verifier_results WHERE node_id=? AND policy_id=? AND port IS ? AND proto=? AND expected=? ORDER BY run_at DESC,rowid DESC LIMIT 1',node.id,policy.id,port,rule.protocol,expected)?.status
-  run('INSERT INTO verifier_results(id,run_id,node_id,policy_id,port,proto,expected,actual,latency_ms,passed,status,reason,probe_status,managed_rule_present) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',result.id,runId,node.id,policy.id,port,rule.protocol,expected,actual,result.latencyMs,result.passed===null?null:Number(result.passed),result.status,result.reason,result.probeStatus,result.managedRulePresent===null?null:Number(result.managedRulePresent))
+  run('INSERT INTO verifier_results(id,run_id,node_id,policy_id,vantage_node_id,port,proto,expected,actual,latency_ms,passed,status,reason,probe_status,managed_rule_present) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',result.id,runId,node.id,policy.id,result.vantageNodeId,port,rule.protocol,expected,actual,result.latencyMs,result.passed===null?null:Number(result.passed),result.status,result.reason,result.probeStatus,result.managedRulePresent===null?null:Number(result.managedRulePresent))
   if(result.status==='fail'&&previous!=='fail')emitNotification({eventKey:`verifier:${result.id}`,category:'verifier_failure',title:'Firewall verification failed',body:`${policy.name} on ${node.hostname}: ${rule.protocol} ${port||'rule'} — ${result.reason}.`,entityType:'node',entityId:node.id})
   return result
 }
 export async function runVerification(data={},actorId=null,canCheckPolicy=()=>true) {
+  const vantageNode=data.vantageNodeId?getNode(data.vantageNodeId):null
+  if(data.vantageNodeId&&!vantageNode)throw Object.assign(new Error('Verifier peer not found'),{status:404})
+  if(vantageNode&&!['winrm','winrms'].includes(vantageNode.transport))throw Object.assign(new Error('Verifier peer requires a working WinRM connection'),{status:409})
   const runId=id()
   run('INSERT INTO verifier_runs(id,status,requested_by) VALUES(?,?,?)',runId,'running',actorId)
   const policies=(data.policyId?[getPolicy(data.policyId)].filter(Boolean):all('SELECT * FROM policies WHERE current_version_id IS NOT NULL')).filter(canCheckPolicy)
@@ -1121,15 +1220,15 @@ export async function runVerification(data={},actorId=null,canCheckPolicy=()=>tr
         try {const response=await remote(node,'rules',{group:`WinFireSecure:${policy.id}`});actualRules=Array.isArray(response)?response:response?[response]:[]}
         catch {actualRules=null}
       }
-      for(const rule of rules){const result=await verifyOne(node,policy,rule,runId,actualRules);if(result)results.push(result)}
+      for(const rule of rules){const result=await verifyOne(node,policy,rule,runId,actualRules,vantageNode);if(result)results.push(result)}
     }
   }
   run('UPDATE verifier_runs SET status=?,finished_at=? WHERE id=?','complete',now(),runId)
-  audit(actorId,'verifier.run','verifier',runId,null,{results:results.length})
+  audit(actorId,'verifier.run','verifier',runId,null,{results:results.length,vantageNodeId:vantageNode?.id||null})
   return {id:runId,status:'complete',results}
 }
 api.post('/verifier/runs',requireRole('editor'),wrap(async(req,res)=>{
-  const data=body(z.object({nodeId:z.string().optional(),policyId:z.string().optional()}),req)
+  const data=body(z.object({nodeId:z.string().optional(),policyId:z.string().optional(),vantageNodeId:z.string().optional()}),req)
   if(data.policyId&&!canWriteResource(req.user,'policy',getPolicy(data.policyId)))return res.status(403).json({error:'Insufficient permission for policy'})
   res.status(201).json(await runVerification(data,req.user.id,policy=>canWriteResource(req.user,'policy',policy)))
 }))
@@ -1168,7 +1267,7 @@ function report(name,user=null) {
   }
   if(name==='verification'){
     const visible=user?readablePolicyIds(user):null
-    return all(`SELECT n.hostname,p.id AS policy_id,p.name AS policy,r.port,r.proto,r.expected,r.actual,r.status,r.reason,r.managed_rule_present,r.run_at FROM verifier_results r LEFT JOIN nodes n ON n.id=r.node_id LEFT JOIN policies p ON p.id=r.policy_id ORDER BY r.run_at DESC LIMIT 1000`).filter(row=>!visible||visible.has(row.policy_id)).map(({policy_id,...row})=>row)
+    return all(`SELECT n.hostname,p.id AS policy_id,p.name AS policy,COALESCE(v.hostname,'Control plane') AS vantage,r.port,r.proto,r.expected,r.actual,r.status,r.reason,r.managed_rule_present,r.run_at FROM verifier_results r LEFT JOIN nodes n ON n.id=r.node_id LEFT JOIN nodes v ON v.id=r.vantage_node_id LEFT JOIN policies p ON p.id=r.policy_id ORDER BY r.run_at DESC LIMIT 1000`).filter(row=>!visible||visible.has(row.policy_id)).map(({policy_id,...row})=>row)
   }
   const drift=driftSummaryByNode()
   return all(`SELECT n.id,n.hostname,n.status,COUNT(DISTINCT a.policy_id) AS policies,COALESCE((SELECT SUM(passed) FROM verifier_results WHERE node_id=n.id),0) AS checks_passed,COALESCE((SELECT COUNT(passed) FROM verifier_results WHERE node_id=n.id),0) AS checks_decisive,COALESCE((SELECT COUNT(*) FROM verifier_results WHERE node_id=n.id AND passed IS NULL),0) AS checks_inconclusive FROM nodes n LEFT JOIN policy_assignments a ON a.node_id=n.id OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=n.id) GROUP BY n.id ORDER BY n.hostname`).map(row=>({...row,drift_status:drift.get(row.id)||null}))
@@ -1251,16 +1350,16 @@ function portalPrompt(req,segment,node,sourceIp,promptId){
   if(!prompt||prompt.segment_id!==segment.id||prompt.target_node_id!==node.id||prompt.source_ip!==sourceIp||prompt.status!=='opened'||prompt.expires_at<=now())throw Object.assign(new Error('MFA browser prompt is invalid or expired'),{status:409})
   return prompt
 }
-async function grantPortalAccess(req,segment,node,sourceIp,provider,promptId=null){
-  portalPrompt(req,segment,node,sourceIp,promptId)
-  if(promptId){
-    const reserved=run("UPDATE mfa_prompt_events SET status='consuming' WHERE id=? AND status='opened' AND expires_at>?",promptId,now())
-    if(reserved.changes!==1)throw Object.assign(new Error('MFA browser prompt was already used'),{status:409})
-  }
-  const challengeId=id(),grantId=id(),expiresAt=new Date(Date.now()+segment.ttl_minutes*60_000).toISOString()
+async function grantPortalAccess(req,segment,node,sourceIp,provider,promptId=null,existingChallengeId=null){
+  const challengeId=existingChallengeId||createMfaChallenge({nodeId:node.id,userUpn:req.user.email,segmentId:segment.id,connection:{srcIp:sourceIp,dstPort:segment.port,protocol:'TCP'},provider,promptId,actorId:req.user.id})
+  const grantId=id(),expiresAt=new Date(Date.now()+segment.ttl_minutes*60_000).toISOString()
   let ruleStarted=false,grantRecorded=false
-  run('INSERT INTO mfa_challenges(id,node_id,user_upn,segment_id,connection_5tuple,status,expires_at) VALUES(?,?,?,?,?,?,?)',challengeId,node.id,req.user.email,segment.id,json({srcIp:sourceIp,dstPort:segment.port,protocol:'TCP'}),'pending',new Date(Date.now()+300_000).toISOString())
   try{
+    portalPrompt(req,segment,node,sourceIp,promptId)
+    if(promptId){
+      const reserved=run("UPDATE mfa_prompt_events SET status='consuming' WHERE id=? AND status='opened' AND expires_at>?",promptId,now())
+      if(reserved.changes!==1)throw Object.assign(new Error('MFA browser prompt was already used'),{status:409})
+    }
     const preflight=await remote(node,'jit_preflight',{port:segment.port})
     if(!preflight?.safe){
       const names=[...(preflight?.conflictingAllows||[]),...(preflight?.conflictingBlocks||[])].map(item=>item.name).slice(0,3).join(', ')
@@ -1275,9 +1374,9 @@ async function grantPortalAccess(req,segment,node,sourceIp,provider,promptId=nul
     }
     run('INSERT INTO jit_grants(id,segment_id,node_id,account_sid,src_ip,dst_port,rule_path,grant_type,ttl_seconds,granted_at,expires_at,mfa_challenge_id,prompt_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',grantId,segment.id,node.id,segment.account_sid||null,sourceIp,segment.port,`WinFireSecure:JIT:${grantId}`,'portal_firewall',segment.ttl_minutes*60,now(),expiresAt,challengeId,promptId)
     grantRecorded=true
-    run("UPDATE mfa_challenges SET status='approved',resolved_at=? WHERE id=?",now(),challengeId)
     if(promptId)run("UPDATE mfa_prompt_events SET status='consumed',consumed_at=? WHERE id=?",now(),promptId)
     audit(req.user.id,'mfa.portal.granted','jit-grant',grantId,null,{segmentId:segment.id,nodeId:node.id,sourceIp,port:segment.port,expiresAt,provider,promptId})
+    if(!resolveMfaChallenge(challengeId,'approved',{actorId:req.user.id}))throw Object.assign(new Error('MFA challenge expired before access could open'),{status:409})
     return {grantId,nodeId:node.id,sourceIp,port:segment.port,expiresAt}
   }catch(error){
     if(ruleStarted){
@@ -1288,8 +1387,8 @@ async function grantPortalAccess(req,segment,node,sourceIp,provider,promptId=nul
         audit(req.user.id,'mfa.portal.cleanup.failed','jit-grant',grantId,null,{nodeId:node.id,error:cleanupError.message})
       }
     }
-    run("UPDATE mfa_challenges SET status='denied',resolved_at=? WHERE id=?",now(),challengeId)
-    if(promptId)run("UPDATE mfa_prompt_events SET status='failed',error=? WHERE id=? AND status='consuming'",error.message,promptId)
+    resolveMfaChallenge(challengeId,'denied',{actorId:req.user.id,reason:error.message})
+    if(promptId)run("UPDATE mfa_prompt_events SET status='failed',consumed_at=NULL,error=? WHERE id=? AND status IN ('consuming','consumed')",error.message,promptId)
     audit(req.user.id,'mfa.portal.failed','challenge',challengeId,null,{segmentId:segment.id,nodeId:node.id,sourceIp,error:error.message,provider})
     throw error
   }
@@ -1330,11 +1429,12 @@ api.post('/segments/:id/access',portalAccessLimit,wrap(async(req,res)=>{
   portalPrompt(req,segment,node,sourceIp,data.promptId)
   if(segment.mfa_provider!=='totp')return res.status(409).json({error:'Use the Entra sign-in action for this segment'})
   if(!req.user.totp_secret)return res.status(409).json({error:'Set up Google Authenticator or another TOTP app in Administration → Security first'})
+  const challengeId=createMfaChallenge({nodeId:node.id,userUpn:req.user.email,segmentId:segment.id,connection:{srcIp:sourceIp,dstPort:segment.port,protocol:'TCP'},provider:'totp',promptId:data.promptId||null,actorId:req.user.id})
   const counter=matchingTotpCounter(openSealed(req.user.totp_secret).secret,data.code)
-  if(counter===null){audit(req.user.id,'mfa.portal.denied','segment',segment.id,null,{nodeId:node.id,sourceIp,reason:'invalid-code'});return res.status(401).json({error:'Invalid authenticator code'})}
+  if(counter===null){resolveMfaChallenge(challengeId,'denied',{actorId:req.user.id,reason:'Invalid authenticator code'});return res.status(401).json({error:'Invalid authenticator code'})}
   const consumed=run('INSERT INTO mfa_totp_replay(user_id,last_counter) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET last_counter=excluded.last_counter WHERE excluded.last_counter>mfa_totp_replay.last_counter',req.user.id,counter)
-  if(consumed.changes!==1)return res.status(401).json({error:'Authenticator code was already used; wait for a new code'})
-  res.status(201).json(await grantPortalAccess(req,segment,node,sourceIp,'totp',data.promptId))
+  if(consumed.changes!==1){resolveMfaChallenge(challengeId,'denied',{actorId:req.user.id,reason:'Authenticator code replayed'});return res.status(401).json({error:'Authenticator code was already used; wait for a new code'})}
+  res.status(201).json(await grantPortalAccess(req,segment,node,sourceIp,'totp',data.promptId,challengeId))
 }))
 api.post('/segments/:id/entra/start',portalAccessLimit,wrap(async(req,res)=>{
   const segment=one('SELECT * FROM identity_segments WHERE id=?',reqId(req))
@@ -1343,8 +1443,11 @@ api.post('/segments/:id/entra/start',portalAccessLimit,wrap(async(req,res)=>{
   portalPrompt(req,segment,node,sourceIp,data.promptId)
   if(segment.mfa_provider!=='entra')return res.status(409).json({error:'This segment uses an authenticator code'})
   if(!entraConfigured())return res.status(503).json({error:'Entra tenant, app, secret, and public URL are not configured'})
-  const flow=await startEntraAuthentication()
-  run('INSERT INTO mfa_entra_flows(state_hash,user_id,segment_id,node_id,source_ip,sealed_checks,expires_at,prompt_id) VALUES(?,?,?,?,?,?,?,?)',hashToken(flow.state),req.user.id,segment.id,node.id,sourceIp,seal({verifier:flow.verifier,nonce:flow.nonce}),new Date(Date.now()+5*60_000).toISOString(),data.promptId||null)
+  const flow=await startEntraAuthentication(),flowExpiresAt=new Date(Date.now()+5*60_000).toISOString()
+  db.transaction(()=>{
+    const challengeId=createMfaChallenge({nodeId:node.id,userUpn:req.user.email,segmentId:segment.id,connection:{srcIp:sourceIp,dstPort:segment.port,protocol:'TCP'},provider:'entra',promptId:data.promptId||null,actorId:req.user.id,expiresAt:flowExpiresAt})
+    run('INSERT INTO mfa_entra_flows(state_hash,user_id,segment_id,node_id,source_ip,sealed_checks,expires_at,prompt_id,challenge_id) VALUES(?,?,?,?,?,?,?,?,?)',hashToken(flow.state),req.user.id,segment.id,node.id,sourceIp,seal({verifier:flow.verifier,nonce:flow.nonce}),flowExpiresAt,data.promptId||null,challengeId)
+  })()
   audit(req.user.id,'mfa.entra.start','segment',segment.id,null,{nodeId:node.id,sourceIp})
   res.json({authorizationUrl:flow.url})
 }))
@@ -1363,22 +1466,48 @@ api.post('/segments/entra/complete',portalAccessLimit,wrap(async(req,res)=>{
     const checks=openSealed(flow.sealed_checks)
     const identity=await completeEntraAuthentication({code:data.code,state:data.state,...checks})
     if(identity.email!==req.user.email.toLowerCase())throw Object.assign(new Error('Entra identity does not match your WinFire account'),{status:403})
-    res.status(201).json(await grantPortalAccess(req,segment,node,sourceIp,'entra',flow.prompt_id))
-  }catch(error){audit(req.user.id,'mfa.entra.failed','segment',segment.id,null,{nodeId:node.id,sourceIp,error:error.message});throw error}
+    res.status(201).json(await grantPortalAccess(req,segment,node,sourceIp,'entra',flow.prompt_id,flow.challenge_id))
+  }catch(error){
+    if(flow.challenge_id)resolveMfaChallenge(flow.challenge_id,'denied',{actorId:req.user.id,reason:'Entra sign-in failed'})
+    audit(req.user.id,'mfa.entra.failed','segment',segment.id,null,{nodeId:node.id,sourceIp,error:error.message});throw error
+  }
 }))
+api.post('/segments/entra/cancel',portalAccessLimit,(req,res)=>{
+  const data=body(z.object({state:z.string().min(16).max(512),error:z.string().regex(/^[A-Za-z0-9_]{1,64}$/)}),req)
+  const flow=one('SELECT * FROM mfa_entra_flows WHERE state_hash=?',hashToken(data.state))
+  if(!flow||flow.used_at||flow.expires_at<=now()||flow.user_id!==req.user.id)return res.status(401).json({error:'Entra sign-in has expired or was already used'})
+  if(normalizeSourceIp(req.ip)!==flow.source_ip)return res.status(403).json({error:'Entra sign-in source IP changed'})
+  const reserved=run('UPDATE mfa_entra_flows SET used_at=? WHERE state_hash=? AND used_at IS NULL',now(),flow.state_hash)
+  if(reserved.changes!==1)return res.status(401).json({error:'Entra sign-in was already used'})
+  if(flow.challenge_id)resolveMfaChallenge(flow.challenge_id,'denied',{actorId:req.user.id,reason:`Entra sign-in returned ${data.error}`})
+  audit(req.user.id,'mfa.entra.cancel','segment',flow.segment_id,null,{nodeId:flow.node_id,sourceIp:flow.source_ip,error:data.error})
+  res.json({ok:true})
+})
 api.get('/segments/:id/challenges',(req,res)=>res.json(all('SELECT * FROM mfa_challenges WHERE segment_id=? ORDER BY challenged_at DESC LIMIT 200',reqId(req))))
+api.get('/mfa/challenges/search',requireRole('auditor'),(req,res)=>{
+  const query=z.object({segmentId:z.string().optional(),nodeId:z.string().optional(),status:z.enum(['pending','approved','denied','expired']).optional(),provider:z.enum(['totp','entra','manual']).optional(),userUpn:z.string().max(255).optional(),page:z.coerce.number().int().min(1).default(1),pageSize:z.coerce.number().int().min(1).max(200).default(10)}).parse(req.query)
+  const filters=[],args=[]
+  for(const [key,column] of [['segmentId','c.segment_id'],['nodeId','c.node_id'],['status','c.status'],['provider','c.provider']])if(query[key]){filters.push(`${column}=?`);args.push(query[key])}
+  if(query.userUpn){filters.push("c.user_upn LIKE ? ESCAPE '\\'");args.push(`%${query.userUpn.replace(/[\\%_]/g,'\\$&')}%`)}
+  const from=`FROM mfa_challenges c LEFT JOIN identity_segments s ON s.id=c.segment_id LEFT JOIN nodes n ON n.id=c.node_id ${filters.length?'WHERE '+filters.join(' AND '):''}`
+  const total=one(`SELECT COUNT(*) count ${from}`,...args).count
+  const items=all(`SELECT c.*,s.name segment_name,n.hostname node_name ${from} ORDER BY datetime(c.challenged_at) DESC,c.rowid DESC LIMIT ? OFFSET ?`,...args,query.pageSize,(query.page-1)*query.pageSize)
+  res.json({items,total,page:query.page,pageSize:query.pageSize,totalPages:Math.ceil(total/query.pageSize)})
+})
 api.post('/segments/:id/challenges',requireRole('editor'),(req,res)=>{
   const segment=one('SELECT * FROM identity_segments WHERE id=?',reqId(req));if(!segment)return notFound(res,'Segment')
-  const data=body(z.object({userUpn:z.email(),nodeId:z.string().optional(),connection:z.record(z.string(),z.any()).optional()}),req),challengeId=id(),expires=new Date(Date.now()+5*60*1000).toISOString()
+  const data=body(z.object({userUpn:z.email(),nodeId:z.string().optional(),connection:z.record(z.string(),z.any()).optional()}),req),expires=new Date(Date.now()+5*60*1000).toISOString()
   const nodeId=segment.node_id||data.nodeId
   if(!nodeId||segment.node_group_id&&!one('SELECT 1 FROM node_group_members WHERE group_id=? AND node_id=?',segment.node_group_id,nodeId))return res.status(400).json({error:'Choose a node in this segment group'})
-  run('INSERT INTO mfa_challenges(id,node_id,user_upn,segment_id,connection_5tuple,status,expires_at) VALUES(?,?,?,?,?,?,?)',challengeId,nodeId,data.userUpn,segment.id,json(data.connection),'pending',expires)
-  audit(req.user.id,'mfa.challenge.create','challenge',challengeId,null,{segmentId:segment.id,userUpn:data.userUpn});res.status(201).json({id:challengeId,status:'pending',expiresAt:expires})
+  const challengeId=createMfaChallenge({nodeId,userUpn:data.userUpn,segmentId:segment.id,connection:data.connection,provider:'manual',actorId:req.user.id,expiresAt:expires})
+  res.status(201).json({id:challengeId,status:'pending',expiresAt:expires})
 })
 api.post('/segments/:id/challenges/:challengeId/resolve',requireRole('admin'),(req,res)=>{
   const challenge=one('SELECT * FROM mfa_challenges WHERE id=? AND segment_id=?',req.params.challengeId,reqId(req));if(!challenge)return notFound(res,'Challenge')
   if(challenge.status!=='pending'||challenge.expires_at<now())return res.status(409).json({error:'Challenge expired or already resolved'})
-  const data=body(z.object({approved:z.boolean()}),req);run('UPDATE mfa_challenges SET status=?,resolved_at=? WHERE id=?',data.approved?'approved':'denied',now(),challenge.id);audit(req.user.id,'mfa.challenge.resolve','challenge',challenge.id,{status:'pending'},{approved:data.approved});if(!data.approved)emitNotification({eventKey:`mfa:${challenge.id}`,category:'mfa_challenge_failure',title:'MFA challenge denied',body:`The challenge for ${challenge.user_upn} on segment ${one('SELECT name FROM identity_segments WHERE id=?',challenge.segment_id)?.name||challenge.segment_id} was denied.`,entityType:'challenge',entityId:challenge.id});res.json({ok:true})
+  const data=body(z.object({approved:z.boolean()}),req)
+  resolveMfaChallenge(challenge.id,data.approved?'approved':'denied',{actorId:req.user.id,reason:data.approved?null:'Denied by administrator'})
+  res.json({ok:true})
 })
 
 api.get('/logon-rights',(req,res)=>res.json(all('SELECT * FROM logon_rights WHERE (? IS NULL OR node_id=?) ORDER BY at DESC LIMIT 500',req.query.nodeId||null,req.query.nodeId||null)))

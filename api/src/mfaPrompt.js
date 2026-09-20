@@ -1,4 +1,5 @@
 import {isIP} from 'node:net'
+import dns from 'node:dns/promises'
 import {all,one,run,id,now,audit,parse} from './db.js'
 import {remote,tcpProbe} from './connector.js'
 import {sourceMatches} from './mfaPortal.js'
@@ -20,9 +21,28 @@ export function remoteIpFromBlockedEvent(event,targetAddresses){
   const sourcePort=event.src_port==null?null:Number(event.src_port)
   return localSource?{sourceIp:destination,targetIp:source,sourcePort}:{sourceIp:source,targetIp:destination,sourcePort}
 }
-function sourceNodeForIp(ip,targetId){
-  const matches=all("SELECT * FROM nodes WHERE id<>? AND connection_mode='agentless' AND COALESCE(ad_enabled,1)=1 AND COALESCE(ad_missing,0)=0",targetId).filter(node=>addresses(node).has(ip))
-  return matches.length===1?matches[0]:null
+const adAddressCache=new Map()
+async function sourceNodeForIp(ip,targetId){
+  const candidates=all("SELECT * FROM nodes WHERE id<>? AND connection_mode='agentless' AND COALESCE(ad_enabled,1)=1 AND COALESCE(ad_missing,0)=0",targetId)
+  const known=candidates.filter(node=>addresses(node).has(ip))
+  if(known.length>1)return {ambiguous:true}
+  if(known.length===1)return {node:known[0]}
+  const adCandidates=candidates.filter(node=>node.ad_guid&&node.fqdn)
+  if(adCandidates.length>500)return {unresolved:true}
+  const matched=[]
+  for(let offset=0;offset<adCandidates.length;offset+=32){
+    const found=await Promise.all(adCandidates.slice(offset,offset+32).map(async node=>{
+      const key=node.fqdn.toLowerCase(),cached=adAddressCache.get(key)
+      if(cached?.expires>Date.now())return cached.ips.includes(ip)?node:null
+      let ips=[]
+      try{ips=(await dns.lookup(node.fqdn,{all:true})).map(item=>item.address)}catch{}
+      adAddressCache.set(key,{ips,expires:Date.now()+5*60_000})
+      return ips.includes(ip)?node:null
+    }))
+    matched.push(...found.filter(Boolean))
+    if(matched.length>1)return {ambiguous:true}
+  }
+  return matched.length===1?{node:matched[0]}:{unknown:true}
 }
 async function sourceTransport(node){
   if(['winrm','winrms'].includes(node.transport))return node
@@ -53,13 +73,14 @@ async function failOpenForUncontrolledSource(promptId,segment,target,pair,reason
 function promptUrl(promptId){
   const base=new URL(process.env.PUBLIC_BASE_URL||'')
   if(base.protocol!=='https:'||base.username||base.password||base.search||base.hash)throw new Error('Automatic MFA browser prompts require an HTTPS PUBLIC_BASE_URL')
-  const url=new URL('/identity',base);url.searchParams.set('prompt',promptId)
+  const url=new URL(`/mfa/${promptId}`,base)
   return url.href
 }
 export async function processBlockedMfaEvent(event,segment,target){
   const promptId=id(),expiresAt=new Date(Date.now()+5*60_000).toISOString()
   const local=addresses(target),pair=remoteIpFromBlockedEvent(event,local)
-  const sourceNode=pair?sourceNodeForIp(pair.sourceIp,target.id):null
+  const sourceMatch=pair?await sourceNodeForIp(pair.sourceIp,target.id):null
+  const sourceNode=sourceMatch?.node||null
   const insert=(status,error=null)=>{
     run('INSERT OR IGNORE INTO mfa_prompt_events(id,segment_id,target_node_id,source_node_id,log_event_id,source_ip,status,error,expires_at) VALUES(?,?,?,?,?,?,?,?,?)',promptId,segment.id,target.id,sourceNode?.id||null,event.id,pair?.sourceIp||null,status,error,expiresAt)
     return {id:promptId,status,error}
@@ -70,6 +91,8 @@ export async function processBlockedMfaEvent(event,segment,target){
   let inScope=false
   try{inScope=sourceMatches(pair.sourceIp,segment.source_ip)}catch(error){return insert('skipped',`Invalid segment source scope: ${error.message}`)}
   if(!inScope)return insert('skipped','Source IP is outside the segment scope')
+  if(sourceMatch?.ambiguous)return insert('skipped','Source IP matches more than one managed workstation')
+  if(sourceMatch?.unresolved)return insert('skipped','AD inventory is too large to resolve this source safely during a prompt')
   if(segment.policy_id){
     const policy=one('SELECT current_version_id FROM policies WHERE id=?',segment.policy_id)
     const assigned=one('SELECT id FROM policy_assignments WHERE policy_id=? AND (node_id=? OR node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?)) LIMIT 1',segment.policy_id,target.id,target.id)
@@ -88,6 +111,7 @@ export async function processBlockedMfaEvent(event,segment,target){
   try{
     const reachable=await sourceTransport(sourceNode)
     const result=await remote(reachable,'prompt_browser',{promptId,url,sourceIp:pair.sourceIp,sourcePort:pair.sourcePort,targetIp:pair.targetIp,port:segment.port})
+    if(reachable.transport!==sourceNode.transport)run('UPDATE nodes SET transport=? WHERE id=?',reachable.transport,sourceNode.id)
     if(!result?.opened){
       run('UPDATE mfa_prompt_events SET status=?,error=? WHERE id=?','skipped',result?.reason||'No interactive browser session was confirmed',promptId)
       return {id:promptId,status:'skipped',error:result?.reason}

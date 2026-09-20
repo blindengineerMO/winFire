@@ -13,10 +13,13 @@ export function agentTlsOptions() {
   if(process.env.NODE_ENV==='production') {
     const key=fs.readFileSync(process.env.AGENT_CA_KEY,'utf8')
     if(!process.env.AGENT_CA_PASSPHRASE||!key.includes('BEGIN ENCRYPTED PRIVATE KEY'))throw new Error('Production agent CA key must be encrypted and AGENT_CA_PASSPHRASE must be set')
+    const serverKey=fs.readFileSync(process.env.TLS_KEY,'utf8')
+    if(!process.env.TLS_KEY_PASSPHRASE||!serverKey.includes('BEGIN ENCRYPTED PRIVATE KEY'))throw new Error('Production TLS key must be encrypted and TLS_KEY_PASSPHRASE must be set')
   }
   return {
     cert:fs.readFileSync(process.env.TLS_CERT),
     key:fs.readFileSync(process.env.TLS_KEY),
+    passphrase:process.env.TLS_KEY_PASSPHRASE,
     ca:[fs.readFileSync(process.env.AGENT_CA_CERT)],
     requestCert:true,
     rejectUnauthorized:false,

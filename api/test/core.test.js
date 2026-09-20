@@ -582,6 +582,33 @@ test('verifier records real TCP evidence and reports it',async()=>{
   } finally {await new Promise(resolve=>listener.close(resolve))}
 })
 
+test('verifier can probe from a managed peer and records its vantage',async()=>{
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@example.test',password:'test-password-12345'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
+  const credential=await auth(request.post('/api/v1/credentials')).send({name:'Verifier peer credential',type:'local',username:'peer-user',password:'peer-password-12345'}).expect(201)
+  const peer=await auth(request.post('/api/v1/nodes')).send({hostname:'verifier-peer',ip:'127.0.0.2',credentialIds:[credential.body.id]}).expect(201)
+  const target=await auth(request.post('/api/v1/nodes')).send({hostname:'verifier-target',ip:'127.0.0.3'}).expect(201)
+  db.prepare("UPDATE nodes SET transport='winrm' WHERE id=?").run(peer.body.id)
+  const policy=await auth(request.post('/api/v1/policies')).send({name:'Peer vantage policy'}).expect(201)
+  await auth(request.post(`/api/v1/policies/${policy.body.id}/versions`)).send({graph:{nodes:[{id:'peer-rule',type:'allow',data:{name:'Peer path',localPort:'12345'}}],edges:[]}}).expect(201)
+  await auth(request.post(`/api/v1/policies/${policy.body.id}/assignments`)).send({nodeId:target.body.id}).expect(201)
+  const stub=path.join(dir,'verifier-peer-transport')
+  fs.writeFileSync(stub,`#!/usr/bin/env node
+let input='';process.stdin.on('data',part=>input+=part);process.stdin.on('end',()=>{const request=JSON.parse(input);if(request.operation!=='tcp_probe'||request.args.host!=='127.0.0.3'||request.args.port!==12345)process.exit(2);process.stdout.write(JSON.stringify({status:'open',latencyMs:4}))})
+`,{mode:0o700})
+  const priorPython=process.env.WINRM_PYTHON
+  process.env.WINRM_PYTHON=stub
+  try{
+    await auth(request.post('/api/v1/verifier/runs')).send({policyId:policy.body.id,vantageNodeId:'missing-peer'}).expect(404)
+    const result=await auth(request.post('/api/v1/verifier/runs')).send({policyId:policy.body.id,nodeId:target.body.id,vantageNodeId:peer.body.id}).expect(201)
+    assert.equal(result.body.results[0].status,'pass')
+    assert.equal(result.body.results[0].vantageNodeId,peer.body.id)
+    assert.equal(db.prepare('SELECT vantage_node_id FROM verifier_results WHERE id=?').get(result.body.results[0].id).vantage_node_id,peer.body.id)
+    const report=await auth(request.get('/api/v1/reports/verification')).expect(200)
+    assert.equal(report.body.find(row=>row.policy==='Peer vantage policy').vantage,'verifier-peer')
+  }finally{if(priorPython===undefined)delete process.env.WINRM_PYTHON;else process.env.WINRM_PYTHON=priorPython}
+})
+
 test('auth, vault, nodes, version history and reports work together',async()=>{
   const login=await request.post('/api/v1/auth/login').send({email:'owner@example.test',password:'test-password-12345'}).expect(200)
   assert.ok(login.body.accessToken)

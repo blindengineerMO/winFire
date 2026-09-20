@@ -2,11 +2,12 @@ import * as oidc from 'openid-client'
 
 let cached=null,cachedUntil=0
 export function entraConfigured(){return !!(process.env.ENTRA_TENANT_ID&&process.env.ENTRA_CLIENT_ID&&process.env.ENTRA_CLIENT_SECRET&&process.env.PUBLIC_BASE_URL)}
-export function entraRedirectUri(){
+export function entraRedirectUri(path='/identity'){
   if(!entraConfigured())throw Object.assign(new Error('Configure ENTRA_TENANT_ID, ENTRA_CLIENT_ID, ENTRA_CLIENT_SECRET, and PUBLIC_BASE_URL'),{status:503})
+  if(!['/identity','/mfa/callback'].includes(path))throw new Error('Unsupported Entra redirect path')
   const base=new URL(process.env.PUBLIC_BASE_URL)
   if(base.protocol!=='https:'&&base.hostname!=='localhost')throw Object.assign(new Error('Entra portal requires an HTTPS PUBLIC_BASE_URL'),{status:503})
-  return new URL('/identity',base).href
+  return new URL(path,base).href
 }
 export async function entraConfig(){
   entraRedirectUri()
@@ -17,13 +18,13 @@ export async function entraConfig(){
   cachedUntil=Date.now()+5*60_000
   return cached
 }
-export async function startEntraAuthentication(){
+export async function startEntraAuthentication({redirectPath='/identity'}={}){
   const config=await entraConfig(),verifier=oidc.randomPKCECodeVerifier(),challenge=await oidc.calculatePKCECodeChallenge(verifier),state=oidc.randomState(),nonce=oidc.randomNonce()
-  const url=oidc.buildAuthorizationUrl(config,{redirect_uri:entraRedirectUri(),scope:'openid profile email',response_type:'code',code_challenge:challenge,code_challenge_method:'S256',state,nonce,max_age:'0',prompt:'login'})
+  const url=oidc.buildAuthorizationUrl(config,{redirect_uri:entraRedirectUri(redirectPath),scope:'openid profile email',response_type:'code',code_challenge:challenge,code_challenge_method:'S256',state,nonce,max_age:'0',prompt:'login'})
   return {url:url.href,state,verifier,nonce}
 }
-export async function completeEntraAuthentication({code,state,verifier,nonce}){
-  const config=await entraConfig(),callback=new URL(entraRedirectUri())
+export async function completeEntraAuthentication({code,state,verifier,nonce,redirectPath='/identity'}){
+  const config=await entraConfig(),callback=new URL(entraRedirectUri(redirectPath))
   callback.searchParams.set('code',code);callback.searchParams.set('state',state)
   const tokens=await oidc.authorizationCodeGrant(config,callback,{pkceCodeVerifier:verifier,expectedState:state,expectedNonce:nonce,maxAge:0,idTokenExpected:true})
   const claims=tokens.claims()

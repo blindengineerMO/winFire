@@ -20,8 +20,20 @@ function Get-WinFireAuditPolicy {
   $setting=[WinFireAuditPolicyQuery]::Read('0CCE9226-69AE-11D9-BED3-505054503030')
   [pscustomobject]@{subcategoryGuid='0CCE9226-69AE-11D9-BED3-505054503030';settingValue=$setting;successEnabled=[bool]($setting -band 1);failureEnabled=[bool]($setting -band 2)}
 }
+# __WINFIRE_LSA_RIGHTS__
 $result = switch ($operation) {
   'auth' { [Security.Principal.WindowsIdentity]::GetCurrent().Name }
+  'tcp_probe' {
+    $client=[System.Net.Sockets.TcpClient]::new();$watch=[Diagnostics.Stopwatch]::StartNew();$status='unreachable'
+    try {
+      $task=$client.ConnectAsync([string]$argsData.host,[int]$argsData.port)
+      if($task.Wait([Math]::Min(5000,[Math]::Max(250,[int]$argsData.timeoutMs)))){$status='open'}else{$status='timeout'}
+    } catch {
+      $cause=$_.Exception;while($cause.InnerException){$cause=$cause.InnerException}
+      if($cause -is [System.Net.Sockets.SocketException] -and $cause.SocketErrorCode -eq [System.Net.Sockets.SocketError]::ConnectionRefused){$status='refused'}
+    } finally {$watch.Stop();$client.Dispose()}
+    [pscustomobject]@{status=$status;latencyMs=$watch.ElapsedMilliseconds}
+  }
   'facts' {
     $computer = Get-CimInstance Win32_ComputerSystem
     $osInfo = Get-CimInstance Win32_OperatingSystem
@@ -122,17 +134,7 @@ $result = switch ($operation) {
       }
     }
   }
-  'rights' {
-    $file = Join-Path $env:TEMP ('winfire-'+[guid]::NewGuid().ToString()+'.inf')
-    try {
-      secedit /export /mergedpolicy /cfg $file /areas USER_RIGHTS | Out-Null
-      if($LASTEXITCODE -ne 0){throw "secedit export failed with exit code $LASTEXITCODE"}
-      $content=@(Get-Content $file)
-      $rights=@($content | Where-Object {$_ -match '^\s*Se\w*LogonRight\s*='})
-      if(!$rights.Count){throw "secedit export contained no logon rights across $($content.Count) lines"}
-      $rights
-    } finally { Remove-Item $file -Force -ErrorAction SilentlyContinue }
-  }
+  'rights' { @(Get-WinFireLogonRights) }
   default { throw 'Unsupported operation' }
 }
 $result | ConvertTo-Json -Depth 12 -Compress
@@ -150,7 +152,7 @@ $result | ConvertTo-Json -Depth 12 -Compress
 def main():
     payload = json.load(sys.stdin)
     operation = payload['operation']
-    if operation not in {'auth', 'facts', 'all_rules', 'rules', 'apply', 'events', 'audit_policy', 'audit_policy_enable', 'rights', 'breakglass_start', 'breakglass_end', 'jit_preflight', 'jit_start', 'jit_end', 'prompt_browser', 'prompt_session'}:
+    if operation not in {'auth', 'tcp_probe', 'facts', 'all_rules', 'rules', 'apply', 'events', 'audit_policy', 'audit_policy_enable', 'rights', 'breakglass_start', 'breakglass_end', 'jit_preflight', 'jit_start', 'jit_end', 'prompt_browser', 'prompt_session'}:
         raise ValueError('Unsupported operation')
     host = payload['host']
     secure = payload.get('transport') == 'winrms'
@@ -164,15 +166,15 @@ def main():
         source = 'jitAccess.ps1' if operation.startswith('jit_') else 'mfaPrompt.ps1' if operation.startswith('prompt_') else 'breakGlass.ps1'
         script = SHARED_POWERSHELL.replace('__WINFIRE_SHARED_FUNCTIONS__',(shared_root / source).read_text()).replace('__WINFIRE_CALL__',calls[operation])
     else:
-        script = POWERSHELL.replace('__OPERATION__', operation)
+        script = POWERSHELL.replace('__OPERATION__', operation).replace('# __WINFIRE_LSA_RIGHTS__', (Path(__file__).resolve().parent / 'lsa_rights.ps1').read_text() if operation == 'rights' else '')
     script = script.replace('[Console]::In.ReadToEnd()', f"'{args}'")
     session = winrm.Session(
         endpoint,
         auth=(payload['username'], payload['password']),
         transport='ntlm',
         server_cert_validation='ignore' if os.environ.get('WINRM_TLS_VERIFY') == 'false' else 'validate',
-        read_timeout_sec=90 if operation in calls else 25,
-        operation_timeout_sec=80 if operation in calls else 20,
+        read_timeout_sec=90 if operation in calls else 45 if operation == 'rights' else 25,
+        operation_timeout_sec=80 if operation in calls else 40 if operation == 'rights' else 20,
     )
     loader = "$encoded=[Console]::In.ReadToEnd(); Invoke-Expression ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded)))"
     encoded_loader = base64.b64encode(loader.encode('utf-16le')).decode()
@@ -192,7 +194,7 @@ def main():
         raise RuntimeError(stderr.decode('utf-8', 'replace').strip() or f'WinRM exited {status}')
     output = stdout.decode('utf-8-sig').strip()
     if operation == 'rights' and (not output or output == 'null'):
-        raise RuntimeError('Logon-rights export returned no data; baseline was not collected')
+        raise RuntimeError('LSA logon-rights query returned no data; baseline was not collected')
     print(output or 'null')
 
 

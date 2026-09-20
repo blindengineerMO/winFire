@@ -11,9 +11,11 @@ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'winfire-agent-test-'))
 const file=name=>path.join(dir,name)
 const openssl=(...args)=>execFileSync('openssl',args,{stdio:'ignore'})
 process.env.AGENT_CA_PASSPHRASE='test-only-ca-passphrase'
+process.env.TLS_KEY_PASSPHRASE='test-only-server-key-passphrase'
 openssl('genpkey','-algorithm','EC','-pkeyopt','ec_paramgen_curve:P-256','-aes-256-cbc','-pass','env:AGENT_CA_PASSPHRASE','-out',file('ca.key'))
 openssl('req','-x509','-key',file('ca.key'),'-passin','env:AGENT_CA_PASSPHRASE','-out',file('ca.crt'),'-days','10','-subj','/CN=WinFire Test CA','-addext','basicConstraints=critical,CA:TRUE','-addext','keyUsage=critical,keyCertSign,cRLSign')
-openssl('req','-newkey','ec','-pkeyopt','ec_paramgen_curve:P-256','-nodes','-keyout',file('server.key'),'-out',file('server.csr'),'-subj','/CN=localhost')
+openssl('genpkey','-algorithm','EC','-pkeyopt','ec_paramgen_curve:P-256','-aes-256-cbc','-pass','env:TLS_KEY_PASSPHRASE','-out',file('server.key'))
+openssl('req','-new','-key',file('server.key'),'-passin','env:TLS_KEY_PASSPHRASE','-out',file('server.csr'),'-subj','/CN=localhost')
 fs.writeFileSync(file('server.ext'),'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1\n')
 openssl('x509','-req','-in',file('server.csr'),'-CA',file('ca.crt'),'-CAkey',file('ca.key'),'-passin','env:AGENT_CA_PASSPHRASE','-set_serial','0x01','-days','7','-extfile',file('server.ext'),'-out',file('server.crt'))
 openssl('req','-newkey','ec','-pkeyopt','ec_paramgen_curve:P-256','-nodes','-keyout',file('agent.key'),'-out',file('agent.csr'),'-subj','/CN=temporary-agent')
@@ -26,6 +28,8 @@ process.env.TLS_KEY=file('server.key')
 process.env.AGENT_CA_CERT=file('ca.crt')
 process.env.AGENT_CA_KEY=file('ca.key')
 process.env.NODE_ENV='production'
+process.env.JWT_SECRET='agent-test-jwt-secret-is-at-least-32-characters'
+process.env.VAULT_MASTER_KEY=crypto.randomBytes(32).toString('base64')
 const {app,processDueBreakGlass,processDueTraining}=await import('../src/app.js')
 const {agentTlsOptions}=await import('../src/agentPki.js')
 const {bootstrap}=await import('../src/security.js')

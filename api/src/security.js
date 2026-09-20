@@ -7,9 +7,12 @@ import {db, one, run, id, now, audit} from './db.js'
 
 const dataDir = path.resolve(process.env.DATA_DIR || 'data')
 const secretsPath = path.join(dataDir, 'secrets.json')
+const production=process.env.NODE_ENV==='production'
+if(production&&(!process.env.JWT_SECRET||!process.env.VAULT_MASTER_KEY))throw new Error('Production requires JWT_SECRET and VAULT_MASTER_KEY from the deployment secret store')
+if(production&&process.env.JWT_SECRET.length<32)throw new Error('Production JWT_SECRET must contain at least 32 characters')
 let stored = {}
-if (fs.existsSync(secretsPath)) stored = JSON.parse(fs.readFileSync(secretsPath, 'utf8'))
-else {
+if (!production&&fs.existsSync(secretsPath)) stored = JSON.parse(fs.readFileSync(secretsPath, 'utf8'))
+else if(!production) {
   stored = {jwt:crypto.randomBytes(32).toString('base64url'), vault:crypto.randomBytes(32).toString('base64')}
   fs.writeFileSync(secretsPath, JSON.stringify(stored), {mode:0o600})
 }

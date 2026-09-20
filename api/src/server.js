@@ -14,6 +14,7 @@ import {deliverPendingNotifications} from './notifications.js'
 import {sweepLoopbackBaseline} from './loopbackBaseline.js'
 import {revokeExpiredGrants} from './mfaPortal.js'
 import {sweepMfaPrompts} from './mfaPrompt.js'
+import {expireMfaChallenges} from './mfaChallenges.js'
 
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..')
 const dist=path.join(root,'web/dist')
@@ -122,6 +123,9 @@ compactionTimer.unref()
 setTimeout(()=>runCompactionIfDue(),10_000).unref()
 const timer=setInterval(()=>{pruneOldEvents();run('DELETE FROM mfa_entra_flows WHERE expires_at<?',now());run("DELETE FROM mfa_prompt_events WHERE datetime(created_at)<datetime('now','-7 days')")},60*60*1000)
 timer.unref()
+setTimeout(()=>expireMfaChallenges(),10_000).unref()
+const challengeTimer=setInterval(()=>expireMfaChallenges(),60_000)
+challengeTimer.unref()
 const agentHealth=setInterval(()=>sweepAgentHealth(),60_000)
 agentHealth.unref()
 let notificationsRunning=false

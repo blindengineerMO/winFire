@@ -106,6 +106,18 @@ export async function testDirectoryConnection(config,credential,clientFactory=de
   return {connected:true,baseDn:config.base_dn,entries:result.value,transport:result.transport,fallbackUsed:result.transport==='ldap'}
 }
 
+export async function authenticateDirectoryUser(config,upn,password,clientFactory=defaultClientFactory){
+  if(!config?.enabled||!config.url||new URL(config.url).protocol!=='ldaps:')throw Object.assign(new Error('AD sign-in requires an enabled LDAPS directory connection'),{status:503})
+  const client=makeClient(config,clientFactory)
+  try{
+    await client.bind(upn,password)
+    return {authenticated:true,transport:'ldaps'}
+  }catch(error){
+    if(String(error?.code||'')==='49'||/invalid credentials|LDAP Result Code: 49/i.test(error?.message||''))throw Object.assign(new Error('Invalid directory credentials or authenticator code'),{status:401})
+    throw directoryConnectionError(error,config.url)
+  }finally{try{await client.unbind()}catch{}}
+}
+
 export async function readDirectoryComputers(config,credential,clientFactory=defaultClientFactory) {
   const result=await runWithDirectory(config,credential,async client=>{
     const computers=[]
