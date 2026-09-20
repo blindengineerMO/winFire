@@ -144,6 +144,7 @@ $result = switch ($operation) {
     }
   }
   'rights' { @(Get-WinFireLogonRights) }
+  'rights_change' { Set-WinFireLogonRight $argsData }
   default { throw 'Unsupported operation' }
 }
 $result | ConvertTo-Json -Depth 12 -Compress
@@ -161,7 +162,7 @@ $result | ConvertTo-Json -Depth 12 -Compress
 def main():
     payload = json.load(sys.stdin)
     operation = payload['operation']
-    if operation not in {'auth', 'tcp_probe', 'facts', 'all_rules', 'rules', 'apply', 'events', 'events_recent', 'audit_policy', 'audit_policy_enable', 'rights', 'breakglass_start', 'breakglass_end', 'jit_preflight', 'jit_start', 'jit_end', 'prompt_browser', 'prompt_session'}:
+    if operation not in {'auth', 'tcp_probe', 'facts', 'all_rules', 'rules', 'apply', 'events', 'events_recent', 'audit_policy', 'audit_policy_enable', 'rights', 'rights_change', 'breakglass_start', 'breakglass_end', 'jit_preflight', 'jit_start', 'jit_end', 'prompt_browser', 'prompt_session'}:
         raise ValueError('Unsupported operation')
     host = payload['host']
     secure = payload.get('transport') == 'winrms'
@@ -175,15 +176,15 @@ def main():
         source = 'jitAccess.ps1' if operation.startswith('jit_') else 'mfaPrompt.ps1' if operation.startswith('prompt_') else 'breakGlass.ps1'
         script = SHARED_POWERSHELL.replace('__WINFIRE_SHARED_FUNCTIONS__',(shared_root / source).read_text()).replace('__WINFIRE_CALL__',calls[operation])
     else:
-        script = POWERSHELL.replace('__OPERATION__', operation).replace('# __WINFIRE_LSA_RIGHTS__', (Path(__file__).resolve().parent / 'lsa_rights.ps1').read_text() if operation == 'rights' else '')
+        script = POWERSHELL.replace('__OPERATION__', operation).replace('# __WINFIRE_LSA_RIGHTS__', (Path(__file__).resolve().parent / 'lsa_rights.ps1').read_text() if operation.startswith('rights') else '')
     script = script.replace('[Console]::In.ReadToEnd()', f"'{args}'")
     session = winrm.Session(
         endpoint,
         auth=(payload['username'], payload['password']),
         transport='ntlm',
         server_cert_validation='ignore' if os.environ.get('WINRM_TLS_VERIFY') == 'false' else 'validate',
-        read_timeout_sec=90 if operation in calls else 45 if operation == 'rights' else 25,
-        operation_timeout_sec=80 if operation in calls else 40 if operation == 'rights' else 20,
+        read_timeout_sec=90 if operation in calls else 45 if operation.startswith('rights') else 25,
+        operation_timeout_sec=80 if operation in calls else 40 if operation.startswith('rights') else 20,
     )
     loader = "$encoded=[Console]::In.ReadToEnd(); Invoke-Expression ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded)))"
     encoded_loader = base64.b64encode(loader.encode('utf-16le')).decode()

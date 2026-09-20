@@ -182,3 +182,4 @@ The server certificate should be issued by a CA trusted on the Windows nodes. To
 ![ScreenShot4](assets/PolicyStudio.png)
 ![ScreenShot5](assets/firewallevents.png)
 ![ScreenShot6](assets/login.png)
+![ScreenShot7](assets/autoRules.png)

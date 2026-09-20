@@ -1549,6 +1549,31 @@ api.post('/logon-rights/baseline',requireRole('admin'),wrap(async(req,res)=>{
   res.status(201).json(rights)
 }))
 
+api.post('/logon-rights/change',requireRole('admin'),wrap(async(req,res)=>{
+  const data=body(z.object({nodeId:z.string().uuid(),accountSid:z.string().regex(/^S-1-\d+-\d+(?:-\d+)+$/),right:z.enum(['SeNetworkLogonRight','SeDenyNetworkLogonRight','SeRemoteInteractiveLogonRight','SeDenyRemoteInteractiveLogonRight','SeBatchLogonRight','SeDenyBatchLogonRight','SeServiceLogonRight','SeDenyServiceLogonRight']),present:z.boolean(),reason:z.string().trim().min(10).max(500),confirmation:z.literal('CHANGE LOGON RIGHT')}),req)
+  const node=getNode(data.nodeId);if(!node)return notFound(res,'Node')
+  if(!['winrm','winrms'].includes(node.transport)||node.connection_mode!=='agentless')return res.status(409).json({error:'Logon rights changes require an agentless WinRM node'})
+  const critical=new Set(['S-1-1-0','S-1-5-9','S-1-5-11','S-1-5-18','S-1-5-19','S-1-5-20','S-1-5-32-544','S-1-5-32-548','S-1-5-32-580'])
+  if(critical.has(data.accountSid)||/-(?:500|512|518|519)$/.test(data.accountSid))return res.status(409).json({error:'This account is protected from direct logon-right changes'})
+  const runId=id()
+  run('INSERT INTO policy_apply_runs(id,node_id,status) VALUES(?,?,?)',runId,node.id,'running')
+  try{
+    const result=await remote(node,'rights_change',{accountSid:data.accountSid,right:data.right,present:data.present})
+    if(result?.accountSid!==data.accountSid||result?.right!==data.right||result?.present!==data.present)throw Object.assign(new Error('LSA readback did not confirm the requested right'),{status:502})
+    db.transaction(()=>{
+      run('UPDATE policy_apply_runs SET status=?,diff_json=?,finished_at=? WHERE id=?','success',json({operation:'rights_change',accountSid:data.accountSid,right:data.right,before:result.before,present:result.present,changed:result.changed}),now(),runId)
+      audit(req.user.id,'logon-rights.change','node',node.id,{accountSid:data.accountSid,right:data.right,present:result.before},{accountSid:data.accountSid,right:data.right,present:result.present,changed:result.changed,reason:data.reason,runId})
+    })()
+    res.json({...result,runId})
+  }catch(error){
+    db.transaction(()=>{
+      run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?',/timed? out|timeout|connection|unreachable/i.test(error.message)?'unknown':'failed',error.message,now(),runId)
+      audit(req.user.id,'logon-rights.change.failed','node',node.id,null,{accountSid:data.accountSid,right:data.right,present:data.present,reason:data.reason,runId,error:error.message})
+    })()
+    throw error
+  }
+}))
+
 api.get('/logs/search',(req,res)=>{
   const query=z.object({
     nodeId:z.string().optional(),action:z.enum(['allow','block','success','failure']).optional(),direction:z.enum(['in','out']).optional(),

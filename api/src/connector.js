@@ -56,7 +56,7 @@ async function pwsh(script, input) {
   return new Promise((resolve,reject) => {
     const encoded=Buffer.from(script,'utf16le').toString('base64')
     const child=spawn('pwsh',['-NoProfile','-NonInteractive','-EncodedCommand',encoded],{stdio:['pipe','pipe','pipe']})
-    let stdout='',stderr=''; const timer=setTimeout(()=>child.kill(),input?.operation==='rights'||input?.operation?.startsWith('jit_')||input?.operation==='prompt_browser'?120000:timeoutMs)
+    let stdout='',stderr=''; const timer=setTimeout(()=>child.kill(),input?.operation?.startsWith('rights')||input?.operation?.startsWith('jit_')||input?.operation==='prompt_browser'?120000:timeoutMs)
     child.stdout.on('data',chunk=>stdout+=chunk); child.stderr.on('data',chunk=>stderr+=chunk)
     child.once('error',reject); child.once('close',code=>{clearTimeout(timer); if(code) reject(new Error(stderr.trim() || `PowerShell exited ${code}`)); else {try {resolve(JSON.parse(stdout || 'null'))} catch {reject(new Error(`Invalid PowerShell response: ${stdout.slice(0,300)}`))}}})
     child.stdin.end(JSON.stringify(input))
@@ -68,7 +68,7 @@ async function pywinrm(input) {
   const python=process.env.WINRM_PYTHON || (fs.existsSync(localPython)?localPython:'python3')
   return new Promise((resolve,reject)=>{
     const child=spawn(python,[sidecar],{stdio:['pipe','pipe','pipe']})
-    let stdout='',stderr='';const timer=setTimeout(()=>child.kill('SIGKILL'),input?.operation==='rights'||input?.operation?.startsWith('jit_')||input?.operation==='prompt_browser'?120000:timeoutMs)
+    let stdout='',stderr='';const timer=setTimeout(()=>child.kill('SIGKILL'),input?.operation?.startsWith('rights')||input?.operation?.startsWith('jit_')||input?.operation==='prompt_browser'?120000:timeoutMs)
     child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk)
     child.once('error',reject);child.once('close',code=>{clearTimeout(timer);if(code)reject(new Error(stderr.trim()||`WinRM sidecar exited ${code}`));else {try{resolve(JSON.parse(stdout||'null'))}catch{reject(new Error(`Invalid WinRM response: ${stdout.slice(0,300)}`))}}})
     child.stdin.end(JSON.stringify(input))
@@ -199,6 +199,7 @@ try {
       'jit_end' { End-WinFireJitAccess $argsData }
       'audit_policy_enable' { $before=Get-WinFireAuditPolicy; if($before.successEnabled -and $before.failureEnabled){$before}else{try{auditpol /set '/subcategory:{0CCE9226-69AE-11D9-BED3-505054503030}' /success:enable /failure:enable | Out-Null; if($LASTEXITCODE -ne 0){throw "auditpol update failed with exit code $LASTEXITCODE"}; $after=Get-WinFireAuditPolicy; if(-not ($after.successEnabled -and $after.failureEnabled)){throw 'Audit policy readback did not confirm success and failure auditing'}; $after}catch{$cause=$_.Exception.Message; $successArg=if($before.successEnabled){'/success:enable'}else{'/success:disable'}; $failureArg=if($before.failureEnabled){'/failure:enable'}else{'/failure:disable'}; auditpol /set '/subcategory:{0CCE9226-69AE-11D9-BED3-505054503030}' $successArg $failureArg | Out-Null; if($LASTEXITCODE -ne 0){throw "Audit policy update failed: $cause; rollback failed with exit code $LASTEXITCODE"}; $restored=Get-WinFireAuditPolicy; if($restored.settingValue -ne $before.settingValue){throw "Audit policy update failed: $cause; rollback readback differs from prior state"}; throw "Audit policy update failed: $cause; prior state restored"}} }
       'rights' { @(Get-WinFireLogonRights) }
+      'rights_change' { Set-WinFireLogonRight $argsData }
       default { throw 'Unsupported operation' }
     }
   }
@@ -235,11 +236,11 @@ export async function remote(node,operation,args={},options={}) {
   let lastError
   for (const credential of nodeCredential(node.id,options.credentialId)) {
     const input={host,transport:node.transport||'winrm',username:credential.username,password:credential.secret.password,operation,args}
-    const mutating=operation==='apply'||operation.startsWith('breakglass_')||operation==='jit_start'||operation==='jit_end'||operation==='prompt_browser'
+    const mutating=operation==='apply'||operation.startsWith('breakglass_')||operation==='jit_start'||operation==='jit_end'||operation==='prompt_browser'||operation==='rights_change'
     const attempts=mutating?1:2
     for(let attempt=0;attempt<attempts;attempt++){
       try {
-        const script=remoteScript.replace('__WINFIRE_PROMPT_FUNCTIONS__',operation.startsWith('prompt_')?mfaPromptFunctions:'').replace('# __WINFIRE_LSA_RIGHTS__',operation==='rights'?lsaRightsFunctions:'')
+        const script=remoteScript.replace('__WINFIRE_PROMPT_FUNCTIONS__',operation.startsWith('prompt_')?mfaPromptFunctions:'').replace('# __WINFIRE_LSA_RIGHTS__',operation.startsWith('rights')?lsaRightsFunctions:'')
         const result=process.platform==='win32' ? await pwsh(script,input) : await pywinrm(input)
         recordNodeSuccess(node.id,input.transport==='winrms'?'winrms-authenticated':'winrm-authenticated')
         return result
