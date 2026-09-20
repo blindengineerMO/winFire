@@ -48,6 +48,7 @@ test('duplicate rules and like ports compile into one firewall entry',()=>{
   const desired={...samePort[0],remoteAddress:'192.0.2.7/24'}
   const observed={...desired,remoteAddress:'192.0.2.0/255.255.255.0'}
   assert.deepEqual(diffRules([desired],[observed]),{add:[],remove:[]})
+  assert.deepEqual(diffRules([{...desired,remoteAddress:'127.0.0.1'}],[{...observed,remoteAddress:'127.0.0.1/255.255.255.255'}]),{add:[],remove:[]})
 })
 
 test('ambiguous JIT readback only accepts the requested source and complete port set',()=>{

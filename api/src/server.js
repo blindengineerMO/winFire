@@ -154,7 +154,7 @@ async function pollNodeLogs(){
   if(logPollRunning)return
   logPollRunning=true
   try{
-    const nodes=all("SELECT id,hostname FROM nodes WHERE transport IN ('winrm','winrms') AND (next_retry_at IS NULL OR next_retry_at<=?) ORDER BY hostname",now())
+    const nodes=all("SELECT id,hostname FROM nodes WHERE transport IN ('winrm','winrms','wmi') AND (next_retry_at IS NULL OR next_retry_at<=?) ORDER BY hostname",now())
     await pollFleet(nodes,async node=>{
       await pullRecentLogs(node.id,null,true)
       await pullLogs(node.id,null,5,true)

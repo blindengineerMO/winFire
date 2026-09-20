@@ -1,5 +1,5 @@
 import {spawn} from 'node:child_process'
-import {connect} from 'node:net'
+import {connect,isIP} from 'node:net'
 import dns from 'node:dns/promises'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -81,11 +81,11 @@ async function pywinrm(input) {
 async function wmiProbePython(input){
   const sidecar=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../sidecar/wmi_probe.py')
   const localPython=path.resolve('.venv/bin/python')
-  const python=process.env.WMI_PROBE_PYTHON||process.env.WINRM_PYTHON||(fs.existsSync(localPython)?localPython:'python3')
+  const python=process.env.WMI_PROBE_PYTHON||process.env.WINRM_PYTHON||(fs.existsSync(localPython)?localPython:process.platform==='win32'?'python':'python3')
   return new Promise((resolve,reject)=>{
     const child=spawn(python,[sidecar],{stdio:['pipe','pipe','pipe']})
     let stdout='',stderr='',timedOut=false
-    const timer=setTimeout(()=>{timedOut=true;child.kill('SIGKILL')},12000)
+    const timer=setTimeout(()=>{timedOut=true;child.kill('SIGKILL')},['facts','audit_policy','audit_policy_enable','all_rules','rules','apply','events','events_recent','events_probe','event_cursor'].includes(input.mode)?45000:12000)
     child.stdout.on('data',chunk=>stdout+=chunk)
     child.stderr.on('data',chunk=>stderr+=chunk)
     child.once('error',error=>{clearTimeout(timer);reject(error)})
@@ -247,39 +247,51 @@ export async function testNodeCredential(node,credentialId){
   recordNodeSuccess(node.id,'wmi-authenticated')
   return {success:true,transport:'wmi',account:credential.username,computerName:result.computerName}
 }
-function directoryWinrmCredentialId(node){
-  if(!node.ad_guid||node.ad_missing||!node.ad_enabled)throw new Error('Active Directory computer must be present and enabled for automatic WinRM activation')
-  const settings=one("SELECT node_credential_id FROM directory_connections WHERE id='default' AND enabled=1")
-  if(!settings?.node_credential_id)throw new Error('Set a default node WinRM credential in Administration → Directory')
-  return settings.node_credential_id
-}
-export async function activateWinrmViaWmi(node){
+export async function activateWinrmViaWmi(node,{wmi=process.platform==='win32'?wmiProbePowerShell:wmiProbePython,probePort=tcpProbe,invoke=remote,collect=collectFacts,wait=pause}={}){
   if(node.connection_mode!=='agentless')throw new Error('Only agentless nodes can be activated through WMI')
-  const credentialId=directoryWinrmCredentialId(node),credential=nodeCredential(node.id,credentialId)[0]
+  const credentials=nodeCredential(node.id)
+  if(node.ad_guid){
+    const preferred=one("SELECT node_credential_id FROM directory_connections WHERE id='default' AND enabled=1")?.node_credential_id
+    if(preferred)credentials.sort((a,b)=>Number(b.id===preferred)-Number(a.id===preferred))
+  }
   const host=node.fqdn||node.ip||node.hostname
-  const input={host,username:credential.username,password:credential.secret.password,mode:'enable_winrm',expectedName:node.hostname}
+  const expectedName=isIP(node.hostname)?null:node.hostname
+  let selected=null,lastProbeError=null
+  for(const credential of credentials){
+    const check={host,username:credential.username,password:credential.secret.password,mode:'probe',expectedName}
+    try{
+      const result=await wmi(check)
+      if(result?.success!==true||result.transport!=='wmi'||!result.computerName)throw new Error('WMI did not confirm the computer identity')
+      if(expectedName&&String(result.computerName).toLowerCase()!==expectedName.split('.')[0].toLowerCase())throw new Error('WMI computer name does not match the inventory record')
+      selected=credential
+      break
+    }catch(error){lastProbeError=error;error.message=String(error.message).replaceAll(check.password,'[redacted]')}
+  }
+  if(!selected)throw lastProbeError||new Error('No assigned credential authenticated over WMI')
+  const credentialId=selected.id
+  const input={host,username:selected.username,password:selected.secret.password,mode:'enable_winrm',expectedName}
   const applyRunId=id()
   run('INSERT INTO policy_apply_runs(id,node_id,status) VALUES(?,?,?)',applyRunId,node.id,'running')
   audit(null,'node.agentless.activate.start','node',node.id,null,{runId:applyRunId,transport:'wmi'})
   try{
   let activation
-  try{activation=process.platform==='win32'?await wmiProbePowerShell(input):await wmiProbePython(input)}
+  try{activation=await wmi(input)}
   catch(error){error.message=String(error.message).replaceAll(input.password,'[redacted]');throw error}
   if(!activation?.success||!activation.activationStarted)throw new Error('WMI did not confirm the WinRM activation request')
   if(activation.activationSucceeded===false)throw new Error(`WinRM activation command failed on ${node.hostname}: ${String(activation.commandOutput||'no command output').replace(/<Objs[\s\S]*/,'').slice(0,300)}`)
   let lastPort=null
   for(let attempt=0;attempt<12;attempt++){
-    await pause(2500)
-    const port=await tcpProbe(host,5985,1500)
+    await wait(2500)
+    const port=await probePort(host,5985,1500)
     lastPort=port
     if(port.status!=='open')continue
     try{
       const managed={...node,transport:'winrm'}
-      await remote(managed,'auth',{}, {credentialId})
-      const facts=await remote(managed,'facts',{}, {credentialId})
+      await invoke(managed,'auth',{}, {credentialId})
+      const facts=await invoke(managed,'facts',{}, {credentialId})
       if(String(facts?.computer?.Name||'').toLowerCase()!==String(node.hostname).toLowerCase())throw new Error('WinRM host identity does not match the directory computer')
       run("UPDATE nodes SET transport='winrm',probe_status='winrm-authenticated',status='reachable',last_probe_at=?,last_seen_at=?,next_retry_at=NULL WHERE id=?",now(),now(),node.id)
-      await collectFacts(managed,{suppliedFacts:facts})
+      await collect(managed,{suppliedFacts:facts})
       run('UPDATE policy_apply_runs SET status=?,diff_json=?,finished_at=? WHERE id=?','success',JSON.stringify({operation:'enable_winrm_via_wmi',transport:'winrm',computerName:facts.computer.Name}),now(),applyRunId)
       audit(null,'node.agentless.activate','node',node.id,{transport:node.transport,probeStatus:node.probe_status},{transport:'winrm',credentialId,computerName:facts.computer.Name,runId:applyRunId})
       return {transport:'winrm',status:'reachable',probeStatus:'winrm-authenticated',facts,activation}
@@ -287,7 +299,7 @@ export async function activateWinrmViaWmi(node){
   }
   let detail=''
   try{
-    const diagnostic=process.platform==='win32'?null:await wmiProbePython({...input,mode:'diagnose_winrm'})
+    const diagnostic=process.platform==='win32'?null:await wmi({...input,mode:'diagnose_winrm'})
     if(diagnostic?.winrmService?.State==='Running'&&String(diagnostic.commandOutput||'').includes('ListeningOn ='))detail=' The WinRM service and listener are running; check network ACLs or an effective host firewall block between the control plane and this node.'
   }catch{}
   throw new Error(`WMI started WinRM activation, but TCP 5985 remains ${lastPort?.status||'unreachable'} from the control plane.${detail}`)
@@ -298,7 +310,58 @@ export async function activateWinrmViaWmi(node){
   }
 }
 export async function remote(node,operation,args={},options={}) {
-  if(node.transport==='wmi')throw new Error('WMI/DCOM transport is detected but authenticated WMI operations are not implemented')
+  if(node.transport==='wmi'){
+    const eventOperation=['events','events_recent','events_probe','event_cursor'].includes(operation)
+    if(!['facts','audit_policy','audit_policy_enable','all_rules','rules','apply'].includes(operation)&&!eventOperation)throw new Error('WMI/DCOM supports host facts, audit policy, firewall rules and Security events; other operations require WinRM or an agent')
+    if(operation==='apply')assertManagementAccess(args.add||[])
+    const host=node.fqdn||node.ip||node.hostname
+    const expectedName=isIP(node.hostname)?null:node.hostname
+    let lastError
+    const credentials=nodeCredential(node.id,options.credentialId)
+    if(operation==='apply'||operation==='audit_policy_enable'){
+      let selected=null
+      for(const credential of credentials){
+        const check={host,username:credential.username,password:credential.secret.password,mode:'probe',expectedName}
+        try{
+          const result=await wmiProbePython(check)
+          if(result?.success!==true||result.transport!=='wmi'||!result.computerName||expectedName&&String(result.computerName).toLowerCase()!==expectedName.split('.')[0].toLowerCase())throw new Error('WMI computer identity was not confirmed before policy apply')
+          selected=credential
+          break
+        }catch(error){lastError=error;error.message=String(error.message).replaceAll(check.password,'[redacted]')}
+      }
+      if(!selected){if(transientError(lastError))recordNodeTransportFailure(node.id);throw lastError||new Error('No credential authenticated over WMI')}
+      const input={host,username:selected.username,password:selected.secret.password,mode:operation,args,expectedName}
+      try{
+        const result=await wmiProbePython(input)
+        if(result?.success!==true||result.transport!=='wmi'||(operation==='apply'?result.applyResult?.applied!==true:result.auditResult?.successEnabled!==true||result.auditResult?.failureEnabled!==true)||expectedName&&String(result.computerName).toLowerCase()!==expectedName.split('.')[0].toLowerCase())throw new Error('WMI write returned no confirmed host readback; inspect host state before retrying')
+        recordNodeSuccess(node.id,'wmi-authenticated')
+        return operation==='apply'?result.applyResult:result.auditResult
+      }catch(error){
+        error.message=String(error.message).replaceAll(input.password,'[redacted]')
+        if(transientError(error))recordNodeTransportFailure(node.id)
+        throw error // The host may have applied the change; the caller must read back before retrying.
+      }
+    }
+    for(const credential of credentials){
+      const input={host,username:credential.username,password:credential.secret.password,mode:operation,args,expectedName}
+      try{
+        const result=await wmiProbePython(input)
+        if(result?.success!==true||result.transport!=='wmi'||!result.computerName||!(eventOperation?'eventResult' in result:operation==='facts'?'factsResult' in result:operation==='audit_policy'?'auditResult' in result:'ruleResult' in result))throw new Error('WMI query did not return an authenticated result')
+        if(expectedName&&String(result.computerName).toLowerCase()!==expectedName.split('.')[0].toLowerCase())throw new Error('WMI computer name does not match the inventory record')
+        if(eventOperation){
+          if(operation==='event_cursor'?!Number.isSafeInteger(result.eventResult)||result.eventResult<0:!Array.isArray(result.eventResult))throw new Error('WMI Security event query returned an invalid result')
+        }else if(operation==='facts'){
+          if(!result.factsResult?.computer?.Name||!result.factsResult?.os?.Version||String(result.factsResult.computer.Name).toLowerCase()!==String(result.computerName).toLowerCase())throw new Error('WMI facts did not match the authenticated host')
+        }else if(operation==='audit_policy'){
+          if(!Number.isInteger(result.auditResult?.settingValue)||typeof result.auditResult?.successEnabled!=='boolean'||typeof result.auditResult?.failureEnabled!=='boolean')throw new Error('WMI audit policy returned an invalid result')
+        }else if(operation==='rules'?!Array.isArray(result.ruleResult):!Array.isArray(result.ruleResult?.rules)||!Number.isInteger(result.ruleResult?.total))throw new Error('WMI firewall inventory returned an invalid rule page')
+        recordNodeSuccess(node.id,'wmi-authenticated')
+        return eventOperation?result.eventResult:operation==='facts'?result.factsResult:operation==='audit_policy'?result.auditResult:result.ruleResult
+      }catch(error){lastError=error;error.message=String(error.message).replaceAll(input.password,'[redacted]')}
+    }
+    if(transientError(lastError))recordNodeTransportFailure(node.id)
+    throw lastError||new Error('No credential authenticated over WMI')
+  }
   const host=node.fqdn || node.ip || node.hostname
   let lastError
   for (const credential of nodeCredential(node.id,options.credentialId)) {
@@ -308,7 +371,7 @@ export async function remote(node,operation,args={},options={}) {
     for(let attempt=0;attempt<attempts;attempt++){
       try {
         const script=remoteScript.replace('__WINFIRE_PROMPT_FUNCTIONS__',operation.startsWith('prompt_')||operation==='security_session_logoff'?mfaPromptFunctions:'').replace('__WINFIRE_AGENT_DEPLOY__',operation==='agent_deploy'?agentDeployFunctions:'').replace('__WINFIRE_SECURITY_PROCESS_OWNER__',operation.startsWith('security_')?securityProcessOwnerFunctions:'').replace('# __WINFIRE_LSA_RIGHTS__',operation.startsWith('rights')?lsaRightsFunctions:'').replace('# __WINFIRE_ACCOUNT_INVENTORY__',()=>operation==='account_inventory'?accountInventoryFunctions:'').replace('# __WINFIRE_FIREWALL_USER__',()=>['rules','apply'].includes(operation)?firewallUserFunctions:'')
-        const legacy=/^(?:5\.[12]\.|windows (?:xp|server 2003))/i.test(String(input.osVersion||''))
+        const legacy=/^(?:5\.[12]\.|6\.[01]\.|windows (?:xp|vista|7\b|server 2003|server 2008))/i.test(String(input.osVersion||''))
         const result=process.platform==='win32'&&!legacy&&operation!=='auth' ? await pwsh(script,input) : await pywinrm(input)
         recordNodeSuccess(node.id,input.transport==='winrms'?'winrms-authenticated':'winrm-authenticated')
         return result
@@ -333,23 +396,27 @@ export function classifyProbe(transport,rpc,winrmAuthenticated=false) {
   if(transport)return {status:'port-open',probeStatus:'port-open'}
   return {status:'unreachable',probeStatus:'unreachable'}
 }
-export async function probeNode(node,{verifyWinrm=true}={}) {
+export async function probeNode(node,{verifyWinrm=true,probePort=tcpProbe,authenticate=remote,authenticateRpc=rpcProbe}={}) {
   const host=node.fqdn || node.ip || node.hostname
-  const winrm=await tcpProbe(host,5985)
-  const winrms=await tcpProbe(host,5986)
-  const wmi=await tcpProbe(host,135)
-  const transport=winrms.status==='open'?'winrms':winrm.status==='open'?'winrm':wmi.status==='open'?'wmi':null
+  const [winrm,winrms,wmi]=await Promise.all([probePort(host,5985),probePort(host,5986),probePort(host,135)])
+  const candidates=[['winrms',winrms],['winrm',winrm]].filter(([,port])=>port.status==='open')
+  let transport=candidates[0]?.[0]||null
   let rpc=null
-  if(transport==='wmi')try{rpc=await rpcProbe(host,node.id)}catch(error){rpc={error:error.message}}
   let winrmAuthenticated=false,winrmError=null
-  if(verifyWinrm&&['winrm','winrms'].includes(transport)){
-    try{await remote({...node,transport},'auth');winrmAuthenticated=true}
-    catch(error){winrmError=error.message}
+  if(verifyWinrm){
+    for(const [candidate] of candidates){
+      try{await authenticate({...node,transport:candidate},'auth');transport=candidate;winrmAuthenticated=true;break}
+      catch(error){winrmError=[winrmError,error.message].filter(Boolean).join('; ')}
+    }
+  }
+  if(!winrmAuthenticated&&wmi.status==='open'){
+    try{rpc=await authenticateRpc(host,node.id)}catch(error){rpc={error:error.message}}
+    if(typeof rpc==='string'||!transport)transport='wmi'
   }
   const {status,probeStatus}=classifyProbe(transport,rpc,winrmAuthenticated),probedAt=now()
   run('UPDATE nodes SET transport=?,status=?,probe_status=?,last_probe_at=?,last_seen_at=?,failures=?,next_retry_at=NULL WHERE id=?',transport,status,probeStatus,probedAt,transport?probedAt:node.last_seen_at,transport?0:(node.failures||0)+1,node.id)
   audit(null,'node.probe','node',node.id,null,{transport,status,probeStatus})
-  return {transport,status,probeStatus,ports:{winrm,winrms,wmi},rpc,winrmAuthenticated,winrmError,note:transport==='wmi'?'RPC authentication checked; WMI/DCOM operations remain unverified.':winrmAuthenticated?'WinRM authentication confirmed.':transport?'WinRM port is open; authentication was not confirmed.':'No supported management port responded.'}
+  return {transport,status,probeStatus,ports:{winrm,winrms,wmi},rpc,winrmAuthenticated,winrmError,note:transport==='wmi'?'RPC authentication checked; WMI firewall and Security log access need a credentialed query.':winrmAuthenticated?'WinRM authentication confirmed.':transport?'WinRM port is open; authentication was not confirmed.':'No supported management port responded.'}
 }
 export async function collectFacts(node,{credentialId,suppliedFacts}={}) {
   const facts=suppliedFacts||await remote(node,'facts',{}, {credentialId})
@@ -363,8 +430,15 @@ export async function collectFacts(node,{credentialId,suppliedFacts}={}) {
 }
 export async function enrichNode(node) {
   if(node.connection_mode==='agent')throw new Error('Agent nodes require agent-reported facts')
-  const probe=await probeNode(node,{verifyWinrm:false})
-  if(probe.transport==='wmi'&&probe.probeStatus==='rpc-authenticated'&&node.ad_guid)return (await activateWinrmViaWmi({...node,transport:'wmi'})).facts
+  const probe=await probeNode(node)
+  if(probe.transport==='wmi'&&probe.probeStatus==='rpc-authenticated'){
+    const managed={...node,transport:'wmi'}
+    try{return (await activateWinrmViaWmi(managed)).facts}
+    catch(error){
+      audit(null,'node.agentless.wmi-fallback','node',node.id,null,{winrmActivationError:error.message})
+      return collectFacts(managed)
+    }
+  }
   if(!['winrm','winrms'].includes(probe.transport))throw new Error('No working WinRM transport for inventory collection')
   return collectFacts(one('SELECT * FROM nodes WHERE id=?',node.id))
 }
@@ -390,8 +464,11 @@ export async function lookupDns(node,resolver=dns) {
 }
 export function diffRules(desired,actual) {
   const normalizeAddress=value=>String(value||'Any').split(',').map(part=>{
-    const match=part.trim().match(/^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/)
-    if(!match||Number(match[2])>32)return part.trim().toLowerCase()
+    const match=part.trim().match(/^(\d{1,3}(?:\.\d{1,3}){3})(?:\/(\d{1,2}|\d{1,3}(?:\.\d{1,3}){3}))?$/)
+    if(!match)return part.trim().toLowerCase()
+    if(!match[2])return `${match[1]}/255.255.255.255`
+    if(match[2].includes('.'))return `${match[1]}/${match[2]}`
+    if(Number(match[2])>32)return part.trim().toLowerCase()
     const prefix=Number(match[2]),mask=prefix===0?0:(0xffffffff<<(32-prefix))>>>0
     const address=match[1].split('.').map(Number).reduce((value,octet)=>(value<<8)|octet,0)>>>0
     return `${[24,16,8,0].map(shift=>((address&mask)>>>shift)&255).join('.')}/${[24,16,8,0].map(shift=>(mask>>>shift)&255).join('.')}`

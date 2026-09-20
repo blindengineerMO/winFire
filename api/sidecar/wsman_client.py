@@ -3,6 +3,7 @@ import base64
 import gzip
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -175,26 +176,12 @@ $result | ConvertTo-Json -Depth 12 -Compress
 
 
 def legacy_ps2(session, payload):
-    """PowerShell 2 compatible WinRM operations for Windows XP's limited host surface."""
+    """PowerShell 2 compatible operations for XP through Server 2008 R2."""
     operation = payload['operation']
     if operation == 'auth':
         script = '[Security.Principal.WindowsIdentity]::GetCurrent().Name'
     elif operation == 'facts':
-        script = r'''
-$ErrorActionPreference='Stop'
-function Out-Field($name,$value) { $bytes=[Text.Encoding]::UTF8.GetBytes([string]$value); Write-Output ($name+'='+[Convert]::ToBase64String($bytes)) }
-$computer=Get-WmiObject Win32_ComputerSystem
-$os=Get-WmiObject Win32_OperatingSystem
-$bios=Get-WmiObject Win32_BIOS
-Out-Field 'NAME' $computer.Name; Out-Field 'DOMAIN' $computer.Domain; Out-Field 'JOINED' $computer.PartOfDomain
-Out-Field 'USER' $computer.UserName; Out-Field 'MODEL' $computer.Model; Out-Field 'MANUFACTURER' $computer.Manufacturer
-Out-Field 'CAPTION' $os.Caption; Out-Field 'VERSION' $os.Version; Out-Field 'BUILD' $os.BuildNumber
-Out-Field 'ARCH' $os.OSArchitecture; Out-Field 'SERIAL' $bios.SerialNumber
-try { Out-Field 'GUID' (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography').MachineGuid } catch {}
-foreach($adapter in @(Get-WmiObject Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True')) {
-  Out-Field 'NET' ((@([string]$adapter.Description,[string]$adapter.MACAddress,([string[]]$adapter.IPAddress -join ','),([string[]]$adapter.DefaultIPGateway -join ','),([string[]]$adapter.DNSServerSearchOrder -join ','),[string]$adapter.DNSDomain)) -join '|')
-}
-'''
+        script = (Path(__file__).resolve().parent / 'wmi_facts.ps1').read_text()
     elif operation == 'account_inventory':
         source = (Path(__file__).resolve().parent / 'account_inventory.ps1').read_text()
         sids = [str(item) for item in (payload.get('args') or {}).get('sids', []) if isinstance(item, str) and len(item) <= 128][:500]
@@ -210,8 +197,27 @@ foreach($adapter in @(Get-WmiObject Win32_NetworkAdapterConfiguration -Filter 'I
             right = base64.b64encode(str(args.get('right') or '').encode()).decode()
             present = '$true' if args.get('present') else '$false'
             script = source + f"\n$sid=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{sid}'));$right=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{right}'));$result=Set-WinFireLogonRight @{{accountSid=$sid;right=$right;present={present}}};Write-Output ($result.accountSid+'|'+$result.right+'|'+$result.before+'|'+$result.present+'|'+$result.changed)\n"
+    elif operation == 'all_rules' and windows_dialect(payload.get('osVersion')) == 'xp':
+        args = payload.get('args') or {}
+        offset = min(1000000, max(0, int(args.get('offset') or 0)))
+        limit = min(200, max(1, int(args.get('limit') or 100)))
+        source = (Path(__file__).resolve().parent / 'xp_firewall.ps1').read_text()
+        script = source + f'\nGet-WinFireXpRules {offset} {limit}\n'
+    elif operation in {'all_rules', 'rules', 'apply'} and windows_dialect(payload.get('osVersion')) == 'advfirewall':
+        args = payload.get('args') or {}
+        group = str(args.get('group') or '')
+        if operation in {'rules', 'apply'} and not re.fullmatch(r'WinFireSecure:[A-Za-z0-9_.:-]{1,160}', group):
+            raise ValueError('Managed firewall group is required')
+        offset = min(1000000, max(0, int(args.get('offset') or 0))) if operation == 'all_rules' else 0
+        limit = min(200, max(1, int(args.get('limit') or 100))) if operation == 'all_rules' else 10000
+        group_encoded = base64.b64encode(group.encode('utf-8')).decode('ascii')
+        source = (Path(__file__).resolve().parent / 'legacy_firewall.ps1').read_text()
+        if operation == 'apply':
+            script = legacy_apply_script(args, group)
+        else:
+            script = source + f"\n$group=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{group_encoded}'));Get-WinFireLegacyRules '{operation}' $group {offset} {limit}\n"
     else:
-        raise RuntimeError(f'{operation} is unavailable on Windows XP; this host requires a legacy firewall adapter')
+        raise RuntimeError(f'{operation} is unavailable on this older Windows host; firewall writes require a compatible adapter')
     # LSA P/Invoke source exceeds Windows' command-line limit. Send a short
     # PowerShell 2 loader, then stream the compressed script through stdin.
     loader = "$encoded=[Console]::In.ReadToEnd();$bytes=[Convert]::FromBase64String($encoded);$buffer=New-Object IO.MemoryStream;$buffer.Write($bytes,0,$bytes.Length);$buffer.Position=0;$zip=New-Object IO.Compression.GzipStream -ArgumentList $buffer,([IO.Compression.CompressionMode]::Decompress);$reader=New-Object IO.StreamReader -ArgumentList $zip,([Text.Encoding]::UTF8);try{Invoke-Expression $reader.ReadToEnd()}finally{$reader.Dispose();$zip.Dispose();$buffer.Dispose()}"
@@ -230,10 +236,16 @@ foreach($adapter in @(Get-WmiObject Win32_NetworkAdapterConfiguration -Filter 'I
     finally:
         protocol.close_shell(shell_id)
     if status != 0:
-        raise RuntimeError(stderr.decode('utf-8', 'replace').strip() or f'Windows XP WinRM operation exited {status}')
+        raise RuntimeError(stderr.decode('utf-8', 'replace').strip() or f'Older Windows WinRM operation exited {status}')
     output = stdout.decode('utf-8-sig', 'replace').strip()
     if operation == 'auth':
         return output
+    if operation in {'all_rules', 'rules'}:
+        return parse_legacy_firewall(output, operation)
+    if operation == 'apply':
+        if output != 'APPLIED|true':
+            raise RuntimeError('Older Windows firewall apply returned no success confirmation')
+        return {'applied': True}
     if operation == 'rights':
         if not output:
             raise RuntimeError('LSA logon-rights query returned no data')
@@ -259,6 +271,10 @@ foreach($adapter in @(Get-WmiObject Win32_NetworkAdapterConfiguration -Filter 'I
         if inventory['computerName'] is None:
             raise RuntimeError('Account inventory returned no host record')
         return inventory
+    return parse_legacy_facts(output)
+
+
+def parse_legacy_facts(output):
     fields = {}
     adapters = []
     for line in output.splitlines():
@@ -278,9 +294,93 @@ foreach($adapter in @(Get-WmiObject Win32_NetworkAdapterConfiguration -Filter 'I
             'network':adapters, 'dnsSuffixes':[item['dnsDomain'] for item in adapters if item['dnsDomain']], 'firewall':[], 'service':None}
 
 
-def is_legacy_windows(value):
+def validate_legacy_apply(args, group):
+    add = args.get('add') or []
+    remove = args.get('remove') or []
+    if not isinstance(add, list) or not isinstance(remove, list) or len(add) + len(remove) > 500:
+        raise ValueError('Invalid legacy firewall diff size')
+    fields = ('name', 'action', 'direction', 'protocol', 'localPort', 'remotePort', 'remoteAddress', 'program', 'profile')
+    normalized = []
+    for raw in add:
+        if not isinstance(raw, dict) or raw.get('localUserSid') or (raw.get('group') and raw['group'] != group):
+            raise ValueError('Unsupported legacy firewall rule scope')
+        rule = {field: str(raw.get(field) or 'Any') for field in fields}
+        if not 1 <= len(rule['name']) <= 180 or '|' in rule['name'] or '\n' in rule['name']:
+            raise ValueError('Invalid legacy firewall rule name')
+        for field, allowed in [('action', {'allow', 'block'}), ('direction', {'in', 'out'}),
+                               ('protocol', {'TCP', 'UDP', 'Any'}), ('profile', {'Any', 'Domain', 'Private', 'Public'})]:
+            if rule[field] not in allowed:
+                raise ValueError(f'Invalid legacy firewall {field}')
+        if rule['protocol'] == 'Any' and (rule['localPort'] != 'Any' or rule['remotePort'] != 'Any'):
+            raise ValueError('Specific ports require TCP or UDP')
+        for field in ('localPort', 'remotePort'):
+            expression = rule[field]
+            if expression == 'Any':
+                continue
+            if not re.fullmatch(r'[0-9,-]+', expression) or any(
+                not all(1 <= int(value) <= 65535 for value in part.split('-')) or
+                (len(part.split('-')) == 2 and int(part.split('-')[0]) > int(part.split('-')[1])) or
+                len(part.split('-')) > 2
+                for part in expression.split(',') if part
+            ) or ',,' in expression or expression.startswith(',') or expression.endswith(','):
+                raise ValueError(f'Invalid legacy firewall {field}')
+        if len(rule['remoteAddress']) > 2000 or len(rule['program']) > 1024:
+            raise ValueError('Legacy firewall rule field is too long')
+        normalized.append(rule)
+    if len({rule['name'] for rule in normalized}) != len(normalized):
+        raise ValueError('Duplicate legacy firewall rule names')
+    if any(not isinstance(name, str) or not 1 <= len(name) <= 180 for name in remove) or len(set(remove)) != len(remove):
+        raise ValueError('Invalid legacy firewall removal names')
+    return normalized, remove
+
+
+def legacy_apply_script(args, group):
+    add, remove = validate_legacy_apply(args, group)
+    source = (Path(__file__).resolve().parent / 'legacy_firewall.ps1').read_text()
+    group_encoded = base64.b64encode(group.encode('utf-8')).decode('ascii')
+    script = source + "\nfunction Dec($s){[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s))}\n"
+    script += f"$group=Dec '{group_encoded}';$add=@();$remove=@()\n"
+    for rule in add:
+        entries = ';'.join(f"{key}=(Dec '{base64.b64encode(value.encode('utf-8')).decode('ascii')}')" for key, value in rule.items())
+        script += f"$add+=,(New-Object PSObject -Property @{{{entries}}})\n"
+    for name in remove:
+        script += f"$remove+=,(Dec '{base64.b64encode(name.encode('utf-8')).decode('ascii')}')\n"
+    return script + 'Set-WinFireLegacyRules $group $add $remove\n'
+
+
+def parse_legacy_firewall(output, operation):
+    header = None
+    rules = []
+    for line in output.splitlines():
+        parts = line.split('|')
+        if parts[0] == 'HEADER' and len(parts) == 3:
+            header = (int(parts[1]), int(parts[2]))
+        elif parts[0] == 'RULE' and len(parts) == 13:
+            values = [base64.b64decode(value, validate=True).decode('utf-8') for value in parts[1:]]
+            if values[3].lower() not in {'true', 'false'} or values[4] not in {'allow', 'block'} or values[5] not in {'in', 'out'}:
+                raise RuntimeError('Older Windows firewall rule returned an invalid state, action, or direction')
+            rules.append({'internalName': values[0], 'name': values[1], 'displayName': values[1],
+                          'group': values[2], 'enabled': values[3].lower() == 'true',
+                          'action': values[4], 'direction': values[5], 'protocol': values[6],
+                          'localPort': values[7], 'remotePort': values[8],
+                          'remoteAddress': values[9], 'program': values[10],
+                          'profile': values[11], 'localUserSid': None, 'source': 'Local'})
+        elif line.strip():
+            raise RuntimeError('Older Windows firewall inventory returned an invalid record')
+    if header is None or len(rules) > header[0] or (operation == 'rules' and len(rules) != header[0]):
+        raise RuntimeError('Older Windows firewall inventory returned an invalid header')
+    if operation == 'rules':
+        return rules
+    return {'total': header[0], 'offset': header[1], 'rules': rules}
+
+
+def windows_dialect(value):
     version = str(value or '').strip().lower()
-    return 'windows xp' in version or 'windows server 2003' in version or version.startswith(('5.1.', '5.2.'))
+    if 'windows xp' in version or 'windows server 2003' in version or version.startswith(('5.1.', '5.2.')):
+        return 'xp'
+    if any(label in version for label in ('windows vista', 'windows 7', 'windows server 2008')) or version.startswith(('6.0.', '6.1.')):
+        return 'advfirewall'
+    return 'netsecurity'
 
 
 def main():
@@ -301,11 +401,12 @@ def main():
         operation_timeout_sec=80 if slow else 20,
     )
     os_version = str(payload.get('osVersion') or '')
-    if not os_version and operation in {'facts', 'rights', 'rights_change', 'account_inventory'}:
+    if not os_version and operation in {'facts', 'rights', 'rights_change', 'account_inventory', 'all_rules', 'rules', 'apply'}:
         detected = session.run_ps('(Get-WmiObject Win32_OperatingSystem).Caption')
         if detected.status_code == 0:
             os_version = detected.std_out.decode('utf-8-sig', 'replace').strip()
-    if operation == 'auth' or is_legacy_windows(os_version):
+    payload['osVersion'] = os_version
+    if operation == 'auth' or windows_dialect(os_version) != 'netsecurity':
         print(json.dumps(legacy_ps2(session, payload)))
         return
     args = base64.b64encode(json.dumps(payload.get('args') or {}).encode()).decode()

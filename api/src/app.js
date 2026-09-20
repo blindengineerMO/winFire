@@ -2125,36 +2125,34 @@ export async function onboardPendingNodes(limit=5,{resolveDns=lookupDns,enrich=e
     WHERE n.connection_mode='agentless' AND COALESCE(n.ad_enabled,1)=1
       AND (n.next_retry_at IS NULL OR n.next_retry_at<=?)
       AND EXISTS (SELECT 1 FROM credential_assignments a WHERE a.node_id=n.id OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=n.id))
-      AND (f.node_id IS NULL OR (n.ad_guid IS NOT NULL AND n.ad_missing=0 AND NOT EXISTS
-        (SELECT 1 FROM audit_log a WHERE a.entity_id=n.id AND a.action='node.onboarding.complete')))
+      AND (f.node_id IS NULL OR NOT EXISTS
+        (SELECT 1 FROM audit_log a WHERE a.entity_id=n.id AND a.action='node.onboarding.complete'))
     ORDER BY CASE WHEN f.node_id IS NULL THEN 0 ELSE 1 END,n.created_at LIMIT ?`,now(),limit)
   const results=[]
   for(const item of pending){
     const node=getNode(item.id)
     try{
       if(!node.ip)await resolveDns(node)
-      if(!one('SELECT 1 FROM node_facts WHERE node_id=?',node.id)||!['winrm','winrms'].includes(node.transport)||node.status!=='reachable')await enrich(getNode(node.id))
+      if(!one('SELECT 1 FROM node_facts WHERE node_id=?',node.id)||!['winrm','winrms','wmi'].includes(node.transport)||node.status!=='reachable')await enrich(getNode(node.id))
       const managed=getNode(node.id)
-      if(managed.ad_guid&&!managed.ad_missing){
-        let policy=await invoke(managed,'audit_policy')
-        if(!policy?.successEnabled||!policy?.failureEnabled){
-          const before=policy,applyRunId=id()
-          run('INSERT INTO policy_apply_runs(id,node_id,status) VALUES(?,?,?)',applyRunId,node.id,'running')
-          try{
-            policy=await invoke(managed,'audit_policy_enable')
-            if(!policy?.successEnabled||!policy?.failureEnabled)throw new Error('Filtering Platform Connection audit policy could not be confirmed')
-            run('UPDATE policy_apply_runs SET status=?,diff_json=?,finished_at=? WHERE id=?','success',json({operation:'audit_policy_auto_enable',before,after:policy}),now(),applyRunId)
-            audit(null,'node.audit-policy.auto-enable','node',node.id,before,{...policy,runId:applyRunId})
-          }catch(error){
-            run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?','unknown',error.message,now(),applyRunId)
-            audit(null,'node.audit-policy.auto-enable.failed','node',node.id,before,{runId:applyRunId,error:error.message})
-            throw error
-          }
+      let policy=await invoke(managed,'audit_policy')
+      if(!policy?.successEnabled||!policy?.failureEnabled){
+        const before=policy,applyRunId=id()
+        run('INSERT INTO policy_apply_runs(id,node_id,status) VALUES(?,?,?)',applyRunId,node.id,'running')
+        try{
+          policy=await invoke(managed,'audit_policy_enable')
+          if(!policy?.successEnabled||!policy?.failureEnabled)throw new Error('Filtering Platform Connection audit policy could not be confirmed')
+          run('UPDATE policy_apply_runs SET status=?,diff_json=?,finished_at=? WHERE id=?','success',json({operation:'audit_policy_auto_enable',before,after:policy}),now(),applyRunId)
+          audit(null,'node.audit-policy.auto-enable','node',node.id,before,{...policy,runId:applyRunId})
+        }catch(error){
+          run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?','unknown',error.message,now(),applyRunId)
+          audit(null,'node.audit-policy.auto-enable.failed','node',node.id,before,{runId:applyRunId,error:error.message})
+          throw error
         }
-        const recent=await pullRecent(node.id,null,true)
-        const history=await pullHistory(node.id,null,2,true)
-        audit(null,'node.onboarding.complete','node',node.id,null,{transport:managed.transport,auditPolicy:policy,eventsInserted:recent.inserted+history.inserted,historyCaughtUp:history.caughtUp})
-      }else audit(null,'node.inventory.collected','node',node.id,null,{transport:managed.transport})
+      }
+      const recent=await pullRecent(node.id,null,true)
+      const history=await pullHistory(node.id,null,2,true)
+      audit(null,'node.onboarding.complete','node',node.id,null,{transport:managed.transport,auditPolicy:policy,eventsInserted:recent.inserted+history.inserted,historyCaughtUp:history.caughtUp})
       results.push({nodeId:node.id,status:'complete'})
     }catch(error){
       run('UPDATE nodes SET next_retry_at=? WHERE id=?',new Date(Date.now()+15*60_000).toISOString(),node.id)
@@ -2279,7 +2277,7 @@ async function collectTrainingTelemetry(node){
     const agent=one('SELECT last_checkin_at FROM agents WHERE id=? AND revoked_at IS NULL',node.agent_id)
     if(!agent?.last_checkin_at||Date.parse(agent.last_checkin_at)<Date.now()-5*60_000)throw new Error('Agent is not online to confirm training telemetry')
   }else{
-    if(!['winrm','winrms'].includes(node.transport))throw new Error('No working event collection transport; probe the node before training can finish')
+    if(!['winrm','winrms','wmi'].includes(node.transport))throw new Error('No working event collection transport; probe the node before training can finish')
     const auditPolicy=await remote(node,'audit_policy')
     if(auditPolicy?.successEnabled!==true)throw new Error('Filtering Platform Connection success auditing is disabled; enable it before automatic training can finish')
     const collection=await pullLogs(node.id)
