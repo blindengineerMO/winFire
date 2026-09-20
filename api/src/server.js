@@ -16,6 +16,7 @@ import {sweepLoopbackBaseline} from './loopbackBaseline.js'
 import {revokeExpiredGrants} from './mfaPortal.js'
 import {sweepMfaPrompts} from './mfaPrompt.js'
 import {expireMfaChallenges} from './mfaChallenges.js'
+import {pollFleet} from './fleetPoll.js'
 
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..')
 const dist=path.join(root,'web/dist')
@@ -153,15 +154,14 @@ async function pollNodeLogs(){
   if(logPollRunning)return
   logPollRunning=true
   try{
-    for(const node of all("SELECT id,hostname FROM nodes WHERE transport IN ('winrm','winrms') AND (next_retry_at IS NULL OR next_retry_at<=?) ORDER BY hostname",now())){
-      try{
-        await pullRecentLogs(node.id,null,true)
-        await pullLogs(node.id,null,5,true)
-      }catch(error){
-        audit(null,'logs.pull.failed','node',node.id,null,{error:error.message})
-        console.error(`Event collection failed for ${node.hostname}:`,error.message)
-      }
-    }
+    const nodes=all("SELECT id,hostname FROM nodes WHERE transport IN ('winrm','winrms') AND (next_retry_at IS NULL OR next_retry_at<=?) ORDER BY hostname",now())
+    await pollFleet(nodes,async node=>{
+      await pullRecentLogs(node.id,null,true)
+      await pullLogs(node.id,null,5,true)
+    },{concurrency:process.env.LOG_POLL_CONCURRENCY||4,onError:(error,node)=>{
+      audit(null,'logs.pull.failed','node',node.id,null,{error:error.message})
+      console.error(`Event collection failed for ${node.hostname}:`,error.message)
+    }})
   }finally{logPollRunning=false}
 }
 setTimeout(()=>pollNodeLogs().catch(error=>console.error('Event collection failed:',error)),5000).unref()

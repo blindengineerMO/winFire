@@ -13,23 +13,28 @@ export async function ensureLoopbackBaseline(node){
     if(job?.status==='queued'||job?.status==='leased')return prior
   }
   run('INSERT INTO node_loopback_baseline(node_id,status,last_attempt_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET status=excluded.status,last_attempt_at=excluded.last_attempt_at,last_error=NULL',node.id,'running',now())
+  const applyRunId=id()
+  run('INSERT INTO policy_apply_runs(id,node_id,status) VALUES(?,?,?)',applyRunId,node.id,'running')
+  audit(null,'node.loopback.apply.start','node',node.id,null,{runId:applyRunId})
   try{
     if(node.connection_mode==='agent'){
       const agent=one('SELECT * FROM agents WHERE id=? AND revoked_at IS NULL',node.agent_id)
       if(!agent)throw new Error('No active enrolled agent')
       const jobId=id()
-      run('INSERT INTO agent_jobs(id,agent_id,type,payload_json) VALUES(?,?,?,?)',jobId,agent.id,'policy.apply',json({policyId:loopbackPolicyId,group:loopbackGroup,rules:loopbackRules,loopbackBaseline:true}))
+      run('INSERT INTO agent_jobs(id,agent_id,type,payload_json) VALUES(?,?,?,?)',jobId,agent.id,'policy.apply',json({policyId:loopbackPolicyId,group:loopbackGroup,rules:loopbackRules,loopbackBaseline:true,applyRunId}))
       run("UPDATE node_loopback_baseline SET status='queued',job_id=? WHERE node_id=?",jobId,node.id)
-      audit(null,'node.loopback.queued','node',node.id,null,{jobId})
-      return {status:'queued',jobId}
+      audit(null,'node.loopback.queued','node',node.id,null,{jobId,runId:applyRunId})
+      return {status:'queued',jobId,runId:applyRunId}
     }
     const diff=await applyRules(node,loopbackPolicyId,loopbackRules)
     run("UPDATE node_loopback_baseline SET status='applied',applied_at=?,last_error=NULL WHERE node_id=?",now(),node.id)
-    audit(null,'node.loopback.applied','node',node.id,null,{diff})
-    return {status:'applied',diff}
+    run('UPDATE policy_apply_runs SET status=?,diff_json=?,finished_at=? WHERE id=?','success',json({operation:'loopback_baseline',diff}),now(),applyRunId)
+    audit(null,'node.loopback.applied','node',node.id,null,{runId:applyRunId,diff})
+    return {status:'applied',diff,runId:applyRunId}
   }catch(error){
     run("UPDATE node_loopback_baseline SET status='failed',last_error=? WHERE node_id=?",error.message,node.id)
-    audit(null,'node.loopback.failed','node',node.id,null,{error:error.message})
+    run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?',/timed?\s*out|timeout|connection|unreachable|ECONNRESET/i.test(error.message)?'unknown':'failed',error.message,now(),applyRunId)
+    audit(null,'node.loopback.failed','node',node.id,null,{runId:applyRunId,error:error.message})
     return {status:'failed',error:error.message}
   }
 }

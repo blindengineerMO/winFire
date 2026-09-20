@@ -23,6 +23,7 @@ test('AD node onboarding collects facts, enables auditing, and starts event coll
     pullHistory:async()=>{calls.push('history');return {inserted:3,caughtUp:false}}
   }
   assert.deepEqual(await onboardPendingNodes(5,handlers),[{nodeId:'new-ad-node',status:'complete'}])
+  assert.equal(db.prepare("SELECT status FROM policy_apply_runs WHERE node_id='new-ad-node' ORDER BY rowid DESC LIMIT 1").get().status,'success')
   assert.deepEqual(calls,['dns','facts','audit_policy','audit_policy_enable','recent','history'])
   assert.equal(db.prepare('SELECT ip FROM nodes WHERE id=?').get('new-ad-node').ip,'192.0.2.10')
   assert.equal(db.prepare("SELECT COUNT(*) n FROM audit_log WHERE entity_id=? AND action='node.onboarding.complete'").get('new-ad-node').n,1)

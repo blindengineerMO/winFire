@@ -390,7 +390,7 @@ const fs=require('fs');let text='';process.stdin.on('data',part=>text+=part);pro
     process.env.WINFIRE_TEST_AUDIT_ENABLE_FAIL='1'
     await auth(request.post(`/api/v1/nodes/${node.body.id}/audit-policy/enable`)).send({confirmation:'ENABLE WFP AUDITING'}).expect(500)
     assert.equal(db.prepare("SELECT COUNT(*) n FROM audit_log WHERE action='node.audit-policy.enable.failed' AND entity_id=?").get(node.body.id).n,1)
-    assert.equal(db.prepare("SELECT status FROM policy_apply_runs WHERE node_id=? AND policy_id IS NULL ORDER BY rowid DESC LIMIT 1").get(node.body.id).status,'failed')
+    assert.equal(db.prepare("SELECT status FROM policy_apply_runs WHERE node_id=? AND policy_id IS NULL ORDER BY rowid DESC LIMIT 1").get(node.body.id).status,'unknown')
     delete process.env.WINFIRE_TEST_AUDIT_ENABLE_FAIL
     const enabled=await auth(request.post(`/api/v1/nodes/${node.body.id}/audit-policy/enable`)).send({confirmation:'ENABLE WFP AUDITING'}).expect(200)
     assert.equal(enabled.body.successEnabled,true)

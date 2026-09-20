@@ -170,9 +170,10 @@ export async function writeDirectoryUserStatus(config,credential,user,enabled,{e
   if(!credential?.username||!credential?.password)throw Object.assign(new Error('A separate AD account-control credential is required'),{status:503})
   const client=makeClient(config,clientFactory)
   const read=async()=>{
-    const result=await client.search(user.dn,{scope:'base',filter:'(objectClass=user)',attributes:['objectGUID','objectSid','userAccountControl'],explicitBufferAttributes:['objectGUID','objectSid'],sizeLimit:1})
+    const result=await client.search(user.dn,{scope:'base',filter:'(objectClass=user)',attributes:['objectGUID','objectSid','userPrincipalName','userAccountControl'],explicitBufferAttributes:['objectGUID','objectSid'],sizeLimit:1})
     const entry=result.searchEntries[0]
     if(!entry||guidFromDirectory(attribute(entry,'objectGUID'))!==user.id||sidFromDirectory(attribute(entry,'objectSid'))!==user.sid)throw Object.assign(new Error('AD user identity changed; sync the directory before changing this account'),{status:409})
+    if(user.upn&&String(attribute(entry,'userPrincipalName')||'').toLowerCase()!==user.upn.toLowerCase())throw Object.assign(new Error('AD user principal name changed; sync the directory before changing this account'),{status:409})
     const flags=Number(attribute(entry,'userAccountControl'))
     if(!Number.isSafeInteger(flags)||flags<0)throw Object.assign(new Error('AD did not return a valid userAccountControl value'),{status:502})
     return flags

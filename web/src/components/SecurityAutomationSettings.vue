@@ -19,8 +19,8 @@ onMounted(load)
 <template>
   <section class="security-automation">
     <div class="panel-title"><div><span class="eyebrow">SECURITY POLICY</span><h2>Automated responses</h2></div></div>
-    <p>Match traffic to an IP address or a known inventory hostname, or count failed MFA challenges. Alerts use operator notification preferences. AD disable requires a recent outbound event on a WinRM-managed client, a verified process owner SID, and a separate LDAPS account-control credential.</p>
-    <p class="muted">A submitted MFA username is not authenticated identity evidence, so repeated MFA failures can alert but cannot automatically disable an AD account. A logoff policy rechecks the active client session before ending it; if logoff fails, the AD hold remains active and an incident requests review.</p>
+    <p>Match traffic to an IP address or a known inventory hostname, or count failed MFA challenges. Alerts use operator notification preferences. AD disable requires a separate LDAPS account-control credential.</p>
+    <p class="muted">Destination actions verify the outbound process owner SID on a WinRM-managed client. Failed MFA actions count only authenticator failures after an AD-backed session or successful LDAPS bind has linked the user to a directory SID. A submitted username alone never triggers an AD action. Client logoff requires a verified destination event and active session.</p>
     <p v-if="error" class="error-msg" role="alert">{{error}}</p><p v-if="message" class="success-msg">{{message}}</p>
     <form class="automation-form" @submit.prevent="save">
       <label>Name<input v-model.trim="form.name" minlength="3" maxlength="120" required placeholder="Investigate RDP server access"></label>
@@ -29,7 +29,7 @@ onMounted(load)
       <label v-else>Failure threshold<input v-model.number="form.failureCount" type="number" min="2" max="100" required></label>
       <label>Within minutes<input v-model.number="form.windowMinutes" type="number" min="1" max="1440" required></label>
       <label>Cooldown minutes<input v-model.number="form.cooldownMinutes" type="number" min="1" max="10080" required></label>
-      <label>Action<select v-model="form.actionType"><option value="alert">Notify operators</option><option v-if="form.triggerType==='destination'" value="disable_ad">Temporarily disable matching AD user and notify</option><option v-if="form.triggerType==='destination'" value="disable_ad_logoff">Disable AD user, log off client, and notify</option></select></label>
+      <label>Action<select v-model="form.actionType"><option value="alert">Notify operators</option><option value="disable_ad">Temporarily disable verified AD user and notify</option><option v-if="form.triggerType==='destination'" value="disable_ad_logoff">Disable AD user, log off client, and notify</option></select></label>
       <label v-if="form.actionType!=='alert'">Disable for minutes<input v-model.number="form.disableMinutes" type="number" min="5" max="10080" required></label>
       <label class="automation-check"><input v-model="form.enabled" type="checkbox"> Enable after saving</label>
       <div class="automation-actions"><button type="button" class="button small secondary" :disabled="busy" @click="runPreview">Preview recent matches</button><button class="button small primary" :disabled="busy">{{editing?'Update policy':'Create policy'}}</button><button v-if="editing" type="button" class="button small secondary" @click="clear">Cancel edit</button></div>

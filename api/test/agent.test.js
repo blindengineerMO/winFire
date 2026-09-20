@@ -163,10 +163,13 @@ test('agent break glass is queued, confirmed, restored, and expires',async()=>{
   const first=await start()
   assert.equal(first.status,202)
   assert.equal(first.body.session.status,'activating')
+  assert.equal(one('SELECT status FROM policy_apply_runs WHERE id=?',first.body.runId).status,'running')
   const startJob=(await request('GET',`/agents/${enrolled.body.agentId}/jobs`,undefined,null,client)).body.jobs[0]
   assert.equal(startJob.type,'breakglass.start')
+  assert.equal(startJob.payload.applyRunId,first.body.runId)
   assert.equal((await request('POST',`/agents/${enrolled.body.agentId}/jobs/${startJob.id}/result`,{leaseToken:startJob.leaseToken,success:true,result:{active:true,profiles}},null,client)).status,200)
   assert.equal(one('SELECT status FROM break_glass_sessions WHERE id=?',first.body.session.id).status,'active')
+  assert.equal(one('SELECT status FROM policy_apply_runs WHERE id=?',first.body.runId).status,'success')
   const end=await request('POST',`/nodes/${node.body.id}/break-glass/end`,{sessionId:first.body.session.id},token)
   assert.equal(end.status,202)
   const endJob=(await request('GET',`/agents/${enrolled.body.agentId}/jobs`,undefined,null,client)).body.jobs[0]
@@ -174,6 +177,7 @@ test('agent break glass is queued, confirmed, restored, and expires',async()=>{
   assert.deepEqual(endJob.payload.profiles,profiles)
   assert.equal((await request('POST',`/agents/${enrolled.body.agentId}/jobs/${endJob.id}/result`,{leaseToken:endJob.leaseToken,success:true,result:{restored:true,profiles}},null,client)).status,200)
   assert.equal(one('SELECT status FROM break_glass_sessions WHERE id=?',first.body.session.id).status,'ended')
+  assert.equal(one('SELECT status FROM policy_apply_runs WHERE id=?',end.body.runId).status,'success')
 
   const second=await start()
   assert.equal(second.status,202)
@@ -186,6 +190,13 @@ test('agent break glass is queued, confirmed, restored, and expires',async()=>{
   assert.equal(expiryJob.payload.finalStatus,'expired')
   assert.equal((await request('POST',`/agents/${enrolled.body.agentId}/jobs/${expiryJob.id}/result`,{leaseToken:expiryJob.leaseToken,success:true,result:{restored:true,profiles}},null,client)).status,200)
   assert.equal(one('SELECT status FROM break_glass_sessions WHERE id=?',second.body.session.id).status,'expired')
+  const invalid=await start()
+  assert.equal(invalid.status,202)
+  const invalidJob=(await request('GET',`/agents/${enrolled.body.agentId}/jobs`,undefined,null,client)).body.jobs[0]
+  assert.equal((await request('POST',`/agents/${enrolled.body.agentId}/jobs/${invalidJob.id}/result`,{leaseToken:invalidJob.leaseToken,success:true,result:{active:false,profiles}},null,client)).status,200)
+  assert.equal(one('SELECT status FROM agent_jobs WHERE id=?',invalidJob.id).status,'failed')
+  assert.equal(one('SELECT status FROM break_glass_sessions WHERE id=?',invalid.body.session.id).status,'failed')
+  assert.equal(one('SELECT status FROM policy_apply_runs WHERE id=?',invalid.body.runId).status,'failed')
 })
 
 test('agent training waits for personal and global apply acknowledgements',async()=>{
@@ -207,5 +218,48 @@ test('agent training waits for personal and global apply acknowledgements',async
   for(const [index,job] of jobs.entries()){
     assert.equal((await request('POST',`/agents/${enrolled.body.agentId}/jobs/${job.id}/result`,{leaseToken:job.leaseToken,success:true,diff:{add:[],remove:[]}},null,client)).status,200)
     assert.equal(one('SELECT status FROM learning_sessions WHERE id=?',node.body.training.id).status,index===0?'applying':'enforced')
+  }
+})
+
+test('remote agent installation records a verified apply run and a failed attempt',async()=>{
+  const login=await request('POST','/auth/login',{email:'owner@agent.test',password:'agent-test-password-123'})
+  const token=login.body.accessToken
+  const credential=await request('POST','/credentials',{name:'Install test',type:'local',username:'test-admin',password:'test-only-password'},token)
+  assert.equal(credential.status,201)
+  const createNode=async hostname=>{
+    const created=await request('POST','/nodes',{hostname,ip:'127.0.0.1',credentialIds:[credential.body.id]},token)
+    assert.equal(created.status,201)
+    run("UPDATE nodes SET transport='winrm' WHERE id=?",created.body.id)
+    return created.body.id
+  }
+  const first=await createNode('install-success'),second=await createNode('install-failure')
+  const packagePath=file('WinFire.Agent.exe'),stub=file('install-stub')
+  fs.writeFileSync(packagePath,'signed-package-fixture')
+  fs.writeFileSync(stub,`#!/usr/bin/env node
+let body='';process.stdin.on('data',part=>body+=part);process.stdin.on('end',()=>{
+  const input=JSON.parse(body)
+  if(input.operation!=='agent_deploy')process.exit(2)
+  if(process.env.WINFIRE_TEST_DEPLOY_FAIL==='1')process.exit(1)
+  const crypto=require('crypto'),path=require('path'),Database=require(require.resolve('better-sqlite3',{paths:[process.cwd()]}))
+  const db=new Database(path.join(process.env.DATA_DIR,'winfire.db')),agentId=crypto.randomUUID()
+  db.prepare("INSERT INTO agents(id,node_id,cert_thumbprint,cert_expires_at,version,mode,last_checkin_at) VALUES(?,?,?,?,?,?,?)").run(agentId,process.env.WINFIRE_TEST_DEPLOY_NODE,'test-thumbprint',new Date(Date.now()+86400000).toISOString(),'test','pull',new Date().toISOString())
+  db.close();process.stdout.write(JSON.stringify({installed:true,status:'Running'}))
+})
+`,{mode:0o700})
+  const previous={python:process.env.WINRM_PYTHON,packagePath:process.env.AGENT_PACKAGE_PATH,base:process.env.PUBLIC_BASE_URL}
+  process.env.WINRM_PYTHON=stub;process.env.AGENT_PACKAGE_PATH=packagePath;process.env.PUBLIC_BASE_URL='https://localhost'
+  try{
+    process.env.WINFIRE_TEST_DEPLOY_NODE=first
+    const installed=await request('POST',`/nodes/${first}/deploy-agent`,{},token)
+    assert.equal(installed.status,200,JSON.stringify(installed.body))
+    assert.equal(one('SELECT status FROM policy_apply_runs WHERE id=?',installed.body.runId).status,'success')
+    assert.equal(JSON.parse(one('SELECT diff_json FROM policy_apply_runs WHERE id=?',installed.body.runId).diff_json).operation,'agent_deploy')
+    process.env.WINFIRE_TEST_DEPLOY_NODE=second;process.env.WINFIRE_TEST_DEPLOY_FAIL='1'
+    const failed=await request('POST',`/nodes/${second}/deploy-agent`,{},token)
+    assert.equal(failed.status,502)
+    assert.equal(one('SELECT status FROM policy_apply_runs WHERE node_id=? ORDER BY rowid DESC LIMIT 1',second).status,'failed')
+  }finally{
+    for(const [key,value] of [['WINRM_PYTHON',previous.python],['AGENT_PACKAGE_PATH',previous.packagePath],['PUBLIC_BASE_URL',previous.base]])if(value===undefined)delete process.env[key];else process.env[key]=value
+    delete process.env.WINFIRE_TEST_DEPLOY_NODE;delete process.env.WINFIRE_TEST_DEPLOY_FAIL
   }
 })

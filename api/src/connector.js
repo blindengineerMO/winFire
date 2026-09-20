@@ -258,6 +258,10 @@ export async function activateWinrmViaWmi(node){
   const credentialId=directoryWinrmCredentialId(node),credential=nodeCredential(node.id,credentialId)[0]
   const host=node.fqdn||node.ip||node.hostname
   const input={host,username:credential.username,password:credential.secret.password,mode:'enable_winrm',expectedName:node.hostname}
+  const applyRunId=id()
+  run('INSERT INTO policy_apply_runs(id,node_id,status) VALUES(?,?,?)',applyRunId,node.id,'running')
+  audit(null,'node.agentless.activate.start','node',node.id,null,{runId:applyRunId,transport:'wmi'})
+  try{
   let activation
   try{activation=process.platform==='win32'?await wmiProbePowerShell(input):await wmiProbePython(input)}
   catch(error){error.message=String(error.message).replaceAll(input.password,'[redacted]');throw error}
@@ -276,7 +280,8 @@ export async function activateWinrmViaWmi(node){
       if(String(facts?.computer?.Name||'').toLowerCase()!==String(node.hostname).toLowerCase())throw new Error('WinRM host identity does not match the directory computer')
       run("UPDATE nodes SET transport='winrm',probe_status='winrm-authenticated',status='reachable',last_probe_at=?,last_seen_at=?,next_retry_at=NULL WHERE id=?",now(),now(),node.id)
       await collectFacts(managed,{suppliedFacts:facts})
-      audit(null,'node.agentless.activate','node',node.id,{transport:node.transport,probeStatus:node.probe_status},{transport:'winrm',credentialId,computerName:facts.computer.Name})
+      run('UPDATE policy_apply_runs SET status=?,diff_json=?,finished_at=? WHERE id=?','success',JSON.stringify({operation:'enable_winrm_via_wmi',transport:'winrm',computerName:facts.computer.Name}),now(),applyRunId)
+      audit(null,'node.agentless.activate','node',node.id,{transport:node.transport,probeStatus:node.probe_status},{transport:'winrm',credentialId,computerName:facts.computer.Name,runId:applyRunId})
       return {transport:'winrm',status:'reachable',probeStatus:'winrm-authenticated',facts,activation}
     }catch(error){if(attempt===11)throw error}
   }
@@ -286,6 +291,11 @@ export async function activateWinrmViaWmi(node){
     if(diagnostic?.winrmService?.State==='Running'&&String(diagnostic.commandOutput||'').includes('ListeningOn ='))detail=' The WinRM service and listener are running; check network ACLs or an effective host firewall block between the control plane and this node.'
   }catch{}
   throw new Error(`WMI started WinRM activation, but TCP 5985 remains ${lastPort?.status||'unreachable'} from the control plane.${detail}`)
+  }catch(error){
+    run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?','unknown',error.message,now(),applyRunId)
+    audit(null,'node.agentless.activate.failed','node',node.id,null,{runId:applyRunId,error:error.message})
+    throw error
+  }
 }
 export async function remote(node,operation,args={},options={}) {
   if(node.transport==='wmi')throw new Error('WMI/DCOM transport is detected but authenticated WMI operations are not implemented')
@@ -293,7 +303,7 @@ export async function remote(node,operation,args={},options={}) {
   let lastError
   for (const credential of nodeCredential(node.id,options.credentialId)) {
     const input={host,transport:node.transport||'winrm',osVersion:node.os_version||null,username:credential.username,password:credential.secret.password,operation,args}
-    const mutating=operation==='apply'||operation.startsWith('breakglass_')||operation==='jit_start'||operation==='jit_end'||operation==='prompt_browser'||operation==='rights_change'||operation==='agent_deploy'||operation==='security_session_logoff'
+    const mutating=operation==='apply'||operation.startsWith('breakglass_')||operation==='jit_start'||operation==='jit_end'||operation==='prompt_browser'||operation==='rights_change'||operation==='audit_policy_enable'||operation==='agent_deploy'||operation==='security_session_logoff'
     const attempts=mutating?1:2
     for(let attempt=0;attempt<attempts;attempt++){
       try {
@@ -363,10 +373,11 @@ export async function lookupDns(node,resolver=dns) {
   try {forward=await resolver.lookup(node.fqdn || node.hostname,{all:true})} catch {}
   // Directory computer objects contain a name, not an address. Resolve that
   // name before checking its PTR so the inventory and source-IP matching work.
-  const addresses=[...new Set(forward.filter(result=>result.family===4||result.family===6).map(result=>result.address))]
-  const resolvedIp=addresses.find(address=>address.includes('.'))||addresses[0]||null
+  const ipv4=[...new Set(forward.filter(result=>result.family===4).map(result=>result.address))]
+  const ipv6=[...new Set(forward.filter(result=>result.family===6).map(result=>result.address))]
+  const resolvedIp=ipv4.length===1?ipv4[0]:ipv4.length===0&&ipv6.length===1?ipv6[0]:null
   const ownsAddress=node.inventory_source==='ad'
-  const ip=(ownsAddress||!node.ip)&&resolvedIp&&addresses.length===1?resolvedIp:node.ip
+  const ip=(ownsAddress||!node.ip)&&resolvedIp?resolvedIp:node.ip
   if(ip!==node.ip)run('UPDATE nodes SET ip=? WHERE id=?',ip,node.id)
   if (ip) try {reverse=await resolver.reverse(ip)} catch {}
   const expected=(node.fqdn||node.hostname).toLowerCase().replace(/\.$/,'')

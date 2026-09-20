@@ -68,6 +68,8 @@ test('agent loopback baseline queues once and keeps scoped IPv4 rules',async()=>
   assert.equal((await ensureLoopbackBaseline(node)).job_id,first.jobId)
   const payload=JSON.parse(db.prepare('SELECT payload_json FROM agent_jobs WHERE id=?').get(first.jobId).payload_json)
   assert.equal(payload.group,'WinFireSecure:system-loopback')
+  assert.equal(payload.applyRunId,first.runId)
+  assert.equal(db.prepare('SELECT status FROM policy_apply_runs WHERE id=?').get(first.runId).status,'running')
   assert.equal(payload.rules.length,2)
   assert.deepEqual(new Set(loopbackRules.map(rule=>rule.remoteAddress)),new Set(['127.0.0.0/255.0.0.0']))
 })
@@ -196,6 +198,13 @@ test('agentless logon learning preview separates service and interactive observa
   const interactive=result.items.find(item=>item.classification==='interactive')
   assert.equal(interactive.failures,1)
   assert.equal(interactive.logon_type,'10')
+  assert.equal(result.proposals.length,1)
+  assert.equal(result.proposals[0].suggestedRight,'SeServiceLogonRight')
+  assert.equal(result.proposals[0].successes,2)
+  assert.equal(result.proposals[0].status,'collect-baseline')
+  db.prepare('INSERT INTO logon_rights(id,node_id,account_sid,logon_type,right_assignment,source,baseline) VALUES(?,?,?,?,?,?,1)').run(crypto.randomUUID(),node.id,sid,'Service','allow','secedit')
+  const reviewed=(await auth(request.get('/api/v1/identity/learning-preview').query({nodeId:node.id,days:30})).expect(200)).body
+  assert.equal(reviewed.proposals[0].status,'already-direct')
 })
 
 test('administrator branding is public on the MFA portal and validates image type',async()=>{
@@ -235,6 +244,14 @@ test('blocked inbound WFP traffic prompts only from an identifiable managed work
   db.prepare("INSERT INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,event_time) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").run(eventId,target.id,999,5157,'block','TCP','192.0.2.10',52000,'192.0.2.20',3389,'in',new Date().toISOString())
   assert.equal((await sweepMfaPrompts()).processed,1)
   assert.equal(db.prepare('SELECT status FROM mfa_prompt_events WHERE log_event_id=?').get(eventId).status,'skipped')
+  db.prepare('UPDATE identity_segments SET account_sid=? WHERE id=?').run('S-1-5-21-1-2-3-1001',segment.id)
+  const scopedEventId=crypto.randomUUID()
+  db.prepare("INSERT INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,event_time) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").run(scopedEventId,target.id,1000,5157,'block','TCP','192.0.2.11',52001,'192.0.2.20',3389,'in',new Date().toISOString())
+  assert.equal((await sweepMfaPrompts()).processed,1)
+  const scopedPrompt=db.prepare('SELECT status,error FROM mfa_prompt_events WHERE log_event_id=?').get(scopedEventId)
+  assert.equal(scopedPrompt.status,'skipped')
+  assert.match(scopedPrompt.error,/identity scope/)
+  db.prepare('UPDATE identity_segments SET account_sid=NULL WHERE id=?').run(segment.id)
   const promptId=crypto.randomUUID()
   db.prepare('INSERT INTO mfa_prompt_events(id,segment_id,target_node_id,log_event_id,source_ip,status,expires_at) VALUES(?,?,?,?,?,?,?)').run(promptId,segment.id,target.id,crypto.randomUUID(),'127.0.0.1','opened',new Date(Date.now()+120_000).toISOString())
   const prompt=(await auth(request.get(`/api/v1/segments/access/prompts/${promptId}`)).expect(200)).body
@@ -282,8 +299,13 @@ test('administrator approved fail open uses a short audited grant only for an un
     assert.equal(db.prepare('SELECT COUNT(*) count FROM jit_grants WHERE prompt_id=?').get(ambiguous.id).count,0)
     const dnsNodeId=crypto.randomUUID()
     db.prepare("INSERT INTO nodes(id,hostname,fqdn,transport,connection_mode,ad_guid,ad_enabled,ad_missing) VALUES(?,?,'localhost','winrm','agentless',?,1,0)").run(dnsNodeId,'new-ad-client',crypto.randomUUID())
-    const discovered=await processBlockedMfaEvent({id:crypto.randomUUID(),event_id:5157,action:'block',direction:'in',protocol:'TCP',src_ip:'127.0.0.1',src_port:51002,dst_ip:target.ip},db.prepare('SELECT * FROM identity_segments WHERE id=?').get(segmentId),target)
+    const previousBase=process.env.PUBLIC_BASE_URL
+    process.env.PUBLIC_BASE_URL='https://winfire.example.test'
+    let discovered
+    try{discovered=await processBlockedMfaEvent({id:crypto.randomUUID(),event_id:5157,action:'block',direction:'in',protocol:'TCP',src_ip:'127.0.0.1',src_port:51002,dst_ip:target.ip},db.prepare('SELECT * FROM identity_segments WHERE id=?').get(segmentId),target)}
+    finally{if(previousBase===undefined)delete process.env.PUBLIC_BASE_URL;else process.env.PUBLIC_BASE_URL=previousBase}
     assert.equal(db.prepare('SELECT source_node_id FROM mfa_prompt_events WHERE id=?').get(discovered.id).source_node_id,dnsNodeId)
+    assert.equal(db.prepare('SELECT status FROM policy_apply_runs WHERE node_id=? ORDER BY rowid DESC LIMIT 1').get(dnsNodeId).status,'failed')
     assert.equal(db.prepare('SELECT COUNT(*) count FROM jit_grants WHERE prompt_id=?').get(discovered.id).count,0)
     db.prepare('UPDATE identity_segments SET account_sid=? WHERE id=?').run('S-1-5-21-1-2-3-1001',segmentId)
     const scoped=await processBlockedMfaEvent({id:crypto.randomUUID(),event_id:5157,action:'block',direction:'in',protocol:'TCP',src_ip:'192.0.2.113',src_port:51003,dst_ip:target.ip},db.prepare('SELECT * FROM identity_segments WHERE id=?').get(segmentId),target)

@@ -60,9 +60,9 @@ test('AD users normalize with account status and group memberships',()=>{
 
 test('AD account-control writes preserve unrelated flags and require identity readback',async()=>{
   const userSid=Buffer.from(sid);userSid.writeUInt32LE(1101,24)
-  const user={id:guidFromDirectory(guid),sid:sidFromDirectory(userSid),dn:'CN=Alice,OU=Users,DC=example,DC=test'}
+  const user={id:guidFromDirectory(guid),sid:sidFromDirectory(userSid),dn:'CN=Alice,OU=Users,DC=example,DC=test',upn:'alice@example.test'}
   let flags=512,modified=0
-  const clientFactory=()=>({async bind(){},async search(){return {searchEntries:[{objectGUID:guid,objectSid:userSid,userAccountControl:String(flags)}]}},async modify(_dn,change){flags=Number(change.modification.values[0]);modified++},async unbind(){}})
+  const clientFactory=()=>({async bind(){},async search(){return {searchEntries:[{objectGUID:guid,objectSid:userSid,userPrincipalName:'alice@example.test',userAccountControl:String(flags)}]}},async modify(_dn,change){flags=Number(change.modification.values[0]);modified++},async unbind(){}})
   const config={enabled:1,url:'ldaps://dc.example.test:636/',base_dn:'DC=example,DC=test'}
   const credential={username:'writer@example.test',password:'test-secret'}
   assert.deepEqual(await writeDirectoryUserStatus(config,credential,user,false,{clientFactory}),{enabled:false,changed:true,beforeUac:512,afterUac:514})
@@ -72,6 +72,8 @@ test('AD account-control writes preserve unrelated flags and require identity re
   assert.equal(modified,2)
   const wrongClient=()=>({async bind(){},async search(){return {searchEntries:[{objectGUID:guid,objectSid:sid,userAccountControl:'512'}]}},async unbind(){}})
   await assert.rejects(writeDirectoryUserStatus(config,credential,user,false,{clientFactory:wrongClient}),error=>error.status===409)
+  const staleUpn=()=>({async bind(){},async search(){return {searchEntries:[{objectGUID:guid,objectSid:userSid,userPrincipalName:'someone-else@example.test',userAccountControl:'512'}]}},async unbind(){}})
+  await assert.rejects(writeDirectoryUserStatus(config,credential,user,false,{clientFactory:staleUpn}),error=>error.status===409)
 })
 
 test('directory settings use vault credentials and sync AD as the first inventory source',async()=>{

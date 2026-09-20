@@ -13,6 +13,7 @@ const {app}=await import('../src/app.js')
 const {bootstrap}=await import('../src/security.js')
 const {db}=await import('../src/db.js')
 const {processSecurityAutomations}=await import('../src/securityAutomations.js')
+const {createMfaChallenge,markVerifiedAdChallenge,resolveMfaChallenge}=await import('../src/mfaChallenges.js')
 await bootstrap()
 const request=supertest(app)
 test.after(()=>{db.close();fs.rmSync(dir,{recursive:true,force:true})})
@@ -37,12 +38,37 @@ test('destination automation previews events, alerts once, and enforces a per-su
   assert.equal(incidents.body[0].status,'alert')
 })
 
-test('unverified MFA usernames cannot trigger AD disable',async()=>{
+test('only AD-verified authenticator failures can trigger an AD hold',async()=>{
   const login=await request.post('/api/v1/auth/login').send({email:'owner@automation.test',password:'automation-test-password-123'}).expect(200)
   const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
   const payload={name:'Failed MFA',triggerType:'mfa_failures',failureCount:3,windowMinutes:15,cooldownMinutes:60,actionType:'disable_ad',disableMinutes:60,enabled:true}
-  const refused=await auth(request.post('/api/v1/security-automations')).send(payload).expect(400)
-  assert.match(refused.body.error,/not verified identity evidence/)
+  const policy=(await auth(request.post('/api/v1/security-automations')).send(payload).expect(201)).body
+  await auth(request.post('/api/v1/security-automations')).send({...payload,name:'Invalid logoff',actionType:'disable_ad_logoff'}).expect(400)
+  const email='mfa-user@automation.test',sid='S-1-5-21-100-200-300-701',userId='mfa-verified-user',directoryId='mfa-verified-directory'
+  db.prepare('INSERT INTO directory_users(id,sid,dn,sam_account_name,upn,enabled,missing,seen_at) VALUES(?,?,?,?,?,1,0,?)').run(directoryId,sid,'CN=MFA User,DC=automation,DC=test','mfa-user',email,new Date().toISOString())
+  db.prepare("INSERT INTO users(id,email,password_hash,role,email_verified,auth_source,ad_guid) VALUES(?,?,?,'auditor',1,'ad',?)").run(userId,email,'unused-ad-password',directoryId)
+  const user=db.prepare('SELECT * FROM users WHERE id=?').get(userId)
+  for(let index=0;index<3;index++){
+    const challenge=createMfaChallenge({userUpn:email,provider:'totp'})
+    assert.equal(markVerifiedAdChallenge(challenge,{...user,ad_guid:'wrong-directory'},email,'ad-session'),false)
+    resolveMfaChallenge(challenge,'denied',{reason:'Invalid authenticator code',failureKind:'totp'})
+  }
+  assert.equal(await processSecurityAutomations({writeStatus:async()=>{throw new Error('Unverified identity reached AD')}}),0)
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM ad_account_holds').get().n,0)
+  const credential=(await auth(request.post('/api/v1/credentials')).send({name:'MFA action test',type:'domain',username:'AUTOMATION\\action',password:'test-password-12345'}).expect(201)).body
+  db.prepare("UPDATE directory_connections SET enabled=1,action_credential_id=? WHERE id='default'").run(credential.id)
+  for(let index=0;index<3;index++){
+    const challenge=createMfaChallenge({userUpn:email,provider:'totp'})
+    assert.equal(markVerifiedAdChallenge(challenge,user,email,'ad-session'),true)
+    resolveMfaChallenge(challenge,'denied',{reason:'Invalid authenticator code',failureKind:'totp'})
+  }
+  let writes=0
+  assert.equal(await processSecurityAutomations({writeStatus:async(_settings,_credential,target,enabled)=>{writes++;assert.equal(target.id,directoryId);assert.equal(enabled,false);return {changed:true,beforeUac:512,afterUac:514}}}),1)
+  assert.equal(writes,1)
+  assert.equal(db.prepare('SELECT status FROM security_automation_incidents WHERE policy_id=?').get(policy.id).status,'disabled')
+  assert.equal(db.prepare('SELECT status FROM ad_account_holds WHERE user_guid=?').get(directoryId).status,'active')
+  db.prepare('DELETE FROM ad_account_holds WHERE user_guid=?').run(directoryId)
+  db.prepare('UPDATE directory_users SET enabled=1 WHERE id=?').run(directoryId)
   const allowed=await auth(request.post('/api/v1/security-automations')).send({...payload,actionType:'alert'}).expect(201)
   assert.equal(allowed.body.action_type,'alert')
 })
@@ -71,4 +97,31 @@ test('a firewall SID without verified outbound process evidence cannot disable A
   const incident=db.prepare('SELECT * FROM security_automation_incidents WHERE policy_id=?').get(policy.body.id)
   assert.equal(incident.status,'review')
   assert.equal(db.prepare('SELECT COUNT(*) n FROM ad_account_holds').get().n,0)
+})
+
+test('verified outbound owner can trigger the combined AD hold and client logoff with an apply run',async()=>{
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@automation.test',password:'automation-test-password-123'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
+  const credential=(await auth(request.post('/api/v1/credentials')).send({name:'Delegated action test',type:'domain',username:'EXAMPLE\\action',password:'test-password-12345'}).expect(201)).body
+  db.prepare("UPDATE directory_connections SET enabled=1,action_credential_id=? WHERE id='default'").run(credential.id)
+  const sid='S-1-5-21-100-200-300-1234',userId='verified-automation-user',stamp=new Date().toISOString()
+  db.prepare('INSERT INTO directory_users(id,sid,dn,sam_account_name,enabled,missing,seen_at) VALUES(?,?,?,?,1,0,?)').run(userId,sid,'CN=Verified,DC=example,DC=test','verified',stamp)
+  const policy=(await auth(request.post('/api/v1/security-automations')).send({name:'Verified logoff',triggerType:'destination',destination:'192.0.2.13',windowMinutes:15,cooldownMinutes:60,actionType:'disable_ad_logoff',disableMinutes:30,enabled:true}).expect(201)).body
+  const node=db.prepare("SELECT id FROM nodes WHERE hostname='target.example.test'").get()
+  db.prepare("UPDATE nodes SET transport='winrm' WHERE id=?").run(node.id)
+  const eventTime=new Date().toISOString()
+  db.prepare("INSERT INTO log_events(id,node_id,record_id,event_id,action,dst_ip,direction,process_id,received_at,event_time) VALUES(?,?,?,?,? ,?,?,?,?,?)").run('verified-logoff',node.id,990,5156,'allow','192.0.2.13','out',3141,eventTime,eventTime)
+  let logoffCalls=0
+  const triggered=await processSecurityAutomations({
+    verifyOwner:async()=>({sid,createdAt:new Date(Date.parse(eventTime)-1000).toISOString(),sessionId:7}),
+    writeStatus:async(_settings,_credential,user,enabled)=>{assert.equal(user.id,userId);assert.equal(enabled,false);return {changed:true,beforeUac:512,afterUac:514}},
+    logoff:async(_node,args)=>{logoffCalls++;assert.equal(args.accountSid,sid);assert.equal(args.sessionId,7);return {loggedOff:true,sessionId:7}}
+  })
+  assert.equal(triggered,1)
+  assert.equal(logoffCalls,1)
+  assert.equal(db.prepare('SELECT status FROM security_automation_incidents WHERE policy_id=?').get(policy.id).status,'disabled_and_logged_off')
+  assert.equal(db.prepare('SELECT status FROM ad_account_holds WHERE user_guid=?').get(userId).status,'active')
+  const run=db.prepare('SELECT status,diff_json FROM policy_apply_runs WHERE node_id=? ORDER BY rowid DESC LIMIT 1').get(node.id)
+  assert.equal(run.status,'success')
+  assert.equal(JSON.parse(run.diff_json).operation,'security_session_logoff')
 })

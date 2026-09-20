@@ -8,7 +8,7 @@ import {useRoute} from 'vue-router'
 const route=useRoute()
 
 const segments=ref([]),accessSegments=ref([]),grants=ref([]),nodes=ref([]),groups=ref([]),policies=ref([]),rights=ref([]),challenges=ref([])
-const logonObservations=ref([]),learningNodeId=ref(''),learningSearch=ref(''),learningPage=ref(1),learningTruncated=ref(false),learningBusy=ref(false)
+const logonObservations=ref([]),logonProposals=ref([]),learningNodeId=ref(''),learningSearch=ref(''),learningPage=ref(1),proposalPage=ref(1),learningTruncated=ref(false),learningBusy=ref(false)
 const challengePage=ref(1),challengeTotal=ref(0),challengePages=ref(1),challengeStatus=ref(''),challengeSegmentId=ref(''),challengeNodeId=ref(''),challengeProvider=ref(''),challengeUser=ref(''),challengeBusy=ref(false)
 const portalBrand=ref({companyName:'WinFire Secure',imageUrl:null})
 const error=ref(''),message=ref(''),formOpen=ref(false),manageOpen=ref(false),targetKind=ref('node')
@@ -17,13 +17,16 @@ const extraPortsText=ref(''),allowedEmails=ref(''),manageSegment=ref(null),manag
 const accessSegmentId=ref(''),accessNodeId=ref(''),accessCode=ref(''),accessPromptId=ref(''),accessBusy=ref(false),accessResult=ref(null)
 const rightsOpen=ref(false),rightsBusy=ref(false)
 const rightsForm=ref({nodeId:'',accountSid:'',right:'SeRemoteInteractiveLogonRight',present:true,reason:'',confirmation:''})
-const logonRightOptions=['SeNetworkLogonRight','SeDenyNetworkLogonRight','SeRemoteInteractiveLogonRight','SeDenyRemoteInteractiveLogonRight','SeBatchLogonRight','SeDenyBatchLogonRight','SeServiceLogonRight','SeDenyServiceLogonRight']
+const logonRightOptions=['SeNetworkLogonRight','SeDenyNetworkLogonRight','SeRemoteInteractiveLogonRight','SeDenyRemoteInteractiveLogonRight','SeInteractiveLogonRight','SeDenyInteractiveLogonRight','SeBatchLogonRight','SeDenyBatchLogonRight','SeServiceLogonRight','SeDenyServiceLogonRight']
 const canManage=computed(()=>['owner','admin'].includes(session.user?.role))
 const unsafeNetworkChange=computed(()=>rightsForm.value.right==='SeNetworkLogonRight'&&!rightsForm.value.present||rightsForm.value.right==='SeDenyNetworkLogonRight'&&rightsForm.value.present)
 const selectedAccess=computed(()=>accessSegments.value.find(item=>item.id===accessSegmentId.value))
 const filteredObservations=computed(()=>logonObservations.value.filter(item=>!learningSearch.value||`${item.accountName||''} ${item.account_sid} ${item.hostname} ${item.source_ip}`.toLowerCase().includes(learningSearch.value.toLowerCase())))
 const learningPages=computed(()=>Math.max(1,Math.ceil(filteredObservations.value.length/20)))
 const visibleObservations=computed(()=>filteredObservations.value.slice((learningPage.value-1)*20,learningPage.value*20))
+const filteredProposals=computed(()=>logonProposals.value.filter(item=>!learningSearch.value||`${item.accountName||''} ${item.accountSid} ${item.hostname} ${item.sourceIps.join(' ')}`.toLowerCase().includes(learningSearch.value.toLowerCase())))
+const proposalPages=computed(()=>Math.max(1,Math.ceil(filteredProposals.value.length/10)))
+const visibleProposals=computed(()=>filteredProposals.value.slice((proposalPage.value-1)*10,proposalPage.value*10))
 const parseEmails=value=>value.split(/[\s,;]+/).map(item=>item.trim().toLowerCase()).filter(Boolean)
 function parseExtraPorts(value,primary){
   const tokens=value.split(/[\s,;]+/).map(item=>item.trim()).filter(Boolean)
@@ -56,7 +59,7 @@ function searchChallenges(){challengePage.value=1;loadChallenges()}
 function moveChallengePage(next){if(next<1||next>challengePages.value||challengeBusy.value)return;challengePage.value=next;loadChallenges()}
 async function loadLogonLearning(){
   learningBusy.value=true
-  try{const query=new URLSearchParams({days:'30'});if(learningNodeId.value)query.set('nodeId',learningNodeId.value);const result=await api(`/identity/learning-preview?${query}`);logonObservations.value=result.items;learningTruncated.value=result.truncated;learningPage.value=1}
+  try{const query=new URLSearchParams({days:'30'});if(learningNodeId.value)query.set('nodeId',learningNodeId.value);const result=await api(`/identity/learning-preview?${query}`);logonObservations.value=result.items;logonProposals.value=result.proposals||[];learningTruncated.value=result.truncated;learningPage.value=1;proposalPage.value=1}
   catch(cause){error.value=cause.message}
   finally{learningBusy.value=false}
 }
@@ -94,6 +97,10 @@ async function requestAccess(){
 }
 async function revokeGrant(grant){try{await api(`/segments/access/grants/${grant.id}/revoke`,{method:'POST',body:{}});message.value='Temporary access closed';accessResult.value=null;await load()}catch(cause){error.value=cause.message}}
 async function baseline(nodeId){try{await api('/logon-rights/baseline',{method:'POST',body:{nodeId}});await load()}catch(cause){error.value=cause.message}}
+function reviewProposal(proposal){
+  rightsForm.value={nodeId:proposal.nodeId,accountSid:proposal.accountSid,right:proposal.suggestedRight,present:true,reason:'',confirmation:''}
+  rightsOpen.value=true
+}
 async function changeLogonRight(){
   rightsBusy.value=true;error.value=''
   try{
@@ -162,7 +169,12 @@ onMounted(async()=>{
     <section class="panel glass">
       <div class="panel-title"><div><span class="eyebrow">LOGON TELEMETRY</span><h2>Identity learning preview</h2></div><div class="rights-actions"><select v-model="learningNodeId" aria-label="Filter logon learning by node" @change="loadLogonLearning"><option value="">All nodes</option><option v-for="node in nodes" :key="node.id" :value="node.id">{{node.hostname}}</option></select><button class="button small secondary" :disabled="learningBusy" @click="loadLogonLearning">{{learningBusy?'Loading…':'Refresh'}}</button></div></div>
       <p class="learning-intro">Observed Windows 4624/4625 logons from the last 30 days. Service, interactive, and network labels describe the Windows logon type, not the account owner; review each account and source before creating an identity gate.</p>
-      <div class="learning-search"><input v-model.trim="learningSearch" aria-label="Search logon observations" placeholder="Search account, SID, node or source IP" @input="learningPage=1"><span v-if="learningTruncated" class="muted">Showing the 500 most recent groups. Select a node to narrow the result.</span></div>
+      <div class="learning-search"><input v-model.trim="learningSearch" aria-label="Search logon observations" placeholder="Search account, SID, node or source IP" @input="learningPage=1;proposalPage=1"><span v-if="learningTruncated" class="muted">Showing the 500 most recent groups. Select a node to narrow the result.</span></div>
+      <h3>Rights to review</h3>
+      <p class="learning-intro">Successful logons suggest a Windows right to inspect. A direct assignment may be absent because a group grants access; these suggestions do not describe effective rights. Collect the node baseline and review group policy before making a change.</p>
+      <div class="table-wrap"><table><thead><tr><th>NODE</th><th>ACCOUNT</th><th>OBSERVED LOGON</th><th>RIGHT TO REVIEW</th><th>SUCCESS</th><th>DIRECT ASSIGNMENT</th><th v-if="canManage">ACTION</th></tr></thead><tbody><tr v-for="item in visibleProposals" :key="`${item.nodeId}:${item.accountSid}:${item.suggestedRight}`"><td>{{item.hostname}}</td><td><strong>{{item.accountName||'Unresolved'}}</strong><small class="learning-sid">{{item.accountSid}}</small></td><td>{{item.classification}}<small class="learning-sid">{{item.sourceIps.join(', ')||'Source unknown'}}</small></td><td class="mono">{{item.suggestedRight}}</td><td>{{item.successes}}</td><td>{{item.status==='already-direct'?'Allow assigned':item.status==='explicit-deny'?'Explicit deny':item.status==='collect-baseline'?'Baseline needed':'No direct allow'}}</td><td v-if="canManage"><button v-if="item.status==='collect-baseline'" class="button small secondary" @click="baseline(item.nodeId)">Collect baseline</button><button v-else-if="item.status==='review'" class="button small secondary" @click="reviewProposal(item)">Review change</button><span v-else>—</span></td></tr><tr v-if="!visibleProposals.length"><td :colspan="canManage?7:6" class="empty-table">{{learningBusy?'Loading suggestions…':'No successful account logons to review.'}}</td></tr></tbody></table></div>
+      <div v-if="proposalPages>1" class="challenge-pages"><span>Suggestions page {{proposalPage}} of {{proposalPages}}</span><div><button class="button small secondary" :disabled="proposalPage<=1" @click="proposalPage--">Previous</button><button class="button small secondary" :disabled="proposalPage>=proposalPages" @click="proposalPage++">Next</button></div></div>
+      <h3>Observed logons</h3>
       <div class="table-wrap"><table><thead><tr><th>NODE</th><th>ACCOUNT</th><th>TYPE</th><th>SOURCE</th><th>SUCCESS</th><th>FAILURE</th><th>LAST SEEN</th></tr></thead><tbody><tr v-for="item in visibleObservations" :key="`${item.node_id}:${item.account_sid}:${item.logon_type}:${item.source_ip}`"><td>{{item.hostname}}</td><td><strong>{{item.accountName||'Unresolved'}}</strong><small class="learning-sid">{{item.account_sid}}</small></td><td>{{item.classification}} · {{item.logon_type||'?'}}</td><td class="mono">{{item.source_ip||'Unknown'}}</td><td>{{item.successes}}</td><td>{{item.failures}}</td><td>{{new Date(item.last_seen_at).toLocaleString()}}</td></tr><tr v-if="!visibleObservations.length"><td colspan="7" class="empty-table">{{learningBusy?'Loading observations…':'No logon observations match this view.'}}</td></tr></tbody></table></div>
       <div v-if="learningPages>1" class="challenge-pages"><span>Page {{learningPage}} of {{learningPages}}</span><div><button class="button small secondary" :disabled="learningPage<=1" @click="learningPage--">Previous</button><button class="button small secondary" :disabled="learningPage>=learningPages" @click="learningPage++">Next</button></div></div>
     </section>

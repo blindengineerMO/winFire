@@ -29,6 +29,12 @@ test('directory DNS lookup fills a unique address and preserves manual addresses
   assert.equal(db.prepare('SELECT ip FROM nodes WHERE id=?').get('ad-dns-node').ip,'192.0.2.20')
   await lookupDns(db.prepare('SELECT * FROM nodes WHERE id=?').get('manual-dns-node'),resolver)
   assert.equal(db.prepare('SELECT ip FROM nodes WHERE id=?').get('manual-dns-node').ip,'192.0.2.10')
+  db.prepare('UPDATE nodes SET ip=NULL WHERE id=?').run('ad-dns-node')
+  const dualStack={lookup:async()=>[{address:'2001:db8::20',family:6},{address:'192.0.2.20',family:4}],reverse:resolver.reverse}
+  assert.equal((await lookupDns(db.prepare('SELECT * FROM nodes WHERE id=?').get('ad-dns-node'),dualStack)).ip,'192.0.2.20')
+  db.prepare('UPDATE nodes SET ip=NULL WHERE id=?').run('ad-dns-node')
+  const ambiguous={lookup:async()=>[{address:'192.0.2.20',family:4},{address:'192.0.2.21',family:4}],reverse:resolver.reverse}
+  assert.equal((await lookupDns(db.prepare('SELECT * FROM nodes WHERE id=?').get('ad-dns-node'),ambiguous)).ip,null)
 })
 
 test('log filters, retention and scheduled DNS refresh use saved settings',async()=>{

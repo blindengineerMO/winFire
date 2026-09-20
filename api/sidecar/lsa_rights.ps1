@@ -128,7 +128,7 @@ function Test-WinFireLogonRight([string[]]$lines,[string]$accountSid,[string]$ri
 function Set-WinFireLogonRight($argsData) {
   $sid=[string]$argsData.accountSid; $right=[string]$argsData.right; $present=[bool]$argsData.present
   if($sid -notmatch '^S-1-\d+-\d+(?:-\d+)+$'){throw 'A valid account SID is required'}
-  $allowed=@('SeNetworkLogonRight','SeDenyNetworkLogonRight','SeRemoteInteractiveLogonRight','SeDenyRemoteInteractiveLogonRight','SeBatchLogonRight','SeDenyBatchLogonRight','SeServiceLogonRight','SeDenyServiceLogonRight')
+  $allowed=@('SeNetworkLogonRight','SeDenyNetworkLogonRight','SeRemoteInteractiveLogonRight','SeDenyRemoteInteractiveLogonRight','SeInteractiveLogonRight','SeDenyInteractiveLogonRight','SeBatchLogonRight','SeDenyBatchLogonRight','SeServiceLogonRight','SeDenyServiceLogonRight')
   if([Array]::IndexOf($allowed,$right) -lt 0){throw 'Unsupported logon right'}
   $before=Test-WinFireLogonRight (Get-WinFireLogonRights) $sid $right
   if($before -eq $present){return (New-Object PSObject -Property @{accountSid=$sid;right=$right;before=$before;present=$before;changed=$false})}

@@ -39,7 +39,7 @@ using System;
 using System.Collections.Generic;
 public static class WinFireLsaRights {
   private static readonly HashSet<string> Rights = new HashSet<string>();
-  public static string[] Read() { return Rights.Contains("S-1-5-21-1-2-3-999:SeBatchLogonRight") ? new[]{"SeBatchLogonRight = *S-1-5-21-1-2-3-999"} : new string[0]; }
+  public static string[] Read() { var rows=new List<string>(); foreach(var right in new[]{"SeBatchLogonRight","SeInteractiveLogonRight"}) if(Rights.Contains("S-1-5-21-1-2-3-999:"+right)) rows.Add(right+" = *S-1-5-21-1-2-3-999"); return rows.ToArray(); }
   public static void Change(string sid,string right,bool present) { if(present) Rights.Add(sid+":"+right); else Rights.Remove(sid+":"+right); }
 }
 '@
@@ -47,12 +47,14 @@ public static class WinFireLsaRights {
 $add=Set-WinFireLogonRight @{accountSid='S-1-5-21-1-2-3-999';right='SeBatchLogonRight';present=$true}
 $same=Set-WinFireLogonRight @{accountSid='S-1-5-21-1-2-3-999';right='SeBatchLogonRight';present=$true}
 $remove=Set-WinFireLogonRight @{accountSid='S-1-5-21-1-2-3-999';right='SeBatchLogonRight';present=$false}
-@($add,$same,$remove) | ConvertTo-Json -Compress
+$interactive=Set-WinFireLogonRight @{accountSid='S-1-5-21-1-2-3-999';right='SeInteractiveLogonRight';present=$true}
+@($add,$same,$remove,$interactive) | ConvertTo-Json -Compress
 `
   const result=spawnSync('pwsh',['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(script,'utf16le').toString('base64')],{encoding:'utf8'})
   assert.equal(result.status,0,result.stderr)
-  const [add,same,remove]=JSON.parse(result.stdout.trim())
+  const [add,same,remove,interactive]=JSON.parse(result.stdout.trim())
   assert.deepEqual([add.changed,add.present,same.changed,same.present,remove.changed,remove.present],[true,true,false,true,true,false])
+  assert.equal(interactive.present,true)
 })
 
 test('administrator LSA change is confirmed and recorded as an apply run',async()=>{
@@ -65,6 +67,8 @@ test('administrator LSA change is confirmed and recorded as an apply run',async(
   await post({...valid,right:'SeDenyNetworkLogonRight',present:true}).expect(409)
   const changed=await post(valid).expect(200)
   assert.equal(changed.body.present,true)
+  const interactive=await post({...valid,right:'SeInteractiveLogonRight'}).expect(200)
+  assert.equal(interactive.body.right,'SeInteractiveLogonRight')
   assert.equal(one('SELECT status FROM policy_apply_runs WHERE id=?',changed.body.runId).status,'success')
   assert.equal(one('SELECT action FROM audit_log WHERE action=? AND entity_id=?','logon-rights.change',nodeId).action,'logon-rights.change')
   process.env.WINFIRE_TEST_RIGHTS_WRONG='1'

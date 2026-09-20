@@ -26,15 +26,15 @@ import {observabilitySettings} from './maintenance.js'
 import {resourceRecord,canReadResource,canWriteResource} from './access.js'
 import {emitNotification,notificationSummary,preferenceKeys} from './notifications.js'
 import {buildOpenApi} from './openapi.js'
-import {parseSeceditRights} from './logonRights.js'
+import {parseSeceditRights,suggestedRightForLogonType,denyRightForAllow} from './logonRights.js'
 import {normalizeProfileSnapshot,publicBreakGlass} from './breakGlass.js'
-import {normalizeSourceIp,sourceMatches} from './mfaPortal.js'
+import {normalizeSourceIp,sourceMatches,revokePortalGrant} from './mfaPortal.js'
 import {entraConfigured,startEntraAuthentication,completeEntraAuthentication} from './entraPortal.js'
 import {publicEntraSettings,saveEntraSettings} from './entraSettings.js'
 import {portalBranding,setPortalCompanyName,savePortalImage,readPortalImage,removePortalImage} from './portalBranding.js'
 import {assertManagementAccess} from './managementGuard.js'
 import {mfaPromptSettings} from './mfaPromptSettings.js'
-import {createMfaChallenge,resolveMfaChallenge} from './mfaChallenges.js'
+import {createMfaChallenge,markVerifiedAdChallenge,resolveMfaChallenge} from './mfaChallenges.js'
 import {beginAdAuthenticatorEnrollment,confirmAdAuthenticatorEnrollment} from './adAuthenticatorEnrollment.js'
 import {validateExportDestination,exportSelectedEvents} from './eventExport.js'
 import {previewSecurityAutomation} from './securityAutomations.js'
@@ -340,21 +340,23 @@ api.post('/mfa/prompts/:id/totp',publicMfaLimit,wrap(async(req,res)=>{
   const {email,password,code}=body(z.object({email:z.email(),password:z.string().min(1).max(512),code:z.string().regex(/^\d{6}$/)}),req)
   const challengeId=createMfaChallenge({nodeId:prompt.target_node_id,userUpn:email.toLowerCase(),segmentId:segment.id,connection:{srcIp:prompt.source_ip,dstPort:segment.port,protocol:'TCP'},provider:'totp',promptId:prompt.id})
   let user=null
+  let totpFailure=false
   try{
     user=portalIdentity(email,segment)
     if(!user.totp_secret)throw Object.assign(new Error('Enroll an authenticator at /enroll-authenticator before using this request'),{status:403})
     await authenticateDirectoryUser(directorySettings(),email,password)
+    markVerifiedAdChallenge(challengeId,user,email,'ldaps-bind')
     const counter=matchingTotpCounter(openSealed(user.totp_secret).secret,code)
-    if(counter===null)throw Object.assign(new Error('Invalid directory credentials or authenticator code'),{status:401})
+    if(counter===null){totpFailure=true;throw Object.assign(new Error('Invalid directory credentials or authenticator code'),{status:401})}
     const consumed=run('INSERT INTO mfa_totp_replay(user_id,last_counter) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET last_counter=excluded.last_counter WHERE excluded.last_counter>mfa_totp_replay.last_counter',user.id,counter)
-    if(consumed.changes!==1)throw Object.assign(new Error('Authenticator code was already used; wait for a new code'),{status:401})
+    if(consumed.changes!==1){totpFailure=true;throw Object.assign(new Error('Authenticator code was already used; wait for a new code'),{status:401})}
     run('UPDATE users SET failed_attempts=0,locked_until=NULL WHERE id=?',user.id)
     req.user=user
     const {node,sourceIp}=portalTarget(req,segment,prompt.target_node_id)
     res.status(201).json(await grantPortalAccess(req,segment,node,sourceIp,'totp',prompt.id,challengeId))
   }catch(error){
     if(user&&error.status===401){const attempts=user.failed_attempts+1;run('UPDATE users SET failed_attempts=?,locked_until=? WHERE id=?',attempts,attempts>=5?new Date(Date.now()+15*60_000).toISOString():null,user.id)}
-    resolveMfaChallenge(challengeId,'denied',{actorId:user?.id||null,reason:error.status===401?'Invalid directory credentials or authenticator code':error.message})
+    resolveMfaChallenge(challengeId,'denied',{actorId:user?.id||null,reason:error.status===401?'Invalid directory credentials or authenticator code':error.message,failureKind:totpFailure?'totp':null})
     throw error
   }
 }))
@@ -402,7 +404,7 @@ api.use(auth)
 const securityAutomationSchema=z.object({name:z.string().trim().min(3).max(120),triggerType:z.enum(['destination','mfa_failures']),destination:z.string().trim().max(255).default(''),failureCount:z.number().int().min(2).max(100).default(3),windowMinutes:z.number().int().min(1).max(1440).default(15),cooldownMinutes:z.number().int().min(1).max(10080).default(60),actionType:z.enum(['alert','disable_ad','disable_ad_logoff']).default('alert'),disableMinutes:z.number().int().min(5).max(10080).default(60),enabled:z.boolean().default(false)})
 function validAutomation(data){
   if(data.triggerType==='destination'&&!data.destination)return 'A destination IP address or hostname is required'
-  if(data.triggerType==='mfa_failures'&&data.actionType!=='alert')return 'Failed MFA challenges cannot disable AD accounts because the submitted username is not verified identity evidence'
+  if(data.triggerType==='mfa_failures'&&data.actionType==='disable_ad_logoff')return 'Failed MFA challenges do not identify a verified client session for logoff'
   return null
 }
 api.get('/security-automations',requireRole('admin'),(_req,res)=>res.json(all('SELECT * FROM security_automations ORDER BY created_at DESC')))
@@ -1088,16 +1090,26 @@ api.post('/nodes/:id/deploy-agent',requireRole('admin'),wrap(async(req,res)=>{
   for await(const chunk of fs.createReadStream(packagePath))digest.update(chunk)
   const token=crypto.randomBytes(32).toString('base64url'),tokenId=id(),expiresAt=new Date(Date.now()+15*60_000).toISOString()
   run('INSERT INTO enrollment_tokens(id,node_id,token_hash,expires_at) VALUES(?,?,?,?)',tokenId,node.id,hashToken(token),expiresAt)
-  audit(req.user.id,'agent.remote-deploy.start','node',node.id,null,{packageSha256:digest.copy().digest('hex'),expiresAt})
+  const applyRunId=id(),packageSha256=digest.copy().digest('hex')
+  run('INSERT INTO policy_apply_runs(id,node_id,status) VALUES(?,?,?)',applyRunId,node.id,'running')
+  audit(req.user.id,'agent.remote-deploy.start','node',node.id,null,{runId:applyRunId,packageSha256,expiresAt})
   try{
     const result=await remote(node,'agent_deploy',{serverUrl:base.replace(/\/$/,''),packageUrl:new URL('/api/v1/agent-package/WinFire.Agent.exe',base).toString(),sha256:digest.digest('hex'),token})
     const agent=one('SELECT id FROM agents WHERE node_id=?',node.id)
     if(!result?.installed||!agent)throw new Error('The agent service or certificate enrollment was not confirmed')
-    audit(req.user.id,'agent.remote-deploy.success','node',node.id,null,{agentId:agent.id,serviceStatus:result.status})
-    res.json({installed:true,serviceStatus:result.status,agentId:agent.id})
+    db.transaction(()=>{
+      run('UPDATE policy_apply_runs SET status=?,diff_json=?,finished_at=? WHERE id=?','success',json({operation:'agent_deploy',agentId:agent.id,serviceStatus:result.status,packageSha256}),now(),applyRunId)
+      audit(req.user.id,'agent.remote-deploy.success','node',node.id,null,{runId:applyRunId,agentId:agent.id,serviceStatus:result.status})
+    })()
+    res.json({installed:true,serviceStatus:result.status,agentId:agent.id,runId:applyRunId})
   }catch(error){
     run('DELETE FROM enrollment_tokens WHERE id=? AND used_at IS NULL',tokenId)
-    audit(req.user.id,'agent.remote-deploy.failed','node',node.id,null,{error:error.message,agentEnrolled:!!one('SELECT id FROM agents WHERE node_id=?',node.id)})
+    const agentEnrolled=!!one('SELECT id FROM agents WHERE node_id=?',node.id)
+    const status=agentEnrolled||/timed?\s*out|timeout|connection|unreachable|ECONNRESET/i.test(error.message)?'unknown':'failed'
+    db.transaction(()=>{
+      run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?',status,error.message,now(),applyRunId)
+      audit(req.user.id,'agent.remote-deploy.failed','node',node.id,null,{runId:applyRunId,status,error:error.message,agentEnrolled})
+    })()
     throw Object.assign(new Error(error.message),{status:502})
   }
 }))
@@ -1112,22 +1124,37 @@ function queueBreakGlassJob(node,type,payload){
 async function endBreakGlass(session,actorId=null,finalStatus='ended'){
   const node=getNode(session.node_id)
   if(!node)throw Object.assign(new Error('Node is missing'),{status:404})
+  if(node.connection_mode==='agent'&&session.status==='ending')return {queued:true,session:publicBreakGlass(session)}
+  const applyRunId=id()
+  run('INSERT INTO policy_apply_runs(id,node_id,status) VALUES(?,?,?)',applyRunId,node.id,'running')
+  audit(actorId,'break-glass.end.start','node',node.id,null,{sessionId:session.id,runId:applyRunId,finalStatus})
   if(node.connection_mode==='agent'){
-    if(session.status==='ending')return {queued:true,session:publicBreakGlass(session)}
-    const jobId=queueBreakGlassJob(node,'breakglass.end',{action:'end',breakGlassSessionId:session.id,sessionId:session.id,profiles:parse(session.profile_snapshot_json)||[],finalStatus})
-    run("UPDATE break_glass_sessions SET status='ending',agent_job_id=?,last_error=NULL WHERE id=?",jobId,session.id)
-    audit(actorId,'break-glass.end.queued','node',node.id,null,{sessionId:session.id,jobId,finalStatus})
-    return {queued:true,session:publicBreakGlass(one('SELECT * FROM break_glass_sessions WHERE id=?',session.id))}
+    try{
+      const jobId=queueBreakGlassJob(node,'breakglass.end',{action:'end',breakGlassSessionId:session.id,sessionId:session.id,profiles:parse(session.profile_snapshot_json)||[],finalStatus,applyRunId})
+      run("UPDATE break_glass_sessions SET status='ending',agent_job_id=?,last_error=NULL WHERE id=?",jobId,session.id)
+      audit(actorId,'break-glass.end.queued','node',node.id,null,{sessionId:session.id,jobId,runId:applyRunId,finalStatus})
+      return {queued:true,runId:applyRunId,session:publicBreakGlass(one('SELECT * FROM break_glass_sessions WHERE id=?',session.id))}
+    }catch(error){
+      run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?','failed',error.message,now(),applyRunId)
+      audit(actorId,'break-glass.end.failed','node',node.id,null,{sessionId:session.id,runId:applyRunId,error:error.message})
+      throw error
+    }
   }
   try{
     const result=await remote(node,'breakglass_end',{sessionId:session.id,profiles:parse(session.profile_snapshot_json)||[]})
     if(result?.restored!==true)throw new Error('Firewall profile restore was not confirmed')
-    run('UPDATE break_glass_sessions SET status=?,ended_at=?,last_error=NULL WHERE id=?',finalStatus,now(),session.id)
-    audit(actorId,finalStatus==='expired'?'break-glass.expired':'break-glass.end','node',node.id,null,{sessionId:session.id,profiles:result.profiles})
-    return {queued:false,session:publicBreakGlass(one('SELECT * FROM break_glass_sessions WHERE id=?',session.id))}
+    db.transaction(()=>{
+      run('UPDATE break_glass_sessions SET status=?,ended_at=?,last_error=NULL WHERE id=?',finalStatus,now(),session.id)
+      run('UPDATE policy_apply_runs SET status=?,diff_json=?,finished_at=? WHERE id=?','success',json({operation:'breakglass_end',sessionId:session.id,profiles:result.profiles}),now(),applyRunId)
+      audit(actorId,finalStatus==='expired'?'break-glass.expired':'break-glass.end','node',node.id,null,{sessionId:session.id,runId:applyRunId,profiles:result.profiles})
+    })()
+    return {queued:false,runId:applyRunId,session:publicBreakGlass(one('SELECT * FROM break_glass_sessions WHERE id=?',session.id))}
   }catch(error){
-    run('UPDATE break_glass_sessions SET last_error=? WHERE id=?',error.message,session.id)
-    audit(actorId,'break-glass.end.failed','node',node.id,null,{sessionId:session.id,error:error.message})
+    db.transaction(()=>{
+      run('UPDATE break_glass_sessions SET last_error=? WHERE id=?',error.message,session.id)
+      run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?','unknown',error.message,now(),applyRunId)
+      audit(actorId,'break-glass.end.failed','node',node.id,null,{sessionId:session.id,runId:applyRunId,error:error.message})
+    })()
     throw Object.assign(new Error(`Firewall restoration was not confirmed: ${error.message}`),{status:502})
   }
 }
@@ -1143,22 +1170,28 @@ api.post('/nodes/:id/break-glass',requireRole('admin'),wrap(async(req,res)=>{
   if(one("SELECT id FROM break_glass_sessions WHERE node_id=? AND status IN ('activating','activation-unknown','active','ending')",node.id))return res.status(409).json({error:'Break glass is already active or pending for this node'})
   const sessionId=id(),startedAt=now(),expiresAt=new Date(Date.now()+data.durationMinutes*60_000).toISOString()
   run("INSERT INTO break_glass_sessions(id,node_id,actor_user_id,reason,started_at,expires_at,status) VALUES(?,?,?,?,?,?,'activating')",sessionId,node.id,req.user.id,data.reason,startedAt,expiresAt)
-  audit(req.user.id,'break-glass.request','node',node.id,null,{sessionId,reason:data.reason,durationMinutes:data.durationMinutes,expiresAt})
+  const applyRunId=id()
+  run('INSERT INTO policy_apply_runs(id,node_id,status) VALUES(?,?,?)',applyRunId,node.id,'running')
+  audit(req.user.id,'break-glass.request','node',node.id,null,{sessionId,runId:applyRunId,reason:data.reason,durationMinutes:data.durationMinutes,expiresAt})
   try{
     if(node.connection_mode==='agent'){
-      const jobId=queueBreakGlassJob(node,'breakglass.start',{action:'start',breakGlassSessionId:sessionId,sessionId,expiresAt})
+      const jobId=queueBreakGlassJob(node,'breakglass.start',{action:'start',breakGlassSessionId:sessionId,sessionId,expiresAt,applyRunId})
       run('UPDATE break_glass_sessions SET agent_job_id=? WHERE id=?',jobId,sessionId)
-      return res.status(202).json({queued:true,session:publicBreakGlass(one('SELECT * FROM break_glass_sessions WHERE id=?',sessionId))})
+      return res.status(202).json({queued:true,runId:applyRunId,session:publicBreakGlass(one('SELECT * FROM break_glass_sessions WHERE id=?',sessionId))})
     }
     const result=await remote(node,'breakglass_start',{sessionId,expiresAt})
     const profiles=normalizeProfileSnapshot(result?.profiles)
     if(result?.active!==true||!profiles)throw new Error('Firewall disable readback or profile snapshot was invalid')
-    run("UPDATE break_glass_sessions SET status='active',profile_snapshot_json=? WHERE id=?",json(profiles),sessionId)
-    audit(req.user.id,'break-glass.active','node',node.id,null,{sessionId,expiresAt,profiles})
-    res.status(201).json({queued:false,session:publicBreakGlass(one('SELECT * FROM break_glass_sessions WHERE id=?',sessionId))})
+    db.transaction(()=>{
+      run("UPDATE break_glass_sessions SET status='active',profile_snapshot_json=? WHERE id=?",json(profiles),sessionId)
+      run('UPDATE policy_apply_runs SET status=?,diff_json=?,finished_at=? WHERE id=?','success',json({operation:'breakglass_start',sessionId,expiresAt,profiles}),now(),applyRunId)
+      audit(req.user.id,'break-glass.active','node',node.id,null,{sessionId,runId:applyRunId,expiresAt,profiles})
+    })()
+    res.status(201).json({queued:false,runId:applyRunId,session:publicBreakGlass(one('SELECT * FROM break_glass_sessions WHERE id=?',sessionId))})
   }catch(error){
     run('UPDATE break_glass_sessions SET status=?,last_error=? WHERE id=?',node.connection_mode==='agent'?'failed':'activation-unknown',error.message,sessionId)
-    audit(req.user.id,'break-glass.start.failed','node',node.id,null,{sessionId,error:error.message})
+    run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?',node.connection_mode==='agent'?'failed':'unknown',error.message,now(),applyRunId)
+    audit(req.user.id,'break-glass.start.failed','node',node.id,null,{sessionId,runId:applyRunId,error:error.message})
     res.status(error.status||502).json({error:error.message})
   }
 }))
@@ -1172,6 +1205,8 @@ api.post('/nodes/:id/break-glass/end',requireRole('admin'),wrap(async(req,res)=>
     const job=one('SELECT status FROM agent_jobs WHERE id=?',session.agent_job_id)
     if(job?.status==='queued'){
       run("UPDATE agent_jobs SET status='failed',error='Cancelled before activation',finished_at=? WHERE id=?",now(),session.agent_job_id)
+      const applyRunId=parse(one('SELECT payload_json FROM agent_jobs WHERE id=?',session.agent_job_id)?.payload_json)?.applyRunId
+      if(applyRunId)run("UPDATE policy_apply_runs SET status='failed',error='Cancelled before activation',finished_at=? WHERE id=?",now(),applyRunId)
       run("UPDATE break_glass_sessions SET status='ended',ended_at=? WHERE id=?",now(),session.id)
       audit(req.user.id,'break-glass.cancel','node',node.id,null,{sessionId:session.id})
       return res.json({queued:false,session:publicBreakGlass(one('SELECT * FROM break_glass_sessions WHERE id=?',session.id))})
@@ -1189,9 +1224,10 @@ api.post('/nodes/:id/audit-policy/enable',requireRole('admin'),wrap(async(req,re
   body(z.object({confirmation:z.literal('ENABLE WFP AUDITING')}),req)
   const runId=id()
   run('INSERT INTO policy_apply_runs(id,node_id,status) VALUES(?,?,?)',runId,node.id,'running')
-  let before=null
+  let before=null,attempted=false
   try {
     before=await remote(node,'audit_policy')
+    attempted=true
     const after=await remote(node,'audit_policy_enable')
     if(after?.successEnabled!==true||after?.failureEnabled!==true)throw Object.assign(new Error('Audit policy readback did not confirm success and failure auditing'),{status:502})
     db.transaction(()=>{
@@ -1201,7 +1237,7 @@ api.post('/nodes/:id/audit-policy/enable',requireRole('admin'),wrap(async(req,re
     res.json(after)
   } catch(error){
     db.transaction(()=>{
-      run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?','failed',error.message,now(),runId)
+      run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?',attempted?'unknown':'failed',error.message,now(),runId)
       audit(req.user.id,'node.audit-policy.enable.failed','node',node.id,before,{runId,error:error.message})
     })()
     throw error
@@ -1635,7 +1671,27 @@ api.get('/identity/learning-preview',(req,res)=>{
     ...row,...accountName(row.node_id,row.account_sid),
     classification:['4','5'].includes(row.logon_type)?'service':['2','7','10','11'].includes(row.logon_type)?'interactive':row.logon_type==='3'?'network':'review'
   }))
-  res.json({items,days:query.days,truncated:observations.length>500})
+  const baseline=all('SELECT node_id,account_sid,logon_type,right_assignment FROM logon_rights WHERE baseline=1')
+  const assignments=new Set(baseline.map(right=>`${right.node_id}:${right.account_sid}:${right.right_assignment==='deny'?'SeDeny':'Se'}${right.logon_type}LogonRight`))
+  const nodesWithBaseline=new Set(baseline.map(right=>right.node_id))
+  const grouped=new Map()
+  for(const item of items){
+    const suggestedRight=suggestedRightForLogonType(item.logon_type)
+    if(!suggestedRight||!Number(item.successes)||!/^S-1-5-21-(?:\d+-){3}\d+$/.test(item.account_sid))continue
+    const key=`${item.node_id}:${item.account_sid}:${suggestedRight}`
+    const proposal=grouped.get(key)||{nodeId:item.node_id,hostname:item.hostname,accountSid:item.account_sid,accountName:item.accountName,accountSource:item.accountSource,classification:item.classification,suggestedRight,successes:0,failures:0,lastSeenAt:item.last_seen_at,sourceIps:[]}
+    proposal.successes+=Number(item.successes)
+    proposal.failures+=Number(item.failures)
+    if(item.last_seen_at>proposal.lastSeenAt)proposal.lastSeenAt=item.last_seen_at
+    if(item.source_ip&&!proposal.sourceIps.includes(item.source_ip)&&proposal.sourceIps.length<5)proposal.sourceIps.push(item.source_ip)
+    grouped.set(key,proposal)
+  }
+  const proposals=[...grouped.values()].map(proposal=>{
+    const directAllow=assignments.has(`${proposal.nodeId}:${proposal.accountSid}:${proposal.suggestedRight}`)
+    const directDeny=assignments.has(`${proposal.nodeId}:${proposal.accountSid}:${denyRightForAllow(proposal.suggestedRight)}`)
+    return {...proposal,directAllow,directDeny,baselineCollected:nodesWithBaseline.has(proposal.nodeId),status:directDeny?'explicit-deny':directAllow?'already-direct':nodesWithBaseline.has(proposal.nodeId)?'review':'collect-baseline'}
+  }).sort((a,b)=>b.lastSeenAt.localeCompare(a.lastSeenAt))
+  res.json({items,proposals,days:query.days,truncated:observations.length>500})
 })
 
 api.get('/segments',(_req,res)=>res.json(all('SELECT * FROM identity_segments ORDER BY created_at DESC')))
@@ -1776,11 +1832,7 @@ api.post('/segments/access/grants/:grantId/revoke',wrap(async(req,res)=>{
   if(!grant)return notFound(res,'Access grant')
   if(!['owner','admin'].includes(req.user.role)&&grant.user_upn!==req.user.email)return res.status(403).json({error:'This grant belongs to another user'})
   if(grant.revoked_at)return res.json({revoked:true})
-  const node=getNode(grant.node_id)
-  if(node)await remote(node,'jit_end',{grantId:grant.id})
-  run('UPDATE jit_grants SET revoked_at=? WHERE id=?',now(),grant.id)
-  audit(req.user.id,'mfa.portal.revoked','jit-grant',grant.id,null,{nodeId:grant.node_id})
-  res.json({revoked:true})
+  res.json(await revokePortalGrant(grant,req.user.id))
 }))
 api.post('/segments/:id/access',portalAccessLimit,wrap(async(req,res)=>{
   const segment=one('SELECT * FROM identity_segments WHERE id=?',reqId(req))
@@ -1790,10 +1842,11 @@ api.post('/segments/:id/access',portalAccessLimit,wrap(async(req,res)=>{
   if(segment.mfa_provider!=='totp')return res.status(409).json({error:'Use the Entra sign-in action for this segment'})
   if(!req.user.totp_secret)return res.status(409).json({error:'Set up Google Authenticator or another TOTP app in Administration → Security first'})
   const challengeId=createMfaChallenge({nodeId:node.id,userUpn:req.user.email,segmentId:segment.id,connection:{srcIp:sourceIp,dstPort:segment.port,protocol:'TCP'},provider:'totp',promptId:data.promptId||null,actorId:req.user.id})
+  markVerifiedAdChallenge(challengeId,req.user,req.user.email,'ad-session')
   const counter=matchingTotpCounter(openSealed(req.user.totp_secret).secret,data.code)
-  if(counter===null){resolveMfaChallenge(challengeId,'denied',{actorId:req.user.id,reason:'Invalid authenticator code'});return res.status(401).json({error:'Invalid authenticator code'})}
+  if(counter===null){resolveMfaChallenge(challengeId,'denied',{actorId:req.user.id,reason:'Invalid authenticator code',failureKind:'totp'});return res.status(401).json({error:'Invalid authenticator code'})}
   const consumed=run('INSERT INTO mfa_totp_replay(user_id,last_counter) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET last_counter=excluded.last_counter WHERE excluded.last_counter>mfa_totp_replay.last_counter',req.user.id,counter)
-  if(consumed.changes!==1){resolveMfaChallenge(challengeId,'denied',{actorId:req.user.id,reason:'Authenticator code replayed'});return res.status(401).json({error:'Authenticator code was already used; wait for a new code'})}
+  if(consumed.changes!==1){resolveMfaChallenge(challengeId,'denied',{actorId:req.user.id,reason:'Authenticator code replayed',failureKind:'totp'});return res.status(401).json({error:'Authenticator code was already used; wait for a new code'})}
   res.status(201).json(await grantPortalAccess(req,segment,node,sourceIp,'totp',data.promptId,challengeId))
 }))
 api.post('/segments/:id/entra/start',portalAccessLimit,wrap(async(req,res)=>{
@@ -1889,7 +1942,7 @@ api.post('/logon-rights/baseline',requireRole('admin'),wrap(async(req,res)=>{
 }))
 
 api.post('/logon-rights/change',requireRole('admin'),wrap(async(req,res)=>{
-  const data=body(z.object({nodeId:z.string().uuid(),accountSid:z.string().regex(/^S-1-\d+-\d+(?:-\d+)+$/),right:z.enum(['SeNetworkLogonRight','SeDenyNetworkLogonRight','SeRemoteInteractiveLogonRight','SeDenyRemoteInteractiveLogonRight','SeBatchLogonRight','SeDenyBatchLogonRight','SeServiceLogonRight','SeDenyServiceLogonRight']),present:z.boolean(),reason:z.string().trim().min(10).max(500),confirmation:z.literal('CHANGE LOGON RIGHT')}),req)
+  const data=body(z.object({nodeId:z.string().uuid(),accountSid:z.string().regex(/^S-1-\d+-\d+(?:-\d+)+$/),right:z.enum(['SeNetworkLogonRight','SeDenyNetworkLogonRight','SeRemoteInteractiveLogonRight','SeDenyRemoteInteractiveLogonRight','SeInteractiveLogonRight','SeDenyInteractiveLogonRight','SeBatchLogonRight','SeDenyBatchLogonRight','SeServiceLogonRight','SeDenyServiceLogonRight']),present:z.boolean(),reason:z.string().trim().min(10).max(500),confirmation:z.literal('CHANGE LOGON RIGHT')}),req)
   const node=getNode(data.nodeId);if(!node)return notFound(res,'Node')
   if(!['winrm','winrms'].includes(node.transport)||node.connection_mode!=='agentless')return res.status(409).json({error:'Logon rights changes require an agentless WinRM node'})
   if(data.right==='SeNetworkLogonRight'&&!data.present||data.right==='SeDenyNetworkLogonRight'&&data.present)return res.status(409).json({error:'This network logon change could block WinRM administration; use a separately validated enforcement workflow'})
@@ -2060,7 +2113,7 @@ export async function pullLogs(nodeId,actorId=null,maxPages=5,quiet=false) {
     const next=Number(events.at(-1).RecordId)
     if(next<=cursor)break
     cursor=next
-    run('INSERT INTO node_log_cursors(node_id,last_record_id,updated_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET last_record_id=excluded.last_record_id,updated_at=excluded.updated_at',nodeId,cursor,now())
+    run('INSERT INTO node_log_cursors(node_id,last_record_id,updated_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET last_record_id=MAX(node_log_cursors.last_record_id,excluded.last_record_id),updated_at=excluded.updated_at',nodeId,cursor,now())
     if(events.length<500){caughtUp=true;pages++;break}
   }
   if(inserted)await refreshUnknownEventAccounts(node)
@@ -2085,9 +2138,18 @@ export async function onboardPendingNodes(limit=5,{resolveDns=lookupDns,enrich=e
       if(managed.ad_guid&&!managed.ad_missing){
         let policy=await invoke(managed,'audit_policy')
         if(!policy?.successEnabled||!policy?.failureEnabled){
-          policy=await invoke(managed,'audit_policy_enable')
-          if(!policy?.successEnabled||!policy?.failureEnabled)throw new Error('Filtering Platform Connection audit policy could not be confirmed')
-          audit(null,'node.audit-policy.auto-enable','node',node.id,null,policy)
+          const before=policy,applyRunId=id()
+          run('INSERT INTO policy_apply_runs(id,node_id,status) VALUES(?,?,?)',applyRunId,node.id,'running')
+          try{
+            policy=await invoke(managed,'audit_policy_enable')
+            if(!policy?.successEnabled||!policy?.failureEnabled)throw new Error('Filtering Platform Connection audit policy could not be confirmed')
+            run('UPDATE policy_apply_runs SET status=?,diff_json=?,finished_at=? WHERE id=?','success',json({operation:'audit_policy_auto_enable',before,after:policy}),now(),applyRunId)
+            audit(null,'node.audit-policy.auto-enable','node',node.id,before,{...policy,runId:applyRunId})
+          }catch(error){
+            run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?','unknown',error.message,now(),applyRunId)
+            audit(null,'node.audit-policy.auto-enable.failed','node',node.id,before,{runId:applyRunId,error:error.message})
+            throw error
+          }
         }
         const recent=await pullRecent(node.id,null,true)
         const history=await pullHistory(node.id,null,2,true)

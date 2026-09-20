@@ -119,10 +119,15 @@ agentRoutes.post('/:id/jobs/:jobId/result',requireAgent,(req,res)=>{
   const job=one('SELECT * FROM agent_jobs WHERE id=? AND agent_id=?',req.params.jobId,req.agent.id)
   if(!job)return res.status(404).json({error:'Job not found'})
   if(job.status!=='leased'||job.lease_until<=now()||job.lease_token!==data.leaseToken)return res.status(409).json({error:'Job lease expired or superseded'})
-  const status=data.success?'success':'failed',payload=parse(job.payload_json)||{}
+  const payload=parse(job.payload_json)||{}
+  let breakGlassValid=true
+  if(payload.breakGlassSessionId&&job.type==='breakglass.start')breakGlassValid=data.result?.active===true&&!!normalizeProfileSnapshot(data.result?.profiles)
+  if(payload.breakGlassSessionId&&job.type==='breakglass.end')breakGlassValid=data.result?.restored===true
+  const status=data.success&&breakGlassValid?'success':'failed'
+  const resultError=data.error||(!breakGlassValid?'Agent break-glass readback was invalid':null)
   db.transaction(()=>{
-    run('UPDATE agent_jobs SET status=?,result_json=?,error=?,finished_at=?,lease_until=NULL,lease_token=NULL WHERE id=?',status,json(data.result||data.diff||null),data.error||null,now(),job.id)
-    if(payload.applyRunId)run('UPDATE policy_apply_runs SET status=?,diff_json=?,error=?,finished_at=? WHERE id=?',status,json(data.diff||null),data.error||null,now(),payload.applyRunId)
+    run('UPDATE agent_jobs SET status=?,result_json=?,error=?,finished_at=?,lease_until=NULL,lease_token=NULL WHERE id=?',status,json(data.result||data.diff||null),resultError,now(),job.id)
+    if(payload.applyRunId)run('UPDATE policy_apply_runs SET status=?,diff_json=?,error=?,finished_at=? WHERE id=?',status,json(data.diff||null),resultError,now(),payload.applyRunId)
     if(payload.loopbackBaseline){
       run('UPDATE node_loopback_baseline SET status=?,applied_at=?,last_error=?,job_id=NULL WHERE node_id=? AND job_id=?',data.success?'applied':'failed',data.success?now():null,data.error||null,req.agent.node_id,job.id)
       audit(null,data.success?'node.loopback.applied':'node.loopback.failed','node',req.agent.node_id,null,{jobId:job.id,error:data.error||null})
@@ -181,15 +186,18 @@ agentRoutes.post('/:id/jobs/:jobId/result',requireAgent,(req,res)=>{
         const profiles=normalizeProfileSnapshot(data.result?.profiles)
         const active=data.success&&data.result?.active===true&&!!profiles
         run('UPDATE break_glass_sessions SET status=?,profile_snapshot_json=?,last_error=? WHERE id=?',active?'active':'failed',active?json(profiles):null,active?null:data.error||'Agent did not confirm firewall state',session.id)
+        if(payload.applyRunId)run('UPDATE policy_apply_runs SET status=?,diff_json=?,error=?,finished_at=? WHERE id=?',active?'success':'failed',active?json({operation:'breakglass_start',sessionId:session.id,profiles}):null,active?null:data.error||'Agent did not confirm firewall state',now(),payload.applyRunId)
         audit(null,active?'break-glass.active':'break-glass.start.failed','node',req.agent.node_id,null,{sessionId:session.id,jobId:job.id,expiresAt:session.expires_at,error:active?null:data.error||'Invalid agent readback'})
       }
       if(session&&job.type==='breakglass.end'&&session.status==='ending'){
         const restored=data.success&&data.result?.restored===true
         run('UPDATE break_glass_sessions SET status=?,ended_at=?,last_error=? WHERE id=?',restored?payload.finalStatus||'ended':'active',restored?now():null,restored?null:data.error||'Agent did not confirm firewall restoration',session.id)
+        if(payload.applyRunId)run('UPDATE policy_apply_runs SET status=?,diff_json=?,error=?,finished_at=? WHERE id=?',restored?'success':'failed',restored?json({operation:'breakglass_end',sessionId:session.id,profiles:data.result?.profiles||null}):null,restored?null:data.error||'Agent did not confirm firewall restoration',now(),payload.applyRunId)
         audit(null,restored?(payload.finalStatus==='expired'?'break-glass.expired':'break-glass.end'):'break-glass.end.failed','node',req.agent.node_id,null,{sessionId:session.id,jobId:job.id,error:restored?null:data.error||'Invalid agent readback'})
       }
+      if(payload.applyRunId&&(!session||(job.type==='breakglass.start'&&session.status!=='activating')||(job.type==='breakglass.end'&&session.status!=='ending')))run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?','unknown','Break-glass session was unavailable or changed before agent readback',now(),payload.applyRunId)
     }
-    audit(null,data.success?'agent.job.success':'agent.job.failed','agent-job',job.id,null,{agentId:req.agent.id,type:job.type,error:data.error||null})
+    audit(null,status==='success'?'agent.job.success':'agent.job.failed','agent-job',job.id,null,{agentId:req.agent.id,type:job.type,error:resultError})
   })()
   res.json({ok:true})
 })

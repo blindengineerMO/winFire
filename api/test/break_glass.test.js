@@ -37,6 +37,7 @@ const fs=require('fs');let input='';process.stdin.on('data',part=>input+=part);p
     await auth(request.post(`/api/v1/nodes/${node.body.id}/break-glass`)).send({...body,confirmation:'yes'}).expect(400)
     const started=await auth(request.post(`/api/v1/nodes/${node.body.id}/break-glass`)).send(body).expect(201)
     assert.equal(started.body.session.status,'active')
+    assert.equal(db.prepare('SELECT status FROM policy_apply_runs WHERE id=?').get(started.body.runId).status,'success')
     assert.equal(JSON.parse(fs.readFileSync(stateFile,'utf8')).enabled,false)
     await auth(request.post(`/api/v1/nodes/${node.body.id}/break-glass`)).send(body).expect(409)
     await auth(request.delete(`/api/v1/nodes/${node.body.id}`)).expect(409)
@@ -45,12 +46,14 @@ const fs=require('fs');let input='';process.stdin.on('data',part=>input+=part);p
     assert.equal(active.body.active.profile_snapshot_json,undefined)
     const ended=await auth(request.post(`/api/v1/nodes/${node.body.id}/break-glass/end`)).send({sessionId:started.body.session.id}).expect(200)
     assert.equal(ended.body.session.status,'ended')
+    assert.equal(db.prepare('SELECT status FROM policy_apply_runs WHERE id=?').get(ended.body.runId).status,'success')
     assert.equal(JSON.parse(fs.readFileSync(stateFile,'utf8')).enabled,true)
 
     const second=await auth(request.post(`/api/v1/nodes/${node.body.id}/break-glass`)).send(body).expect(201)
     process.env.WINFIRE_BREAK_GLASS_FAIL_END='1'
     await auth(request.post(`/api/v1/nodes/${node.body.id}/break-glass/end`)).send({sessionId:second.body.session.id}).expect(502)
     assert.equal(db.prepare('SELECT status FROM break_glass_sessions WHERE id=?').get(second.body.session.id).status,'active')
+    assert.equal(db.prepare('SELECT status FROM policy_apply_runs WHERE node_id=? ORDER BY rowid DESC LIMIT 1').get(node.body.id).status,'unknown')
     delete process.env.WINFIRE_BREAK_GLASS_FAIL_END
     db.prepare('UPDATE break_glass_sessions SET expires_at=? WHERE id=?').run(new Date(Date.now()-1000).toISOString(),second.body.session.id)
     const sweep=await processDueBreakGlass()

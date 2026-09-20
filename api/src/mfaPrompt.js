@@ -1,6 +1,6 @@
 import {isIP} from 'node:net'
 import dns from 'node:dns/promises'
-import {all,one,run,id,now,audit,parse} from './db.js'
+import {all,one,run,id,now,audit,parse,json} from './db.js'
 import {remote,tcpProbe} from './connector.js'
 import {sourceMatches} from './mfaPortal.js'
 import {mfaPromptSettings} from './mfaPromptSettings.js'
@@ -118,20 +118,30 @@ export async function processBlockedMfaEvent(event,segment,target){
   let url
   try{url=promptUrl(promptId)}catch(error){return insert('skipped',error.message)}
   insert('pending')
+  const applyRunId=id()
+  run('INSERT INTO policy_apply_runs(id,node_id,status) VALUES(?,?,?)',applyRunId,sourceNode.id,'running')
+  audit(null,'mfa.prompt.launch.start','node',sourceNode.id,null,{promptId,runId:applyRunId,targetNodeId:target.id})
+  let attempted=false
   try{
     const reachable=await sourceTransport(sourceNode)
+    attempted=true
     const result=await remote(reachable,'prompt_browser',{promptId,url,sourceIp:pair.sourceIp,sourcePort:pair.sourcePort,targetIp:pair.targetIp,port:segment.port})
     if(reachable.transport!==sourceNode.transport)run('UPDATE nodes SET transport=? WHERE id=?',reachable.transport,sourceNode.id)
     if(!result?.opened){
       run('UPDATE mfa_prompt_events SET status=?,error=? WHERE id=?','skipped',result?.reason||'No interactive browser session was confirmed',promptId)
+      run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?','failed',result?.reason||'No interactive browser session was confirmed',now(),applyRunId)
+      audit(null,'mfa.prompt.launch.failed','node',sourceNode.id,null,{promptId,runId:applyRunId,reason:result?.reason||'No interactive browser session was confirmed'})
       return {id:promptId,status:'skipped',error:result?.reason}
     }
     run('UPDATE mfa_prompt_events SET status=?,opened_at=?,opened_user=?,opened_session_id=?,opened_process_id=?,source_event_record_id=? WHERE id=?','opened',now(),result.user||null,result.sessionId||null,result.processId||null,result.sourceEventRecordId||null,promptId)
-    audit(null,'mfa.prompt.opened','mfa-prompt',promptId,null,{segmentId:segment.id,targetNodeId:target.id,sourceNodeId:sourceNode.id,sourceIp:pair.sourceIp,sessionId:result.sessionId})
-    return {id:promptId,status:'opened'}
+    run('UPDATE policy_apply_runs SET status=?,diff_json=?,finished_at=? WHERE id=?','success',json({operation:'prompt_browser',promptId,sessionId:result.sessionId,processId:result.processId}),now(),applyRunId)
+    audit(null,'mfa.prompt.opened','mfa-prompt',promptId,null,{segmentId:segment.id,targetNodeId:target.id,sourceNodeId:sourceNode.id,sourceIp:pair.sourceIp,sessionId:result.sessionId,runId:applyRunId})
+    return {id:promptId,status:'opened',runId:applyRunId}
   }catch(error){
     run('UPDATE mfa_prompt_events SET status=?,error=? WHERE id=?','failed',error.message,promptId)
-    audit(null,'mfa.prompt.failed','mfa-prompt',promptId,null,{segmentId:segment.id,targetNodeId:target.id,sourceNodeId:sourceNode.id,error:error.message})
+    const status=attempted?'unknown':'failed'
+    run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?',status,error.message,now(),applyRunId)
+    audit(null,'mfa.prompt.failed','mfa-prompt',promptId,null,{segmentId:segment.id,targetNodeId:target.id,sourceNodeId:sourceNode.id,runId:applyRunId,error:error.message})
     if(/WinRM|WSMan|timed? out|timeout|connect|refused|unreachable|401|unauthorized|authentication/i.test(error.message)){
       const fallback=await failOpenForUncontrolledSource(promptId,segment,target,pair,`Source workstation cannot be controlled over WinRM: ${error.message.slice(0,180)}`)
       if(fallback)return fallback
@@ -147,7 +157,8 @@ export async function sweepMfaPrompts(limit=25){
   try{
     const threshold=new Date(Date.now()-3*60_000).toISOString()
     const rows=all(`SELECT e.id,e.node_id,e.event_id,e.action,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,e.src_port,COALESCE(e.dst_ip,p.dst_ip) dst_ip,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.direction,p.direction) direction,e.event_time,e.received_at,
-        s.id segment_id,s.port,s.source_ip,s.allowed_upns,s.portal_enabled,s.auto_prompt_enabled,s.mode,s.ttl_minutes,s.policy_id
+        s.id segment_id,s.port,s.source_ip,s.allowed_upns,s.portal_enabled,s.auto_prompt_enabled,s.mode,s.ttl_minutes,s.policy_id,
+        s.account_sid,s.source_process,s.fallback_to_logged_on_user,s.fail_open
       FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id
       JOIN nodes n ON n.id=e.node_id
       JOIN identity_segments s ON (s.node_id=e.node_id OR s.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=e.node_id))
@@ -158,7 +169,7 @@ export async function sweepMfaPrompts(limit=25){
     for(const row of rows){
       const target=one('SELECT * FROM nodes WHERE id=?',row.node_id)
       if(!target)continue
-      await processBlockedMfaEvent(row,{id:row.segment_id,port:row.port,source_ip:row.source_ip,allowed_upns:row.allowed_upns,policy_id:row.policy_id},target)
+      await processBlockedMfaEvent(row,{id:row.segment_id,port:row.port,source_ip:row.source_ip,allowed_upns:row.allowed_upns,policy_id:row.policy_id,account_sid:row.account_sid,source_process:row.source_process,fallback_to_logged_on_user:row.fallback_to_logged_on_user,fail_open:row.fail_open},target)
       processed++
     }
     return {processed}
