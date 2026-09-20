@@ -45,7 +45,8 @@ export function pruneOldEvents(at=new Date()) {
 
 export async function refreshDueDns(at=new Date(),limit=25) {
   const cutoff=new Date(at.getTime()-observabilitySettings().dnsRefreshHours*36e5).toISOString()
-  const nodes=all('SELECT n.* FROM nodes n LEFT JOIN dns_lookups d ON d.node_id=n.id WHERE d.checked_at IS NULL OR d.checked_at<? ORDER BY COALESCE(d.checked_at,n.created_at),n.id LIMIT ?',cutoff,limit)
+  const unresolvedCutoff=new Date(at.getTime()-15*60_000).toISOString()
+  const nodes=all('SELECT n.* FROM nodes n LEFT JOIN dns_lookups d ON d.node_id=n.id WHERE d.checked_at IS NULL OR d.checked_at<? OR (n.ip IS NULL AND d.checked_at<?) ORDER BY CASE WHEN n.ip IS NULL THEN 0 ELSE 1 END,COALESCE(d.checked_at,n.created_at),n.id LIMIT ?',cutoff,unresolvedCutoff,limit)
   for(const node of nodes)await lookupDns(node)
   return nodes.length
 }

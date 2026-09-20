@@ -3,13 +3,13 @@ import path from 'node:path'
 import {fileURLToPath} from 'node:url'
 import express from 'express'
 import https from 'node:https'
-import {app,runVerification,runDriftCheck,pullLogs,pullRecentLogs,processDueTraining,processDueBreakGlass,processDuePolicySync,processDueAdAccountHolds,syncDirectory} from './app.js'
+import {app,runVerification,runDriftCheck,pullLogs,pullRecentLogs,processDueTraining,processDueBreakGlass,processDuePolicySync,processDueAdAccountHolds,syncDirectory,onboardPendingNodes} from './app.js'
 import {processSecurityAutomations} from './securityAutomations.js'
 import {bootstrap,ensureBootstrapAdmin} from './security.js'
 import {all,one,run,now,audit} from './db.js'
 import {agentTlsOptions} from './agentPki.js'
 import {sweepAgentHealth} from './agentHealth.js'
-import {collectFacts,enrichNode} from './connector.js'
+import {collectFacts} from './connector.js'
 import {pruneOldEvents,refreshDueDns,runCompactionIfDue} from './maintenance.js'
 import {deliverPendingNotifications} from './notifications.js'
 import {sweepLoopbackBaseline} from './loopbackBaseline.js'
@@ -84,11 +84,7 @@ async function sweepNewNodes(){
   if(inventoryRunning)return
   inventoryRunning=true
   try{
-    const pending=all(`SELECT n.* FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id WHERE f.node_id IS NULL AND n.connection_mode='agentless' AND COALESCE(n.ad_enabled,1)=1 AND (n.next_retry_at IS NULL OR n.next_retry_at<=?) AND EXISTS (SELECT 1 FROM credential_assignments a WHERE a.node_id=n.id OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=n.id)) ORDER BY n.created_at LIMIT 5`,now())
-    for(const node of pending){
-      try{await enrichNode(node);audit(null,'node.inventory.collected','node',node.id,null,{transport:one('SELECT transport FROM nodes WHERE id=?',node.id)?.transport||null})}
-      catch(error){run('UPDATE nodes SET next_retry_at=? WHERE id=?',new Date(Date.now()+15*60*1000).toISOString(),node.id);audit(null,'node.inventory.failed','node',node.id,null,{error:error.message})}
-    }
+    await onboardPendingNodes(5)
   }catch(error){console.error('Node inventory sweep failed:',error)}
   finally{inventoryRunning=false}
 }

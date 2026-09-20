@@ -27,22 +27,30 @@ test('portal MFA records rejected, approved, replayed and expired attempts witho
   const credential=await auth(request.post('/api/v1/credentials')).send({name:'MFA audit test',type:'local',username:'test-admin',password:'test-password-12345'}).expect(201)
   const node=await auth(request.post('/api/v1/nodes')).send({hostname:'mfa-audit-node',credentialIds:[credential.body.id]}).expect(201)
   db.prepare("UPDATE nodes SET transport='winrm',firewall_state='enforcing' WHERE id=?").run(node.body.id)
-  const segment=await auth(request.post('/api/v1/segments')).send({name:'Audit RDP',nodeId:node.body.id,port:3389,allowedUpns:['owner@mfa-audit.test'],mfaProvider:'totp',ttlMinutes:10}).expect(201)
+  const segment=await auth(request.post('/api/v1/segments')).send({name:'Audit RDP',nodeId:node.body.id,port:3389,extraPorts:[22],allowedUpns:['owner@mfa-audit.test'],mfaProvider:'totp',ttlMinutes:10}).expect(201)
   const invalid=code==='000000'?'111111':'000000'
   await auth(request.post(`/api/v1/segments/${segment.body.id}/access`)).send({code:invalid}).expect(401)
   const rejected=db.prepare("SELECT * FROM mfa_challenges WHERE segment_id=? ORDER BY challenged_at DESC,rowid DESC LIMIT 1").get(segment.body.id)
   assert.equal(rejected.status,'denied')
   assert.equal(rejected.provider,'totp')
   assert.equal(rejected.failure_reason,'Invalid authenticator code')
-  const stub=path.join(dir,'mfa-jit-transport')
+  const stub=path.join(dir,'mfa-jit-transport'),portsReceipt=path.join(dir,'jit-ports-receipt')
   fs.writeFileSync(stub,`#!/usr/bin/env node
-let data='';process.stdin.on('data',part=>data+=part);process.stdin.on('end',()=>{const request=JSON.parse(data);const responses={jit_preflight:{safe:true},jit_start:{active:true},jit_end:{revoked:true}};if(!(request.operation in responses))process.exit(2);process.stdout.write(JSON.stringify(responses[request.operation]))})
+let data='';process.stdin.on('data',part=>data+=part);process.stdin.on('end',()=>{const request=JSON.parse(data);const responses={jit_preflight:{safe:true},jit_start:{active:true},jit_end:{revoked:true}};if(!(request.operation in responses))process.exit(2);if(request.operation==='jit_start')require('fs').writeFileSync(${JSON.stringify(portsReceipt)},JSON.stringify(request.args.ports));process.stdout.write(JSON.stringify(responses[request.operation]))})
 `,{mode:0o700})
   const priorPython=process.env.WINRM_PYTHON
   process.env.WINRM_PYTHON=stub
   try{
     const approved=await auth(request.post(`/api/v1/segments/${segment.body.id}/access`)).send({code}).expect(201)
+    assert.deepEqual(approved.body.ports,[3389,22])
+    assert.deepEqual(JSON.parse(fs.readFileSync(portsReceipt,'utf8')),[3389,22])
     const grant=db.prepare('SELECT * FROM jit_grants WHERE id=?').get(approved.body.grantId)
+    assert.deepEqual(JSON.parse(grant.ports_json),[3389,22])
+    const active=(await auth(request.get('/api/v1/segments/access/grants')).expect(200)).body
+    assert.deepEqual(active.find(item=>item.id===grant.id).ports,[3389,22])
+    const applyRun=db.prepare('SELECT status,diff_json FROM policy_apply_runs WHERE id=?').get(approved.body.applyRunId)
+    assert.equal(applyRun.status,'success')
+    assert.deepEqual(JSON.parse(applyRun.diff_json).ports,[3389,22])
     assert.equal(db.prepare('SELECT status FROM mfa_challenges WHERE id=?').get(grant.mfa_challenge_id).status,'approved')
     await auth(request.post(`/api/v1/segments/${segment.body.id}/access`)).send({code}).expect(401)
     assert.equal(db.prepare("SELECT COUNT(*) count FROM mfa_challenges WHERE segment_id=? AND status='denied'").get(segment.body.id).count,2)

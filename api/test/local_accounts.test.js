@@ -53,6 +53,8 @@ test('node-local SIDs resolve after AD and remain scoped to their host',async()=
   assert.equal(rules[0].direction,'out')
   assert.equal(rules[0].action,'block')
   assert.equal(all('SELECT * FROM policy_assignments WHERE policy_id=?',stage.body.policyId).length,1)
+  const pending=await auth(request.get('/api/v1/policies/sync')).expect(200)
+  assert.ok(pending.body.pending.some(item=>item.policy_id===stage.body.policyId&&item.node_id===nodeId))
   const duplicate=await auth(request.post(`/api/v1/directory/local-accounts/${detail.body.id}/network-rule`)).send({remoteAddress:'192.0.2.10',remotePort:'3389',protocol:'TCP',reason:'Restrict this unauthorized local account'}).expect(200)
   assert.equal(duplicate.body.duplicate,true)
   assert.equal(diffRules(rules,[{...rules[0],localUserSid:null}]).add.length,1)

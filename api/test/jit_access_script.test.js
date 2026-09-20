@@ -12,13 +12,14 @@ test('JIT firewall grant registers host-local expiry first and rejects an open g
   const script=`
 $ErrorActionPreference='Stop'
 $env:SystemRoot='/tmp'
-$script:task=$false; $script:rule=$null; $script:defaultInbound='Block'; $script:existingAllow=$false; $script:taskFirst=$false; $script:cleanup=''
+$script:task=$false; $script:rule=$null; $script:defaultInbound='Block'; $script:existingAllow=$false; $script:existingAllowPort='3389'; $script:badReadback=$false; $script:taskFirst=$false; $script:cleanup=''
 function Get-NetFirewallProfile { param($PolicyStore) @('Domain','Private','Public') | ForEach-Object {[pscustomobject]@{Name=$_;Enabled='True';DefaultInboundAction=$script:defaultInbound}} }
 function Get-NetFirewallRule { param($PolicyStore,$Enabled,$Direction,$Action,$Group,$ErrorAction)
-  if($PolicyStore){if($script:existingAllow){[pscustomobject]@{DisplayName='Existing RDP';Group='Other';Action='Allow';Protocol='TCP';LocalPort='3389'}};return}
+  if($PolicyStore){if($script:existingAllow){[pscustomobject]@{DisplayName='Existing rule';Group='Other';Action='Allow';Protocol='TCP';LocalPort=$script:existingAllowPort}};return}
   if($Group -and $script:rule){$script:rule}
 }
-function Get-NetFirewallPortFilter { [CmdletBinding()] param([Parameter(ValueFromPipeline)]$InputObject) process{[pscustomobject]@{Protocol=$InputObject.Protocol;LocalPort=$InputObject.LocalPort}} }
+function Get-NetFirewallPortFilter { [CmdletBinding()] param([Parameter(ValueFromPipeline)]$InputObject) process{[pscustomobject]@{Protocol=$InputObject.Protocol;LocalPort=$(if($script:badReadback){'9999'}else{$InputObject.LocalPort})}} }
+function Get-NetFirewallAddressFilter { [CmdletBinding()] param([Parameter(ValueFromPipeline)]$InputObject) process{[pscustomobject]@{RemoteAddress=$InputObject.RemoteAddress}} }
 function Get-ScheduledTask { param($TaskName,$ErrorAction) if($script:task){[pscustomobject]@{TaskName=$TaskName}} }
 function New-ScheduledTaskAction { param($Execute,$Argument) $script:cleanup=$Argument; [pscustomobject]@{Argument=$Argument} }
 function New-ScheduledTaskTrigger { param([switch]$Once,$At) [pscustomobject]@{At=$At} }
@@ -27,7 +28,7 @@ function New-ScheduledTaskSettingsSet { param([switch]$StartWhenAvailable) [pscu
 function Register-ScheduledTask { param($TaskName,$Action,$Trigger,$Principal,$Settings,$ErrorAction) $script:task=$true; [pscustomobject]@{TaskName=$TaskName} }
 function Unregister-ScheduledTask { param($TaskName,$Confirm,$ErrorAction) $script:task=$false }
 function New-NetFirewallRule { param($DisplayName,$Group,$Direction,$Action,$Protocol,$LocalPort,$RemoteAddress,$Profile,$ErrorAction)
-  $script:taskFirst=$script:task; $script:rule=[pscustomobject]@{DisplayName=$DisplayName;Group=$Group;Protocol=$Protocol;LocalPort=[string]$LocalPort;RemoteAddress=$RemoteAddress};$script:rule
+  $script:taskFirst=$script:task; $script:rule=[pscustomobject]@{DisplayName=$DisplayName;Group=$Group;Protocol=$Protocol;LocalPort=@($LocalPort);RemoteAddress=$RemoteAddress};$script:rule
 }
 function Remove-NetFirewallRule { [CmdletBinding()] param([Parameter(ValueFromPipeline)]$InputObject) process{$script:rule=$null} }
 ${source}
@@ -38,14 +39,22 @@ $decoded=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(($script
 $hasLocalExpiry=($decoded -match 'Remove-NetFirewallRule' -and $decoded -match 'Unregister-ScheduledTask')
 End-WinFireJitAccess $data | Out-Null
 $clean=(!$script:task -and !$script:rule)
+$data | Add-Member -NotePropertyName ports -NotePropertyValue @(22)
+$multi=Start-WinFireJitAccess $data
+$multiPorts=($multi.ports.Count -eq 2 -and $script:rule.LocalPort -match '3389' -and $script:rule.LocalPort -match '22')
+End-WinFireJitAccess $data | Out-Null
 $script:defaultInbound='Allow'
 try {Start-WinFireJitAccess $data | Out-Null; $openRejected=$false} catch {$openRejected=$true}
 $script:defaultInbound='Block';$script:existingAllow=$true
 try {Start-WinFireJitAccess $data | Out-Null; $allowRejected=$false} catch {$allowRejected=$true}
-[pscustomobject]@{active=$active;localExpiry=$hasLocalExpiry;clean=$clean;openRejected=$openRejected;allowRejected=$allowRejected;noResidual=(!$script:task -and !$script:rule)} | ConvertTo-Json -Compress
+$script:existingAllowPort=@('443','22')
+try {Start-WinFireJitAccess $data | Out-Null; $extraPortRejected=$false} catch {$extraPortRejected=$true}
+$script:existingAllow=$false;$script:badReadback=$true
+try {Start-WinFireJitAccess $data | Out-Null; $badReadbackRejected=$false} catch {$badReadbackRejected=$true}
+[pscustomobject]@{active=$active;localExpiry=$hasLocalExpiry;clean=$clean;multiPorts=$multiPorts;openRejected=$openRejected;allowRejected=$allowRejected;extraPortRejected=$extraPortRejected;badReadbackRejected=$badReadbackRejected;noResidual=(!$script:task -and !$script:rule)} | ConvertTo-Json -Compress
 `
   const result=spawnSync('pwsh',['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(script,'utf16le').toString('base64')],{encoding:'utf8'})
   assert.equal(result.status,0,result.stderr)
   const observed=JSON.parse(result.stdout.trim().split('\n').at(-1))
-  assert.deepEqual(observed,{active:true,localExpiry:true,clean:true,openRejected:true,allowRejected:true,noResidual:true})
+  assert.deepEqual(observed,{active:true,localExpiry:true,clean:true,multiPorts:true,openRejected:true,allowRejected:true,extraPortRejected:true,badReadbackRejected:true,noResidual:true})
 })

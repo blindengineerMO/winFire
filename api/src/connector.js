@@ -262,9 +262,12 @@ export async function activateWinrmViaWmi(node){
   try{activation=process.platform==='win32'?await wmiProbePowerShell(input):await wmiProbePython(input)}
   catch(error){error.message=String(error.message).replaceAll(input.password,'[redacted]');throw error}
   if(!activation?.success||!activation.activationStarted)throw new Error('WMI did not confirm the WinRM activation request')
+  if(activation.activationSucceeded===false)throw new Error(`WinRM activation command failed on ${node.hostname}: ${String(activation.commandOutput||'no command output').replace(/<Objs[\s\S]*/,'').slice(0,300)}`)
+  let lastPort=null
   for(let attempt=0;attempt<12;attempt++){
     await pause(2500)
     const port=await tcpProbe(host,5985,1500)
+    lastPort=port
     if(port.status!=='open')continue
     try{
       const managed={...node,transport:'winrm'}
@@ -277,7 +280,12 @@ export async function activateWinrmViaWmi(node){
       return {transport:'winrm',status:'reachable',probeStatus:'winrm-authenticated',facts,activation}
     }catch(error){if(attempt===11)throw error}
   }
-  throw new Error('WMI started WinRM activation, but WinRM did not become reachable within 30 seconds')
+  let detail=''
+  try{
+    const diagnostic=process.platform==='win32'?null:await wmiProbePython({...input,mode:'diagnose_winrm'})
+    if(diagnostic?.winrmService?.State==='Running'&&String(diagnostic.commandOutput||'').includes('ListeningOn ='))detail=' The WinRM service and listener are running; check network ACLs or an effective host firewall block between the control plane and this node.'
+  }catch{}
+  throw new Error(`WMI started WinRM activation, but TCP 5985 remains ${lastPort?.status||'unreachable'} from the control plane.${detail}`)
 }
 export async function remote(node,operation,args={},options={}) {
   if(node.transport==='wmi')throw new Error('WMI/DCOM transport is detected but authenticated WMI operations are not implemented')
@@ -350,17 +358,24 @@ export async function enrichNode(node) {
   if(!['winrm','winrms'].includes(probe.transport))throw new Error('No working WinRM transport for inventory collection')
   return collectFacts(one('SELECT * FROM nodes WHERE id=?',node.id))
 }
-export async function lookupDns(node) {
+export async function lookupDns(node,resolver=dns) {
   let forward=[],reverse=[]
-  try {forward=await dns.lookup(node.fqdn || node.hostname,{all:true})} catch {}
-  if (node.ip) try {reverse=await dns.reverse(node.ip)} catch {}
+  try {forward=await resolver.lookup(node.fqdn || node.hostname,{all:true})} catch {}
+  // Directory computer objects contain a name, not an address. Resolve that
+  // name before checking its PTR so the inventory and source-IP matching work.
+  const addresses=[...new Set(forward.filter(result=>result.family===4||result.family===6).map(result=>result.address))]
+  const resolvedIp=addresses.find(address=>address.includes('.'))||addresses[0]||null
+  const ownsAddress=node.inventory_source==='ad'
+  const ip=(ownsAddress||!node.ip)&&resolvedIp&&addresses.length===1?resolvedIp:node.ip
+  if(ip!==node.ip)run('UPDATE nodes SET ip=? WHERE id=?',ip,node.id)
+  if (ip) try {reverse=await resolver.reverse(ip)} catch {}
   const expected=(node.fqdn||node.hostname).toLowerCase().replace(/\.$/,'')
-  const ptrMissing=!!(node.ip&&!reverse.length)
+  const ptrMissing=!!(ip&&!reverse.length)
   const ptrMismatch=!!(reverse.length&&!reverse.some(name=>name.toLowerCase().replace(/\.$/,'')===expected))
-  const forwardMismatch=!!(node.ip&&forward.length&&!forward.some(address=>address.address===node.ip))
+  const forwardMismatch=!!(ip&&forward.length&&!forward.some(address=>address.address===ip))
   const mismatch=ptrMissing||ptrMismatch||forwardMismatch
   run('INSERT INTO dns_lookups(node_id,forward_result,reverse_result,mismatch,checked_at) VALUES(?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET forward_result=excluded.forward_result,reverse_result=excluded.reverse_result,mismatch=excluded.mismatch,checked_at=excluded.checked_at',node.id,JSON.stringify(forward),JSON.stringify(reverse),Number(mismatch),now())
-  return {forward,reverse,mismatch,ptrMissing,ptrMismatch,forwardMismatch}
+  return {forward,reverse,mismatch,ptrMissing,ptrMismatch,forwardMismatch,ip}
 }
 export function diffRules(desired,actual) {
   const normalizeAddress=value=>String(value||'Any').split(',').map(part=>{

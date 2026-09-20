@@ -1,12 +1,17 @@
-"""Read-only DCOM/WMI credential check. One JSON request on stdin, one result on stdout."""
+"""DCOM/WMI host check and optional WinRM bootstrap. JSON in and out."""
 
+import base64
+import io
 import json
 import socket
 import sys
+import time
+import uuid
 
 from impacket.dcerpc.v5.dcom import wmi
 from impacket.dcerpc.v5.dcomrt import DCOMConnection
 from impacket.dcerpc.v5.dtypes import NULL
+from impacket.smbconnection import SMBConnection
 
 
 def credentials(value):
@@ -46,9 +51,35 @@ def main():
         if expected and name.casefold() != expected.casefold():
             raise RuntimeError("WMI computer name does not match the directory inventory record")
         response = {"success": True, "transport": "wmi", "computerName": name}
-        if mode == "enable_winrm":
+        if mode == "diagnose_winrm":
+            service_enum = services.ExecQuery("SELECT Name,State,StartMode,ProcessId FROM Win32_Service WHERE Name='WinRM'")
+            try:
+                service = service_enum.Next(0xFFFFFFFF, 1)[0].getProperties()
+                response["winrmService"] = {
+                    key: service.get(key, {}).get("value")
+                    for key in ("Name", "State", "StartMode", "ProcessId")
+                }
+            finally:
+                service_enum.RemRelease()
+        if mode in ("enable_winrm", "diagnose_winrm"):
             process_class, _ = services.GetObject("Win32_Process")
-            command = 'powershell.exe -NoProfile -NonInteractive -Command "Enable-PSRemoting -Force"'
+            output_name = f"WinFire-{uuid.uuid4().hex}.txt"
+            output_path = f"C:\\Windows\\Temp\\{output_name}"
+            script = ("$ErrorActionPreference='Stop'; Enable-PSRemoting -Force; 'WINFIRE_READY'"
+                      if mode == "enable_winrm" else
+                      "$ErrorActionPreference='Stop'; "
+                      "Get-NetFirewallRule -Name 'WINRM*' -ErrorAction SilentlyContinue | "
+                      "Select-Object Name,Enabled,Profile,Direction,Action | ConvertTo-Json -Compress; "
+                      "Get-NetFirewallRule -Name 'WINRM-HTTP-In-TCP*' -ErrorAction SilentlyContinue | "
+                      "ForEach-Object { $f=$_ | Get-NetFirewallAddressFilter; "
+                      "[pscustomobject]@{Name=$_.Name;RemoteAddress=$f.RemoteAddress} } | ConvertTo-Json -Compress; "
+                      "Get-NetConnectionProfile | Select-Object Name,NetworkCategory | ConvertTo-Json -Compress; "
+                      "winrm enumerate winrm/config/listener")
+            encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+            command = (
+                f'cmd.exe /c powershell.exe -NoProfile -NonInteractive '
+                f'-EncodedCommand {encoded} > "{output_path}" 2>&1'
+            )
             process_result = process_class.Create(command, "C:\\", None)
             values = process_result.getProperties()
             raw_return = values.get("ReturnValue", {}).get("value")
@@ -58,8 +89,39 @@ def main():
             if return_value != 0:
                 raise RuntimeError(f"Win32_Process.Create returned {return_value}")
             response["processId"] = values.get("ProcessId", {}).get("value")
-            response["activationStarted"] = True
-        elif mode != "probe":
+            if mode == "enable_winrm":
+                response["activationStarted"] = True
+            # Win32_Process.Create only confirms launch. Read the exit output
+            # through the administrative share before claiming success.
+            smb = None
+            try:
+                smb = SMBConnection(host, host, timeout=4)
+                smb.login(account, password, domain)
+                for _ in range(8):
+                    output = io.BytesIO()
+                    try:
+                        smb.getFile("ADMIN$", f"Temp\\{output_name}", output.write)
+                        raw = output.getvalue()
+                        content = (raw.decode("utf-16", errors="replace") if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else raw.decode("utf-8", errors="replace").replace("\x00", ""))
+                        if content:
+                            response["commandOutput"] = content[:5000]
+                            if mode == "enable_winrm":
+                                response["activationSucceeded"] = "WINFIRE_READY" in content
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(1)
+                if "commandOutput" in response:
+                    smb.deleteFile("ADMIN$", f"Temp\\{output_name}")
+            except Exception as error:
+                response["activationReadbackError"] = str(error).replace(password, "[redacted]")[:200]
+            finally:
+                if smb is not None:
+                    try:
+                        smb.logoff()
+                    except Exception:
+                        pass
+        elif mode not in ("probe", "diagnose_winrm"):
             raise RuntimeError("Unsupported WMI operation")
         print(json.dumps(response))
     except Exception as error:

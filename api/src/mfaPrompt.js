@@ -54,18 +54,27 @@ async function sourceTransport(node){
 }
 async function failOpenForUncontrolledSource(promptId,segment,target,pair,reason){
   const settings=mfaPromptSettings()
-  if(settings.failureMode!=='open')return null
+  if(settings.failureMode!=='open'||segment.fail_open||segment.account_sid||segment.source_process||segment.fallback_to_logged_on_user)return null
   const grantId=id(),expiresAt=new Date(Date.now()+settings.failOpenMinutes*60_000).toISOString()
+  let applyRunId=null,ruleStarted=false
   try{
-    const preflight=await remote(target,'jit_preflight',{port:segment.port})
+    const ports=[segment.port,...(parse(segment.extra_ports)||[])]
+    const preflight=await remote(target,'jit_preflight',{port:segment.port,ports})
     if(!preflight?.safe)throw new Error('Target firewall gate is not ready for a scoped fallback grant')
-    await remote(target,'jit_start',{grantId,sourceIp:pair.sourceIp,port:segment.port,expiresAt})
-    run('INSERT INTO jit_grants(id,segment_id,node_id,src_ip,dst_port,rule_path,grant_type,ttl_seconds,granted_at,expires_at,prompt_id,fallback_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',grantId,segment.id,target.id,pair.sourceIp,segment.port,`WinFireSecure:JIT:${grantId}`,'portal_firewall',settings.failOpenMinutes*60,now(),expiresAt,promptId,reason)
+    applyRunId=id()
+    run('INSERT INTO policy_apply_runs(id,node_id,status) VALUES(?,?,?)',applyRunId,target.id,'running')
+    const started=await remote(target,'jit_start',{grantId,sourceIp:pair.sourceIp,port:segment.port,ports,expiresAt})
+    if(started?.active!==true)throw new Error('The node did not confirm the fallback firewall rule')
+    ruleStarted=true
+    run('INSERT INTO jit_grants(id,segment_id,node_id,src_ip,dst_port,ports_json,rule_path,grant_type,ttl_seconds,granted_at,expires_at,prompt_id,fallback_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',grantId,segment.id,target.id,pair.sourceIp,segment.port,JSON.stringify(ports),`WinFireSecure:JIT:${grantId}`,'portal_firewall',settings.failOpenMinutes*60,now(),expiresAt,promptId,reason)
     run("UPDATE mfa_prompt_events SET status='fallback_open',error=? WHERE id=?",reason,promptId)
-    audit(null,'mfa.prompt.fail_open','jit-grant',grantId,null,{segmentId:segment.id,nodeId:target.id,sourceIp:pair.sourceIp,port:segment.port,expiresAt,reason})
-    return {id:promptId,status:'fallback_open',grantId,expiresAt}
+    audit(null,'mfa.prompt.fail_open','jit-grant',grantId,null,{segmentId:segment.id,nodeId:target.id,sourceIp:pair.sourceIp,ports,expiresAt,reason})
+    run('UPDATE policy_apply_runs SET status=?,diff_json=?,finished_at=? WHERE id=?','success',JSON.stringify({operation:'mfa_fail_open',grantId,sourceIp:pair.sourceIp,ports,expiresAt,reason}),now(),applyRunId)
+    return {id:promptId,status:'fallback_open',grantId,expiresAt,applyRunId}
   }catch(error){
-    try{await remote(target,'jit_end',{grantId})}catch{}
+    let cleanupFailed=false
+    if(ruleStarted||applyRunId)try{await remote(target,'jit_end',{grantId})}catch{cleanupFailed=true}
+    if(applyRunId)run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?',cleanupFailed||/timed? out|timeout|connection|unreachable/i.test(error.message)?'unknown':'failed',error.message,now(),applyRunId)
     audit(null,'mfa.prompt.fail_open.failed','mfa-prompt',promptId,null,{reason,error:error.message})
     return null
   }
@@ -88,6 +97,7 @@ export async function processBlockedMfaEvent(event,segment,target){
   if(!pair)return insert('skipped','Blocked event does not identify exactly one target-local address')
   if(!Number.isInteger(pair.sourcePort)||pair.sourcePort<1||pair.sourcePort>65535)return insert('skipped','Blocked event is missing a valid source port')
   if(!parse(segment.allowed_upns)?.length)return insert('skipped','No operators are assigned to this MFA segment')
+  if(segment.fail_open||segment.account_sid||segment.source_process||segment.fallback_to_logged_on_user)return insert('skipped','This segment uses an identity scope or fail mode that the agentless portal cannot enforce')
   let inScope=false
   try{inScope=sourceMatches(pair.sourceIp,segment.source_ip)}catch(error){return insert('skipped',`Invalid segment source scope: ${error.message}`)}
   if(!inScope)return insert('skipped','Source IP is outside the segment scope')

@@ -11,7 +11,7 @@ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'winfire-sync-test-'))
 process.env.DATA_DIR=dir
 process.env.BOOTSTRAP_EMAIL='owner@sync.test'
 process.env.BOOTSTRAP_PASSWORD='sync-test-password-123'
-const {app,processDuePolicySync}=await import('../src/app.js')
+const {app,processDuePolicySync,matchesJitRule}=await import('../src/app.js')
 const {bootstrap,seal}=await import('../src/security.js')
 const {db}=await import('../src/db.js')
 const {ensureLoopbackBaseline,loopbackRules}=await import('../src/loopbackBaseline.js')
@@ -48,6 +48,14 @@ test('duplicate rules and like ports compile into one firewall entry',()=>{
   const desired={...samePort[0],remoteAddress:'192.0.2.7/24'}
   const observed={...desired,remoteAddress:'192.0.2.0/255.255.255.0'}
   assert.deepEqual(diffRules([desired],[observed]),{add:[],remove:[]})
+})
+
+test('ambiguous JIT readback only accepts the requested source and complete port set',()=>{
+  const rule={action:'allow',direction:'in',protocol:'TCP',remoteAddress:'192.0.2.8',localPort:'22,3389'}
+  assert.equal(matchesJitRule(rule,'192.0.2.8',[3389,22]),true)
+  assert.equal(matchesJitRule({...rule,remoteAddress:'Any'},'192.0.2.8',[3389,22]),false)
+  assert.equal(matchesJitRule({...rule,localPort:'3389'},'192.0.2.8',[3389,22]),false)
+  assert.equal(matchesJitRule({...rule,action:'block'},'192.0.2.8',[3389,22]),false)
 })
 
 test('agent loopback baseline queues once and keeps scoped IPv4 rules',async()=>{
@@ -151,6 +159,45 @@ test('portal access is scoped to listed operators and requires an enrolled authe
   await auth(request.post('/api/v1/segments/entra/complete')).send({code:'dummy-code-value',state:'0123456789abcdef'}).expect(401)
 })
 
+test('identity segment scope fields can be revised and are audited',async()=>{
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@sync.test',password:'sync-test-password-123'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
+  const node=(await auth(request.post('/api/v1/nodes')).send({hostname:'scope-test',connectionMode:'agentless'}).expect(201)).body
+  db.prepare("UPDATE nodes SET transport='winrm',firewall_state='enforcing' WHERE id=?").run(node.id)
+  const created=(await auth(request.post('/api/v1/segments')).send({name:'Scoped SSH',nodeId:node.id,port:22,extraPorts:[22,3389,3389],accountSid:'S-1-5-21-1-2-3-1001',allowedUpns:['owner@sync.test']}).expect(201)).body
+  assert.deepEqual(JSON.parse(created.extra_ports),[3389])
+  assert.match((await auth(request.post(`/api/v1/segments/${created.id}/access`)).send({code:'123456'}).expect(409)).body.error,/Account SID gating/)
+  const revised=(await auth(request.patch(`/api/v1/segments/${created.id}`)).send({accountSid:'S-1-5-21-1-2-3-1002',extraPorts:[22,5985,5985],sourceProcess:'C:\\Tools\\client.exe',fallbackToLoggedOnUser:true,failOpen:true,ttlMinutes:30}).expect(200)).body
+  assert.equal(revised.account_sid,'S-1-5-21-1-2-3-1002')
+  assert.deepEqual(JSON.parse(revised.extra_ports),[5985])
+  assert.equal(revised.source_process,'C:\\Tools\\client.exe')
+  assert.equal(revised.fallback_to_logged_on_user,1)
+  assert.equal(revised.fail_open,1)
+  assert.equal(revised.ttl_minutes,30)
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM audit_log WHERE action='segment.update' AND entity_id=?").get(created.id).n,1)
+  await auth(request.patch(`/api/v1/segments/${created.id}`)).send({accountSid:'invalid'}).expect(400)
+})
+
+test('agentless logon learning preview separates service and interactive observations',async()=>{
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@sync.test',password:'sync-test-password-123'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
+  const node=(await auth(request.post('/api/v1/nodes')).send({hostname:'identity-learning',connectionMode:'agentless'}).expect(201)).body
+  const insert=db.prepare('INSERT INTO log_events(id,node_id,record_id,event_id,action,src_ip,account_sid,logon_type,event_time) VALUES(?,?,?,?,?,?,?,?,?)')
+  const at=new Date().toISOString(),sid='S-1-5-21-1-2-3-1001'
+  insert.run(crypto.randomUUID(),node.id,81001,4624,'success','192.0.2.10',sid,'5',at)
+  insert.run(crypto.randomUUID(),node.id,81002,4624,'success','192.0.2.10',sid,'5',at)
+  insert.run(crypto.randomUUID(),node.id,81003,4625,'failure','192.0.2.11',sid,'10',at)
+  const result=(await auth(request.get('/api/v1/identity/learning-preview').query({nodeId:node.id,days:30})).expect(200)).body
+  assert.equal(result.truncated,false)
+  assert.equal(result.items.length,2)
+  const service=result.items.find(item=>item.classification==='service')
+  assert.equal(service.successes,2)
+  assert.equal(service.source_ip,'192.0.2.10')
+  const interactive=result.items.find(item=>item.classification==='interactive')
+  assert.equal(interactive.failures,1)
+  assert.equal(interactive.logon_type,'10')
+})
+
 test('administrator branding is public on the MFA portal and validates image type',async()=>{
   const login=await request.post('/api/v1/auth/login').send({email:'owner@sync.test',password:'sync-test-password-123'}).expect(200)
   const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
@@ -221,6 +268,7 @@ test('administrator approved fail open uses a short audited grant only for an un
     assert.equal(grant.dst_port,3389)
     assert.equal(grant.ttl_seconds,180)
     assert.match(grant.fallback_reason,/not in managed or Active Directory inventory/)
+    assert.equal(db.prepare('SELECT status FROM policy_apply_runs WHERE id=?').get(result.applyRunId).status,'success')
     assert.equal(db.prepare("SELECT COUNT(*) count FROM audit_log WHERE action='mfa.prompt.fail_open' AND entity_id=?").get(result.grantId).count,1)
     const visible=(await auth(request.get('/api/v1/segments/access/grants')).expect(200)).body
     assert.equal(visible.some(item=>item.id===result.grantId&&item.fallback_reason),true)
@@ -237,6 +285,14 @@ test('administrator approved fail open uses a short audited grant only for an un
     const discovered=await processBlockedMfaEvent({id:crypto.randomUUID(),event_id:5157,action:'block',direction:'in',protocol:'TCP',src_ip:'127.0.0.1',src_port:51002,dst_ip:target.ip},db.prepare('SELECT * FROM identity_segments WHERE id=?').get(segmentId),target)
     assert.equal(db.prepare('SELECT source_node_id FROM mfa_prompt_events WHERE id=?').get(discovered.id).source_node_id,dnsNodeId)
     assert.equal(db.prepare('SELECT COUNT(*) count FROM jit_grants WHERE prompt_id=?').get(discovered.id).count,0)
+    db.prepare('UPDATE identity_segments SET account_sid=? WHERE id=?').run('S-1-5-21-1-2-3-1001',segmentId)
+    const scoped=await processBlockedMfaEvent({id:crypto.randomUUID(),event_id:5157,action:'block',direction:'in',protocol:'TCP',src_ip:'192.0.2.113',src_port:51003,dst_ip:target.ip},db.prepare('SELECT * FROM identity_segments WHERE id=?').get(segmentId),target)
+    assert.equal(scoped.status,'skipped')
+    assert.equal(db.prepare('SELECT COUNT(*) count FROM jit_grants WHERE prompt_id=?').get(scoped.id).count,0)
+    db.prepare('UPDATE identity_segments SET account_sid=NULL,fail_open=1 WHERE id=?').run(segmentId)
+    const override=await processBlockedMfaEvent({id:crypto.randomUUID(),event_id:5157,action:'block',direction:'in',protocol:'TCP',src_ip:'192.0.2.114',src_port:51004,dst_ip:target.ip},db.prepare('SELECT * FROM identity_segments WHERE id=?').get(segmentId),target)
+    assert.equal(override.status,'skipped')
+    assert.equal(db.prepare('SELECT COUNT(*) count FROM jit_grants WHERE prompt_id=?').get(override.id).count,0)
     await auth(request.patch('/api/v1/settings/mfa-prompt')).send({failureMode:'closed',failOpenMinutes:3}).expect(200)
   }finally{
     db.prepare("UPDATE directory_connections SET enabled=0,node_credential_id=NULL WHERE id='default'").run()

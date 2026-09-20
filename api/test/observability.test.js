@@ -13,9 +13,23 @@ const {app}=await import('../src/app.js')
 const {bootstrap}=await import('../src/security.js')
 const {db}=await import('../src/db.js')
 const {pruneOldEvents,refreshDueDns,compactDueEvents,runCompactionIfDue}=await import('../src/maintenance.js')
+const {lookupDns}=await import('../src/connector.js')
 await bootstrap()
 const request=supertest(app)
 test.after(()=>{db.close();fs.rmSync(dir,{recursive:true,force:true})})
+
+test('directory DNS lookup fills a unique address and preserves manual addresses',async()=>{
+  const insert=db.prepare("INSERT INTO nodes(id,hostname,fqdn,inventory_source,ip) VALUES(?,?,?,?,?)")
+  insert.run('ad-dns-node','AD-DNS','ad-dns.example.test','ad',null)
+  insert.run('manual-dns-node','MANUAL-DNS','manual-dns.example.test','manual','192.0.2.10')
+  const resolver={lookup:async()=>[{address:'192.0.2.20',family:4}],reverse:async()=>['ad-dns.example.test']}
+  const ad=await lookupDns(db.prepare('SELECT * FROM nodes WHERE id=?').get('ad-dns-node'),resolver)
+  assert.equal(ad.ip,'192.0.2.20')
+  assert.equal(ad.mismatch,false)
+  assert.equal(db.prepare('SELECT ip FROM nodes WHERE id=?').get('ad-dns-node').ip,'192.0.2.20')
+  await lookupDns(db.prepare('SELECT * FROM nodes WHERE id=?').get('manual-dns-node'),resolver)
+  assert.equal(db.prepare('SELECT ip FROM nodes WHERE id=?').get('manual-dns-node').ip,'192.0.2.10')
+})
 
 test('log filters, retention and scheduled DNS refresh use saved settings',async()=>{
   const login=await request.post('/api/v1/auth/login').send({email:'owner@observability.test',password:'observability-test-password'}).expect(200)
