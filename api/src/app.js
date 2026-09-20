@@ -1534,6 +1534,7 @@ api.post('/segments/:id/challenges/:challengeId/resolve',requireRole('admin'),(r
 })
 
 api.get('/logon-rights',(req,res)=>res.json(all('SELECT * FROM logon_rights WHERE (? IS NULL OR node_id=?) ORDER BY at DESC LIMIT 500',req.query.nodeId||null,req.query.nodeId||null)))
+// LSA changes use the authenticated WinRM connector and require readback.
 api.post('/logon-rights/baseline',requireRole('admin'),wrap(async(req,res)=>{
   const {nodeId}=body(z.object({nodeId:z.string()}),req),node=getNode(nodeId);if(!node)return notFound(res,'Node')
   const raw=await remote(node,'rights'),lines=Array.isArray(raw)?raw:[raw].filter(Boolean)
