@@ -695,7 +695,7 @@ test('credential test authenticates only the selected direct or group credential
   process.env.WINRM_PYTHON=stub
   try {
     const tested=await auth(request.post(`/api/v1/credentials/${good.body.id}/test`)).send({nodeId:node.body.id}).expect(200)
-    assert.deepEqual(tested.body,{success:true,account:'good-user'})
+    assert.deepEqual(tested.body,{success:true,transport:'winrm',account:'good-user'})
     const rejected=await auth(request.post(`/api/v1/credentials/${bad.body.id}/test`)).send({nodeId:node.body.id}).expect(200)
     assert.equal(rejected.body.success,false)
     assert.match(rejected.body.error,/Invalid credential/)
@@ -703,6 +703,20 @@ test('credential test authenticates only the selected direct or group credential
     if(previous===undefined)delete process.env.WINRM_PYTHON
     else process.env.WINRM_PYTHON=previous
   }
+  db.prepare('UPDATE nodes SET transport=? WHERE id=?').run('wmi',node.body.id)
+  const wmiStub=path.join(dir,'wmi-auth-transport')
+  fs.writeFileSync(wmiStub,'#!/usr/bin/env node\nlet data="";process.stdin.on("data",x=>data+=x);process.stdin.on("end",()=>{const p=JSON.parse(data);if(p.username!=="good-user"){process.stderr.write("WMI access denied");process.exitCode=1}else process.stdout.write(JSON.stringify({success:true,transport:"wmi",computerName:"AUTH-TEST"}))})\n',{mode:0o700})
+  const previousWmi=process.env.WMI_PROBE_PYTHON
+  process.env.WMI_PROBE_PYTHON=wmiStub
+  try{
+    const wmi=await auth(request.post(`/api/v1/credentials/${good.body.id}/test`)).send({nodeId:node.body.id}).expect(200)
+    assert.deepEqual(wmi.body,{success:true,transport:'wmi',account:'good-user',computerName:'AUTH-TEST'})
+    assert.equal(db.prepare('SELECT probe_status FROM nodes WHERE id=?').get(node.body.id).probe_status,'wmi-authenticated')
+    const rejected=await auth(request.post(`/api/v1/credentials/${bad.body.id}/test`)).send({nodeId:node.body.id}).expect(200)
+    assert.equal(rejected.body.success,false)
+    assert.equal(rejected.body.transport,'wmi')
+    assert.match(rejected.body.error,/WMI access denied/)
+  }finally{if(previousWmi===undefined)delete process.env.WMI_PROBE_PYTHON;else process.env.WMI_PROBE_PYTHON=previousWmi}
 })
 
 test('TOTP enrollment gates login and can be disabled',async()=>{

@@ -13,6 +13,7 @@ import Administration from './views/Administration.vue'
 import Login from './views/Login.vue'
 import AcceptInvite from './views/AcceptInvite.vue'
 import VerifyEmail from './views/VerifyEmail.vue'
+import EnrollAuthenticator from './views/EnrollAuthenticator.vue'
 import {session} from './lib/api.js'
 import '@mdi/font/css/materialdesignicons.css'
 import './styles.scss'
@@ -23,6 +24,7 @@ const routes=[
   {path:'/login',component:Login,meta:{public:true}},
   {path:'/accept-invite',component:AcceptInvite,meta:{public:true}},
   {path:'/verify-email',component:VerifyEmail,meta:{public:true}},
+  {path:'/enroll-authenticator',component:EnrollAuthenticator,meta:{public:true}},
   {path:'/mfa/callback',component:MfaPrompt,meta:{public:true}},
   {path:'/mfa/:promptId',component:MfaPrompt,meta:{public:true}},
   {path:'/',component:Dashboard},

@@ -111,6 +111,15 @@ $result = switch ($operation) {
       [pscustomobject]@{RecordId=$event.RecordId;Id=$event.Id;TimeCreated=$event.TimeCreated.ToUniversalTime().ToString('o');Fields=$fields}
     })
   }
+  'events_recent' {
+    $firewall=@(Get-WinEvent -LogName Security -FilterXPath '*[System[(EventID=5156 or EventID=5157 or EventID=5150 or EventID=5151)]]' -MaxEvents 500 -ErrorAction SilentlyContinue)
+    $other=@(Get-WinEvent -LogName Security -FilterXPath '*[System[(EventID=4624 or EventID=4625 or EventID=5712)]]' -MaxEvents 100 -ErrorAction SilentlyContinue)
+    @($firewall+$other | Sort-Object RecordId | ForEach-Object {
+      $event=$_; $xml=[xml]$event.ToXml(); $fields=@{}
+      foreach($data in @($xml.Event.EventData.Data)) { if($data.Name) {$fields[$data.Name]=[string]$data.'#text'} }
+      [pscustomobject]@{RecordId=$event.RecordId;Id=$event.Id;TimeCreated=$event.TimeCreated.ToUniversalTime().ToString('o');Fields=$fields}
+    })
+  }
   'audit_policy' { Get-WinFireAuditPolicy }
   'audit_policy_enable' {
     $before=Get-WinFireAuditPolicy
@@ -152,7 +161,7 @@ $result | ConvertTo-Json -Depth 12 -Compress
 def main():
     payload = json.load(sys.stdin)
     operation = payload['operation']
-    if operation not in {'auth', 'tcp_probe', 'facts', 'all_rules', 'rules', 'apply', 'events', 'audit_policy', 'audit_policy_enable', 'rights', 'breakglass_start', 'breakglass_end', 'jit_preflight', 'jit_start', 'jit_end', 'prompt_browser', 'prompt_session'}:
+    if operation not in {'auth', 'tcp_probe', 'facts', 'all_rules', 'rules', 'apply', 'events', 'events_recent', 'audit_policy', 'audit_policy_enable', 'rights', 'breakglass_start', 'breakglass_end', 'jit_preflight', 'jit_start', 'jit_end', 'prompt_browser', 'prompt_session'}:
         raise ValueError('Unsupported operation')
     host = payload['host']
     secure = payload.get('transport') == 'winrms'

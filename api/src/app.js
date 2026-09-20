@@ -10,7 +10,7 @@ import {z} from 'zod'
 import {compilePolicy, graphSchema, findRuleConflicts,validateAddressExpression,validateProgramPath} from '@winfire/shared'
 import {db, all, one, run, id, now, audit, json, parse} from './db.js'
 import {auth, requireRole, publicUser, issueAccess, issueRefresh, rotateRefresh, hashToken, seal, openSealed} from './security.js'
-import {probeNode, collectFacts, lookupDns, remote, applyRules, diffRules, tcpProbe} from './connector.js'
+import {probeNode, collectFacts, lookupDns, remote, applyRules, diffRules, tcpProbe,testNodeCredential} from './connector.js'
 import {classifyVerification,hasManagedRule} from './verifier.js'
 import {makeTotpSecret,verifyTotp,matchingTotpCounter} from './totp.js'
 import {agentRoutes} from './agentRoutes.js'
@@ -28,10 +28,12 @@ import {parseSeceditRights} from './logonRights.js'
 import {normalizeProfileSnapshot,publicBreakGlass} from './breakGlass.js'
 import {normalizeSourceIp,sourceMatches} from './mfaPortal.js'
 import {entraConfigured,startEntraAuthentication,completeEntraAuthentication} from './entraPortal.js'
+import {publicEntraSettings,saveEntraSettings} from './entraSettings.js'
 import {portalBranding,setPortalCompanyName,savePortalImage,readPortalImage,removePortalImage} from './portalBranding.js'
 import {assertManagementAccess} from './managementGuard.js'
 import {mfaPromptSettings} from './mfaPromptSettings.js'
 import {createMfaChallenge,resolveMfaChallenge} from './mfaChallenges.js'
+import {beginAdAuthenticatorEnrollment,confirmAdAuthenticatorEnrollment} from './adAuthenticatorEnrollment.js'
 
 export const app=express()
 app.disable('x-powered-by')
@@ -192,8 +194,8 @@ const publicMfaLimit=rateLimit({windowMs:15*60*1000,limit:10,standardHeaders:'dr
 api.post('/auth/login',loginLimit,wrap(async(req,res)=>{
   const {email,password,totp}=body(z.object({email:z.email(),password:z.string().min(1),totp:z.string().optional()}),req)
   const user=one('SELECT * FROM users WHERE email=?',email.toLowerCase())
-  if (!user || user.suspended || user.locked_until && user.locked_until>now() || !await argon2.verify(user.password_hash,password)) {
-    if(user && !user.suspended) {
+  if (!user || user.directory_only || user.suspended || user.locked_until && user.locked_until>now() || !await argon2.verify(user.password_hash,password)) {
+    if(user && !user.directory_only && !user.suspended) {
       const attempts=user.failed_attempts+1
       run('UPDATE users SET failed_attempts=?,locked_until=? WHERE id=?',attempts,attempts>=5?new Date(Date.now()+15*60*1000).toISOString():null,user.id)
     }
@@ -211,6 +213,22 @@ api.post('/auth/login',loginLimit,wrap(async(req,res)=>{
 api.post('/auth/refresh',loginLimit,(req,res)=>{const tokens=rotateRefresh(req.body?.refreshToken);return tokens?res.json(tokens):res.status(401).json({error:'Invalid refresh token'})})
 api.post('/auth/logout',auth,(req,res)=>{if(req.body?.refreshToken)run('UPDATE refresh_tokens SET revoked_at=? WHERE token_hash=?',now(),hashToken(req.body.refreshToken));audit(req.user.id,'auth.logout','user',req.user.id,null,null);res.json({ok:true})})
 api.get('/auth/me',auth,(req,res)=>res.json({...publicUser(req.user),totpEnabled:!!req.user.totp_secret,emailVerified:!!req.user.email_verified,profile:one('SELECT avatar_url,theme,notification_prefs FROM user_profiles WHERE user_id=?',req.user.id)}))
+
+const enrollmentLimit=rateLimit({windowMs:15*60*1000,limit:10,standardHeaders:'draft-8',legacyHeaders:false})
+function requireEnrollmentHttps(req,res,next){
+  if(process.env.NODE_ENV==='production'&&!req.secure&&!['127.0.0.1','::1'].includes(req.ip))return res.status(426).json({error:'Authenticator enrollment requires HTTPS'})
+  next()
+}
+api.post('/auth/ad-totp/enroll',enrollmentLimit,requireEnrollmentHttps,wrap(async(req,res)=>{
+  const {email,password}=body(z.object({email:z.email(),password:z.string().min(1).max(512)}),req)
+  const result=await beginAdAuthenticatorEnrollment({settings:directorySettings(),email,password,sourceIp:normalizeSourceIp(req.ip)})
+  res.set('Cache-Control','no-store').json(result)
+}))
+api.post('/auth/ad-totp/confirm',enrollmentLimit,requireEnrollmentHttps,wrap(async(req,res)=>{
+  const {token,code}=body(z.object({token:z.string().min(32).max(128),code:z.string().regex(/^\d{6}$/)}),req)
+  const result=await confirmAdAuthenticatorEnrollment({token,code,sourceIp:normalizeSourceIp(req.ip)})
+  res.set('Cache-Control','no-store').json(result)
+}))
 
 api.post('/invites/accept',loginLimit,wrap(async(req,res)=>{
   const {token,password}=body(z.object({token:z.string().min(32),password:z.string().min(12)}),req)
@@ -284,7 +302,7 @@ api.post('/mfa/prompts/:id/totp',publicMfaLimit,wrap(async(req,res)=>{
   let user=null
   try{
     user=portalIdentity(email,segment)
-    if(!user.totp_secret)throw Object.assign(new Error('Enroll an authenticator in your WinFire profile before using this request'),{status:403})
+    if(!user.totp_secret)throw Object.assign(new Error('Enroll an authenticator at /enroll-authenticator before using this request'),{status:403})
     await authenticateDirectoryUser(directorySettings(),email,password)
     const counter=matchingTotpCounter(openSealed(user.totp_secret).secret,code)
     if(counter===null)throw Object.assign(new Error('Invalid directory credentials or authenticator code'),{status:401})
@@ -341,6 +359,11 @@ api.post('/mfa/entra/cancel',publicMfaLimit,(req,res)=>{
 
 api.use('/agents',agentRoutes)
 api.use(auth)
+api.get('/settings/entra',requireRole('admin'),(_req,res)=>res.json(publicEntraSettings()))
+api.patch('/settings/entra',requireRole('admin'),(req,res)=>{
+  const data=body(z.object({tenantId:z.uuid(),clientId:z.uuid(),clientSecret:z.string().min(8).max(4096).optional(),enabled:z.boolean()}),req)
+  res.json(saveEntraSettings(data,req.user.id))
+})
 api.get('/settings/mfa-prompt',requireRole('admin'),(_req,res)=>res.json(mfaPromptSettings()))
 api.patch('/settings/mfa-prompt',requireRole('admin'),(req,res)=>{
   const data=body(z.object({failureMode:z.enum(['closed','open']),failOpenMinutes:z.number().int().min(2).max(15),approval:z.string().optional()}),req)
@@ -749,7 +772,7 @@ api.post('/credentials/:id/test',requireRole('editor'),wrap(async(req,res)=>{
   if(!canUseCredential(req.user,credential))return res.status(403).json({error:'Insufficient permission'})
   const assigned=one('SELECT 1 FROM credential_assignments WHERE credential_id=? AND (node_id=? OR node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?))',credential.id,node.id,node.id)
   if(!assigned)return res.status(400).json({error:'Assign credential to node first'})
-  try {const account=await remote(node,'auth',{}, {credentialId:credential.id});res.json({success:true,account})}catch(error){res.json({success:false,error:error.message})}
+  try {res.json(await testNodeCredential(node,credential.id))}catch(error){res.json({success:false,transport:node.transport||'winrm',error:error.message})}
 }))
 
 api.get('/nodes',(_req,res)=>res.json(all('SELECT n.*,f.snapshot_json FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id ORDER BY n.created_at DESC').map(publicNode)))
@@ -1584,20 +1607,35 @@ api.post('/logs/ingest',requireRole('editor'),(req,res)=>{
   res.status(201).json({inserted})
 })
 
+function insertCollectedEvents(nodeId,events,ignoreLoopback){
+  let inserted=0
+  db.transaction(()=>{for(const event of events){
+    const item=normalizeWindowsEvent(event)
+    if(ignoreLoopback&&isLoopbackEvent(item))continue
+    const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,program,account_sid,event_time,event_type,logon_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),nodeId,item.recordId,item.eventId,item.action,item.protocol,item.srcIp,item.srcPort,item.dstIp,item.dstPort,item.direction,item.program,item.accountSid,item.eventTime,item.eventType,item.logonType)
+    inserted+=result.changes
+  }})()
+  return inserted
+}
+export async function pullRecentLogs(nodeId,actorId=null,quiet=false){
+  const node=getNode(nodeId);if(!node)throw Object.assign(new Error('Node not found'),{status:404})
+  const raw=await remote(node,'events_recent'),events=Array.isArray(raw)?raw:[raw].filter(Boolean)
+  const inserted=insertCollectedEvents(nodeId,events,observabilitySettings().ignoreLoopbackIngest)
+  if(!quiet)audit(actorId,'logs.pull.recent','node',nodeId,null,{inserted,sampled:events.length,latestRecordId:events.at(-1)?.RecordId??null})
+  return {inserted,sampled:events.length,latestRecordId:events.at(-1)?.RecordId??null}
+}
 export async function pullLogs(nodeId,actorId=null,maxPages=5,quiet=false) {
   const node=getNode(nodeId);if(!node)throw Object.assign(new Error('Node not found'),{status:404})
   const ignoreLoopback=observabilitySettings().ignoreLoopbackIngest
-  let cursor=one('SELECT last_record_id FROM node_log_cursors WHERE node_id=?',nodeId)?.last_record_id??one('SELECT MAX(record_id) n FROM log_events WHERE node_id=?',nodeId)?.n??0
+  // The recent tail is stored in log_events too. Never use MAX(record_id) to
+  // initialize the historical cursor, or one fresh sample skips the backlog.
+  const auditedCursor=one("SELECT json_extract(after_json,'$.lastRecordId') value FROM audit_log WHERE action='logs.pull' AND entity_id=? ORDER BY at DESC,rowid DESC LIMIT 1",nodeId)?.value
+  let cursor=one('SELECT last_record_id FROM node_log_cursors WHERE node_id=?',nodeId)?.last_record_id??auditedCursor??0
   let inserted=0,pages=0,caughtUp=false
   for(;pages<maxPages;pages++){
     const raw=await remote(node,'events',{after:cursor}),events=Array.isArray(raw)?raw:[raw].filter(Boolean)
     if(!events.length){caughtUp=true;break}
-    db.transaction(()=>{for(const event of events){
-      const item=normalizeWindowsEvent(event)
-      if(ignoreLoopback&&isLoopbackEvent(item))continue
-      const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,program,account_sid,event_time,event_type,logon_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),nodeId,item.recordId,item.eventId,item.action,item.protocol,item.srcIp,item.srcPort,item.dstIp,item.dstPort,item.direction,item.program,item.accountSid,item.eventTime,item.eventType,item.logonType)
-      inserted+=result.changes
-    }})()
+    inserted+=insertCollectedEvents(nodeId,events,ignoreLoopback)
     const next=Number(events.at(-1).RecordId)
     if(next<=cursor)break
     cursor=next
@@ -1609,7 +1647,9 @@ export async function pullLogs(nodeId,actorId=null,maxPages=5,quiet=false) {
 }
 api.post('/logs/pull',requireRole('editor'),wrap(async(req,res)=>{
   const {nodeId}=body(z.object({nodeId:z.string()}),req)
-  res.json(await pullLogs(nodeId,req.user.id))
+  const recent=await pullRecentLogs(nodeId,req.user.id)
+  const history=await pullLogs(nodeId,req.user.id)
+  res.json({...history,inserted:history.inserted+recent.inserted,recent})
 }))
 api.get('/learning-sessions',(req,res)=>res.json(all('SELECT * FROM learning_sessions WHERE (? IS NULL OR node_id=?) ORDER BY started_at DESC,rowid DESC LIMIT 500',req.query.nodeId||null,req.query.nodeId||null)))
 api.post('/learning-sessions',requireRole('editor'),(req,res)=>{

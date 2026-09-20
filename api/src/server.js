@@ -3,7 +3,7 @@ import path from 'node:path'
 import {fileURLToPath} from 'node:url'
 import express from 'express'
 import https from 'node:https'
-import {app,runVerification,runDriftCheck,pullLogs,processDueTraining,processDueBreakGlass,processDuePolicySync,syncDirectory} from './app.js'
+import {app,runVerification,runDriftCheck,pullLogs,pullRecentLogs,processDueTraining,processDueBreakGlass,processDuePolicySync,syncDirectory} from './app.js'
 import {bootstrap,ensureBootstrapAdmin} from './security.js'
 import {all,one,run,now,audit} from './db.js'
 import {agentTlsOptions} from './agentPki.js'
@@ -70,7 +70,7 @@ async function pollMfaEvents(){
         AND (n.next_retry_at IS NULL OR n.next_retry_at<=?) ORDER BY n.id`,now())
     const batch=targets.length?Array.from({length:Math.min(targets.length,5)},(_,index)=>targets[(mfaPollCursor+index)%targets.length]):[]
     mfaPollCursor=targets.length?(mfaPollCursor+batch.length)%targets.length:0
-    await Promise.all(batch.map(async target=>{try{await pullLogs(target.id,null,1,true)}catch(error){console.error(`MFA event poll failed for ${target.id}:`,error.message)}}))
+    await Promise.all(batch.map(async target=>{try{await pullRecentLogs(target.id,null,true)}catch(error){console.error(`MFA event poll failed for ${target.id}:`,error.message)}}))
     await sweepMfaPrompts()
   }catch(error){console.error('MFA prompt sweep failed:',error)}
   finally{mfaPollRunning=false}
@@ -138,6 +138,25 @@ const notificationTimer=setInterval(async()=>{
 },30_000)
 notificationTimer.unref()
 let jobsRunning=false
+let logPollRunning=false
+async function pollNodeLogs(){
+  if(logPollRunning)return
+  logPollRunning=true
+  try{
+    for(const node of all("SELECT id,hostname FROM nodes WHERE transport IN ('winrm','winrms') AND (next_retry_at IS NULL OR next_retry_at<=?) ORDER BY hostname",now())){
+      try{
+        await pullRecentLogs(node.id,null,true)
+        await pullLogs(node.id,null,5,true)
+      }catch(error){
+        audit(null,'logs.pull.failed','node',node.id,null,{error:error.message})
+        console.error(`Event collection failed for ${node.hostname}:`,error.message)
+      }
+    }
+  }finally{logPollRunning=false}
+}
+setTimeout(()=>pollNodeLogs().catch(error=>console.error('Event collection failed:',error)),5000).unref()
+const logPollTimer=setInterval(()=>pollNodeLogs().catch(error=>console.error('Event collection failed:',error)),Math.max(30,Number(process.env.LOG_POLL_INTERVAL_SECONDS||120))*1000)
+logPollTimer.unref()
 const jobs=setInterval(async()=>{
   if(jobsRunning)return
   jobsRunning=true
@@ -145,7 +164,6 @@ const jobs=setInterval(async()=>{
     for(const node of all("SELECT * FROM nodes WHERE transport IN ('winrm','winrms') AND (next_retry_at IS NULL OR next_retry_at<=?)",now())) {
       try{
         if(node.status==='unreachable')await collectFacts(node)
-        await pullLogs(node.id)
       }catch(error){audit(null,'logs.pull.failed','node',node.id,null,{error:error.message})}
     }
     await runVerification()

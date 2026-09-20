@@ -74,6 +74,45 @@ async function pywinrm(input) {
     child.stdin.end(JSON.stringify(input))
   })
 }
+async function wmiProbePython(input){
+  const sidecar=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../sidecar/wmi_probe.py')
+  const localPython=path.resolve('.venv/bin/python')
+  const python=process.env.WMI_PROBE_PYTHON||process.env.WINRM_PYTHON||(fs.existsSync(localPython)?localPython:'python3')
+  return new Promise((resolve,reject)=>{
+    const child=spawn(python,[sidecar],{stdio:['pipe','pipe','pipe']})
+    let stdout='',stderr='',timedOut=false
+    const timer=setTimeout(()=>{timedOut=true;child.kill('SIGKILL')},12000)
+    child.stdout.on('data',chunk=>stdout+=chunk)
+    child.stderr.on('data',chunk=>stderr+=chunk)
+    child.once('error',error=>{clearTimeout(timer);reject(error)})
+    child.once('close',code=>{
+      clearTimeout(timer)
+      if(timedOut)return reject(new Error('WMI/DCOM probe timed out; check the dynamic RPC port range and firewall'))
+      if(code)return reject(new Error(stderr.trim().slice(0,500)||`WMI probe exited ${code}`))
+      try{resolve(JSON.parse(stdout))}catch{reject(new Error('Invalid WMI probe response'))}
+    })
+    child.stdin.end(JSON.stringify(input))
+  })
+}
+async function wmiProbePowerShell(input){
+  const script=`$ErrorActionPreference='Stop';$payload=[Console]::In.ReadToEnd()|ConvertFrom-Json;$secure=ConvertTo-SecureString $payload.password -AsPlainText -Force;$credential=[pscredential]::new($payload.username,$secure);$computer=Get-WmiObject -Class Win32_ComputerSystem -ComputerName $payload.host -Credential $credential -ErrorAction Stop|Select-Object -First 1 -ExpandProperty Name;@{success=$true;transport='wmi';computerName=[string]$computer}|ConvertTo-Json -Compress`
+  const encoded=Buffer.from(script,'utf16le').toString('base64')
+  return new Promise((resolve,reject)=>{
+    const child=spawn('powershell.exe',['-NoProfile','-NonInteractive','-EncodedCommand',encoded],{stdio:['pipe','pipe','pipe']})
+    let stdout='',stderr='',timedOut=false
+    const timer=setTimeout(()=>{timedOut=true;child.kill()},12000)
+    child.stdout.on('data',chunk=>stdout+=chunk)
+    child.stderr.on('data',chunk=>stderr+=chunk)
+    child.once('error',error=>{clearTimeout(timer);reject(error)})
+    child.once('close',code=>{
+      clearTimeout(timer)
+      if(timedOut)return reject(new Error('WMI/DCOM probe timed out; check the dynamic RPC port range and firewall'))
+      if(code)return reject(new Error(stderr.trim().slice(0,500)||`WMI probe exited ${code}`))
+      try{resolve(JSON.parse(stdout))}catch{reject(new Error('Invalid WMI probe response'))}
+    })
+    child.stdin.end(JSON.stringify(input))
+  })
+}
 const remoteScript = `
 $ErrorActionPreference='Stop'
 $payload=[Console]::In.ReadToEnd() | ConvertFrom-Json
@@ -151,6 +190,7 @@ try {
     @{applied = $true}
   }
   'events' { $after=[long]$argsData.after; $xpath="*[System[((EventID=5156 or EventID=5157 or EventID=5150 or EventID=5151 or EventID=4624 or EventID=4625 or EventID=5712) and EventRecordID > $after)]]"; @(Get-WinEvent -LogName Security -FilterXPath $xpath -Oldest -MaxEvents 500 -ErrorAction SilentlyContinue | ForEach-Object { $event=$_; $xml=[xml]$event.ToXml(); $fields=@{}; foreach($data in @($xml.Event.EventData.Data)) { if($data.Name) {$fields[$data.Name]=[string]$data.'#text'} }; [pscustomobject]@{RecordId=$event.RecordId;Id=$event.Id;TimeCreated=$event.TimeCreated.ToUniversalTime().ToString('o');Fields=$fields} }) }
+  'events_recent' { $firewall=@(Get-WinEvent -LogName Security -FilterXPath '*[System[(EventID=5156 or EventID=5157 or EventID=5150 or EventID=5151)]]' -MaxEvents 500 -ErrorAction SilentlyContinue); $other=@(Get-WinEvent -LogName Security -FilterXPath '*[System[(EventID=4624 or EventID=4625 or EventID=5712)]]' -MaxEvents 100 -ErrorAction SilentlyContinue); @($firewall+$other | Sort-Object RecordId | ForEach-Object { $event=$_; $xml=[xml]$event.ToXml(); $fields=@{}; foreach($data in @($xml.Event.EventData.Data)) { if($data.Name) {$fields[$data.Name]=[string]$data.'#text'} }; [pscustomobject]@{RecordId=$event.RecordId;Id=$event.Id;TimeCreated=$event.TimeCreated.ToUniversalTime().ToString('o');Fields=$fields} }) }
       'audit_policy' { Get-WinFireAuditPolicy }
       'breakglass_start' { Start-WinFireBreakGlass $argsData }
       'breakglass_end' { End-WinFireBreakGlass $argsData }
@@ -174,6 +214,20 @@ function nodeCredential(nodeId,credentialId) {
   }
   if (!rows.length) throw new Error('No credential assigned to node')
   return rows.map(row=>({...row,secret:openSealed(row.encrypted_blob)}))
+}
+export async function testNodeCredential(node,credentialId){
+  if(node.transport!=='wmi'){
+    const account=await remote(node,'auth',{}, {credentialId})
+    return {success:true,transport:node.transport||'winrm',account}
+  }
+  const credential=nodeCredential(node.id,credentialId)[0]
+  const input={host:node.fqdn||node.ip||node.hostname,username:credential.username,password:credential.secret.password}
+  let result
+  try{result=process.platform==='win32'?await wmiProbePowerShell(input):await wmiProbePython(input)}
+  catch(error){error.message=String(error.message).replaceAll(input.password,'[redacted]');throw error}
+  if(result?.success!==true||result.transport!=='wmi'||!result.computerName)throw new Error('WMI did not confirm access to Win32_ComputerSystem')
+  recordNodeSuccess(node.id,'wmi-authenticated')
+  return {success:true,transport:'wmi',account:credential.username,computerName:result.computerName}
 }
 export async function remote(node,operation,args={},options={}) {
   if(node.transport==='wmi')throw new Error('WMI/DCOM transport is detected but authenticated WMI operations are not implemented')

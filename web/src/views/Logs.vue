@@ -13,6 +13,8 @@ const hideLoopback=ref(true)
 const page=ref(1),pageSize=ref(100),total=ref(0),sortBy=ref('time'),sortDir=ref('desc')
 const error=ref(''),message=ref(''),loading=ref(false),duration=ref(24)
 let requestId=0
+let refreshTimer=null
+const pulling=ref(false)
 const totalPages=computed(()=>Math.max(1,Math.ceil(total.value/pageSize.value)))
 const firstRow=computed(()=>total.value?(page.value-1)*pageSize.value+1:0)
 const lastRow=computed(()=>Math.min(page.value*pageSize.value,total.value))
@@ -42,22 +44,36 @@ function changePage(next){if(next<1||next>totalPages.value||loading.value)return
 async function startLearning(){if(!filters.value.nodeId)return;try{await api('/learning-sessions',{method:'POST',body:{nodeId:filters.value.nodeId,durationHours:Number(duration.value)}});await load()}catch(e){error.value=e.message}}
 async function finalize(session){try{const result=await api(`/learning-sessions/${session.id}/finalize`,{method:'POST',body:{}});message.value=`Proposal generated with ${result.ruleCount} rules. Review it in Policy Studio before approval.`;await load()}catch(e){error.value=e.message}}
 async function approve(session){try{const result=await api(`/learning-sessions/${session.id}/approve`,{method:'POST',body:{}});message.value=result.status==='enforced'?'Learned policy applied':result.status==='applying'?'Policy queued for agent application':'Policy apply failed; review the run before retrying';await load()}catch(e){error.value=e.message}}
-async function pull(){if(!filters.value.nodeId)return;try{await api('/logs/pull',{method:'POST',body:{nodeId:filters.value.nodeId}});searchEvents()}catch(e){error.value=e.message}}
+async function pull(){
+  const targets=nodes.value.filter(node=>['winrm','winrms'].includes(node.transport)&&(filters.value.nodeId?node.id===filters.value.nodeId:true))
+  if(!targets.length)return
+  error.value='';message.value='';pulling.value=true
+  let inserted=0;const failures=[]
+  try{
+    for(const node of targets){
+      try{const result=await api('/logs/pull',{method:'POST',body:{nodeId:node.id}});inserted+=result.inserted}
+      catch(cause){failures.push(`${node.hostname}: ${cause.message}`)}
+    }
+    message.value=`Collected ${inserted} new events from ${targets.length-failures.length} node${targets.length-failures.length===1?'':'s'}.`
+    page.value=1;await load()
+    if(failures.length)error.value=[error.value,failures.join(' · ')].filter(Boolean).join(' · ')
+  }finally{pulling.value=false}
+}
 function canRule(event){return ['in','out'].includes(event.direction)&&['TCP','UDP'].includes(event.protocol)&&Number(event.dst_port)>0&&!!(event.direction==='in'?event.src_ip:event.dst_ip)}
 function openEventMenu(mouseEvent,event){if(!canManageRules.value)return;mouseEvent.preventDefault();const x=Math.min(mouseEvent.clientX||80,window.innerWidth-235),y=Math.min(mouseEvent.clientY||80,window.innerHeight-130);eventContext.value={event,x:Math.max(8,x),y:Math.max(8,y)};nextTick(()=>eventContextEl.value?.querySelector('button')?.focus({preventScroll:true}))}
 function closeEventMenu(){eventContext.value=null}
 function onPointer(event){if(eventContext.value&&!event.target.closest('.event-context-menu,.event-menu-trigger'))closeEventMenu()}
 function beginRule(event,action){ruleEvent.value=event;ruleAction.value=action;rulePolicyId.value='personal';ruleOpen.value=true;closeEventMenu()}
 async function addRule(){if(!ruleEvent.value)return;ruleBusy.value=true;error.value='';try{const result=await api(`/logs/${ruleEvent.value.id}/rule`,{method:'POST',body:{action:ruleAction.value,...(rulePolicyId.value==='personal'?{}:{policyId:rulePolicyId.value})}});ruleOpen.value=false;message.value=`Rule saved to policy version ${result.versionNo}. An administrator can sync it from the top bar.`;policies.value=await api('/policies')}catch(e){error.value=e.message}finally{ruleBusy.value=false}}
-onMounted(async()=>{window.addEventListener('pointerdown',onPointer);window.addEventListener('keydown',onMenuKey);try{const [loadedNodes,loadedPolicies,display]=await Promise.all([api('/nodes'),api('/policies'),api('/settings/logs-display')]);nodes.value=loadedNodes;policies.value=loadedPolicies;hideLoopback.value=display.hideLoopbackEvents;await load()}catch(e){error.value=e.message}})
+onMounted(async()=>{window.addEventListener('pointerdown',onPointer);window.addEventListener('keydown',onMenuKey);refreshTimer=window.setInterval(()=>{if(document.visibilityState==='visible'&&page.value===1&&!loading.value&&!pulling.value)load()},30000);try{const [loadedNodes,loadedPolicies,display]=await Promise.all([api('/nodes'),api('/policies'),api('/settings/logs-display')]);nodes.value=loadedNodes;policies.value=loadedPolicies;hideLoopback.value=display.hideLoopbackEvents;await load()}catch(e){error.value=e.message}})
 function onMenuKey(event){if(event.key==='Escape')closeEventMenu()}
-onUnmounted(()=>{window.removeEventListener('pointerdown',onPointer);window.removeEventListener('keydown',onMenuKey)})
+onUnmounted(()=>{window.removeEventListener('pointerdown',onPointer);window.removeEventListener('keydown',onMenuKey);if(refreshTimer)window.clearInterval(refreshTimer)})
 </script>
 
 <template>
   <div class="view">
     <PageHeader eyebrow="OBSERVABILITY / EVENTS" title="Firewall events" description="Search collected traffic and train a policy from observed flows">
-      <button class="button secondary" :disabled="!filters.nodeId" @click="pull"><i class="mdi mdi-download-network-outline"></i> Pull from node</button>
+      <button class="button secondary" :disabled="pulling||!nodes.some(node=>['winrm','winrms'].includes(node.transport)&&(filters.nodeId?node.id===filters.nodeId:true))" @click="pull"><i class="mdi mdi-download-network-outline"></i> {{pulling?'Pulling…':filters.nodeId?'Pull from node':'Pull from all nodes'}}</button>
       <button class="button primary" :disabled="loading" @click="load"><i class="mdi mdi-refresh"></i> Refresh</button>
     </PageHeader>
     <div v-if="error" class="error-msg" role="alert">{{error}}</div>

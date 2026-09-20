@@ -100,6 +100,7 @@ onMounted(async()=>{
             <label>Google Authenticator code<input v-model="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000" required></label>
             <button class="mfa-action" :disabled="working||!prompt.providerAvailable"><i class="mdi mdi-shield-check-outline"></i> {{working?'Verifying…':'Authorize access'}}</button>
           </form>
+          <a class="mfa-return" :href="`/enroll-authenticator?next=${encodeURIComponent(`/mfa/${prompt.id}`)}`">New to AD + Authenticator? Enroll here</a>
         </template>
         <a v-if="callback&&error&&prompt" class="mfa-return" :href="`/mfa/${prompt.id}`">Return to request</a>
       </template>
