@@ -9,7 +9,7 @@ import crypto from 'node:crypto'
 import {isIP} from 'node:net'
 import PDFDocument from 'pdfkit'
 import {z} from 'zod'
-import {compilePolicy, graphSchema, findRuleConflicts,validateAddressExpression,validateProgramPath} from '@winfire/shared'
+import {compilePolicy, graphSchema, findRuleConflicts,validateAddressExpression,validatePortExpression,validateProgramPath} from '@winfire/shared'
 import {db, all, one, run, id, now, audit, json, parse} from './db.js'
 import {auth, requireRole, publicUser, issueAccess, issueRefresh, rotateRefresh, hashToken, seal, openSealed} from './security.js'
 import {probeNode, collectFacts, enrichNode, lookupDns, remote, applyRules, diffRules, tcpProbe,testNodeCredential} from './connector.js'
@@ -37,6 +37,8 @@ import {mfaPromptSettings} from './mfaPromptSettings.js'
 import {createMfaChallenge,resolveMfaChallenge} from './mfaChallenges.js'
 import {beginAdAuthenticatorEnrollment,confirmAdAuthenticatorEnrollment} from './adAuthenticatorEnrollment.js'
 import {validateExportDestination,exportSelectedEvents} from './eventExport.js'
+import {previewSecurityAutomation} from './securityAutomations.js'
+import {collectAccountInventory,accountName} from './localAccounts.js'
 
 export const app=express()
 app.disable('x-powered-by')
@@ -166,6 +168,10 @@ async function applyPolicy(policy,actorId=null,targetNodes=null,context={}) {
   const rules=parse(version.rules_compiled_json)||[], results=[]
   assertManagementAccess(rules)
   const targets=targetNodes||assignedNodes(policy.id)
+  for(const node of targets)for(const rule of rules)if(rule.localUserSid){
+    if(node.connection_mode!=='agentless'||!['winrm','winrms'].includes(node.transport))throw Object.assign(new Error('Local account firewall rules require an agentless WinRM source node'),{status:409})
+    if(!one('SELECT id FROM local_accounts WHERE node_id=? AND sid=? AND missing=0',node.id,rule.localUserSid))throw Object.assign(new Error(`Local account ${rule.localUserSid} is not present on ${node.hostname}`),{status:409})
+  }
   const conflicts=assignmentConflicts(policy.id,rules,targets)
   if(conflicts.length)throw Object.assign(new Error('Conflicting firewall rules on assigned nodes'),{status:409,conflicts})
   for (const node of targets) {
@@ -393,6 +399,36 @@ api.post('/mfa/entra/cancel',publicMfaLimit,(req,res)=>{
 
 api.use('/agents',agentRoutes)
 api.use(auth)
+const securityAutomationSchema=z.object({name:z.string().trim().min(3).max(120),triggerType:z.enum(['destination','mfa_failures']),destination:z.string().trim().max(255).default(''),failureCount:z.number().int().min(2).max(100).default(3),windowMinutes:z.number().int().min(1).max(1440).default(15),cooldownMinutes:z.number().int().min(1).max(10080).default(60),actionType:z.enum(['alert','disable_ad','disable_ad_logoff']).default('alert'),disableMinutes:z.number().int().min(5).max(10080).default(60),enabled:z.boolean().default(false)})
+function validAutomation(data){
+  if(data.triggerType==='destination'&&!data.destination)return 'A destination IP address or hostname is required'
+  if(data.triggerType==='mfa_failures'&&data.actionType!=='alert')return 'Failed MFA challenges cannot disable AD accounts because the submitted username is not verified identity evidence'
+  return null
+}
+api.get('/security-automations',requireRole('admin'),(_req,res)=>res.json(all('SELECT * FROM security_automations ORDER BY created_at DESC')))
+api.post('/security-automations',requireRole('admin'),(req,res)=>{
+  const data=body(securityAutomationSchema,req),error=validAutomation(data)
+  if(error)return res.status(400).json({error})
+  const policyId=id(),stamp=now()
+  run('INSERT INTO security_automations(id,name,trigger_type,destination,failure_count,window_minutes,cooldown_minutes,action_type,disable_minutes,enabled,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',policyId,data.name,data.triggerType,data.destination.toLowerCase(),data.failureCount,data.windowMinutes,data.cooldownMinutes,data.actionType,data.disableMinutes,Number(data.enabled),req.user.id,stamp,stamp)
+  audit(req.user.id,'security.automation.create','security_automation',policyId,null,data)
+  res.status(201).json(one('SELECT * FROM security_automations WHERE id=?',policyId))
+})
+api.patch('/security-automations/:id',requireRole('admin'),(req,res)=>{
+  const before=one('SELECT * FROM security_automations WHERE id=?',reqId(req));if(!before)return notFound(res,'Security policy')
+  const data=body(securityAutomationSchema,req),error=validAutomation(data)
+  if(error)return res.status(400).json({error})
+  run('UPDATE security_automations SET name=?,trigger_type=?,destination=?,failure_count=?,window_minutes=?,cooldown_minutes=?,action_type=?,disable_minutes=?,enabled=?,updated_at=? WHERE id=?',data.name,data.triggerType,data.destination.toLowerCase(),data.failureCount,data.windowMinutes,data.cooldownMinutes,data.actionType,data.disableMinutes,Number(data.enabled),now(),before.id)
+  const after=one('SELECT * FROM security_automations WHERE id=?',before.id)
+  audit(req.user.id,'security.automation.update','security_automation',before.id,before,after)
+  res.json(after)
+})
+api.post('/security-automations/preview',requireRole('admin'),(req,res)=>{
+  const data=body(securityAutomationSchema,req),error=validAutomation(data)
+  if(error)return res.status(400).json({error})
+  res.json(previewSecurityAutomation({trigger_type:data.triggerType,destination:data.destination,failure_count:data.failureCount,window_minutes:data.windowMinutes,created_at:new Date(Date.now()-data.windowMinutes*60_000).toISOString()}))
+})
+api.get('/security-automations/incidents',requireRole('admin'),(_req,res)=>res.json(all('SELECT i.*,p.name policy_name FROM security_automation_incidents i JOIN security_automations p ON p.id=i.policy_id ORDER BY i.created_at DESC LIMIT 100')))
 api.get('/settings/entra',requireRole('admin'),(_req,res)=>res.json(publicEntraSettings()))
 api.patch('/settings/entra',requireRole('admin'),(req,res)=>{
   const data=body(z.object({tenantId:z.uuid(),clientId:z.uuid(),clientSecret:z.string().min(8).max(4096).optional(),enabled:z.boolean()}),req)
@@ -783,6 +819,61 @@ export async function syncDirectory(actorId=null,clientFactory=undefined) {
   } finally {directorySyncInFlight=false}
 }
 api.post('/directory/sync',requireRole('admin'),wrap(async(req,res)=>res.json(await syncDirectory(req.user.id))))
+api.get('/directory/accounts',requireRole('auditor'),(req,res)=>{
+  const query=z.object({q:z.string().max(200).default(''),source:z.enum(['all','ad','local']).default('all'),enabled:z.enum(['all','true','false']).default('all'),mfa:z.enum(['all','enrolled','missing']).default('all'),page:z.coerce.number().int().min(1).default(1),pageSize:z.coerce.number().int().min(10).max(250).default(50),sortBy:z.enum(['name','username','email','lastLogon','status','source','node']).default('name'),sortDir:z.enum(['asc','desc']).default('asc')}).parse(req.query)
+  const union=`SELECT d.id,d.sid,'ad' source,d.display_name,d.sam_account_name,d.upn,d.email,d.enabled,d.missing,d.last_logon_at,NULL node_id,NULL hostname,d.seen_at,
+    EXISTS(SELECT 1 FROM users u WHERE u.ad_guid=d.id AND u.totp_secret IS NOT NULL) mfa_enrolled,
+    EXISTS(SELECT 1 FROM users u WHERE u.ad_guid=d.id AND u.auth_source='ad') operator_imported
+    FROM directory_users d UNION ALL
+    SELECT l.id,l.sid,'local' source,COALESCE(NULLIF(l.full_name,''),l.username) display_name,l.qualified_name sam_account_name,NULL upn,NULL email,l.enabled,l.missing,NULL last_logon_at,l.node_id,n.hostname,l.seen_at,0 mfa_enrolled,0 operator_imported
+    FROM local_accounts l JOIN nodes n ON n.id=l.node_id`
+  const clauses=[],args=[]
+  if(query.source!=='all'){clauses.push('source=?');args.push(query.source)}
+  if(query.enabled!=='all'){clauses.push('enabled=?');args.push(query.enabled==='true'?1:0)}
+  if(query.mfa!=='all')clauses.push(query.mfa==='enrolled'?'mfa_enrolled=1':'mfa_enrolled=0')
+  if(query.q.trim()){const term=`%${query.q.trim().replace(/[\\%_]/g,'\\$&')}%`;clauses.push("(display_name LIKE ? ESCAPE '\\' OR sam_account_name LIKE ? ESCAPE '\\' OR COALESCE(upn,'') LIKE ? ESCAPE '\\' OR COALESCE(email,'') LIKE ? ESCAPE '\\' OR sid LIKE ? ESCAPE '\\' OR COALESCE(hostname,'') LIKE ? ESCAPE '\\')");args.push(term,term,term,term,term,term)}
+  const where=clauses.length?`WHERE ${clauses.join(' AND ')}`:''
+  const order={name:'display_name',username:'sam_account_name',email:'email',lastLogon:'last_logon_at',status:'enabled',source:'source',node:'hostname'}[query.sortBy]
+  const total=one(`SELECT COUNT(*) count FROM (${union}) ${where}`,...args).count
+  const items=all(`SELECT * FROM (${union}) ${where} ORDER BY ${order} ${query.sortDir.toUpperCase()},id LIMIT ? OFFSET ?`,...args,query.pageSize,(query.page-1)*query.pageSize)
+  res.json({items,total,page:query.page,pageSize:query.pageSize,totalPages:Math.max(1,Math.ceil(total/query.pageSize))})
+})
+api.get('/directory/local-accounts/:id',requireRole('auditor'),(req,res)=>{
+  const account=one('SELECT l.*,n.hostname FROM local_accounts l JOIN nodes n ON n.id=l.node_id WHERE l.id=?',reqId(req));if(!account)return notFound(res,'Local account')
+  const logonEvents=all('SELECT e.id,e.node_id,n.hostname,e.event_id,e.action,e.src_ip,e.event_time,e.logon_type FROM log_events e LEFT JOIN nodes n ON n.id=e.node_id WHERE e.account_sid=? AND e.node_id=? AND e.event_id IN (4624,4625,4634,4647) ORDER BY e.event_time DESC,e.record_id DESC LIMIT 100',account.sid,account.node_id)
+  res.json({...account,source:'local',sam_account_name:account.qualified_name,display_name:account.full_name||account.username,logonEvents,mfaEvents:[]})
+})
+api.post('/nodes/:id/local-accounts/refresh',requireRole('admin'),wrap(async(req,res)=>{
+  const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
+  if(!['winrm','winrms'].includes(node.transport)||node.connection_mode!=='agentless')return res.status(409).json({error:'Local account inventory requires an agentless WinRM node'})
+  const result=await collectAccountInventory(node)
+  audit(req.user.id,'local-accounts.refresh','node',node.id,null,result)
+  res.json(result)
+}))
+api.post('/directory/local-accounts/:id/network-rule',requireRole('admin'),(req,res)=>{
+  const data=body(z.object({remoteAddress:z.string().trim().min(1).max(500),remotePort:z.string().trim().min(1).max(100),protocol:z.enum(['TCP','UDP']),reason:z.string().trim().min(10).max(500)}),req)
+  if(!validateAddressExpression(data.remoteAddress)||!validatePortExpression(data.remotePort)||data.remotePort==='Any')return res.status(400).json({error:'Invalid destination address or port'})
+  const account=one('SELECT * FROM local_accounts WHERE id=? AND missing=0',reqId(req));if(!account)return notFound(res,'Local account')
+  const node=getNode(account.node_id);if(!node)return notFound(res,'Node')
+  if(node.connection_mode!=='agentless'||!['winrm','winrms'].includes(node.transport)||/^(?:5\.[12]\.|windows (?:xp|server 2003))/i.test(node.os_version||''))return res.status(409).json({error:'Account-scoped firewall rules require Windows with NetSecurity and an agentless WinRM source node'})
+  const policy=ensurePersonalPolicy(node,req.user.id)
+  const previous=one('SELECT * FROM policy_versions WHERE id=?',policy.current_version_id)
+  const graph=parse(previous.graph_json)||{nodes:[],edges:[]}
+  const matched=graph.nodes.find(item=>item.type==='deny'&&item.data?.localUserSid===account.sid&&item.data?.direction==='out'&&item.data?.remoteAddress===data.remoteAddress&&item.data?.remotePort===data.remotePort&&item.data?.protocol===data.protocol)
+  if(matched)return res.json({policyId:policy.id,versionId:previous.id,versionNo:previous.version_no,duplicate:true,pendingSync:true})
+  const ruleNode={id:id(),type:'deny',data:{name:`Block ${account.qualified_name} to ${data.remoteAddress}:${data.remotePort}`,direction:'out',protocol:data.protocol,localPort:'Any',remotePort:data.remotePort,remoteAddress:data.remoteAddress,program:'Any',profile:'Any',localUserSid:account.sid}}
+  const next={nodes:[...graph.nodes,ruleNode],edges:graph.edges||[]},rules=compilePolicy(next,policy.id)
+  assertManagementAccess(rules)
+  const conflicts=assignmentConflicts(policy.id,rules,[node]);if(conflicts.length)return rejectConflicts(res,conflicts)
+  const versionId=id(),versionNo=Number(previous.version_no)+1
+  db.transaction(()=>{
+    if(!one('SELECT id FROM policy_assignments WHERE policy_id=? AND node_id=?',policy.id,node.id))run('INSERT INTO policy_assignments(id,policy_id,node_id,assigned_by) VALUES(?,?,?,?)',id(),policy.id,node.id,req.user.id)
+    run('INSERT INTO policy_versions(id,policy_id,version_no,graph_json,rules_compiled_json,created_by,comment) VALUES(?,?,?,?,?,?,?)',versionId,policy.id,versionNo,json(next),json(rules),req.user.id,data.reason)
+    run('UPDATE policies SET current_version_id=? WHERE id=?',versionId,policy.id)
+    audit(req.user.id,'local-account.network-rule.stage','policy',policy.id,null,{nodeId:node.id,accountSid:account.sid,remoteAddress:data.remoteAddress,remotePort:data.remotePort,protocol:data.protocol,versionId,reason:data.reason})
+  })()
+  res.status(201).json({policyId:policy.id,versionId,versionNo,pendingSync:true})
+})
 api.get('/directory/users',requireRole('auditor'),(req,res)=>{
   const query=z.object({q:z.string().max(200).default(''),enabled:z.enum(['all','true','false']).default('all'),mfa:z.enum(['all','enrolled','missing']).default('all'),page:z.coerce.number().int().min(1).default(1),pageSize:z.coerce.number().int().min(10).max(250).default(50),sortBy:z.enum(['name','username','email','lastLogon','status']).default('name'),sortDir:z.enum(['asc','desc']).default('asc')}).parse(req.query)
   const clauses=[],args=[]
@@ -810,17 +901,24 @@ api.post('/directory/users/:id/status',requireRole('admin'),wrap(async(req,res)=
   if(user.missing)return res.status(409).json({error:'Sync the directory before changing a missing AD user'})
   if(!data.enabled&&one("SELECT id FROM ad_account_holds WHERE user_guid=? AND status='active'",user.id))return res.status(409).json({error:'A temporary account hold is already active'})
   audit(req.user.id,'directory.user.status.attempt','directory_user',user.id,null,{enabled:data.enabled,reason:data.reason,durationMinutes:data.durationMinutes||null})
+  const settings=directorySettings(),actionCredential=directoryActionCredential(settings)
   let result
-  try{result=await writeDirectoryUserStatus(directorySettings(),directoryActionCredential(directorySettings()),user,data.enabled)}
+  try{result=await writeDirectoryUserStatus(settings,actionCredential,user,data.enabled)}
   catch(error){audit(req.user.id,'directory.user.status.failed','directory_user',user.id,null,{enabled:data.enabled,reason:data.reason,error:error.message});throw error}
   if(data.durationMinutes&&!result.changed)return res.status(409).json({error:'The account was already disabled; WinFire did not schedule an automatic re-enable'})
   const expiresAt=data.durationMinutes?new Date(Date.now()+data.durationMinutes*60_000).toISOString():null
-  db.transaction(()=>{
+  try{db.transaction(()=>{
     run('UPDATE directory_users SET enabled=?,seen_at=? WHERE id=?',Number(data.enabled),now(),user.id)
     if(data.enabled)run("UPDATE ad_account_holds SET status='resolved-manually',resolved_at=? WHERE user_guid=? AND status='active'",now(),user.id)
     if(expiresAt)run('INSERT INTO ad_account_holds(id,user_guid,expected_uac,expires_at,status,created_by,created_at) VALUES(?,?,?,?,?,?,?)',id(),user.id,result.afterUac,expiresAt,'active',req.user.id,now())
     audit(req.user.id,'directory.user.status.changed','directory_user',user.id,{enabled:!!user.enabled,uac:result.beforeUac},{enabled:data.enabled,uac:result.afterUac,reason:data.reason,expiresAt})
-  })()
+  })()}catch(error){
+    if(result.changed){
+      try{await writeDirectoryUserStatus(settings,actionCredential,user,!data.enabled,{expectedUac:result.afterUac})}
+      catch(rollbackError){throw new Error(`AD was changed but its local record could not be stored (${error.message}); automatic rollback failed (${rollbackError.message}). Immediate manual review is required`)}
+    }
+    throw new Error(`AD change was rolled back because its local record could not be stored: ${error.message}`)
+  }
   res.json({enabled:data.enabled,changed:result.changed,expiresAt})
 }))
 export async function processDueAdAccountHolds(){
@@ -1724,13 +1822,15 @@ api.post('/segments/:id/challenges/:challengeId/resolve',requireRole('admin'),(r
   res.json({ok:true})
 })
 
-api.get('/logon-rights',(req,res)=>res.json(all('SELECT r.*,COALESCE(d.sam_account_name,d.upn) ad_username FROM logon_rights r LEFT JOIN directory_users d ON d.sid=r.account_sid WHERE (? IS NULL OR r.node_id=?) ORDER BY r.at DESC LIMIT 500',req.query.nodeId||null,req.query.nodeId||null)))
+api.get('/logon-rights',(req,res)=>res.json(all('SELECT r.* FROM logon_rights r WHERE (? IS NULL OR r.node_id=?) ORDER BY r.at DESC LIMIT 500',req.query.nodeId||null,req.query.nodeId||null).map(right=>({...right,...accountName(right.node_id,right.account_sid)}))))
 // LSA changes use the authenticated WinRM connector and require readback.
 api.post('/logon-rights/baseline',requireRole('admin'),wrap(async(req,res)=>{
   const {nodeId}=body(z.object({nodeId:z.string()}),req),node=getNode(nodeId);if(!node)return notFound(res,'Node')
   const raw=await remote(node,'rights'),lines=Array.isArray(raw)?raw:[raw].filter(Boolean)
   let parsed
   try{parsed=parseSeceditRights(lines)}catch(error){throw Object.assign(error,{status:502})}
+  try{await collectAccountInventory(node,parsed.map(right=>right.accountSid))}
+  catch(error){audit(req.user.id,'local-accounts.baseline.failed','node',node.id,null,{error:error.message})}
   const rights=db.transaction(()=>{
     run('DELETE FROM logon_rights WHERE node_id=? AND baseline=1',node.id)
     const collected=parsed.map(right=>{const rightId=id();run('INSERT INTO logon_rights(id,node_id,account_sid,logon_type,right_assignment,source,baseline,created_by) VALUES(?,?,?,?,?,?,1,?)',rightId,node.id,right.accountSid,right.logonType,right.assignment,'secedit',req.user.id);return {id:rightId,...right}})
@@ -1773,20 +1873,21 @@ api.get('/logs/search',(req,res)=>{
     eventId:z.coerce.number().int().min(0).optional(),protocol:z.string().max(32).optional(),srcIp:z.string().max(128).optional(),dstIp:z.string().max(128).optional(),
     port:z.coerce.number().int().min(1).max(65535).optional(),from:z.iso.datetime({local:true,offset:true}).optional(),to:z.iso.datetime({local:true,offset:true}).optional(),
     page:z.coerce.number().int().min(1).default(1),pageSize:z.coerce.number().int().min(1).max(500).default(100),
-    sortBy:z.enum(['time','node','eventId','action','direction','srcIp','dstIp','port','program']).default('time'),sortDir:z.enum(['asc','desc']).default('desc'),hideLoopback:z.enum(['true','false']).optional()
+    sortBy:z.enum(['time','node','eventId','action','direction','srcIp','dstIp','port','program','account']).default('time'),sortDir:z.enum(['asc','desc']).default('desc'),hideLoopback:z.enum(['true','false']).optional(),account:z.string().max(200).default('')
   }).parse(req.query)
   if(query.from&&query.to&&new Date(query.from)>new Date(query.to))return res.status(400).json({error:'From must be earlier than To'})
   const filters=[],args=[]
   for(const [key,column] of [['nodeId','e.node_id'],['action','e.action'],['direction','COALESCE(e.direction,p.direction)'],['challengeId','e.challenge_id'],['eventId','e.event_id'],['port','COALESCE(e.dst_port,p.dst_port)']])if(query[key]!==undefined){filters.push(`${column}=?`);args.push(query[key])}
   for(const [key,column] of [['program','COALESCE(e.program,p.program)'],['protocol','COALESCE(e.protocol,p.protocol)'],['srcIp','COALESCE(e.src_ip,p.src_ip)'],['dstIp','COALESCE(e.dst_ip,p.dst_ip)']])if(query[key]){filters.push(`${column} LIKE ? ESCAPE '\\'`);args.push(`%${query[key].replace(/[\\%_]/g,'\\$&')}%`)}
+  if(query.account.trim()){const term=`%${query.account.trim().replace(/[\\%_]/g,'\\$&')}%`;filters.push("(e.account_sid LIKE ? ESCAPE '\\' OR COALESCE(ad.sam_account_name,ad.upn,'') LIKE ? ESCAPE '\\' OR COALESCE(la.qualified_name,'') LIKE ? ESCAPE '\\' OR COALESCE(sr.qualified_name,'') LIKE ? ESCAPE '\\')");args.push(term,term,term,term)}
   if(query.from){filters.push('datetime(COALESCE(e.event_time,e.received_at))>=datetime(?)');args.push(query.from)}
   if(query.to){filters.push('datetime(COALESCE(e.event_time,e.received_at))<=datetime(?)');args.push(query.to)}
   if((query.hideLoopback===undefined?observabilitySettings().hideLoopbackEvents:query.hideLoopback==='true'))filters.push("NOT ((COALESCE(e.src_ip,p.src_ip,'') LIKE '127.%' OR COALESCE(e.src_ip,p.src_ip,'') IN ('::1','0:0:0:0:0:0:0:1')) AND (COALESCE(e.dst_ip,p.dst_ip,'') LIKE '127.%' OR COALESCE(e.dst_ip,p.dst_ip,'') IN ('::1','0:0:0:0:0:0:0:1')))")
   const where=filters.length?'WHERE '+filters.join(' AND '):''
-  const sortColumns={time:'julianday(COALESCE(e.event_time,e.received_at))',node:'n.hostname COLLATE NOCASE',eventId:'e.event_id',action:'e.action COLLATE NOCASE',direction:'COALESCE(e.direction,p.direction) COLLATE NOCASE',srcIp:'COALESCE(e.src_ip,p.src_ip) COLLATE NOCASE',dstIp:'COALESCE(e.dst_ip,p.dst_ip) COLLATE NOCASE',port:'COALESCE(e.dst_port,p.dst_port)',program:'COALESCE(e.program,p.program) COLLATE NOCASE'}
-  const fromSql=`FROM log_events e LEFT JOIN nodes n ON n.id=e.node_id LEFT JOIN event_patterns p ON p.id=e.pattern_id ${where}`
+  const sortColumns={time:'julianday(COALESCE(e.event_time,e.received_at))',node:'n.hostname COLLATE NOCASE',eventId:'e.event_id',action:'e.action COLLATE NOCASE',direction:'COALESCE(e.direction,p.direction) COLLATE NOCASE',srcIp:'COALESCE(e.src_ip,p.src_ip) COLLATE NOCASE',dstIp:'COALESCE(e.dst_ip,p.dst_ip) COLLATE NOCASE',port:'COALESCE(e.dst_port,p.dst_port)',program:'COALESCE(e.program,p.program) COLLATE NOCASE',account:'COALESCE(ad.sam_account_name,ad.upn,la.qualified_name,sr.qualified_name,e.account_sid) COLLATE NOCASE'}
+  const fromSql=`FROM log_events e LEFT JOIN nodes n ON n.id=e.node_id LEFT JOIN event_patterns p ON p.id=e.pattern_id LEFT JOIN directory_users ad ON ad.sid=e.account_sid LEFT JOIN local_accounts la ON la.node_id=e.node_id AND la.sid=e.account_sid AND la.missing=0 LEFT JOIN sid_resolutions sr ON sr.node_id=e.node_id AND sr.sid=e.account_sid ${where}`
   const total=one(`SELECT COUNT(*) AS count ${fromSql}`,...args).count
-  const items=all(`SELECT e.*,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,COALESCE(e.dst_ip,p.dst_ip) dst_ip,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.direction,p.direction) direction,COALESCE(e.program,p.program) program,COALESCE(e.event_type,p.event_type) event_type ${fromSql} ORDER BY ${sortColumns[query.sortBy]} ${query.sortDir.toUpperCase()}, e.id DESC LIMIT ? OFFSET ?`,...args,query.pageSize,(query.page-1)*query.pageSize)
+  const items=all(`SELECT e.*,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,COALESCE(e.dst_ip,p.dst_ip) dst_ip,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.direction,p.direction) direction,COALESCE(e.program,p.program) program,COALESCE(e.event_type,p.event_type) event_type,COALESCE(ad.sam_account_name,ad.upn,la.qualified_name,sr.qualified_name) account_name ${fromSql} ORDER BY ${sortColumns[query.sortBy]} ${query.sortDir.toUpperCase()}, e.id DESC LIMIT ? OFFSET ?`,...args,query.pageSize,(query.page-1)*query.pageSize).map(event=>event.account_name?event:{...event,account_name:event.account_sid?accountName(event.node_id,event.account_sid).accountName:null})
   res.json({items,total,page:query.page,pageSize:query.pageSize,totalPages:Math.ceil(total/query.pageSize)})
 })
 const publicEventExport=destination=>({id:destination.id,name:destination.name,kind:destination.kind,endpoint:destination.endpoint,hasToken:!!destination.token_blob,createdAt:destination.created_at,updatedAt:destination.updated_at})
@@ -1872,17 +1973,27 @@ function insertCollectedEvents(nodeId,events,ignoreLoopback){
   db.transaction(()=>{for(const event of events){
     const item=normalizeWindowsEvent(event)
     if(ignoreLoopback&&isLoopbackEvent(item))continue
-    const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,program,account_sid,event_time,event_type,logon_type,filter_origin,filter_runtime_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),nodeId,item.recordId,item.eventId,item.action,item.protocol,item.srcIp,item.srcPort,item.dstIp,item.dstPort,item.direction,item.program,item.accountSid,item.eventTime,item.eventType,item.logonType,item.filterOrigin,item.filterRuntimeId)
+    const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,program,process_id,account_sid,event_time,event_type,logon_type,filter_origin,filter_runtime_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),nodeId,item.recordId,item.eventId,item.action,item.protocol,item.srcIp,item.srcPort,item.dstIp,item.dstPort,item.direction,item.program,item.processId,item.accountSid,item.eventTime,item.eventType,item.logonType,item.filterOrigin,item.filterRuntimeId)
     inserted+=result.changes
     if(!result.changes&&item.filterOrigin)run('UPDATE log_events SET filter_origin=COALESCE(filter_origin,?),filter_runtime_id=COALESCE(filter_runtime_id,?) WHERE node_id=? AND record_id=? AND filter_origin IS NULL',item.filterOrigin,item.filterRuntimeId,nodeId,item.recordId)
     if(!result.changes&&item.eventType==='firewall'&&item.direction==='in')run('UPDATE log_events SET src_ip=?,src_port=?,dst_ip=?,dst_port=? WHERE node_id=? AND record_id=? AND pattern_id IS NULL AND (src_ip IS NOT ? OR src_port IS NOT ? OR dst_ip IS NOT ? OR dst_port IS NOT ?)',item.srcIp,item.srcPort,item.dstIp,item.dstPort,nodeId,item.recordId,item.srcIp,item.srcPort,item.dstIp,item.dstPort)
   }})()
   return inserted
 }
+async function refreshUnknownEventAccounts(node){
+  if(node.connection_mode!=='agentless'||!['winrm','winrms'].includes(node.transport))return
+  const last=one('SELECT collected_at FROM account_inventory_state WHERE node_id=?',node.id)?.collected_at
+  if(last&&Date.now()-Date.parse(last)<60*60*1000)return
+  const recent=all("SELECT DISTINCT account_sid FROM log_events WHERE node_id=? AND account_sid IS NOT NULL AND datetime(COALESCE(event_time,received_at))>=datetime('now','-1 hour') LIMIT 500",node.id)
+  const unknown=recent.map(item=>item.account_sid).filter(sid=>/^S-1-\d+-\d+(?:-\d+)+$/i.test(sid)&&!accountName(node.id,sid).accountName)
+  if(!unknown.length)return
+  try{await collectAccountInventory(node,unknown)}catch(error){audit(null,'local-accounts.event-lookup.failed','node',node.id,null,{error:error.message,count:unknown.length})}
+}
 export async function pullRecentLogs(nodeId,actorId=null,quiet=false){
   const node=getNode(nodeId);if(!node)throw Object.assign(new Error('Node not found'),{status:404})
   const raw=await remote(node,'events_recent'),events=Array.isArray(raw)?raw:[raw].filter(Boolean)
   const inserted=insertCollectedEvents(nodeId,events,observabilitySettings().ignoreLoopbackIngest)
+  if(inserted)await refreshUnknownEventAccounts(node)
   if(!quiet)audit(actorId,'logs.pull.recent','node',nodeId,null,{inserted,sampled:events.length,latestRecordId:events.at(-1)?.RecordId??null})
   return {inserted,sampled:events.length,latestRecordId:events.at(-1)?.RecordId??null}
 }
@@ -1904,6 +2015,7 @@ export async function pullLogs(nodeId,actorId=null,maxPages=5,quiet=false) {
     run('INSERT INTO node_log_cursors(node_id,last_record_id,updated_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET last_record_id=excluded.last_record_id,updated_at=excluded.updated_at',nodeId,cursor,now())
     if(events.length<500){caughtUp=true;pages++;break}
   }
+  if(inserted)await refreshUnknownEventAccounts(node)
   if(!quiet)audit(actorId,'logs.pull','node',nodeId,null,{inserted,pages,lastRecordId:cursor,caughtUp})
   return {inserted,pages,lastRecordId:cursor,caughtUp}
 }

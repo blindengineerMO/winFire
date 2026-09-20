@@ -14,7 +14,10 @@ import {emitNotification} from './notifications.js'
 
 const timeoutMs = 40000
 const lsaRightsFunctions=fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../sidecar/lsa_rights.ps1'),'utf8')
+const firewallUserFunctions=fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../sidecar/firewall_user.ps1'),'utf8')
+const accountInventoryFunctions=fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../sidecar/account_inventory.ps1'),'utf8')
 const agentDeployFunctions=fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../sidecar/agent_deploy.ps1'),'utf8')
+const securityProcessOwnerFunctions=fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../sidecar/security_process_owner.ps1'),'utf8')
 const pause=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds))
 const transientError=error=>/timed?\s*out|timeout|ECONNRESET|ECONNREFUSED|Max retries exceeded|unreachable/i.test(error?.message||'')
 export function recordNodeSuccess(nodeId,probeStatus=null) {
@@ -57,7 +60,7 @@ async function pwsh(script, input) {
   return new Promise((resolve,reject) => {
     const encoded=Buffer.from(script,'utf16le').toString('base64')
     const child=spawn('pwsh',['-NoProfile','-NonInteractive','-EncodedCommand',encoded],{stdio:['pipe','pipe','pipe']})
-    let stdout='',stderr=''; const timer=setTimeout(()=>child.kill(),input?.operation?.startsWith('rights')||input?.operation?.startsWith('jit_')||input?.operation==='prompt_browser'||input?.operation==='agent_deploy'?120000:timeoutMs)
+    let stdout='',stderr=''; const timer=setTimeout(()=>child.kill(),input?.operation?.startsWith('rights')||input?.operation?.startsWith('jit_')||input?.operation==='prompt_browser'||input?.operation==='agent_deploy'||input?.operation==='security_session_logoff'?120000:timeoutMs)
     child.stdout.on('data',chunk=>stdout+=chunk); child.stderr.on('data',chunk=>stderr+=chunk)
     child.once('error',reject); child.once('close',code=>{clearTimeout(timer); if(code) reject(new Error(stderr.trim() || `PowerShell exited ${code}`)); else {try {resolve(JSON.parse(stdout || 'null'))} catch {reject(new Error(`Invalid PowerShell response: ${stdout.slice(0,300)}`))}}})
     child.stdin.end(JSON.stringify(input))
@@ -66,10 +69,10 @@ async function pwsh(script, input) {
 async function pywinrm(input) {
   const sidecar=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../sidecar/wsman_client.py')
   const localPython=path.resolve('.venv/bin/python')
-  const python=process.env.WINRM_PYTHON || (fs.existsSync(localPython)?localPython:'python3')
+  const python=process.env.WINRM_PYTHON || (fs.existsSync(localPython)?localPython:process.platform==='win32'?'python':'python3')
   return new Promise((resolve,reject)=>{
     const child=spawn(python,[sidecar],{stdio:['pipe','pipe','pipe']})
-    let stdout='',stderr='';const timer=setTimeout(()=>child.kill('SIGKILL'),input?.operation?.startsWith('rights')||input?.operation?.startsWith('jit_')||input?.operation==='prompt_browser'||input?.operation==='agent_deploy'?120000:timeoutMs)
+    let stdout='',stderr='';const timer=setTimeout(()=>child.kill('SIGKILL'),input?.operation?.startsWith('rights')||input?.operation?.startsWith('jit_')||input?.operation==='prompt_browser'||input?.operation==='agent_deploy'||input?.operation==='security_session_logoff'?120000:timeoutMs)
     child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk)
     child.once('error',reject);child.once('close',code=>{clearTimeout(timer);if(code)reject(new Error(stderr.trim()||`WinRM sidecar exited ${code}`));else {try{resolve(JSON.parse(stdout||'null'))}catch{reject(new Error(`Invalid WinRM response: ${stdout.slice(0,300)}`))}}})
     child.stdin.end(JSON.stringify(input))
@@ -136,12 +139,18 @@ try {
     ${jitAccessFunctions}
     __WINFIRE_AGENT_DEPLOY__
     __WINFIRE_PROMPT_FUNCTIONS__
+    __WINFIRE_SECURITY_PROCESS_OWNER__
     # __WINFIRE_LSA_RIGHTS__
+    # __WINFIRE_ACCOUNT_INVENTORY__
+    # __WINFIRE_FIREWALL_USER__
     switch($operation) {
+      'account_inventory' { Get-WinFireAccountInventory $argsData }
       'prompt_browser' { Open-WinFireMfaPortal $argsData }
       'prompt_session' { @(Get-WinFireActiveSession) }
       'agent_deploy' { Install-WinFireAgentRemote $argsData }
       'auth' { [Security.Principal.WindowsIdentity]::GetCurrent().Name }
+      'security_process_owner' { Get-WinFireProcessOwner $argsData }
+      'security_session_logoff' { End-WinFireClientSession $argsData }
       'tcp_probe' {
         $addresses=@([System.Net.Dns]::GetHostAddresses([string]$argsData.host));$address=@($addresses | Where-Object AddressFamily -EQ InterNetwork | Select-Object -First 1)[0];if(-not $address){$address=$addresses[0]}
         $route=[System.Net.Sockets.Socket]::new($address.AddressFamily,[System.Net.Sockets.SocketType]::Dgram,[System.Net.Sockets.ProtocolType]::Udp)
@@ -170,16 +179,16 @@ try {
         $page=@(Get-NetFirewallRule | Select-Object -Skip $offset -First $limit | ForEach-Object { $r=$_; $p=$r | Get-NetFirewallPortFilter; $a=$r | Get-NetFirewallAddressFilter; $app=$r | Get-NetFirewallApplicationFilter; [pscustomobject]@{name=$r.Name;displayName=$r.DisplayName;group=$r.Group;enabled=[bool]($r.Enabled -eq 'True');action=[string]$r.Action;direction=[string]$r.Direction;profile=[string]$r.Profile;protocol=[string]$p.Protocol;localPort=[string]$p.LocalPort;remotePort=[string]$p.RemotePort;remoteAddress=[string]$a.RemoteAddress;program=[string]$app.Program;source=[string]$r.PolicyStoreSourceType} })
         [pscustomobject]@{total=$total;offset=$offset;rules=$page}
       }
-      'rules' { @(Get-NetFirewallRule -Group $argsData.group -ErrorAction SilentlyContinue | ForEach-Object { $r=$_; $p=$r | Get-NetFirewallPortFilter; $a=$r | Get-NetFirewallAddressFilter; $app=$r | Get-NetFirewallApplicationFilter; [pscustomobject]@{internalName=$r.Name;name=$r.DisplayName;group=$r.Group;action=([string]$r.Action).ToLower();direction=$(if($r.Direction -eq 'Inbound'){'in'}else{'out'});protocol=[string]$p.Protocol;localPort=[string]$p.LocalPort;remotePort=[string]$p.RemotePort;remoteAddress=[string]$a.RemoteAddress;program=[string]$app.Program;profile=[string]$r.Profile} }) }
+      'rules' { @(Get-NetFirewallRule -Group $argsData.group -ErrorAction SilentlyContinue | ForEach-Object { $r=$_; $p=$r | Get-NetFirewallPortFilter; $a=$r | Get-NetFirewallAddressFilter; $app=$r | Get-NetFirewallApplicationFilter; [pscustomobject]@{internalName=$r.Name;name=$r.DisplayName;group=$r.Group;action=([string]$r.Action).ToLower();direction=$(if($r.Direction -eq 'Inbound'){'in'}else{'out'});protocol=[string]$p.Protocol;localPort=[string]$p.LocalPort;remotePort=[string]$p.RemotePort;remoteAddress=[string]$a.RemoteAddress;program=[string]$app.Program;profile=[string]$r.Profile;localUserSid=Get-WinFireLocalUserSid $r} }) }
   'apply' {
     $old=@(Get-NetFirewallRule -Group $argsData.group -ErrorAction SilentlyContinue | Where-Object { $argsData.remove -contains $_.DisplayName } | ForEach-Object {
       $r=$_; $p=$r | Get-NetFirewallPortFilter; $a=$r | Get-NetFirewallAddressFilter; $app=$r | Get-NetFirewallApplicationFilter
-      [pscustomobject]@{internalName=$r.Name;name=$r.DisplayName;action=$r.Action;direction=$r.Direction;protocol=$p.Protocol;localPort=$p.LocalPort;remotePort=$p.RemotePort;remoteAddress=$a.RemoteAddress;program=$app.Program;profile=$r.Profile}
+      [pscustomobject]@{internalName=$r.Name;name=$r.DisplayName;action=$r.Action;direction=$r.Direction;protocol=$p.Protocol;localPort=$p.LocalPort;remotePort=$p.RemotePort;remoteAddress=$a.RemoteAddress;program=$app.Program;profile=$r.Profile;localUserSid=Get-WinFireLocalUserSid $r}
     })
     $created=@()
     try {
       foreach ($r in $argsData.add) {
-        $new=New-NetFirewallRule -DisplayName $r.name -Group $r.group -Direction $r.direction -Action $r.action -Protocol $r.protocol -LocalPort $r.localPort -RemotePort $(if($r.remotePort){$r.remotePort}else{'Any'}) -RemoteAddress $r.remoteAddress -Program $r.program -Profile $r.profile -ErrorAction Stop
+        $new=New-WinFireFirewallRule $r $r.group
         $created+=,$new.Name
       }
       foreach($r in $old){Remove-NetFirewallRule -Name $r.internalName -ErrorAction Stop}
@@ -187,7 +196,7 @@ try {
       $applyError=$_; $rollbackErrors=@()
       foreach($name in $created){try{if(Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue){Remove-NetFirewallRule -Name $name -ErrorAction Stop}}catch{$rollbackErrors+=,"remove new rule $($name): $($_.Exception.Message)"}}
       foreach($r in $old){
-        try{if(-not (Get-NetFirewallRule -Name $r.internalName -ErrorAction SilentlyContinue)){New-NetFirewallRule -DisplayName $r.name -Group $argsData.group -Direction $r.direction -Action $r.action -Protocol $r.protocol -LocalPort $r.localPort -RemotePort $r.remotePort -RemoteAddress $r.remoteAddress -Program $r.program -Profile $r.profile -ErrorAction Stop | Out-Null}}
+        try{if(-not (Get-NetFirewallRule -Name $r.internalName -ErrorAction SilentlyContinue)){New-WinFireFirewallRule $r $argsData.group | Out-Null}}
         catch{$rollbackErrors+=,"restore old rule $($r.name): $($_.Exception.Message)"}
       }
       if($rollbackErrors.Count){throw "Firewall apply failed: $($applyError.Exception.Message); rollback incomplete: $($rollbackErrors -join '; ')"}
@@ -276,12 +285,13 @@ export async function remote(node,operation,args={},options={}) {
   let lastError
   for (const credential of nodeCredential(node.id,options.credentialId)) {
     const input={host,transport:node.transport||'winrm',osVersion:node.os_version||null,username:credential.username,password:credential.secret.password,operation,args}
-    const mutating=operation==='apply'||operation.startsWith('breakglass_')||operation==='jit_start'||operation==='jit_end'||operation==='prompt_browser'||operation==='rights_change'||operation==='agent_deploy'
+    const mutating=operation==='apply'||operation.startsWith('breakglass_')||operation==='jit_start'||operation==='jit_end'||operation==='prompt_browser'||operation==='rights_change'||operation==='agent_deploy'||operation==='security_session_logoff'
     const attempts=mutating?1:2
     for(let attempt=0;attempt<attempts;attempt++){
       try {
-        const script=remoteScript.replace('__WINFIRE_PROMPT_FUNCTIONS__',operation.startsWith('prompt_')?mfaPromptFunctions:'').replace('__WINFIRE_AGENT_DEPLOY__',operation==='agent_deploy'?agentDeployFunctions:'').replace('# __WINFIRE_LSA_RIGHTS__',operation.startsWith('rights')?lsaRightsFunctions:'')
-        const result=process.platform==='win32' ? await pwsh(script,input) : await pywinrm(input)
+        const script=remoteScript.replace('__WINFIRE_PROMPT_FUNCTIONS__',operation.startsWith('prompt_')||operation==='security_session_logoff'?mfaPromptFunctions:'').replace('__WINFIRE_AGENT_DEPLOY__',operation==='agent_deploy'?agentDeployFunctions:'').replace('__WINFIRE_SECURITY_PROCESS_OWNER__',operation.startsWith('security_')?securityProcessOwnerFunctions:'').replace('# __WINFIRE_LSA_RIGHTS__',operation.startsWith('rights')?lsaRightsFunctions:'').replace('# __WINFIRE_ACCOUNT_INVENTORY__',()=>operation==='account_inventory'?accountInventoryFunctions:'').replace('# __WINFIRE_FIREWALL_USER__',()=>['rules','apply'].includes(operation)?firewallUserFunctions:'')
+        const legacy=/^(?:5\.[12]\.|windows (?:xp|server 2003))/i.test(String(input.osVersion||''))
+        const result=process.platform==='win32'&&!legacy&&operation!=='auth' ? await pwsh(script,input) : await pywinrm(input)
         recordNodeSuccess(node.id,input.transport==='winrms'?'winrms-authenticated':'winrm-authenticated')
         return result
       }
@@ -327,6 +337,10 @@ export async function collectFacts(node,{credentialId,suppliedFacts}={}) {
   const facts=suppliedFacts||await remote(node,'facts',{}, {credentialId})
   run('INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET snapshot_json=excluded.snapshot_json,collected_at=excluded.collected_at',node.id,JSON.stringify(facts),now())
   run('UPDATE nodes SET os_version=?,os_build=?,last_seen_at=?,status=? WHERE id=?',facts?.os?.Version||null,facts?.os?.BuildNumber||null,now(),'reachable',node.id)
+  if(node.connection_mode==='agentless'&&['winrm','winrms'].includes(node.transport)){
+    try{const {collectAccountInventory}=await import('./localAccounts.js');await collectAccountInventory(node)}
+    catch(error){audit(null,'local-accounts.collect.failed','node',node.id,null,{error:error.message})}
+  }
   return facts
 }
 export async function enrichNode(node) {
@@ -356,7 +370,7 @@ export function diffRules(desired,actual) {
     const address=match[1].split('.').map(Number).reduce((value,octet)=>(value<<8)|octet,0)>>>0
     return `${[24,16,8,0].map(shift=>((address&mask)>>>shift)&255).join('.')}/${[24,16,8,0].map(shift=>(mask>>>shift)&255).join('.')}`
   }).sort().join(',')
-  const comparable=r=>JSON.stringify([r.name,r.action,r.direction==='inbound'?'in':r.direction==='outbound'?'out':r.direction,r.protocol,r.localPort,r.remotePort||'Any',normalizeAddress(r.remoteAddress),r.program,r.profile].map(x=>String(x).toLowerCase()))
+  const comparable=r=>JSON.stringify([r.name,r.action,r.direction==='inbound'?'in':r.direction==='outbound'?'out':r.direction,r.protocol,r.localPort,r.remotePort||'Any',normalizeAddress(r.remoteAddress),r.program,r.profile,r.localUserSid||''].map(x=>String(x).toLowerCase()))
   const wanted=new Map(desired.map(r=>[r.name,comparable(r)])), present=new Map((actual||[]).map(r=>[r.name,comparable(r)]))
   return {remove:[...present.keys()].filter(name=>!wanted.has(name)||wanted.get(name)!==present.get(name)),add:desired.filter(r=>!present.has(r.name)||present.get(r.name)!==wanted.get(r.name))}
 }

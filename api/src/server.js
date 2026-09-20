@@ -4,6 +4,7 @@ import {fileURLToPath} from 'node:url'
 import express from 'express'
 import https from 'node:https'
 import {app,runVerification,runDriftCheck,pullLogs,pullRecentLogs,processDueTraining,processDueBreakGlass,processDuePolicySync,processDueAdAccountHolds,syncDirectory} from './app.js'
+import {processSecurityAutomations} from './securityAutomations.js'
 import {bootstrap,ensureBootstrapAdmin} from './security.js'
 import {all,one,run,now,audit} from './db.js'
 import {agentTlsOptions} from './agentPki.js'
@@ -110,6 +111,16 @@ directoryTimer.unref()
 setTimeout(()=>processDueAdAccountHolds().catch(error=>console.error('AD account hold sweep failed:',error)),10_000).unref()
 const adHoldTimer=setInterval(()=>processDueAdAccountHolds().catch(error=>console.error('AD account hold sweep failed:',error)),60_000)
 adHoldTimer.unref()
+let securityAutomationRunning=false
+async function sweepSecurityAutomations(){
+  if(securityAutomationRunning)return
+  securityAutomationRunning=true
+  try{await processSecurityAutomations()}
+  catch(error){console.error('Security automation sweep failed:',error)}
+  finally{securityAutomationRunning=false}
+}
+setTimeout(sweepSecurityAutomations,20_000).unref()
+setInterval(sweepSecurityAutomations,60_000).unref()
 let dnsRunning=false
 async function sweepDns(){
   if(dnsRunning)return

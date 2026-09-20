@@ -25,6 +25,8 @@ function exactScopeOverlaps(left,right) {
 }
 
 export function rulesConflict(left,right) {
+  if(!!left.localUserSid!==!!right.localUserSid)return false
+  if(left.localUserSid&&right.localUserSid&&left.localUserSid!==right.localUserSid)return false
   return left.action !== right.action
     && left.direction === right.direction
     && (left.protocol === right.protocol || left.protocol === 'Any' || right.protocol === 'Any')

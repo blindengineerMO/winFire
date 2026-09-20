@@ -1,7 +1,7 @@
 import {db,all,one,run,id,now,parse,json} from './db.js'
 import {deliverAlert} from './mailer.js'
 
-export const categories=['policy_drift','verifier_failure','mfa_challenge_failure','agent_offline','node_unreachable']
+export const categories=['policy_drift','verifier_failure','mfa_challenge_failure','agent_offline','node_unreachable','security_policy']
 export const channels=['in_app','email','webhook']
 export const preferenceKeys=categories.flatMap(category=>channels.map(channel=>`${category}.${channel}`))
 

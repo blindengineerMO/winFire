@@ -11,7 +11,8 @@ export const firewallRule = z.object({
   remotePort: z.string().refine(validatePortExpression,'Invalid remote port expression').default('Any'),
   remoteAddress: z.string().refine(validateAddressExpression,'Invalid remote address expression').default('Any'),
   program: z.string().refine(value=>value==='Any'||validateProgramPath(value),'Invalid program path').default('Any'),
-  profile: z.enum(['Any', 'Domain', 'Private', 'Public']).default('Any')
+  profile: z.enum(['Any', 'Domain', 'Private', 'Public']).default('Any'),
+  localUserSid: z.string().regex(/^S-1-\d+-\d+(?:-\d+)+$/).nullable().default(null)
 })
 
 export const graphSchema = z.object({
@@ -22,7 +23,7 @@ export const graphSchema = z.object({
 // Merge along one match dimension at a time. Every other dimension must be
 // identical, so a merged rule represents exactly the union of its inputs.
 export function dedupeRules(input) {
-  const matchFields=['action','direction','protocol','localPort','remotePort','remoteAddress','program','profile','group']
+  const matchFields=['action','direction','protocol','localPort','remotePort','remoteAddress','program','profile','group','localUserSid']
   const mergeValue=(left,right,dimension)=>{
     const parts=new Set([...String(left).split(','),...String(right).split(',')].map(value=>value.trim()).filter(Boolean))
     if(parts.has('Any'))return 'Any'
@@ -96,8 +97,9 @@ export function compilePolicy(graph, policyId) {
       direction: data.direction || 'in', protocol: data.protocol || 'TCP',
       localPort: String(data.localPort || 'Any'), remotePort:String(data.remotePort||'Any'),remoteAddress: data.remoteAddress || 'Any',
       program: node.type === 'program' ? data.program : data.program || 'Any',
-      profile: data.profile || 'Any'
+      profile: data.profile || 'Any',localUserSid:data.localUserSid||null
     })
+    if(rule.localUserSid&&(rule.direction!=='out'||rule.action!=='block'))throw new Error('Local account rules must be outbound block rules on the account source node')
     if(rule.protocol==='Any'&&(rule.localPort!=='Any'||rule.remotePort!=='Any'))throw new Error('Specific ports require TCP or UDP protocol')
     rules.push({...rule, group: `WinFireSecure:${policyId}`, sourceNodeId:node.id})
   }

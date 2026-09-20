@@ -9,7 +9,7 @@ const eventContext=ref(null),eventContextEl=ref(null),ruleOpen=ref(false),ruleEv
 const groupPolicies=computed(()=>policies.value.filter(policy=>policy.origin!=='learned'&&policy.scopes?.some(scope=>scope.node_group_id)))
 const canManageRules=computed(()=>['owner','admin'].includes(session.user?.role))
 const selectedIds=ref([]),destinations=ref([]),exportDestinationId=ref(''),exportBusy=ref(false)
-const filters=ref({nodeId:'',eventId:'',action:'',direction:'',srcIp:'',dstIp:'',port:'',program:'',protocol:'',challengeId:'',from:'',to:''})
+const filters=ref({nodeId:'',eventId:'',action:'',direction:'',srcIp:'',dstIp:'',port:'',program:'',account:'',protocol:'',challengeId:'',from:'',to:''})
 const hideLoopback=ref(true)
 const page=ref(1),pageSize=ref(100),total=ref(0),sortBy=ref('time'),sortDir=ref('desc')
 const error=ref(''),message=ref(''),loading=ref(false),duration=ref(24)
@@ -22,7 +22,7 @@ const lastRow=computed(()=>Math.min(page.value*pageSize.value,total.value))
 const totals=computed(()=>({allowed:events.value.filter(e=>e.action==='allow').length,blocked:events.value.filter(e=>e.action==='block').length}))
 const activeAuto=computed(()=>sessions.value.some(session=>session.node_id===filters.value.nodeId&&session.mode==='auto'&&session.status==='active'))
 const nodeName=id=>nodes.value.find(node=>node.id===id)?.hostname||id?.slice(0,8)||'—'
-const columns=[{key:'time',label:'Time'},{key:'node',label:'Node'},{key:'eventId',label:'Event'},{key:'action',label:'Action'},{key:'direction',label:'Direction'},{key:'srcIp',label:'Source'},{key:'dstIp',label:'Destination'},{key:'port',label:'Port'},{key:'program',label:'Program'}]
+const columns=[{key:'time',label:'Time'},{key:'node',label:'Node'},{key:'eventId',label:'Event'},{key:'action',label:'Action'},{key:'direction',label:'Direction'},{key:'srcIp',label:'Source'},{key:'dstIp',label:'Destination'},{key:'port',label:'Port'},{key:'program',label:'Program'},{key:'account',label:'Account'}]
 function queryString(){
   const query={page:page.value,pageSize:pageSize.value,sortBy:sortBy.value,sortDir:sortDir.value,hideLoopback:hideLoopback.value,...filters.value}
   for(const key of ['from','to'])if(query[key])query[key]=new Date(query[key]).toISOString()
@@ -39,7 +39,7 @@ async function load(){
   finally{if(current===requestId)loading.value=false}
 }
 function searchEvents(){page.value=1;load()}
-function clearFilters(){filters.value={nodeId:'',eventId:'',action:'',direction:'',srcIp:'',dstIp:'',port:'',program:'',protocol:'',challengeId:'',from:'',to:''};searchEvents()}
+function clearFilters(){filters.value={nodeId:'',eventId:'',action:'',direction:'',srcIp:'',dstIp:'',port:'',program:'',account:'',protocol:'',challengeId:'',from:'',to:''};searchEvents()}
 function sort(key){if(sortBy.value===key)sortDir.value=sortDir.value==='asc'?'desc':'asc';else{sortBy.value=key;sortDir.value=key==='time'?'desc':'asc'}page.value=1;load()}
 function changePage(next){if(next<1||next>totalPages.value||loading.value)return;page.value=next;load()}
 async function startLearning(){if(!filters.value.nodeId)return;try{await api('/learning-sessions',{method:'POST',body:{nodeId:filters.value.nodeId,durationHours:Number(duration.value)}});await load()}catch(e){error.value=e.message}}
@@ -112,11 +112,11 @@ onUnmounted(()=>{window.removeEventListener('pointerdown',onPointer);window.remo
           <th><input v-model.trim="filters.srcIp" placeholder="Source IP" aria-label="Filter source IP" @keyup.enter="searchEvents"></th>
           <th><input v-model.trim="filters.dstIp" placeholder="Destination IP" aria-label="Filter destination IP" @keyup.enter="searchEvents"></th>
           <th><input v-model="filters.port" type="number" min="1" max="65535" placeholder="Port" aria-label="Filter destination port" @keyup.enter="searchEvents"></th>
-          <th><input v-model.trim="filters.program" placeholder="Program" aria-label="Filter program" @keyup.enter="searchEvents"></th><th></th>
+          <th><input v-model.trim="filters.program" placeholder="Program" aria-label="Filter program" @keyup.enter="searchEvents"></th><th><input v-model.trim="filters.account" placeholder="Account or SID" aria-label="Filter account" @keyup.enter="searchEvents"></th><th></th>
         </tr>
       </thead><tbody>
-        <tr v-for="event in events" :key="event.id" tabindex="0" @contextmenu="openEventMenu($event,event)" @keydown.shift.f10="openEventMenu($event,event)"><td v-if="canManageRules"><input type="checkbox" :checked="selectedIds.includes(event.id)" :aria-label="`Select event ${event.event_id} at ${event.event_time||event.received_at}`" @change="toggleSelected(event)"></td><td>{{new Date(event.event_time||event.received_at).toLocaleString()}}</td><td class="mono">{{nodeName(event.node_id)}}</td><td>{{event.event_id}}</td><td><span class="status" :class="event.action">{{event.action}}</span></td><td>{{event.direction||'—'}}</td><td class="mono">{{event.src_ip||'—'}}</td><td class="mono">{{event.dst_ip||'—'}}</td><td class="mono">{{event.dst_port||'—'}}</td><td class="mono">{{event.program||'—'}}</td><td v-if="canManageRules"><button class="icon-button event-menu-trigger" :aria-label="`Actions for event ${event.event_id}`" @click.stop="openEventMenu($event,event)"><i class="mdi mdi-dots-vertical"></i></button></td></tr>
-        <tr v-if="!events.length"><td :colspan="canManageRules?11:9" class="empty-table">{{loading?'Loading events…':'No events found. Pull the Windows Security log or adjust filters.'}}</td></tr>
+        <tr v-for="event in events" :key="event.id" tabindex="0" @contextmenu="openEventMenu($event,event)" @keydown.shift.f10="openEventMenu($event,event)"><td v-if="canManageRules"><input type="checkbox" :checked="selectedIds.includes(event.id)" :aria-label="`Select event ${event.event_id} at ${event.event_time||event.received_at}`" @change="toggleSelected(event)"></td><td>{{new Date(event.event_time||event.received_at).toLocaleString()}}</td><td class="mono">{{nodeName(event.node_id)}}</td><td>{{event.event_id}}</td><td><span class="status" :class="event.action">{{event.action}}</span></td><td>{{event.direction||'—'}}</td><td class="mono">{{event.src_ip||'—'}}</td><td class="mono">{{event.dst_ip||'—'}}</td><td class="mono">{{event.dst_port||'—'}}</td><td class="mono">{{event.program||'—'}}</td><td class="mono" :title="event.account_sid||''">{{event.account_name||event.account_sid||'—'}}</td><td v-if="canManageRules"><button class="icon-button event-menu-trigger" :aria-label="`Actions for event ${event.event_id}`" @click.stop="openEventMenu($event,event)"><i class="mdi mdi-dots-vertical"></i></button></td></tr>
+        <tr v-if="!events.length"><td :colspan="canManageRules?12:10" class="empty-table">{{loading?'Loading events…':'No events found. Pull the Windows Security log or adjust filters.'}}</td></tr>
       </tbody></table></div>
       <div class="event-pagination" role="navigation" aria-label="Firewall events pages"><span>Showing {{firstRow}}–{{lastRow}} of {{total}}</span><div><button type="button" class="button small secondary" :disabled="page<=1||loading" @click="changePage(page-1)">Previous</button><span>Page {{page}} of {{totalPages}}</span><button type="button" class="button small secondary" :disabled="page>=totalPages||loading" @click="changePage(page+1)">Next</button></div></div>
     </section>

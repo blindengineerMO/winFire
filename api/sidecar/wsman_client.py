@@ -22,7 +22,10 @@ function Get-WinFireAuditPolicy {
   [pscustomobject]@{subcategoryGuid='0CCE9226-69AE-11D9-BED3-505054503030';settingValue=$setting;successEnabled=[bool]($setting -band 1);failureEnabled=[bool]($setting -band 2)}
 }
 # __WINFIRE_LSA_RIGHTS__
+# __WINFIRE_ACCOUNT_INVENTORY__
+# __WINFIRE_FIREWALL_USER__
 $result = switch ($operation) {
+  'account_inventory' { Get-WinFireAccountInventory $argsData }
   'auth' { [Security.Principal.WindowsIdentity]::GetCurrent().Name }
   'tcp_probe' {
     $addresses=@([System.Net.Dns]::GetHostAddresses([string]$argsData.host));$address=@($addresses | Where-Object AddressFamily -EQ InterNetwork | Select-Object -First 1)[0];if(-not $address){$address=$addresses[0]}
@@ -78,19 +81,19 @@ $result = switch ($operation) {
         action = ([string]$r.Action).ToLower(); direction = $(if($r.Direction -eq 'Inbound'){'in'}else{'out'})
         protocol = [string]$p.Protocol; localPort = [string]$p.LocalPort; remotePort = [string]$p.RemotePort
         remoteAddress = [string]$a.RemoteAddress; program = [string]$app.Program
-        profile = [string]$r.Profile
+        profile = [string]$r.Profile; localUserSid = Get-WinFireLocalUserSid $r
       }
     })
   }
   'apply' {
     $old=@(Get-NetFirewallRule -Group $argsData.group -ErrorAction SilentlyContinue | Where-Object { $argsData.remove -contains $_.DisplayName } | ForEach-Object {
       $r=$_; $p=$r | Get-NetFirewallPortFilter; $a=$r | Get-NetFirewallAddressFilter; $app=$r | Get-NetFirewallApplicationFilter
-      [pscustomobject]@{internalName=$r.Name;name=$r.DisplayName;action=$r.Action;direction=$r.Direction;protocol=$p.Protocol;localPort=$p.LocalPort;remotePort=$p.RemotePort;remoteAddress=$a.RemoteAddress;program=$app.Program;profile=$r.Profile}
+      [pscustomobject]@{internalName=$r.Name;name=$r.DisplayName;action=$r.Action;direction=$r.Direction;protocol=$p.Protocol;localPort=$p.LocalPort;remotePort=$p.RemotePort;remoteAddress=$a.RemoteAddress;program=$app.Program;profile=$r.Profile;localUserSid=Get-WinFireLocalUserSid $r}
     })
     $created=@()
     try {
       foreach ($r in $argsData.add) {
-        $new=New-NetFirewallRule -DisplayName $r.name -Group $r.group -Direction $r.direction -Action $r.action -Protocol $r.protocol -LocalPort $r.localPort -RemotePort $(if($r.remotePort){$r.remotePort}else{'Any'}) -RemoteAddress $r.remoteAddress -Program $r.program -Profile $r.profile -ErrorAction Stop
+        $new=New-WinFireFirewallRule $r $r.group
         $created+=,$new.Name
       }
       foreach($r in $old){Remove-NetFirewallRule -Name $r.internalName -ErrorAction Stop}
@@ -98,7 +101,7 @@ $result = switch ($operation) {
       $applyError=$_; $rollbackErrors=@()
       foreach($name in $created){try{if(Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue){Remove-NetFirewallRule -Name $name -ErrorAction Stop}}catch{$rollbackErrors+=,"remove new rule ${name}: $($_.Exception.Message)"}}
       foreach($r in $old){
-        try{if(-not (Get-NetFirewallRule -Name $r.internalName -ErrorAction SilentlyContinue)){New-NetFirewallRule -DisplayName $r.name -Group $argsData.group -Direction $r.direction -Action $r.action -Protocol $r.protocol -LocalPort $r.localPort -RemotePort $r.remotePort -RemoteAddress $r.remoteAddress -Program $r.program -Profile $r.profile -ErrorAction Stop | Out-Null}}
+        try{if(-not (Get-NetFirewallRule -Name $r.internalName -ErrorAction SilentlyContinue)){New-WinFireFirewallRule $r $argsData.group | Out-Null}}
         catch{$rollbackErrors+=,"restore old rule $($r.name): $($_.Exception.Message)"}
       }
       if($rollbackErrors.Count){throw "Firewall apply failed: $($applyError.Exception.Message); rollback incomplete: $($rollbackErrors -join '; ')"}
@@ -192,6 +195,11 @@ foreach($adapter in @(Get-WmiObject Win32_NetworkAdapterConfiguration -Filter 'I
   Out-Field 'NET' ((@([string]$adapter.Description,[string]$adapter.MACAddress,([string[]]$adapter.IPAddress -join ','),([string[]]$adapter.DefaultIPGateway -join ','),([string[]]$adapter.DNSServerSearchOrder -join ','),[string]$adapter.DNSDomain)) -join '|')
 }
 '''
+    elif operation == 'account_inventory':
+        source = (Path(__file__).resolve().parent / 'account_inventory.ps1').read_text()
+        sids = [str(item) for item in (payload.get('args') or {}).get('sids', []) if isinstance(item, str) and len(item) <= 128][:500]
+        encoded = ','.join("'" + base64.b64encode(item.encode()).decode() + "'" for item in sids)
+        script = source + "\n$values=@(" + encoded + ");$sids=@($values | ForEach-Object {[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($_))});$result=Get-WinFireAccountInventory (New-Object PSObject -Property @{sids=$sids});function Enc($value){[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$value))};Write-Output ('HOST|'+(Enc $result.computerName)+'|'+(Enc $result.domainController));foreach($item in @($result.accounts)){Write-Output ('ACCOUNT|'+((@($item.sid,$item.username,$item.fullName,$item.description,$item.enabled,$item.locked,$item.passwordRequired) | ForEach-Object {Enc $_}) -join '|'))};foreach($item in @($result.resolutions)){Write-Output ('SID|'+(Enc $item.sid)+'|'+(Enc $item.qualifiedName))}\n"
     elif operation in {'rights', 'rights_change'}:
         source = (Path(__file__).resolve().parent / 'lsa_rights.ps1').read_text()
         if operation == 'rights':
@@ -235,6 +243,22 @@ foreach($adapter in @(Get-WmiObject Win32_NetworkAdapterConfiguration -Filter 'I
         if len(parts) != 5:
             raise RuntimeError('LSA change returned an invalid response')
         return {'accountSid':parts[0], 'right':parts[1], 'before':parts[2].lower() == 'true', 'present':parts[3].lower() == 'true', 'changed':parts[4].lower() == 'true'}
+    if operation == 'account_inventory':
+        inventory = {'computerName':None,'domainController':False,'accounts':[],'resolutions':[]}
+        for line in output.splitlines():
+            parts = line.split('|')
+            if parts[0] not in {'HOST','ACCOUNT','SID'}:
+                continue
+            values = [base64.b64decode(value).decode('utf-8', 'replace') for value in parts[1:]]
+            if parts[0] == 'HOST' and len(values) == 2:
+                inventory['computerName'],inventory['domainController'] = values[0],values[1].lower() == 'true'
+            elif parts[0] == 'ACCOUNT' and len(values) == 7:
+                inventory['accounts'].append({'sid':values[0],'username':values[1],'fullName':values[2],'description':values[3],'enabled':values[4].lower() == 'true','locked':values[5].lower() == 'true','passwordRequired':values[6].lower() == 'true'})
+            elif parts[0] == 'SID' and len(values) == 2:
+                inventory['resolutions'].append({'sid':values[0],'qualifiedName':values[1]})
+        if inventory['computerName'] is None:
+            raise RuntimeError('Account inventory returned no host record')
+        return inventory
     fields = {}
     adapters = []
     for line in output.splitlines():
@@ -254,15 +278,20 @@ foreach($adapter in @(Get-WmiObject Win32_NetworkAdapterConfiguration -Filter 'I
             'network':adapters, 'dnsSuffixes':[item['dnsDomain'] for item in adapters if item['dnsDomain']], 'firewall':[], 'service':None}
 
 
+def is_legacy_windows(value):
+    version = str(value or '').strip().lower()
+    return 'windows xp' in version or 'windows server 2003' in version or version.startswith(('5.1.', '5.2.'))
+
+
 def main():
     payload = json.load(sys.stdin)
     operation = payload['operation']
-    if operation not in {'auth', 'tcp_probe', 'facts', 'all_rules', 'rules', 'apply', 'events', 'events_recent', 'events_probe', 'event_cursor', 'audit_policy', 'audit_policy_enable', 'rights', 'rights_change', 'breakglass_start', 'breakglass_end', 'jit_preflight', 'jit_start', 'jit_end', 'prompt_browser', 'prompt_session', 'agent_deploy'}:
+    if operation not in {'auth', 'tcp_probe', 'facts', 'all_rules', 'rules', 'apply', 'events', 'events_recent', 'events_probe', 'event_cursor', 'audit_policy', 'audit_policy_enable', 'rights', 'rights_change', 'account_inventory', 'breakglass_start', 'breakglass_end', 'jit_preflight', 'jit_start', 'jit_end', 'prompt_browser', 'prompt_session', 'agent_deploy', 'security_process_owner', 'security_session_logoff'}:
         raise ValueError('Unsupported operation')
     host = payload['host']
     secure = payload.get('transport') == 'winrms'
     endpoint = f"{'https' if secure else 'http'}://{host}:{5986 if secure else 5985}/wsman"
-    slow = operation.startswith(('rights', 'jit_', 'breakglass_', 'prompt_')) or operation == 'agent_deploy'
+    slow = operation.startswith(('rights', 'jit_', 'breakglass_', 'prompt_')) or operation in {'agent_deploy','security_session_logoff'}
     session = winrm.Session(
         endpoint,
         auth=(payload['username'], payload['password']),
@@ -272,11 +301,11 @@ def main():
         operation_timeout_sec=80 if slow else 20,
     )
     os_version = str(payload.get('osVersion') or '')
-    if not os_version and operation in {'facts', 'rights', 'rights_change'}:
+    if not os_version and operation in {'facts', 'rights', 'rights_change', 'account_inventory'}:
         detected = session.run_ps('(Get-WmiObject Win32_OperatingSystem).Caption')
         if detected.status_code == 0:
             os_version = detected.std_out.decode('utf-8-sig', 'replace').strip()
-    if operation == 'auth' or 'windows xp' in os_version.lower():
+    if operation == 'auth' or is_legacy_windows(os_version):
         print(json.dumps(legacy_ps2(session, payload)))
         return
     args = base64.b64encode(json.dumps(payload.get('args') or {}).encode()).decode()
@@ -284,12 +313,16 @@ def main():
     calls = {'jit_preflight':'Test-WinFireJitGate $argsData','jit_start':'Start-WinFireJitAccess $argsData','jit_end':'End-WinFireJitAccess $argsData',
              'breakglass_start':'Start-WinFireBreakGlass $argsData','breakglass_end':'End-WinFireBreakGlass $argsData',
              'prompt_browser':'Open-WinFireMfaPortal $argsData','prompt_session':'@(Get-WinFireActiveSession)',
-             'agent_deploy':'Install-WinFireAgentRemote $argsData'}
+             'agent_deploy':'Install-WinFireAgentRemote $argsData','security_process_owner':'Get-WinFireProcessOwner $argsData',
+             'security_session_logoff':'End-WinFireClientSession $argsData'}
     if operation in calls:
-        source = (Path(__file__).resolve().parent / 'agent_deploy.ps1') if operation == 'agent_deploy' else shared_root / ('jitAccess.ps1' if operation.startswith('jit_') else 'mfaPrompt.ps1' if operation.startswith('prompt_') else 'breakGlass.ps1')
-        script = SHARED_POWERSHELL.replace('__WINFIRE_SHARED_FUNCTIONS__',source.read_text()).replace('__WINFIRE_CALL__',calls[operation])
+        source = (Path(__file__).resolve().parent / ('agent_deploy.ps1' if operation == 'agent_deploy' else 'security_process_owner.ps1')) if operation in {'agent_deploy','security_process_owner','security_session_logoff'} else shared_root / ('jitAccess.ps1' if operation.startswith('jit_') else 'mfaPrompt.ps1' if operation.startswith('prompt_') else 'breakGlass.ps1')
+        functions = source.read_text()
+        if operation == 'security_session_logoff':
+            functions = (shared_root / 'mfaPrompt.ps1').read_text() + '\n' + functions
+        script = SHARED_POWERSHELL.replace('__WINFIRE_SHARED_FUNCTIONS__',functions).replace('__WINFIRE_CALL__',calls[operation])
     else:
-        script = POWERSHELL.replace('__OPERATION__', operation).replace('# __WINFIRE_LSA_RIGHTS__', (Path(__file__).resolve().parent / 'lsa_rights.ps1').read_text() if operation.startswith('rights') else '')
+        script = POWERSHELL.replace('__OPERATION__', operation).replace('# __WINFIRE_LSA_RIGHTS__', (Path(__file__).resolve().parent / 'lsa_rights.ps1').read_text() if operation.startswith('rights') else '').replace('# __WINFIRE_ACCOUNT_INVENTORY__', (Path(__file__).resolve().parent / 'account_inventory.ps1').read_text() if operation == 'account_inventory' else '').replace('# __WINFIRE_FIREWALL_USER__', (Path(__file__).resolve().parent / 'firewall_user.ps1').read_text() if operation in {'rules','apply'} else '')
     script = script.replace('[Console]::In.ReadToEnd()', f"'{args}'")
     loader = "$encoded=[Console]::In.ReadToEnd();$buffer=[IO.MemoryStream]::new([Convert]::FromBase64String($encoded));$zip=[IO.Compression.GzipStream]::new($buffer,[IO.Compression.CompressionMode]::Decompress);$reader=[IO.StreamReader]::new($zip,[Text.Encoding]::UTF8);try{Invoke-Expression $reader.ReadToEnd()}finally{$reader.Dispose();$zip.Dispose();$buffer.Dispose()}"
     encoded_loader = base64.b64encode(loader.encode('utf-16le')).decode()

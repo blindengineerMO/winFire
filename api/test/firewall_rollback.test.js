@@ -6,7 +6,8 @@ import {spawnSync} from 'node:child_process'
 const sidecar=readFileSync(new URL('../sidecar/wsman_client.py',import.meta.url),'utf8')
 const connector=readFileSync(new URL('../src/connector.js',import.meta.url),'utf8')
 const agent=readFileSync(new URL('../../agent/WinFire.Agent/Firewall.cs',import.meta.url),'utf8')
-const sidecarScript=sidecar.match(/POWERSHELL = r'''([\s\S]*?)'''/)?.[1].replace('__WINFIRE_SHARED_FUNCTIONS__','')
+const firewallUserFunctions=readFileSync(new URL('../sidecar/firewall_user.ps1',import.meta.url),'utf8')
+const sidecarScript=sidecar.match(/POWERSHELL = r'''([\s\S]*?)'''/)?.[1].replace('__WINFIRE_SHARED_FUNCTIONS__','').replace('# __WINFIRE_FIREWALL_USER__',()=>firewallUserFunctions)
 const connectorApply=connector.slice(connector.indexOf("  'apply' {"),connector.indexOf("  'events' {",connector.indexOf("  'apply' {")))
 const agentScript=agent.match(/private const string ApplyScript = """([\s\S]*?)""";/)?.[1]
 const hasPwsh=spawnSync('pwsh',['-NoProfile','-Command','$PSVersionTable.PSVersion.Major'],{encoding:'utf8'}).status===0
@@ -31,9 +32,12 @@ function Get-NetFirewallAddressFilter { [CmdletBinding()] param([Parameter(Value
 function Get-NetFirewallApplicationFilter { [CmdletBinding()] param([Parameter(ValueFromPipeline)]$InputObject)
   process{[pscustomobject]@{Program=$InputObject.Program}}
 }
-function New-NetFirewallRule { [CmdletBinding()] param($DisplayName,$Group,$Direction,$Action,$Protocol,$LocalPort,$RemotePort,$RemoteAddress,$Program,$Profile)
+function Get-NetFirewallSecurityFilter { [CmdletBinding()] param([Parameter(ValueFromPipeline)]$InputObject)
+  process{[pscustomobject]@{LocalUser=$(if($InputObject.LocalUser){$InputObject.LocalUser}else{'Any'})}}
+}
+function New-NetFirewallRule { [CmdletBinding()] param($DisplayName,$Group,$Direction,$Action,$Protocol,$LocalPort,$RemotePort,$RemoteAddress,$Program,$Profile,$LocalUser)
   $global:serial++
-  $row=[pscustomobject]@{Name="new-$global:serial";DisplayName=$DisplayName;Group=$Group;Action=$Action;Direction=$(if($Direction -eq 'in'){'Inbound'}else{'Outbound'});Protocol=$Protocol;LocalPort=$LocalPort;RemotePort=$RemotePort;RemoteAddress=$RemoteAddress;Program=$Program;Profile=$Profile}
+  $row=[pscustomobject]@{Name="new-$global:serial";DisplayName=$DisplayName;Group=$Group;Action=$Action;Direction=$(if($Direction -eq 'in'){'Inbound'}else{'Outbound'});Protocol=$Protocol;LocalPort=$LocalPort;RemotePort=$RemotePort;RemoteAddress=$RemoteAddress;Program=$Program;Profile=$Profile;LocalUser=$LocalUser}
   $global:rules+=,$row
   $row
 }
@@ -58,7 +62,7 @@ test('WinRM and agent firewall scripts restore old rules after partial removal',
   const args={group,add:[updated,added],remove:['A','B']}
   const encoded=Buffer.from(JSON.stringify(args)).toString('base64')
   const remote=execute(sidecarScript.replace('__OPERATION__','apply').replace('[Console]::In.ReadToEnd()',`'${encoded}'`))
-  const windowsConnector=execute(`$argsData=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}')) | ConvertFrom-Json; $result=switch('apply'){${connectorApply}}; $result | ConvertTo-Json -Compress`)
+  const windowsConnector=execute(`${firewallUserFunctions}\n$argsData=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}')) | ConvertFrom-Json; $result=switch('apply'){${connectorApply}}; $result | ConvertTo-Json -Compress`)
   const payload=JSON.stringify({group,rules:[updated,added]})
   const local=execute(agentScript.replace('[Console]::In.ReadToEnd()',`'${payload}'`))
   for(const outcome of [remote,windowsConnector,local]){
