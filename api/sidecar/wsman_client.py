@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import sys
+from pathlib import Path
 
 import winrm
 
@@ -137,24 +138,41 @@ $result = switch ($operation) {
 $result | ConvertTo-Json -Depth 12 -Compress
 '''
 
+SHARED_POWERSHELL = r'''
+$ErrorActionPreference='Stop'
+$argsData=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd())) | ConvertFrom-Json
+__WINFIRE_SHARED_FUNCTIONS__
+$result=__WINFIRE_CALL__
+$result | ConvertTo-Json -Depth 12 -Compress
+'''
+
 
 def main():
     payload = json.load(sys.stdin)
     operation = payload['operation']
-    if operation not in {'auth', 'facts', 'all_rules', 'rules', 'apply', 'events', 'audit_policy', 'audit_policy_enable', 'rights', 'breakglass_start', 'breakglass_end'}:
+    if operation not in {'auth', 'facts', 'all_rules', 'rules', 'apply', 'events', 'audit_policy', 'audit_policy_enable', 'rights', 'breakglass_start', 'breakglass_end', 'jit_preflight', 'jit_start', 'jit_end', 'prompt_browser', 'prompt_session'}:
         raise ValueError('Unsupported operation')
     host = payload['host']
     secure = payload.get('transport') == 'winrms'
     endpoint = f"{'https' if secure else 'http'}://{host}:{5986 if secure else 5985}/wsman"
     args = base64.b64encode(json.dumps(payload.get('args') or {}).encode()).decode()
-    script = POWERSHELL.replace('__OPERATION__', operation).replace('[Console]::In.ReadToEnd()', f"'{args}'")
+    shared_root = Path(__file__).resolve().parents[2] / 'packages' / 'shared'
+    calls = {'jit_preflight':'Test-WinFireJitGate $argsData','jit_start':'Start-WinFireJitAccess $argsData','jit_end':'End-WinFireJitAccess $argsData',
+             'breakglass_start':'Start-WinFireBreakGlass $argsData','breakglass_end':'End-WinFireBreakGlass $argsData',
+             'prompt_browser':'Open-WinFireMfaPortal $argsData','prompt_session':'@(Get-WinFireActiveSession)'}
+    if operation in calls:
+        source = 'jitAccess.ps1' if operation.startswith('jit_') else 'mfaPrompt.ps1' if operation.startswith('prompt_') else 'breakGlass.ps1'
+        script = SHARED_POWERSHELL.replace('__WINFIRE_SHARED_FUNCTIONS__',(shared_root / source).read_text()).replace('__WINFIRE_CALL__',calls[operation])
+    else:
+        script = POWERSHELL.replace('__OPERATION__', operation)
+    script = script.replace('[Console]::In.ReadToEnd()', f"'{args}'")
     session = winrm.Session(
         endpoint,
         auth=(payload['username'], payload['password']),
         transport='ntlm',
         server_cert_validation='ignore' if os.environ.get('WINRM_TLS_VERIFY') == 'false' else 'validate',
-        read_timeout_sec=25,
-        operation_timeout_sec=20,
+        read_timeout_sec=90 if operation in calls else 25,
+        operation_timeout_sec=80 if operation in calls else 20,
     )
     loader = "$encoded=[Console]::In.ReadToEnd(); Invoke-Expression ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded)))"
     encoded_loader = base64.b64encode(loader.encode('utf-16le')).decode()

@@ -15,10 +15,13 @@ export function normalizeWindowsEvent(event) {
   const protocol=rawProtocol==='6'?'TCP':rawProtocol==='17'?'UDP':rawProtocol||null
   const rawDirection=String(fields.Direction||'')
   const direction=rawDirection==='%%14592'||rawDirection.toLowerCase()==='inbound'?'in':rawDirection==='%%14593'||rawDirection.toLowerCase()==='outbound'?'out':rawDirection||null
+  // WFP 515x names the local listener Source on inbound records. Store a
+  // conventional network tuple (remote source -> local destination) instead.
+  const inboundFirewall=eventType==='firewall'&&direction==='in'
   return {
     recordId:intOrNull(event.RecordId??event.recordId),eventId:id,eventTime:event.TimeCreated??event.timeCreated??null,eventType,action,protocol,
-    srcIp:fields.SourceAddress||fields.IpAddress||null,srcPort:intOrNull(fields.SourcePort||fields.IpPort),
-    dstIp:fields.DestAddress||null,dstPort:intOrNull(fields.DestPort),direction,
+    srcIp:(inboundFirewall?fields.DestAddress:fields.SourceAddress)||fields.IpAddress||null,srcPort:intOrNull(inboundFirewall?fields.DestPort:fields.SourcePort||fields.IpPort),
+    dstIp:(inboundFirewall?fields.SourceAddress:fields.DestAddress)||null,dstPort:intOrNull(inboundFirewall?fields.SourcePort:fields.DestPort),direction,
     program:fields.Application||fields.ProcessName||null,accountSid:fields.TargetUserSid||fields.SubjectUserSid||null,
     logonType:fields.LogonType||null
   }

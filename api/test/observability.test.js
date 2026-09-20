@@ -12,7 +12,7 @@ process.env.BOOTSTRAP_PASSWORD='observability-test-password'
 const {app}=await import('../src/app.js')
 const {bootstrap}=await import('../src/security.js')
 const {db}=await import('../src/db.js')
-const {pruneOldEvents,refreshDueDns}=await import('../src/maintenance.js')
+const {pruneOldEvents,refreshDueDns,compactDueEvents,runCompactionIfDue}=await import('../src/maintenance.js')
 await bootstrap()
 const request=supertest(app)
 test.after(()=>{db.close();fs.rmSync(dir,{recursive:true,force:true})})
@@ -22,7 +22,7 @@ test('log filters, retention and scheduled DNS refresh use saved settings',async
   const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
   const node=await auth(request.post('/api/v1/nodes')).send({hostname:'localhost',ip:'127.0.0.1'}).expect(201)
   const read=await auth(request.get('/api/v1/settings/observability')).expect(200)
-  assert.deepEqual(read.body,{logRetentionDays:90,dnsRefreshHours:24})
+  assert.deepEqual(read.body,{logRetentionDays:90,dnsRefreshHours:24,eventCompactHours:24,hideLoopbackEvents:true,ignoreLoopbackIngest:false})
   await auth(request.patch('/api/v1/settings/observability')).send({logRetentionDays:0,dnsRefreshHours:24}).expect(400)
   await auth(request.patch('/api/v1/settings/observability')).send({logRetentionDays:30,dnsRefreshHours:12}).expect(200)
   const event=db.prepare('INSERT INTO log_events(id,node_id,record_id,event_id,action,protocol,dst_port,direction,program,challenge_id,event_time,received_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
@@ -137,4 +137,32 @@ test('credential assignment validates targets and is idempotent',async()=>{
   const repeated=await auth(request.post(`/api/v1/credentials/${credential.body.id}/assignments`)).send({nodeId:node.body.id}).expect(200)
   assert.equal(repeated.body.alreadyAssigned,true)
   assert.equal(db.prepare('SELECT COUNT(*) n FROM credential_assignments WHERE credential_id=? AND node_id=?').get(credential.body.id,node.body.id).n,1)
+})
+
+test('loopback display and ingest controls preserve searchable compacted events',async()=>{
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@observability.test',password:'new-observability-password'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
+  const node=(await auth(request.post('/api/v1/nodes')).send({hostname:'loopback-node',connectionMode:'agent'}).expect(201)).body
+  const events=[
+    {recordId:700,eventId:5156,action:'allow',protocol:'TCP',srcIp:'127.0.0.1',dstIp:'127.0.0.1',dstPort:8080,direction:'in',program:'C:\\loop.exe'},
+    {recordId:701,eventId:5156,action:'allow',protocol:'TCP',srcIp:'192.0.2.15',dstIp:'198.51.100.5',dstPort:8443,direction:'in',program:'C:\\service.exe'}
+  ]
+  await auth(request.post('/api/v1/logs/ingest')).send({nodeId:node.id,events}).expect(201)
+  assert.equal((await auth(request.get('/api/v1/logs/search').query({nodeId:node.id})).expect(200)).body.total,1)
+  assert.equal((await auth(request.get('/api/v1/logs/search').query({nodeId:node.id,hideLoopback:'false'})).expect(200)).body.total,2)
+  await auth(request.patch('/api/v1/settings/observability')).send({logRetentionDays:30,dnsRefreshHours:24,eventCompactHours:1,hideLoopbackEvents:true,ignoreLoopbackIngest:true}).expect(200)
+  const ignored=await auth(request.post('/api/v1/logs/ingest')).send({nodeId:node.id,events:[{...events[0],recordId:702}]}).expect(201)
+  assert.equal(ignored.body.inserted,0)
+  const compacted=compactDueEvents(new Date(Date.now()+3*36e5))
+  assert.ok(compacted>=2)
+  assert.ok(db.prepare('SELECT pattern_id FROM log_events WHERE node_id=? AND record_id=701').get(node.id).pattern_id)
+  const row=(await auth(request.get('/api/v1/logs/search').query({nodeId:node.id,srcIp:'192.0.2.15'})).expect(200)).body.items[0]
+  assert.equal(row.src_ip,'192.0.2.15')
+  assert.equal(row.dst_port,8443)
+  assert.equal((await auth(request.get('/api/v1/logs/search').query({nodeId:node.id})).expect(200)).body.total,1)
+  const cadenceStart=new Date()
+  db.prepare("UPDATE app_settings SET value=? WHERE key='event_compact_last_at'").run(cadenceStart.toISOString())
+  assert.equal(runCompactionIfDue(new Date(cadenceStart.getTime()+30*60_000)).due,false)
+  assert.equal(runCompactionIfDue(new Date(cadenceStart.getTime()+2*36e5)).due,true)
+  await auth(request.patch('/api/v1/settings/observability')).send({logRetentionDays:90,dnsRefreshHours:24,eventCompactHours:24,hideLoopbackEvents:true,ignoreLoopbackIngest:false}).expect(200)
 })

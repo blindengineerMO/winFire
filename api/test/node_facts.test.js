@@ -5,7 +5,7 @@ import {spawnSync} from 'node:child_process'
 
 const sidecar=readFileSync(new URL('../sidecar/wsman_client.py',import.meta.url),'utf8')
 const connector=readFileSync(new URL('../src/connector.js',import.meta.url),'utf8')
-const sidecarScript=sidecar.match(/POWERSHELL = r'''([\s\S]*?)'''/)?.[1]
+const sidecarScript=sidecar.match(/POWERSHELL = r'''([\s\S]*?)'''/)?.[1].replace('__WINFIRE_SHARED_FUNCTIONS__','')
 const factBlock=connector.slice(connector.indexOf("      'facts' {"),connector.indexOf("      'all_rules' {"))
 const ruleBlock=connector.slice(connector.indexOf("      'all_rules' {"),connector.indexOf("      'rules' {"))
 const hasPwsh=spawnSync('pwsh',['-NoProfile','-Command','$PSVersionTable.PSVersion.Major'],{encoding:'utf8'}).status===0

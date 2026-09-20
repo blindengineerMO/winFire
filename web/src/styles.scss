@@ -7,6 +7,8 @@
 .brand-mark{width:40px;height:40px;flex:none;background:none;box-shadow:none}
 .brand-mark img{display:block;width:100%;height:100%;object-fit:contain}
 .login-symbol img{display:block;width:92px;height:92px;object-fit:contain}
+.policy-sync-window{display:grid;gap:12px}.policy-sync-window h3{margin:10px 0 0}.sync-pending-list{max-height:230px;overflow:auto;border:1px solid var(--border);border-radius:6px}.sync-pending-list>div{display:flex;justify-content:space-between;gap:12px;padding:9px 12px;border-bottom:1px solid var(--border);font-size:.75rem}.sync-pending-list>div span{color:var(--muted)}.sync-pending-list>p{padding:12px;margin:0}.sync-schedule-label{display:grid;gap:7px;font-size:.75rem}.top-sync-button{white-space:nowrap}
+@media(max-width:900px){.top-sync-button span{display:none}}
 @media(max-width:440px){.metric-grid{grid-template-columns:1fr 1fr}.metric{min-height:100px}.metric-top .mdi{display:none}.form-grid,.detail-grid{grid-template-columns:1fr}.page-actions{width:100%}.page-actions .button{flex:1}.breadcrumb span{display:none}.canvas-footer input{width:100%;flex-basis:100%}}
 .security-settings{padding:18px;max-width:720px}.security-settings p{font-size:.76rem}.security-settings .form-grid{margin-top:16px}
 .status.learning,.status.applying{background:#123e4a77;border-color:#397f8d;color:#8de4ee}.status.enforcing{background:#153d3566;border-color:#317965;color:var(--green)}.status.review{background:#4c3e2366;border-color:#8b7139;color:#f5c370}

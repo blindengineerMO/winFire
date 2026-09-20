@@ -31,5 +31,5 @@ const routes=[
   {path:'/admin',component:Administration}
 ]
 const router=createRouter({history:createWebHistory(),routes})
-router.beforeEach(to=>!to.meta.public&&!session.token?'/login':to.path==='/login'&&session.token?'/':true)
+router.beforeEach(to=>!to.meta.public&&!session.token?{path:'/login',query:{next:to.fullPath}}:to.path==='/login'&&session.token?'/':true)
 createApp(App).use(createPinia()).use(router).mount('#app')

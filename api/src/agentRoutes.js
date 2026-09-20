@@ -6,6 +6,7 @@ import {db,one,all,run,id,now,audit,json,parse} from './db.js'
 import {hashToken} from './security.js'
 import {agentPkiReady,signAgentCsr} from './agentPki.js'
 import {normalizeWindowsEvent} from './eventNormalizer.js'
+import {isLoopbackEvent} from './eventPattern.js'
 import {diffRules} from './connector.js'
 import {emitNotification} from './notifications.js'
 import {normalizeProfileSnapshot} from './breakGlass.js'
@@ -55,10 +56,12 @@ agentRoutes.post('/:id/heartbeat',requireAgent,(req,res)=>{
 agentRoutes.post('/:id/events',requireAgent,(req,res)=>{
   const event=z.object({recordId:z.number().int().positive(),id:z.number().int().positive(),timeCreated:z.string().datetime({offset:true}),fields:z.record(z.string(),z.string()).default({})})
   const {events}=z.object({events:z.array(event).min(1).max(500)}).parse(req.body)
+  const ignoreLoopback=one("SELECT value FROM app_settings WHERE key='ignore_loopback_ingest'")?.value==='true'
   let inserted=0
   db.transaction(()=>{
     for(const raw of events){
       const item=normalizeWindowsEvent(raw)
+      if(ignoreLoopback&&isLoopbackEvent(item))continue
       const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,program,account_sid,event_time,event_type,logon_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),req.agent.node_id,item.recordId,item.eventId,item.action,item.protocol,item.srcIp,item.srcPort,item.dstIp,item.dstPort,item.direction,item.program,item.accountSid,item.eventTime,item.eventType,item.logonType)
       inserted+=result.changes
     }
@@ -77,6 +80,7 @@ agentRoutes.get('/:id/jobs',requireAgent,(req,res)=>{
       run("UPDATE agent_jobs SET status='failed',error='Job lease expired after five attempts',finished_at=?,lease_token=NULL WHERE id=?",now(),job.id)
       const payload=parse(job.payload_json)||{}
       if(payload.applyRunId)run("UPDATE policy_apply_runs SET status='failed',error='Agent did not complete job after five attempts',finished_at=? WHERE id=?",now(),payload.applyRunId)
+      if(payload.loopbackBaseline)run("UPDATE node_loopback_baseline SET status='failed',last_error='Agent did not complete loopback baseline job',job_id=NULL WHERE node_id=? AND job_id=?",req.agent.node_id,job.id)
       if(payload.removalAssignmentId){
         run('UPDATE policy_assignments SET removal_job_id=NULL WHERE id=? AND removal_job_id=?',payload.removalAssignmentId,job.id)
         audit(null,'policy.unassign.failed','policy',payload.policyId,null,{assignmentId:payload.removalAssignmentId,jobId:job.id,error:'Agent did not complete job after five attempts'})
@@ -117,6 +121,10 @@ agentRoutes.post('/:id/jobs/:jobId/result',requireAgent,(req,res)=>{
   db.transaction(()=>{
     run('UPDATE agent_jobs SET status=?,result_json=?,error=?,finished_at=?,lease_until=NULL,lease_token=NULL WHERE id=?',status,json(data.result||data.diff||null),data.error||null,now(),job.id)
     if(payload.applyRunId)run('UPDATE policy_apply_runs SET status=?,diff_json=?,error=?,finished_at=? WHERE id=?',status,json(data.diff||null),data.error||null,now(),payload.applyRunId)
+    if(payload.loopbackBaseline){
+      run('UPDATE node_loopback_baseline SET status=?,applied_at=?,last_error=?,job_id=NULL WHERE node_id=? AND job_id=?',data.success?'applied':'failed',data.success?now():null,data.error||null,req.agent.node_id,job.id)
+      audit(null,data.success?'node.loopback.applied':'node.loopback.failed','node',req.agent.node_id,null,{jobId:job.id,error:data.error||null})
+    }
     if(payload.removalAssignmentId){
       const assignment=one('SELECT * FROM policy_assignments WHERE id=? AND removal_job_id=?',payload.removalAssignmentId,job.id)
       if(assignment){

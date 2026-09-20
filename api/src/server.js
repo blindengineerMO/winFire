@@ -3,14 +3,17 @@ import path from 'node:path'
 import {fileURLToPath} from 'node:url'
 import express from 'express'
 import https from 'node:https'
-import {app,runVerification,runDriftCheck,pullLogs,processDueTraining,processDueBreakGlass,syncDirectory} from './app.js'
+import {app,runVerification,runDriftCheck,pullLogs,processDueTraining,processDueBreakGlass,processDuePolicySync,syncDirectory} from './app.js'
 import {bootstrap,ensureBootstrapAdmin} from './security.js'
 import {all,one,run,now,audit} from './db.js'
 import {agentTlsOptions} from './agentPki.js'
 import {sweepAgentHealth} from './agentHealth.js'
 import {collectFacts,enrichNode} from './connector.js'
-import {pruneOldEvents,refreshDueDns} from './maintenance.js'
+import {pruneOldEvents,refreshDueDns,runCompactionIfDue} from './maintenance.js'
 import {deliverPendingNotifications} from './notifications.js'
+import {sweepLoopbackBaseline} from './loopbackBaseline.js'
+import {revokeExpiredGrants} from './mfaPortal.js'
+import {sweepMfaPrompts} from './mfaPrompt.js'
 
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..')
 const dist=path.join(root,'web/dist')
@@ -47,6 +50,33 @@ async function sweepBreakGlass(){
 setTimeout(sweepBreakGlass,1000).unref()
 const breakGlassTimer=setInterval(sweepBreakGlass,60_000)
 breakGlassTimer.unref()
+setTimeout(()=>processDuePolicySync().catch(error=>console.error('Policy sync sweep failed:',error)),1500).unref()
+const policySyncTimer=setInterval(()=>processDuePolicySync().catch(error=>console.error('Policy sync sweep failed:',error)),60_000)
+policySyncTimer.unref()
+setTimeout(()=>sweepLoopbackBaseline().catch(error=>console.error('Loopback baseline sweep failed:',error)),3000).unref()
+const loopbackTimer=setInterval(()=>sweepLoopbackBaseline().catch(error=>console.error('Loopback baseline sweep failed:',error)),60_000)
+loopbackTimer.unref()
+setTimeout(()=>revokeExpiredGrants().catch(error=>console.error('MFA grant expiry sweep failed:',error)),4000).unref()
+const grantTimer=setInterval(()=>revokeExpiredGrants().catch(error=>console.error('MFA grant expiry sweep failed:',error)),60_000)
+grantTimer.unref()
+let mfaPollRunning=false,mfaPollCursor=0
+async function pollMfaEvents(){
+  if(mfaPollRunning)return
+  mfaPollRunning=true
+  try{
+    const targets=all(`SELECT DISTINCT n.id FROM nodes n JOIN identity_segments s ON (s.node_id=n.id OR s.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=n.id))
+      WHERE s.portal_enabled=1 AND s.auto_prompt_enabled=1 AND s.mode='agentless' AND n.connection_mode='agentless' AND n.transport IN ('winrm','winrms') AND n.firewall_state<>'learning'
+        AND (n.next_retry_at IS NULL OR n.next_retry_at<=?) ORDER BY n.id`,now())
+    const batch=targets.length?Array.from({length:Math.min(targets.length,5)},(_,index)=>targets[(mfaPollCursor+index)%targets.length]):[]
+    mfaPollCursor=targets.length?(mfaPollCursor+batch.length)%targets.length:0
+    await Promise.all(batch.map(async target=>{try{await pullLogs(target.id,null,1,true)}catch(error){console.error(`MFA event poll failed for ${target.id}:`,error.message)}}))
+    await sweepMfaPrompts()
+  }catch(error){console.error('MFA prompt sweep failed:',error)}
+  finally{mfaPollRunning=false}
+}
+setTimeout(pollMfaEvents,15_000).unref()
+const mfaPollTimer=setInterval(pollMfaEvents,Math.max(15,Number(process.env.MFA_EVENT_POLL_SECONDS||30))*1000)
+mfaPollTimer.unref()
 let inventoryRunning=false
 async function sweepNewNodes(){
   if(inventoryRunning)return
@@ -87,7 +117,10 @@ async function sweepDns(){
 setTimeout(sweepDns,5000).unref()
 const dnsTimer=setInterval(sweepDns,15*60_000)
 dnsTimer.unref()
-const timer=setInterval(()=>pruneOldEvents(),60*60*1000)
+const compactionTimer=setInterval(()=>runCompactionIfDue(),5*60*1000)
+compactionTimer.unref()
+setTimeout(()=>runCompactionIfDue(),10_000).unref()
+const timer=setInterval(()=>{pruneOldEvents();run('DELETE FROM mfa_entra_flows WHERE expires_at<?',now());run("DELETE FROM mfa_prompt_events WHERE datetime(created_at)<datetime('now','-7 days')")},60*60*1000)
 timer.unref()
 const agentHealth=setInterval(()=>sweepAgentHealth(),60_000)
 agentHealth.unref()

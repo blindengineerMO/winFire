@@ -65,7 +65,7 @@ test('mTLS enrollment, job polling, completion and revocation',async()=>{
   const client={cert:enrolled.body.certificate,key:fs.readFileSync(file('agent.key'))}
   assert.equal((await request('POST',`/agents/${enrolled.body.agentId}/heartbeat`,{version:'test-1'})).status,401)
   assert.equal((await request('POST',`/agents/${enrolled.body.agentId}/heartbeat`,{version:'test-1'},null,client)).status,200)
-  const event={recordId:42,id:5157,timeCreated:new Date().toISOString(),fields:{SourceAddress:'192.0.2.10',SourcePort:'52000',DestAddress:'192.0.2.20',DestPort:'3389',Protocol:'6',Direction:'%%14592',Application:'test.exe'}}
+  const event={recordId:42,id:5157,timeCreated:new Date().toISOString(),fields:{SourceAddress:'192.0.2.20',SourcePort:'3389',DestAddress:'192.0.2.10',DestPort:'52000',Protocol:'6',Direction:'%%14592',Application:'test.exe'}}
   assert.equal((await request('POST',`/agents/${enrolled.body.agentId}/events`,{events:[event]})).status,401)
   const firstEvents=await request('POST',`/agents/${enrolled.body.agentId}/events`,{events:[event]},null,client)
   assert.equal(firstEvents.status,201)

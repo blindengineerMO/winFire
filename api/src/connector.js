@@ -7,6 +7,9 @@ import {fileURLToPath} from 'node:url'
 import {all, one, run, parse, now, audit} from './db.js'
 import {openSealed} from './security.js'
 import {breakGlassFunctions} from './breakGlassScript.js'
+import {jitAccessFunctions} from './jitAccessScript.js'
+import {mfaPromptFunctions} from './mfaPromptScript.js'
+import {assertManagementAccess} from './managementGuard.js'
 
 const timeoutMs = 40000
 const pause=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds))
@@ -47,7 +50,7 @@ async function pwsh(script, input) {
   return new Promise((resolve,reject) => {
     const encoded=Buffer.from(script,'utf16le').toString('base64')
     const child=spawn('pwsh',['-NoProfile','-NonInteractive','-EncodedCommand',encoded],{stdio:['pipe','pipe','pipe']})
-    let stdout='',stderr=''; const timer=setTimeout(()=>child.kill(),input?.operation==='rights'?120000:timeoutMs)
+    let stdout='',stderr=''; const timer=setTimeout(()=>child.kill(),input?.operation==='rights'||input?.operation?.startsWith('jit_')||input?.operation==='prompt_browser'?120000:timeoutMs)
     child.stdout.on('data',chunk=>stdout+=chunk); child.stderr.on('data',chunk=>stderr+=chunk)
     child.once('error',reject); child.once('close',code=>{clearTimeout(timer); if(code) reject(new Error(stderr.trim() || `PowerShell exited ${code}`)); else {try {resolve(JSON.parse(stdout || 'null'))} catch {reject(new Error(`Invalid PowerShell response: ${stdout.slice(0,300)}`))}}})
     child.stdin.end(JSON.stringify(input))
@@ -59,7 +62,7 @@ async function pywinrm(input) {
   const python=process.env.WINRM_PYTHON || (fs.existsSync(localPython)?localPython:'python3')
   return new Promise((resolve,reject)=>{
     const child=spawn(python,[sidecar],{stdio:['pipe','pipe','pipe']})
-    let stdout='',stderr='';const timer=setTimeout(()=>child.kill('SIGKILL'),input?.operation==='rights'?120000:timeoutMs)
+    let stdout='',stderr='';const timer=setTimeout(()=>child.kill('SIGKILL'),input?.operation==='rights'||input?.operation?.startsWith('jit_')||input?.operation==='prompt_browser'?120000:timeoutMs)
     child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk)
     child.once('error',reject);child.once('close',code=>{clearTimeout(timer);if(code)reject(new Error(stderr.trim()||`WinRM sidecar exited ${code}`));else {try{resolve(JSON.parse(stdout||'null'))}catch{reject(new Error(`Invalid WinRM response: ${stdout.slice(0,300)}`))}}})
     child.stdin.end(JSON.stringify(input))
@@ -84,7 +87,11 @@ try {
       [pscustomobject]@{subcategoryGuid='0CCE9226-69AE-11D9-BED3-505054503030';settingValue=$setting;successEnabled=[bool]($setting -band 1);failureEnabled=[bool]($setting -band 2)}
     }
     ${breakGlassFunctions}
+    ${jitAccessFunctions}
+    __WINFIRE_PROMPT_FUNCTIONS__
     switch($operation) {
+      'prompt_browser' { Open-WinFireMfaPortal $argsData }
+      'prompt_session' { @(Get-WinFireActiveSession) }
       'auth' { [Security.Principal.WindowsIdentity]::GetCurrent().Name }
       'facts' {
         $computer=Get-CimInstance Win32_ComputerSystem; $osInfo=Get-CimInstance Win32_OperatingSystem; $biosInfo=Get-CimInstance Win32_BIOS
@@ -129,6 +136,9 @@ try {
       'audit_policy' { Get-WinFireAuditPolicy }
       'breakglass_start' { Start-WinFireBreakGlass $argsData }
       'breakglass_end' { End-WinFireBreakGlass $argsData }
+      'jit_preflight' { Test-WinFireJitGate $argsData }
+      'jit_start' { Start-WinFireJitAccess $argsData }
+      'jit_end' { End-WinFireJitAccess $argsData }
       'audit_policy_enable' { $before=Get-WinFireAuditPolicy; if($before.successEnabled -and $before.failureEnabled){$before}else{try{auditpol /set '/subcategory:{0CCE9226-69AE-11D9-BED3-505054503030}' /success:enable /failure:enable | Out-Null; if($LASTEXITCODE -ne 0){throw "auditpol update failed with exit code $LASTEXITCODE"}; $after=Get-WinFireAuditPolicy; if(-not ($after.successEnabled -and $after.failureEnabled)){throw 'Audit policy readback did not confirm success and failure auditing'}; $after}catch{$cause=$_.Exception.Message; $successArg=if($before.successEnabled){'/success:enable'}else{'/success:disable'}; $failureArg=if($before.failureEnabled){'/failure:enable'}else{'/failure:disable'}; auditpol /set '/subcategory:{0CCE9226-69AE-11D9-BED3-505054503030}' $successArg $failureArg | Out-Null; if($LASTEXITCODE -ne 0){throw "Audit policy update failed: $cause; rollback failed with exit code $LASTEXITCODE"}; $restored=Get-WinFireAuditPolicy; if($restored.settingValue -ne $before.settingValue){throw "Audit policy update failed: $cause; rollback readback differs from prior state"}; throw "Audit policy update failed: $cause; prior state restored"}} }
       'rights' { $file=Join-Path $env:TEMP ('winfire-'+[guid]::NewGuid().ToString()+'.inf'); try {secedit /export /mergedpolicy /cfg $file /areas USER_RIGHTS | Out-Null; if($LASTEXITCODE -ne 0){throw "secedit export failed with exit code $LASTEXITCODE"}; $content=@(Get-Content $file); $rights=@($content | Where-Object {$_ -match '^\\s*Se\\w*LogonRight\\s*='}); if(!$rights.Count){throw "secedit export contained no logon rights across $($content.Count) lines"}; $rights} finally {Remove-Item $file -Force -ErrorAction SilentlyContinue} }
       default { throw 'Unsupported operation' }
@@ -139,6 +149,11 @@ try {
 `
 function nodeCredential(nodeId,credentialId) {
   const rows=all(`SELECT DISTINCT c.* FROM credentials c JOIN credential_assignments a ON a.credential_id=c.id WHERE (a.node_id=? OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?)) AND (? IS NULL OR c.id=?) ORDER BY c.priority`,nodeId,nodeId,credentialId||null,credentialId||null)
+  if(!credentialId){
+    const directory=one(`SELECT c.* FROM credentials c JOIN directory_connections d ON d.node_credential_id=c.id JOIN nodes n ON n.id=?
+      WHERE d.id='default' AND d.enabled=1 AND n.ad_guid IS NOT NULL AND n.ad_enabled=1 AND n.ad_missing=0 AND n.connection_mode='agentless'`,nodeId)
+    if(directory&&!rows.some(row=>row.id===directory.id))rows.push(directory)
+  }
   if (!rows.length) throw new Error('No credential assigned to node')
   return rows.map(row=>({...row,secret:openSealed(row.encrypted_blob)}))
 }
@@ -148,17 +163,18 @@ export async function remote(node,operation,args={},options={}) {
   let lastError
   for (const credential of nodeCredential(node.id,options.credentialId)) {
     const input={host,transport:node.transport||'winrm',username:credential.username,password:credential.secret.password,operation,args}
-    const attempts=operation==='apply'||operation.startsWith('breakglass_')?1:2
+    const mutating=operation==='apply'||operation.startsWith('breakglass_')||operation==='jit_start'||operation==='jit_end'||operation==='prompt_browser'
+    const attempts=mutating?1:2
     for(let attempt=0;attempt<attempts;attempt++){
       try {
-        const result=process.platform==='win32' ? await pwsh(remoteScript,input) : await pywinrm(input)
+        const result=process.platform==='win32' ? await pwsh(remoteScript.replace('__WINFIRE_PROMPT_FUNCTIONS__',operation.startsWith('prompt_')?mfaPromptFunctions:''),input) : await pywinrm(input)
         recordNodeSuccess(node.id,input.transport==='winrms'?'winrms-authenticated':'winrm-authenticated')
         return result
       }
       catch(error) {
         lastError=error
         if(!transientError(error))break
-        if(operation==='apply'||operation.startsWith('breakglass_')){
+        if(mutating){
           recordNodeTransportFailure(node.id)
           throw error // Outcome may be ambiguous; re-read state before retrying.
         }
@@ -218,11 +234,19 @@ export async function lookupDns(node) {
   return {forward,reverse,mismatch,ptrMissing,ptrMismatch,forwardMismatch}
 }
 export function diffRules(desired,actual) {
-  const comparable=r=>JSON.stringify([r.name,r.action,r.direction==='inbound'?'in':r.direction==='outbound'?'out':r.direction,r.protocol,r.localPort,r.remotePort||'Any',r.remoteAddress,r.program,r.profile].map(x=>String(x).toLowerCase()))
+  const normalizeAddress=value=>String(value||'Any').split(',').map(part=>{
+    const match=part.trim().match(/^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/)
+    if(!match||Number(match[2])>32)return part.trim().toLowerCase()
+    const prefix=Number(match[2]),mask=prefix===0?0:(0xffffffff<<(32-prefix))>>>0
+    const address=match[1].split('.').map(Number).reduce((value,octet)=>(value<<8)|octet,0)>>>0
+    return `${[24,16,8,0].map(shift=>((address&mask)>>>shift)&255).join('.')}/${[24,16,8,0].map(shift=>(mask>>>shift)&255).join('.')}`
+  }).sort().join(',')
+  const comparable=r=>JSON.stringify([r.name,r.action,r.direction==='inbound'?'in':r.direction==='outbound'?'out':r.direction,r.protocol,r.localPort,r.remotePort||'Any',normalizeAddress(r.remoteAddress),r.program,r.profile].map(x=>String(x).toLowerCase()))
   const wanted=new Map(desired.map(r=>[r.name,comparable(r)])), present=new Map((actual||[]).map(r=>[r.name,comparable(r)]))
   return {remove:[...present.keys()].filter(name=>!wanted.has(name)||wanted.get(name)!==present.get(name)),add:desired.filter(r=>!present.has(r.name)||present.get(r.name)!==wanted.get(r.name))}
 }
 export async function applyRules(node,policyId,rules) {
+  assertManagementAccess(rules)
   const group=`WinFireSecure:${policyId}`
   const asRules=response=>Array.isArray(response)?response:response?[response]:[]
   const previous=asRules(await remote(node,'rules',{group}))

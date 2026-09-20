@@ -19,6 +19,33 @@ export const graphSchema = z.object({
   edges: z.array(z.object({id:z.string(),source:z.string(),target:z.string()})).default([])
 })
 
+// Merge along one match dimension at a time. Every other dimension must be
+// identical, so a merged rule represents exactly the union of its inputs.
+export function dedupeRules(input) {
+  const matchFields=['action','direction','protocol','localPort','remotePort','remoteAddress','program','profile','group']
+  const mergeValue=(left,right,dimension)=>{
+    const parts=new Set([...String(left).split(','),...String(right).split(',')].map(value=>value.trim()).filter(Boolean))
+    if(parts.has('Any'))return 'Any'
+    return [...parts].sort(dimension==='remoteAddress'?(a,b)=>a.localeCompare(b):(a,b)=>Number(a)-Number(b)||a.localeCompare(b)).join(',')
+  }
+  let rules=input.map(rule=>({...rule}))
+  let changed=true
+  while(changed){
+    changed=false
+    for(const dimension of ['localPort','remotePort','remoteAddress']){
+      const byMatch=new Map(),merged=[]
+      for(const rule of rules){
+        const key=JSON.stringify(matchFields.filter(field=>field!==dimension).map(field=>rule[field]))
+        const existing=byMatch.get(key)
+        if(existing){existing[dimension]=mergeValue(existing[dimension],rule[dimension],dimension);changed=true}
+        else{byMatch.set(key,rule);merged.push(rule)}
+      }
+      rules=merged
+    }
+  }
+  return rules
+}
+
 export function compilePolicy(graph, policyId) {
   const doc = graphSchema.parse(graph)
   const supportedTypes=new Set(['allow','deny','program','portGroup','addressGroup','profile','schedule','mfaGate'])
@@ -74,5 +101,5 @@ export function compilePolicy(graph, policyId) {
     if(rule.protocol==='Any'&&(rule.localPort!=='Any'||rule.remotePort!=='Any'))throw new Error('Specific ports require TCP or UDP protocol')
     rules.push({...rule, group: `WinFireSecure:${policyId}`, sourceNodeId:node.id})
   }
-  return rules
+  return dedupeRules(rules)
 }

@@ -19,3 +19,9 @@ export function verifyTotp(secret,code){
   const provided=Buffer.from(String(code))
   return [-30000,0,30000].some(delta=>crypto.timingSafeEqual(Buffer.from(totpCode(secret,Date.now()+delta)),provided))
 }
+export function matchingTotpCounter(secret,code,time=Date.now()){
+  if(!/^\d{6}$/.test(String(code||'')))return null
+  const supplied=Buffer.from(String(code)),counter=Math.floor(time/30000)
+  for(const offset of [-1,0,1])if(crypto.timingSafeEqual(Buffer.from(totpCode(secret,(counter+offset)*30000)),supplied))return counter+offset
+  return null
+}

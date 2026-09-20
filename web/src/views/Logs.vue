@@ -1,10 +1,15 @@
 <script setup>
-import {onMounted,ref,computed} from 'vue'
+import {onMounted,onUnmounted,ref,computed,nextTick} from 'vue'
 import PageHeader from '../components/PageHeader.vue'
-import {api} from '../lib/api.js'
+import GlassWindow from '../components/GlassWindow.vue'
+import {api,session} from '../lib/api.js'
 
-const events=ref([]),nodes=ref([]),sessions=ref([])
+const events=ref([]),nodes=ref([]),sessions=ref([]),policies=ref([])
+const eventContext=ref(null),eventContextEl=ref(null),ruleOpen=ref(false),ruleEvent=ref(null),ruleAction=ref('allow'),rulePolicyId=ref('personal'),ruleBusy=ref(false)
+const groupPolicies=computed(()=>policies.value.filter(policy=>policy.origin!=='learned'&&policy.scopes?.some(scope=>scope.node_group_id)))
+const canManageRules=computed(()=>['owner','admin'].includes(session.user?.role))
 const filters=ref({nodeId:'',eventId:'',action:'',direction:'',srcIp:'',dstIp:'',port:'',program:'',protocol:'',challengeId:'',from:'',to:''})
+const hideLoopback=ref(true)
 const page=ref(1),pageSize=ref(100),total=ref(0),sortBy=ref('time'),sortDir=ref('desc')
 const error=ref(''),message=ref(''),loading=ref(false),duration=ref(24)
 let requestId=0
@@ -16,7 +21,7 @@ const activeAuto=computed(()=>sessions.value.some(session=>session.node_id===fil
 const nodeName=id=>nodes.value.find(node=>node.id===id)?.hostname||id?.slice(0,8)||'—'
 const columns=[{key:'time',label:'Time'},{key:'node',label:'Node'},{key:'eventId',label:'Event'},{key:'action',label:'Action'},{key:'direction',label:'Direction'},{key:'srcIp',label:'Source'},{key:'dstIp',label:'Destination'},{key:'port',label:'Port'},{key:'program',label:'Program'}]
 function queryString(){
-  const query={page:page.value,pageSize:pageSize.value,sortBy:sortBy.value,sortDir:sortDir.value,...filters.value}
+  const query={page:page.value,pageSize:pageSize.value,sortBy:sortBy.value,sortDir:sortDir.value,hideLoopback:hideLoopback.value,...filters.value}
   for(const key of ['from','to'])if(query[key])query[key]=new Date(query[key]).toISOString()
   return new URLSearchParams(Object.entries(query).filter(([,value])=>value!==''&&value!==null)).toString()
 }
@@ -38,7 +43,15 @@ async function startLearning(){if(!filters.value.nodeId)return;try{await api('/l
 async function finalize(session){try{const result=await api(`/learning-sessions/${session.id}/finalize`,{method:'POST',body:{}});message.value=`Proposal generated with ${result.ruleCount} rules. Review it in Policy Studio before approval.`;await load()}catch(e){error.value=e.message}}
 async function approve(session){try{const result=await api(`/learning-sessions/${session.id}/approve`,{method:'POST',body:{}});message.value=result.status==='enforced'?'Learned policy applied':result.status==='applying'?'Policy queued for agent application':'Policy apply failed; review the run before retrying';await load()}catch(e){error.value=e.message}}
 async function pull(){if(!filters.value.nodeId)return;try{await api('/logs/pull',{method:'POST',body:{nodeId:filters.value.nodeId}});searchEvents()}catch(e){error.value=e.message}}
-onMounted(async()=>{try{nodes.value=await api('/nodes');await load()}catch(e){error.value=e.message}})
+function canRule(event){return ['in','out'].includes(event.direction)&&['TCP','UDP'].includes(event.protocol)&&Number(event.dst_port)>0&&!!(event.direction==='in'?event.src_ip:event.dst_ip)}
+function openEventMenu(mouseEvent,event){if(!canManageRules.value)return;mouseEvent.preventDefault();const x=Math.min(mouseEvent.clientX||80,window.innerWidth-235),y=Math.min(mouseEvent.clientY||80,window.innerHeight-130);eventContext.value={event,x:Math.max(8,x),y:Math.max(8,y)};nextTick(()=>eventContextEl.value?.querySelector('button')?.focus({preventScroll:true}))}
+function closeEventMenu(){eventContext.value=null}
+function onPointer(event){if(eventContext.value&&!event.target.closest('.event-context-menu,.event-menu-trigger'))closeEventMenu()}
+function beginRule(event,action){ruleEvent.value=event;ruleAction.value=action;rulePolicyId.value='personal';ruleOpen.value=true;closeEventMenu()}
+async function addRule(){if(!ruleEvent.value)return;ruleBusy.value=true;error.value='';try{const result=await api(`/logs/${ruleEvent.value.id}/rule`,{method:'POST',body:{action:ruleAction.value,...(rulePolicyId.value==='personal'?{}:{policyId:rulePolicyId.value})}});ruleOpen.value=false;message.value=`Rule saved to policy version ${result.versionNo}. An administrator can sync it from the top bar.`;policies.value=await api('/policies')}catch(e){error.value=e.message}finally{ruleBusy.value=false}}
+onMounted(async()=>{window.addEventListener('pointerdown',onPointer);window.addEventListener('keydown',onMenuKey);try{const [loadedNodes,loadedPolicies,display]=await Promise.all([api('/nodes'),api('/policies'),api('/settings/logs-display')]);nodes.value=loadedNodes;policies.value=loadedPolicies;hideLoopback.value=display.hideLoopbackEvents;await load()}catch(e){error.value=e.message}})
+function onMenuKey(event){if(event.key==='Escape')closeEventMenu()}
+onUnmounted(()=>{window.removeEventListener('pointerdown',onPointer);window.removeEventListener('keydown',onMenuKey)})
 </script>
 
 <template>
@@ -62,11 +75,12 @@ onMounted(async()=>{try{nodes.value=await api('/nodes');await load()}catch(e){er
         <label>Challenge ID<input v-model.trim="filters.challengeId" placeholder="MFA challenge ID"></label>
         <label>From<input v-model="filters.from" type="datetime-local"></label>
         <label>To<input v-model="filters.to" type="datetime-local"></label>
+        <label class="check-label"><input v-model="hideLoopback" type="checkbox" @change="searchEvents"> Hide local loopback</label>
         <button class="button small primary" :disabled="loading">Apply filters</button>
         <button type="button" class="button small secondary" @click="clearFilters">Clear filters</button>
       </form>
       <div class="table-wrap events-table-wrap"><table class="events-table"><thead>
-        <tr><th v-for="column in columns" :key="column.key" :aria-sort="sortBy===column.key?(sortDir==='asc'?'ascending':'descending'):undefined"><button type="button" class="sort-heading" :aria-label="`Sort by ${column.label}`" @click="sort(column.key)">{{column.label}} <i :class="sortBy===column.key?(sortDir==='asc'?'mdi mdi-arrow-up':'mdi mdi-arrow-down'):'mdi mdi-swap-vertical'"></i></button></th></tr>
+        <tr><th v-for="column in columns" :key="column.key" :aria-sort="sortBy===column.key?(sortDir==='asc'?'ascending':'descending'):undefined"><button type="button" class="sort-heading" :aria-label="`Sort by ${column.label}`" @click="sort(column.key)">{{column.label}} <i :class="sortBy===column.key?(sortDir==='asc'?'mdi mdi-arrow-up':'mdi mdi-arrow-down'):'mdi mdi-swap-vertical'"></i></button></th><th v-if="canManageRules">Actions</th></tr>
         <tr class="column-filters">
           <th><span class="filter-hint">Use dates above</span></th>
           <th><select v-model="filters.nodeId" aria-label="Filter node" @change="searchEvents"><option value="">All nodes</option><option v-for="node in nodes" :key="node.id" :value="node.id">{{node.hostname}}</option></select></th>
@@ -76,15 +90,17 @@ onMounted(async()=>{try{nodes.value=await api('/nodes');await load()}catch(e){er
           <th><input v-model.trim="filters.srcIp" placeholder="Source IP" aria-label="Filter source IP" @keyup.enter="searchEvents"></th>
           <th><input v-model.trim="filters.dstIp" placeholder="Destination IP" aria-label="Filter destination IP" @keyup.enter="searchEvents"></th>
           <th><input v-model="filters.port" type="number" min="1" max="65535" placeholder="Port" aria-label="Filter destination port" @keyup.enter="searchEvents"></th>
-          <th><input v-model.trim="filters.program" placeholder="Program" aria-label="Filter program" @keyup.enter="searchEvents"></th>
+          <th><input v-model.trim="filters.program" placeholder="Program" aria-label="Filter program" @keyup.enter="searchEvents"></th><th></th>
         </tr>
       </thead><tbody>
-        <tr v-for="event in events" :key="event.id"><td>{{new Date(event.event_time||event.received_at).toLocaleString()}}</td><td class="mono">{{nodeName(event.node_id)}}</td><td>{{event.event_id}}</td><td><span class="status" :class="event.action">{{event.action}}</span></td><td>{{event.direction||'—'}}</td><td class="mono">{{event.src_ip||'—'}}</td><td class="mono">{{event.dst_ip||'—'}}</td><td class="mono">{{event.dst_port||'—'}}</td><td class="mono">{{event.program||'—'}}</td></tr>
-        <tr v-if="!events.length"><td colspan="9" class="empty-table">{{loading?'Loading events…':'No events found. Pull the Windows Security log or adjust filters.'}}</td></tr>
+        <tr v-for="event in events" :key="event.id" tabindex="0" @contextmenu="openEventMenu($event,event)" @keydown.shift.f10="openEventMenu($event,event)"><td>{{new Date(event.event_time||event.received_at).toLocaleString()}}</td><td class="mono">{{nodeName(event.node_id)}}</td><td>{{event.event_id}}</td><td><span class="status" :class="event.action">{{event.action}}</span></td><td>{{event.direction||'—'}}</td><td class="mono">{{event.src_ip||'—'}}</td><td class="mono">{{event.dst_ip||'—'}}</td><td class="mono">{{event.dst_port||'—'}}</td><td class="mono">{{event.program||'—'}}</td><td v-if="canManageRules"><button class="icon-button event-menu-trigger" :aria-label="`Actions for event ${event.event_id}`" @click.stop="openEventMenu($event,event)"><i class="mdi mdi-dots-vertical"></i></button></td></tr>
+        <tr v-if="!events.length"><td colspan="10" class="empty-table">{{loading?'Loading events…':'No events found. Pull the Windows Security log or adjust filters.'}}</td></tr>
       </tbody></table></div>
       <div class="event-pagination" role="navigation" aria-label="Firewall events pages"><span>Showing {{firstRow}}–{{lastRow}} of {{total}}</span><div><button type="button" class="button small secondary" :disabled="page<=1||loading" @click="changePage(page-1)">Previous</button><span>Page {{page}} of {{totalPages}}</span><button type="button" class="button small secondary" :disabled="page>=totalPages||loading" @click="changePage(page+1)">Next</button></div></div>
     </section>
     <section class="panel glass"><div class="panel-title"><div><span class="eyebrow">POLICY DISCOVERY</span><h2>Learning sessions</h2></div><div class="table-tools"><input v-model.number="duration" type="number" min="1" max="720" aria-label="Duration in hours" style="width:90px"><span class="hint">hours</span><button class="button small secondary" :disabled="!filters.nodeId" @click="startLearning">{{activeAuto?'Switch to manual review':'Start manual learning'}}</button></div></div><div v-for="session in sessions" :key="session.id" class="history-row"><div><strong>{{nodeName(session.node_id)}}</strong><small>{{session.mode==='auto'?'Automatic':'Manual review'}} · {{session.status}} · ends {{new Date(session.ends_at).toLocaleString()}}</small><small v-if="session.last_error" class="danger-text">{{session.last_error}}</small></div><router-link v-if="session.generated_policy_id" class="button small secondary" :to="{path:'/policies',query:{policyId:session.generated_policy_id}}">Review policy</router-link><button v-if="session.status==='active'&&session.mode!=='auto'" class="button small secondary" @click="finalize(session)">Generate proposal</button><button v-if="['review','apply-failed'].includes(session.status)" class="button small primary" @click="approve(session)">{{session.mode==='auto'?'Retry apply':'Approve and apply'}}</button></div><div v-if="!sessions.length" class="empty-side">No learning sessions yet.</div></section>
+    <div v-if="eventContext" ref="eventContextEl" class="event-context-menu" role="menu" :style="{left:`${eventContext.x}px`,top:`${eventContext.y}px`}" @contextmenu.prevent><strong>Event {{eventContext.event.event_id}} · {{nodeName(eventContext.event.node_id)}}</strong><button role="menuitem" :disabled="!canRule(eventContext.event)" @click="beginRule(eventContext.event,'allow')"><i class="mdi mdi-check-circle-outline"></i> Add allow rule…</button><button role="menuitem" :disabled="!canRule(eventContext.event)" @click="beginRule(eventContext.event,'block')"><i class="mdi mdi-cancel"></i> Add reject rule…</button></div>
+    <GlassWindow v-model="ruleOpen" title="Create rule from firewall event" width="560px"><div v-if="ruleEvent" class="form-grid"><p>{{nodeName(ruleEvent.node_id)}} · {{ruleEvent.direction}}bound {{ruleEvent.protocol}} {{ruleEvent.dst_port}} · {{ruleEvent.direction==='in'?ruleEvent.src_ip:ruleEvent.dst_ip}}</p><label>Action<select v-model="ruleAction"><option value="allow">Allow</option><option value="block">Reject</option></select></label><label>Policy<select v-model="rulePolicyId"><option value="personal">{{nodeName(ruleEvent.node_id)}} personal policy</option><option v-for="policy in groupPolicies" :key="policy.id" :value="policy.id">{{policy.name}} · group/global</option></select></label><p class="muted">The rule is staged in a new version. It will reach enforced nodes when an administrator syncs policies.</p><div class="form-actions"><button class="button secondary" @click="ruleOpen=false">Cancel</button><button class="button primary" :disabled="ruleBusy" @click="addRule">{{ruleBusy?'Saving…':'Create rule'}}</button></div></div></GlassWindow>
   </div>
 </template>
 
@@ -92,5 +108,6 @@ onMounted(async()=>{try{nodes.value=await api('/nodes');await load()}catch(e){er
 .page-size{display:flex;align-items:center;gap:.55rem;white-space:nowrap;font-size:.8rem}.page-size select{min-width:75px}
 .events-table{min-width:1150px}.events-table th{white-space:nowrap}.sort-heading{display:flex;align-items:center;gap:.4rem;border:0;background:none;color:inherit;font:inherit;font-weight:700;text-transform:uppercase;cursor:pointer;padding:0}.sort-heading i{font-size:1rem;opacity:.7}.sort-heading:hover,.sort-heading:focus-visible{color:var(--accent,#3864ae)}
 .column-filters th{padding:.45rem .35rem}.column-filters input,.column-filters select{width:100%;min-width:85px;box-sizing:border-box;font-size:.75rem}.column-filters th:first-child{min-width:130px}.column-filters th:nth-child(2){min-width:125px}.column-filters th:last-child{min-width:180px}.filter-hint{font-size:.72rem;font-weight:400;text-transform:none;opacity:.75}.event-pagination{display:flex;justify-content:space-between;align-items:center;gap:1rem;padding:.85rem 1rem;font-size:.8rem}.event-pagination>div{display:flex;align-items:center;gap:.7rem}
+.event-context-menu{position:fixed;z-index:1000;min-width:220px;display:grid;padding:6px;background:var(--panel);color:var(--field-value);border:1px solid var(--border);border-radius:7px;box-shadow:0 20px 55px #0005}.event-context-menu strong{font-size:.68rem;padding:8px 10px;color:var(--muted)}.event-context-menu button{border:0;background:transparent;color:inherit;text-align:left;padding:9px 10px;border-radius:4px;font-size:.75rem;cursor:pointer}.event-context-menu button:hover{background:color-mix(in srgb,var(--green) 18%,transparent)}.event-context-menu button:disabled{opacity:.45;cursor:not-allowed}
 @media(max-width:700px){.event-pagination{flex-direction:column;align-items:flex-start}.log-filters{grid-template-columns:repeat(auto-fit,minmax(130px,1fr))}}
 </style>

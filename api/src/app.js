@@ -7,15 +7,16 @@ import crypto from 'node:crypto'
 import {isIP} from 'node:net'
 import PDFDocument from 'pdfkit'
 import {z} from 'zod'
-import {compilePolicy, graphSchema, findRuleConflicts} from '@winfire/shared'
+import {compilePolicy, graphSchema, findRuleConflicts,validateAddressExpression,validateProgramPath} from '@winfire/shared'
 import {db, all, one, run, id, now, audit, json, parse} from './db.js'
 import {auth, requireRole, publicUser, issueAccess, issueRefresh, rotateRefresh, hashToken, seal, openSealed} from './security.js'
 import {probeNode, collectFacts, lookupDns, remote, applyRules, diffRules, tcpProbe} from './connector.js'
 import {classifyVerification,hasManagedRule} from './verifier.js'
-import {makeTotpSecret,verifyTotp} from './totp.js'
+import {makeTotpSecret,verifyTotp,matchingTotpCounter} from './totp.js'
 import {agentRoutes} from './agentRoutes.js'
 import {agentPkiReady} from './agentPki.js'
 import {normalizeWindowsEvent} from './eventNormalizer.js'
+import {isLoopbackEvent} from './eventPattern.js'
 import {deliverInvite,deliverVerification,inviteLink} from './mailer.js'
 import {saveAvatar,readAvatar,removeAvatar} from './avatar.js'
 import {readDirectoryComputers,testDirectoryConnection} from './directory.js'
@@ -25,12 +26,18 @@ import {emitNotification,notificationSummary,preferenceKeys} from './notificatio
 import {buildOpenApi} from './openapi.js'
 import {parseSeceditRights} from './logonRights.js'
 import {normalizeProfileSnapshot,publicBreakGlass} from './breakGlass.js'
+import {normalizeSourceIp,sourceMatches} from './mfaPortal.js'
+import {entraConfigured,startEntraAuthentication,completeEntraAuthentication} from './entraPortal.js'
+import {portalBranding,setPortalCompanyName,savePortalImage,readPortalImage,removePortalImage} from './portalBranding.js'
+import {assertManagementAccess} from './managementGuard.js'
+import {mfaPromptSettings} from './mfaPromptSettings.js'
 
 export const app=express()
 app.disable('x-powered-by')
+if(process.env.TRUST_PROXY_CIDRS)app.set('trust proxy',process.env.TRUST_PROXY_CIDRS.split(',').map(item=>item.trim()).filter(Boolean))
 app.use(helmet({contentSecurityPolicy:false}))
 app.use(cors({origin:(origin,cb)=>{const allowed=(process.env.CORS_ORIGIN||'').split(',').filter(Boolean);cb(null,!origin||allowed.includes(origin))}}))
-app.use(express.json({limit:'1mb'}))
+app.use(express.json({limit:'2mb'}))
 const api=express.Router()
 app.use('/api/v1',api)
 const wrap=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next)
@@ -95,6 +102,42 @@ async function requestEmailVerification(user,email,actorId) {
 function assignedNodes(policyId) {
   return all(`SELECT DISTINCT n.* FROM nodes n JOIN policy_assignments a ON a.node_id=n.id OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=n.id) WHERE a.policy_id=?`,policyId)
 }
+function pendingPolicySync(){
+  const pairs=all(`SELECT DISTINCT p.id policy_id,p.name policy_name,p.current_version_id version_id,n.id node_id,n.hostname
+    FROM policies p JOIN policy_assignments a ON a.policy_id=p.id
+    JOIN nodes n ON a.node_id=n.id OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=n.id)
+    WHERE p.current_version_id IS NOT NULL AND NOT EXISTS
+      (SELECT 1 FROM learning_sessions s WHERE s.node_id=n.id AND s.status IN ('active','review','applying'))`)
+  return pairs.filter(pair=>{
+    const applied=one('SELECT version_id,status FROM policy_apply_runs WHERE policy_id=? AND node_id=? ORDER BY started_at DESC,rowid DESC LIMIT 1',pair.policy_id,pair.node_id)
+    return applied?.version_id!==pair.version_id||!['success','queued','running'].includes(applied.status)
+  })
+}
+let policySyncRunning=false
+async function performPolicySync(actorId){
+  if(policySyncRunning)throw Object.assign(new Error('A policy sync is already running'),{status:409})
+  policySyncRunning=true
+  try{
+    const results=[]
+    for(const pair of pendingPolicySync()){
+      const policy=getPolicy(pair.policy_id),node=getNode(pair.node_id)
+      if(!policy||!node)continue
+      try{results.push(...await applyPolicy(policy,actorId,[node]))}
+      catch(error){results.push({nodeId:node.id,policyId:policy.id,status:'failed',error:error.message});audit(actorId,'policy.sync.failed','node',node.id,null,{policyId:policy.id,error:error.message})}
+    }
+    audit(actorId,'policy.sync','policy',null,null,{count:results.length,failed:results.filter(item=>item.status==='failed').length})
+    return results
+  }finally{policySyncRunning=false}
+}
+export async function processDuePolicySync(){
+  const schedules=all("SELECT * FROM policy_sync_schedules WHERE status='scheduled' AND execute_at<=? ORDER BY execute_at LIMIT 5",now())
+  for(const schedule of schedules){
+    if(policySyncRunning)break
+    run("UPDATE policy_sync_schedules SET status='running' WHERE id=? AND status='scheduled'",schedule.id)
+    try{const results=await performPolicySync(schedule.requested_by);run('UPDATE policy_sync_schedules SET status=?,result_json=?,finished_at=? WHERE id=?','complete',json(results),now(),schedule.id)}
+    catch(error){run('UPDATE policy_sync_schedules SET status=?,result_json=?,finished_at=? WHERE id=?','failed',json({error:error.message}),now(),schedule.id)}
+  }
+}
 function assignmentConflicts(policyId,rules,nodes) {
   const conflicts=[]
   if(!rules.length)return conflicts
@@ -110,6 +153,7 @@ async function applyPolicy(policy,actorId=null,targetNodes=null,context={}) {
   const version=one('SELECT * FROM policy_versions WHERE id=? AND policy_id=?',policy.current_version_id,policy.id)
   if (!version) throw Object.assign(new Error('Policy has no version'),{status:400})
   const rules=parse(version.rules_compiled_json)||[], results=[]
+  assertManagementAccess(rules)
   const targets=targetNodes||assignedNodes(policy.id)
   const conflicts=assignmentConflicts(policy.id,rules,targets)
   if(conflicts.length)throw Object.assign(new Error('Conflicting firewall rules on assigned nodes'),{status:409,conflicts})
@@ -202,9 +246,44 @@ api.get('/avatars/:id',(req,res)=>{
   if(!avatar)return notFound(res,'Avatar')
   res.set('Cache-Control','private, max-age=300').type(avatar.mimeType).send(avatar.bytes)
 })
+api.get('/portal-branding',(_req,res)=>res.json(portalBranding()))
+api.get('/portal-branding/image',(_req,res)=>{
+  const image=readPortalImage()
+  if(!image)return notFound(res,'Portal image')
+  res.set('Cache-Control','public, max-age=300').type(image.mimeType).send(image.bytes)
+})
 
 api.use('/agents',agentRoutes)
 api.use(auth)
+api.get('/settings/mfa-prompt',requireRole('admin'),(_req,res)=>res.json(mfaPromptSettings()))
+api.patch('/settings/mfa-prompt',requireRole('admin'),(req,res)=>{
+  const data=body(z.object({failureMode:z.enum(['closed','open']),failOpenMinutes:z.number().int().min(2).max(15),approval:z.string().optional()}),req)
+  const before=mfaPromptSettings()
+  if(data.failureMode==='open'&&before.failureMode!=='open'&&data.approval!=='ENABLE MFA FAIL OPEN')return res.status(400).json({error:'Type ENABLE MFA FAIL OPEN to approve temporary access without MFA when a client cannot be controlled'})
+  db.transaction(()=>{
+    run("UPDATE app_settings SET value=? WHERE key='mfa_prompt_failure_mode'",data.failureMode)
+    run("UPDATE app_settings SET value=? WHERE key='mfa_prompt_fail_open_minutes'",String(data.failOpenMinutes))
+    audit(req.user.id,'mfa.prompt.settings.update','app-settings','mfa-prompt',before,{failureMode:data.failureMode,failOpenMinutes:data.failOpenMinutes})
+  })()
+  res.json(mfaPromptSettings())
+})
+api.patch('/settings/portal-branding',requireRole('admin'),(req,res)=>{
+  const {companyName}=body(z.object({companyName:z.string().trim().min(1).max(80)}),req)
+  const before=portalBranding(),after=setPortalCompanyName(companyName)
+  audit(req.user.id,'portal.branding.name','settings',null,before,after)
+  res.json(after)
+})
+api.put('/settings/portal-branding/image',requireRole('admin'),(req,res)=>{
+  const {mimeType,base64}=body(z.object({mimeType:z.string(),base64:z.string()}),req)
+  const after=savePortalImage(mimeType,base64)
+  audit(req.user.id,'portal.branding.image','settings',null,null,{mimeType})
+  res.json(after)
+})
+api.delete('/settings/portal-branding/image',requireRole('admin'),(_req,res)=>{
+  const after=removePortalImage()
+  audit(_req.user.id,'portal.branding.image.delete','settings',null,null,null)
+  res.json(after)
+})
 api.get('/notifications',(req,res)=>res.json(notificationSummary(req.user.id)))
 api.patch('/notifications/:id/read',(req,res)=>{
   const result=run('UPDATE notifications SET read_at=COALESCE(read_at,?) WHERE id=? AND user_id=?',now(),reqId(req),req.user.id)
@@ -398,6 +477,37 @@ api.delete('/access/grants/:id',requireRole('editor'),(req,res)=>{
   res.status(204).end()
 })
 api.get('/audit',requireRole('auditor'),(req,res)=>res.json(all('SELECT * FROM audit_log ORDER BY at DESC LIMIT 500')))
+api.get('/audit/search',requireRole('auditor'),(req,res)=>{
+  const query=z.object({q:z.string().max(200).optional(),action:z.string().max(100).optional(),entityType:z.string().max(100).optional(),actor:z.string().max(200).optional(),from:z.iso.datetime({offset:true}).optional(),to:z.iso.datetime({offset:true}).optional(),page:z.coerce.number().int().min(1).default(1),pageSize:z.coerce.number().int().min(1).max(500).default(100),sortBy:z.enum(['time','action','entity','actor']).default('time'),sortDir:z.enum(['asc','desc']).default('desc'),export:z.enum(['csv','pdf','xls']).optional()}).parse(req.query)
+  const conditions=[],values=[]
+  for(const [field,column] of [['action','a.action'],['entityType','a.entity_type']])if(query[field]){conditions.push(`${column}=?`);values.push(query[field])}
+  if(query.actor){conditions.push('(u.email LIKE ? OR a.actor_user_id LIKE ?)');values.push(`%${query.actor}%`,`%${query.actor}%`)}
+  if(query.q){conditions.push('(a.action LIKE ? OR a.entity_type LIKE ? OR a.entity_id LIKE ? OR u.email LIKE ?)');values.push(...Array(4).fill(`%${query.q}%`))}
+  if(query.from){conditions.push('a.at>=?');values.push(query.from)}
+  if(query.to){conditions.push('a.at<=?');values.push(query.to)}
+  const where=conditions.length?'WHERE '+conditions.join(' AND '):''
+  const fromSql=`FROM audit_log a LEFT JOIN users u ON u.id=a.actor_user_id ${where}`
+  const sortColumn={time:'a.at',action:'a.action',entity:'a.entity_type',actor:'u.email'}[query.sortBy]
+  const total=one(`SELECT COUNT(*) count ${fromSql}`,...values).count
+  const limit=query.export?50000:query.pageSize,offset=query.export?0:(query.page-1)*query.pageSize
+  const items=all(`SELECT a.id,a.at,a.action,a.entity_type,a.entity_id,a.actor_user_id,u.email actor_email ${fromSql} ORDER BY ${sortColumn} ${query.sortDir.toUpperCase()},a.id DESC LIMIT ? OFFSET ?`,...values,limit,offset)
+  if(!query.export)return res.json({items,total,page:query.page,pageSize:query.pageSize,totalPages:Math.ceil(total/query.pageSize)})
+  const fields=['at','action','entity_type','entity_id','actor_email','actor_user_id']
+  if(query.export==='csv'){
+    const cell=value=>`"${String(value??'').replace(/^[=+\-@]/,"'$&").replaceAll('"','""')}"`
+    return res.type('text/csv').attachment('audit-trail.csv').send([fields.join(','),...items.map(row=>fields.map(key=>cell(row[key])).join(','))].join('\n'))
+  }
+  if(query.export==='xls'){
+    const xml=value=>String(value??'').replace(/[<>&"']/g,char=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&apos;'}[char]))
+    const row=values=>`<Row>${values.map(value=>`<Cell><Data ss:Type="String">${xml(value)}</Data></Cell>`).join('')}</Row>`
+    const sheet=`<?xml version="1.0"?><Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"><Worksheet ss:Name="Audit trail"><Table>${row(fields)}${items.map(item=>row(fields.map(key=>item[key]))).join('')}</Table></Worksheet></Workbook>`
+    return res.type('application/vnd.ms-excel').attachment('audit-trail.xls').send(sheet)
+  }
+  res.type('application/pdf').attachment('audit-trail.pdf')
+  const pdf=new PDFDocument({margin:38});pdf.pipe(res);pdf.fontSize(16).text('WinFire audit trail');pdf.fontSize(8).text(`Generated ${now()} · ${items.length} of ${total} matching records`);pdf.moveDown()
+  for(const item of items){pdf.fontSize(8).text(`${item.at}  ${item.action}  ${item.entity_type}/${item.entity_id||'—'}  ${item.actor_email||'system'}`,{width:520});pdf.moveDown(.25)}
+  pdf.end()
+})
 const publicTrainingSettings=()=>({newHostTrainingDays:trainingDays(),progressiveLearning:progressiveSettings()})
 api.get('/settings/training',(_req,res)=>res.json(publicTrainingSettings()))
 api.patch('/settings/training',requireRole('admin'),(req,res)=>{
@@ -414,12 +524,16 @@ api.patch('/settings/training',requireRole('admin'),(req,res)=>{
   res.json(publicTrainingSettings())
 })
 api.get('/settings/observability',requireRole('admin'),(_req,res)=>res.json(observabilitySettings()))
+api.get('/settings/logs-display',(_req,res)=>res.json({hideLoopbackEvents:observabilitySettings().hideLoopbackEvents}))
 api.patch('/settings/observability',requireRole('admin'),(req,res)=>{
-  const data=body(z.object({logRetentionDays:z.number().int().min(1).max(3650),dnsRefreshHours:z.number().int().min(1).max(720)}),req)
+  const data=body(z.object({logRetentionDays:z.number().int().min(1).max(3650),dnsRefreshHours:z.number().int().min(1).max(720),eventCompactHours:z.number().int().min(1).max(720).optional(),hideLoopbackEvents:z.boolean().optional(),ignoreLoopbackIngest:z.boolean().optional()}),req)
   const before=observabilitySettings()
   db.transaction(()=>{
     run("UPDATE app_settings SET value=? WHERE key='log_retention_days'",String(data.logRetentionDays))
     run("UPDATE app_settings SET value=? WHERE key='dns_refresh_hours'",String(data.dnsRefreshHours))
+    if(data.eventCompactHours!==undefined)run("UPDATE app_settings SET value=? WHERE key='event_compact_hours'",String(data.eventCompactHours))
+    if(data.hideLoopbackEvents!==undefined)run("UPDATE app_settings SET value=? WHERE key='hide_loopback_events'",String(data.hideLoopbackEvents))
+    if(data.ignoreLoopbackIngest!==undefined)run("UPDATE app_settings SET value=? WHERE key='ignore_loopback_ingest'",String(data.ignoreLoopbackIngest))
     audit(req.user.id,'observability.settings.update','app-settings','observability',before,data)
   })()
   res.json(observabilitySettings())
@@ -727,6 +841,12 @@ api.get('/nodes/:id/firewall-rules',wrap(async(req,res)=>{
 api.get('/nodes/:id/dns',(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json(one('SELECT * FROM dns_lookups WHERE node_id=?',node.id)||{})})
 api.post('/nodes/:id/dns/refresh',requireRole('editor'),wrap(async(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json(await lookupDns(node))}))
 api.get('/node-groups',(req,res)=>res.json(all('SELECT * FROM node_groups ORDER BY name').filter(group=>canReadResource(req.user,'node_group',group))))
+api.get('/node-groups/:id',(req,res)=>{
+  const group=one('SELECT * FROM node_groups WHERE id=?',reqId(req));if(!group)return notFound(res,'Node group')
+  if(!canReadResource(req.user,'node_group',group))return res.status(403).json({error:'Insufficient permission for node group'})
+  const members=all('SELECT n.id,n.hostname,n.fqdn,n.ip,n.status,n.firewall_state FROM nodes n JOIN node_group_members m ON m.node_id=n.id WHERE m.group_id=? ORDER BY n.hostname',group.id)
+  res.json({...group,count:members.length,members,canWrite:canWriteResource(req.user,'node_group',group)})
+})
 api.post('/node-groups',requireRole('editor'),(req,res)=>{const {name}=body(z.object({name:z.string().min(1)}),req),groupId=id();run('INSERT INTO node_groups(id,name,owner_user_id) VALUES(?,?,?)',groupId,name,req.user.id);audit(req.user.id,'node-group.create','node-group',groupId,null,{name});res.status(201).json({id:groupId,name,owner_user_id:req.user.id})})
 api.post('/node-groups/:id/members',requireRole('editor'),(req,res)=>{
   const {nodeId}=body(z.object({nodeId:z.string()}),req),node=getNode(nodeId),group=one('SELECT * FROM node_groups WHERE id=?',reqId(req))
@@ -786,7 +906,26 @@ api.delete('/node-groups/:id/members/:nodeId',requireRole('editor'),wrap(async(r
   res.json({removed:true,cleanedPolicies:completed.map(item=>item.policy.id),retainedByOtherAssignment:policies.length-completed.length})
 }))
 
-api.get('/policies',(req,res)=>res.json(all('SELECT p.*,v.version_no FROM policies p LEFT JOIN policy_versions v ON v.id=p.current_version_id ORDER BY p.created_at DESC').filter(policy=>canReadResource(req.user,'policy',policy)).map(policy=>({...policy,verificationStatus:policyVerification(policy.id),learning:policy.origin==='learned'?one('SELECT id,status,ends_at,progressive_enabled,next_progressive_at,last_progressive_at FROM learning_sessions WHERE generated_policy_id=? ORDER BY started_at DESC,rowid DESC LIMIT 1',policy.id):null}))))
+api.get('/policies',(req,res)=>res.json(all('SELECT p.*,v.version_no FROM policies p LEFT JOIN policy_versions v ON v.id=p.current_version_id ORDER BY p.created_at DESC').filter(policy=>canReadResource(req.user,'policy',policy)).map(policy=>({...policy,scopes:all('SELECT node_id,node_group_id FROM policy_assignments WHERE policy_id=?',policy.id),verificationStatus:policyVerification(policy.id),learning:policy.origin==='learned'?one('SELECT id,status,ends_at,progressive_enabled,next_progressive_at,last_progressive_at FROM learning_sessions WHERE generated_policy_id=? ORDER BY started_at DESC,rowid DESC LIMIT 1',policy.id):null}))))
+api.get('/policies/sync',requireRole('admin'),(_req,res)=>res.json({pending:pendingPolicySync(),schedules:all("SELECT id,execute_at,status,created_at,finished_at,result_json FROM policy_sync_schedules WHERE status IN ('scheduled','running') ORDER BY execute_at") }))
+api.post('/policies/sync',requireRole('admin'),wrap(async(req,res)=>{
+  const data=body(z.object({executeAt:z.iso.datetime({offset:true}).optional()}),req)
+  if(data.executeAt&&Date.parse(data.executeAt)>Date.now()+10_000){
+    const scheduleId=id()
+    run('INSERT INTO policy_sync_schedules(id,requested_by,execute_at,status) VALUES(?,?,?,?)',scheduleId,req.user.id,data.executeAt,'scheduled')
+    audit(req.user.id,'policy.sync.schedule','policy',null,null,{scheduleId,executeAt:data.executeAt})
+    return res.status(201).json({id:scheduleId,status:'scheduled',executeAt:data.executeAt})
+  }
+  const results=await performPolicySync(req.user.id)
+  res.json({results,pending:pendingPolicySync().length})
+}))
+api.delete('/policies/sync/:scheduleId',requireRole('admin'),(req,res)=>{
+  const schedule=one("SELECT * FROM policy_sync_schedules WHERE id=? AND status='scheduled'",req.params.scheduleId)
+  if(!schedule)return notFound(res,'Scheduled sync')
+  run("UPDATE policy_sync_schedules SET status='cancelled',finished_at=? WHERE id=?",now(),schedule.id)
+  audit(req.user.id,'policy.sync.cancel','policy',null,schedule,null)
+  res.status(204).end()
+})
 api.post('/policies',requireRole('editor'),(req,res)=>{const data=body(z.object({name:z.string().min(1),description:z.string().default('')}),req),policyId=id();run('INSERT INTO policies(id,name,description,owner_user_id) VALUES(?,?,?,?)',policyId,data.name,data.description,req.user.id);audit(req.user.id,'policy.create','policy',policyId,null,data);res.status(201).json(getPolicy(policyId))})
 api.get('/policies/:id',(req,res)=>{const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy');if(!canReadResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});res.json({...policy,versions:all('SELECT id,version_no,created_at,comment FROM policy_versions WHERE policy_id=? ORDER BY version_no DESC',policy.id),assignments:all('SELECT * FROM policy_assignments WHERE policy_id=?',policy.id)})})
 api.get('/policies/:id/versions',(req,res)=>{const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy');if(!canReadResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});res.json(all('SELECT * FROM policy_versions WHERE policy_id=? ORDER BY version_no DESC',policy.id).map(v=>({...v,graph:parse(v.graph_json),rules:parse(v.rules_compiled_json)})))})
@@ -803,13 +942,14 @@ api.post('/policies/:id/versions',requireRole('editor'),(req,res)=>{
   if(hasActiveLearning(policy.id))return res.status(409).json({error:'Automatic learning owns this policy until training ends'})
   if(one('SELECT id FROM policy_assignments WHERE policy_id=? AND removal_job_id IS NOT NULL',policy.id))return res.status(409).json({error:'Wait for pending agent firewall cleanup before changing this policy'})
   const data=body(z.object({graph:graphSchema,comment:z.string().default('')}),req),rules=compilePolicy(data.graph,policy.id),versionId=id()
+  assertManagementAccess(rules)
   const conflicts=assignmentConflicts(policy.id,rules,assignedNodes(policy.id))
   if(conflicts.length)return rejectConflicts(res,conflicts)
   const last=one('SELECT MAX(version_no) as n FROM policy_versions WHERE policy_id=?',policy.id)?.n||0
   db.transaction(()=>{run('INSERT INTO policy_versions(id,policy_id,version_no,graph_json,rules_compiled_json,created_by,comment) VALUES(?,?,?,?,?,?,?)',versionId,policy.id,last+1,json(data.graph),json(rules),req.user.id,data.comment);run('UPDATE policies SET current_version_id=? WHERE id=?',versionId,policy.id);audit(req.user.id,'policy.version.create','policy',policy.id,null,{versionId,versionNo:last+1,rules})})()
   res.status(201).json({id:versionId,versionNo:last+1,rules})
 })
-api.post('/policies/:id/versions/:versionId/recall',requireRole('editor'),wrap(async(req,res)=>{const policy=getPolicy(reqId(req)),version=one('SELECT * FROM policy_versions WHERE id=? AND policy_id=?',req.params.versionId,reqId(req));if(!policy||!version)return notFound(res,'Version');if(!canWriteResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});if(hasActiveLearning(policy.id))return res.status(409).json({error:'Automatic learning owns this policy until training ends'});if(one('SELECT id FROM policy_assignments WHERE policy_id=? AND removal_job_id IS NOT NULL',policy.id))return res.status(409).json({error:'Wait for pending agent firewall cleanup before changing this policy'});const conflicts=assignmentConflicts(policy.id,parse(version.rules_compiled_json)||[],assignedNodes(policy.id));if(conflicts.length)return rejectConflicts(res,conflicts);run('UPDATE policies SET current_version_id=? WHERE id=?',version.id,policy.id);audit(req.user.id,'policy.recall','policy',policy.id,{versionId:policy.current_version_id},{versionId:version.id});res.json({versionId:version.id,results:await applyPolicy(getPolicy(policy.id),req.user.id)})}))
+api.post('/policies/:id/versions/:versionId/recall',requireRole('editor'),(req,res)=>{const policy=getPolicy(reqId(req)),version=one('SELECT * FROM policy_versions WHERE id=? AND policy_id=?',req.params.versionId,reqId(req));if(!policy||!version)return notFound(res,'Version');if(!canWriteResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});if(hasActiveLearning(policy.id))return res.status(409).json({error:'Automatic learning owns this policy until training ends'});if(one('SELECT id FROM policy_assignments WHERE policy_id=? AND removal_job_id IS NOT NULL',policy.id))return res.status(409).json({error:'Wait for pending agent firewall cleanup before changing this policy'});const conflicts=assignmentConflicts(policy.id,parse(version.rules_compiled_json)||[],assignedNodes(policy.id));if(conflicts.length)return rejectConflicts(res,conflicts);run('UPDATE policies SET current_version_id=? WHERE id=?',version.id,policy.id);audit(req.user.id,'policy.recall','policy',policy.id,{versionId:policy.current_version_id},{versionId:version.id});res.json({versionId:version.id,pendingSync:true})})
 api.post('/policies/:id/assignments',requireRole('editor'),(req,res)=>{const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy');if(!canWriteResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});if(hasActiveLearning(policy.id))return res.status(409).json({error:'Automatic learning owns this policy until training ends'});if(one('SELECT id FROM policy_assignments WHERE policy_id=? AND removal_job_id IS NOT NULL',policy.id))return res.status(409).json({error:'Wait for pending agent firewall cleanup before assigning this policy'});if(one("SELECT id FROM learning_sessions WHERE generated_policy_id=? AND status IN ('review','apply-failed')",policy.id))return res.status(409).json({error:'Approve the learning proposal before assigning it'});const data=body(z.object({nodeId:z.string().optional(),nodeGroupId:z.string().optional()}),req);if(Number(!!data.nodeId)+Number(!!data.nodeGroupId)!==1)return res.status(400).json({error:'Specify exactly one nodeId or nodeGroupId'});const targets=data.nodeId?[getNode(data.nodeId)].filter(Boolean):all('SELECT n.* FROM nodes n JOIN node_group_members m ON m.node_id=n.id WHERE m.group_id=?',data.nodeGroupId);if(data.nodeId&&!targets.length)return notFound(res,'Node');const targetGroup=data.nodeGroupId?one('SELECT * FROM node_groups WHERE id=?',data.nodeGroupId):null;if(data.nodeGroupId&&!targetGroup)return notFound(res,'Node group');if(targetGroup&&!canWriteResource(req.user,'node_group',targetGroup))return res.status(403).json({error:'Insufficient permission for node group'});const rules=parse(one('SELECT rules_compiled_json FROM policy_versions WHERE id=?',policy.current_version_id)?.rules_compiled_json)||[];const conflicts=assignmentConflicts(policy.id,rules,targets);if(conflicts.length)return rejectConflicts(res,conflicts);const assignmentId=id();run('INSERT INTO policy_assignments(id,policy_id,node_id,node_group_id,assigned_by) VALUES(?,?,?,?,?)',assignmentId,policy.id,data.nodeId||null,data.nodeGroupId||null,req.user.id);audit(req.user.id,'policy.assign','policy',policy.id,null,data);res.status(201).json({id:assignmentId,...data})})
 api.delete('/policies/:id/assignments/:assignmentId',requireRole('editor'),wrap(async(req,res)=>{
   const policy=getPolicy(reqId(req))
@@ -876,7 +1016,7 @@ api.delete('/policies/:id/assignments/:assignmentId',requireRole('editor'),wrap(
   })()
   res.json({removed:true,cleanedNodes:completed.map(item=>item.node.id),retainedByOtherAssignment:targets.length-completed.length})
 }))
-api.post('/policies/:id/apply',requireRole('editor'),wrap(async(req,res)=>{const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy');if(!canWriteResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});if(hasActiveLearning(policy.id))return res.status(409).json({error:'Automatic learning owns this policy until training ends'});if(one("SELECT id FROM learning_sessions WHERE generated_policy_id=? AND status IN ('review','apply-failed')",policy.id))return res.status(409).json({error:'Approve the learning proposal before applying it'});res.json({results:await applyPolicy(policy,req.user.id)})}))
+api.post('/policies/:id/apply',requireRole('admin'),wrap(async(req,res)=>{const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy');if(!canWriteResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});if(hasActiveLearning(policy.id))return res.status(409).json({error:'Automatic learning owns this policy until training ends'});if(one("SELECT id FROM learning_sessions WHERE generated_policy_id=? AND status IN ('review','apply-failed')",policy.id))return res.status(409).json({error:'Approve the learning proposal before applying it'});res.json({results:await applyPolicy(policy,req.user.id)})}))
 api.get('/policies/:id/diff',(req,res)=>{
   const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy')
   if(!canReadResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'})
@@ -1053,7 +1193,7 @@ api.get('/reports/dashboard',(_req,res)=>{
   const checks=one('SELECT COUNT(passed) n,COALESCE(SUM(passed),0) passed,COUNT(*)-COUNT(passed) inconclusive FROM verifier_results')
   const agentCutoff=new Date(Date.now()-120_000).toISOString()
   const agents=one('SELECT COUNT(*) total,COALESCE(SUM(CASE WHEN revoked_at IS NULL AND last_checkin_at>=? THEN 1 ELSE 0 END),0) online FROM agents',agentCutoff)
-  const denied=all("SELECT dst_port,COUNT(*) count FROM log_events WHERE action='block' GROUP BY dst_port ORDER BY count DESC LIMIT 6")
+  const denied=all("SELECT COALESCE(e.dst_port,p.dst_port) dst_port,COUNT(*) count FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE e.action='block' GROUP BY COALESCE(e.dst_port,p.dst_port) ORDER BY count DESC LIMIT 6")
   const verifierTrend=all("SELECT date(run_at) day,COUNT(passed) decisive,SUM(CASE WHEN passed=1 THEN 1 ELSE 0 END) passed FROM verifier_results WHERE datetime(run_at)>=datetime('now','-14 days') GROUP BY date(run_at) ORDER BY day").map(row=>({day:row.day,decisive:row.decisive,passRate:row.decisive?Math.round(row.passed/row.decisive*100):null}))
   const mfaTrend=all("SELECT date(resolved_at) day,SUM(CASE WHEN status='approved' THEN 1 ELSE 0 END) approved,SUM(CASE WHEN status='denied' THEN 1 ELSE 0 END) denied FROM mfa_challenges WHERE datetime(resolved_at)>=datetime('now','-14 days') GROUP BY date(resolved_at) ORDER BY day")
   const coverage=report('coverage')
@@ -1063,15 +1203,176 @@ api.get('/reports/dashboard',(_req,res)=>{
 
 api.get('/segments',(_req,res)=>res.json(all('SELECT * FROM identity_segments ORDER BY created_at DESC')))
 api.post('/segments',requireRole('admin'),(req,res)=>{
-  const data=body(z.object({name:z.string().min(1),nodeId:z.string(),policyId:z.string().optional(),port:z.number().int().min(1).max(65535),accountSid:z.string().optional(),sourceIp:z.string().optional(),extraPorts:z.array(z.number().int().min(1).max(65535)).default([]),sourceProcess:z.string().optional(),fallbackToLoggedOnUser:z.boolean().default(false),failOpen:z.boolean().default(false),ttlMinutes:z.number().int().min(1).max(10080).default(240),mode:z.enum(['agentless','agent']).default('agentless')}),req)
-  const segmentId=id();run('INSERT INTO identity_segments(id,name,node_id,policy_id,port,account_sid,source_ip,extra_ports,source_process,fallback_to_logged_on_user,fail_open,ttl_minutes,mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',segmentId,data.name,data.nodeId,data.policyId||null,data.port,data.accountSid||null,data.sourceIp||null,json(data.extraPorts),data.sourceProcess||null,Number(data.fallbackToLoggedOnUser),Number(data.failOpen),data.ttlMinutes,data.mode)
+  const data=body(z.object({name:z.string().min(1),nodeId:z.string().optional(),nodeGroupId:z.string().optional(),policyId:z.string().nullable().optional(),port:z.number().int().min(1).max(65535),accountSid:z.string().optional(),sourceIp:z.string().optional(),extraPorts:z.array(z.number().int().min(1).max(65535)).default([]),sourceProcess:z.string().optional(),fallbackToLoggedOnUser:z.boolean().default(false),failOpen:z.boolean().default(false),ttlMinutes:z.number().int().min(1).max(10080).default(240),mode:z.enum(['agentless','agent']).default('agentless'),mfaProvider:z.enum(['totp','entra']).default('totp'),allowedUpns:z.array(z.email()).max(100).default([]),portalEnabled:z.boolean().default(true),autoPromptEnabled:z.boolean().default(false)}),req)
+  if(Number(!!data.nodeId)+Number(!!data.nodeGroupId)!==1)return res.status(400).json({error:'Choose one node or node group'})
+  if(data.nodeId&&!getNode(data.nodeId))return notFound(res,'Node')
+  if(data.nodeGroupId&&!one('SELECT id FROM node_groups WHERE id=?',data.nodeGroupId))return notFound(res,'Node group')
+  if(data.policyId&&!getPolicy(data.policyId))return notFound(res,'Policy')
+  const segmentId=id();run('INSERT INTO identity_segments(id,name,node_id,node_group_id,policy_id,port,account_sid,source_ip,extra_ports,source_process,fallback_to_logged_on_user,fail_open,ttl_minutes,mode,mfa_provider,allowed_upns,portal_enabled,auto_prompt_enabled) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',segmentId,data.name,data.nodeId||null,data.nodeGroupId||null,data.policyId||null,data.port,data.accountSid||null,data.sourceIp||null,json(data.extraPorts),data.sourceProcess||null,Number(data.fallbackToLoggedOnUser),Number(data.failOpen),data.ttlMinutes,data.mode,data.mfaProvider,json(data.allowedUpns.map(value=>value.toLowerCase())),Number(data.portalEnabled),Number(data.autoPromptEnabled))
   audit(req.user.id,'segment.create','segment',segmentId,null,data);res.status(201).json(one('SELECT * FROM identity_segments WHERE id=?',segmentId))
 })
+api.patch('/segments/:id',requireRole('admin'),(req,res)=>{
+  const before=one('SELECT * FROM identity_segments WHERE id=?',reqId(req))
+  if(!before)return notFound(res,'Segment')
+  const data=body(z.object({allowedUpns:z.array(z.email()).max(100).optional(),mfaProvider:z.enum(['totp','entra']).optional(),portalEnabled:z.boolean().optional(),autoPromptEnabled:z.boolean().optional(),ttlMinutes:z.number().int().min(2).max(10080).optional(),sourceIp:z.string().max(255).optional(),policyId:z.string().nullable().optional()}),req)
+  if(data.policyId&&!getPolicy(data.policyId))return notFound(res,'Policy')
+  const next={allowedUpns:data.allowedUpns?data.allowedUpns.map(value=>value.toLowerCase()):parse(before.allowed_upns)||[],mfaProvider:data.mfaProvider||before.mfa_provider,portalEnabled:data.portalEnabled===undefined?!!before.portal_enabled:data.portalEnabled,autoPromptEnabled:data.autoPromptEnabled===undefined?!!before.auto_prompt_enabled:data.autoPromptEnabled,ttlMinutes:data.ttlMinutes||before.ttl_minutes,sourceIp:data.sourceIp===undefined?before.source_ip:data.sourceIp||null,policyId:data.policyId===undefined?before.policy_id:data.policyId}
+  run('UPDATE identity_segments SET allowed_upns=?,mfa_provider=?,portal_enabled=?,auto_prompt_enabled=?,ttl_minutes=?,source_ip=?,policy_id=? WHERE id=?',json(next.allowedUpns),next.mfaProvider,Number(next.portalEnabled),Number(next.autoPromptEnabled),next.ttlMinutes,next.sourceIp,next.policyId,before.id)
+  audit(req.user.id,'segment.update','segment',before.id,{allowedUpns:parse(before.allowed_upns),mfaProvider:before.mfa_provider,portalEnabled:!!before.portal_enabled,autoPromptEnabled:!!before.auto_prompt_enabled,ttlMinutes:before.ttl_minutes,sourceIp:before.source_ip,policyId:before.policy_id},next)
+  res.json(one('SELECT * FROM identity_segments WHERE id=?',before.id))
+})
+const portalAccessLimit=rateLimit({windowMs:15*60*1000,limit:10,standardHeaders:'draft-8',legacyHeaders:false})
+function portalTarget(req,segment,requestedNodeId){
+  if(!segment)throw Object.assign(new Error('Segment not found'),{status:404})
+  if(!segment.portal_enabled||segment.mode!=='agentless')throw Object.assign(new Error('The access portal is disabled for this segment'),{status:409})
+  if(!(parse(segment.allowed_upns)||[]).includes(req.user.email.toLowerCase()))throw Object.assign(new Error('Your account is not assigned to this segment'),{status:403})
+  if(segment.fail_open)throw Object.assign(new Error('Portal access requires a fail-closed segment'),{status:409})
+  if(segment.source_process)throw Object.assign(new Error('Agentless portal access cannot enforce a source process'),{status:409})
+  const nodeId=segment.node_id||requestedNodeId
+  if(!nodeId||segment.node_id&&requestedNodeId&&requestedNodeId!==segment.node_id||segment.node_group_id&&!one('SELECT 1 FROM node_group_members WHERE group_id=? AND node_id=?',segment.node_group_id,nodeId))throw Object.assign(new Error('Choose a node covered by this segment'),{status:400})
+  const node=getNode(nodeId)
+  if(!node)throw Object.assign(new Error('Node not found'),{status:404})
+  if(node.connection_mode!=='agentless'||!['winrm','winrms'].includes(node.transport))throw Object.assign(new Error('Agentless portal access requires a working WinRM node'),{status:409})
+  if(node.firewall_state==='learning')throw Object.assign(new Error('The target is still learning; enforce its firewall policy before enabling portal access'),{status:409})
+  if(segment.policy_id){
+    const policy=getPolicy(segment.policy_id)
+    if(!policy||!assignedNodes(policy.id).some(target=>target.id===node.id))throw Object.assign(new Error('The linked MFA policy is not assigned to this node'),{status:409})
+    const applied=one('SELECT version_id,status FROM policy_apply_runs WHERE policy_id=? AND node_id=? ORDER BY started_at DESC,rowid DESC LIMIT 1',policy.id,node.id)
+    if(!applied||applied.version_id!==policy.current_version_id||applied.status!=='success')throw Object.assign(new Error('Sync the linked MFA policy to this node before granting access'),{status:409})
+  }
+  if(segment.ttl_minutes<2)throw Object.assign(new Error('Portal access TTL must be at least two minutes'),{status:409})
+  const sourceIp=normalizeSourceIp(req.ip)
+  if(!sourceMatches(sourceIp,segment.source_ip))throw Object.assign(new Error('Your source IP is outside this segment'),{status:403})
+  return {node,sourceIp}
+}
+function portalPrompt(req,segment,node,sourceIp,promptId){
+  if(!promptId)return null
+  const prompt=one('SELECT * FROM mfa_prompt_events WHERE id=?',promptId)
+  if(!prompt||prompt.segment_id!==segment.id||prompt.target_node_id!==node.id||prompt.source_ip!==sourceIp||prompt.status!=='opened'||prompt.expires_at<=now())throw Object.assign(new Error('MFA browser prompt is invalid or expired'),{status:409})
+  return prompt
+}
+async function grantPortalAccess(req,segment,node,sourceIp,provider,promptId=null){
+  portalPrompt(req,segment,node,sourceIp,promptId)
+  if(promptId){
+    const reserved=run("UPDATE mfa_prompt_events SET status='consuming' WHERE id=? AND status='opened' AND expires_at>?",promptId,now())
+    if(reserved.changes!==1)throw Object.assign(new Error('MFA browser prompt was already used'),{status:409})
+  }
+  const challengeId=id(),grantId=id(),expiresAt=new Date(Date.now()+segment.ttl_minutes*60_000).toISOString()
+  let ruleStarted=false,grantRecorded=false
+  run('INSERT INTO mfa_challenges(id,node_id,user_upn,segment_id,connection_5tuple,status,expires_at) VALUES(?,?,?,?,?,?,?)',challengeId,node.id,req.user.email,segment.id,json({srcIp:sourceIp,dstPort:segment.port,protocol:'TCP'}),'pending',new Date(Date.now()+300_000).toISOString())
+  try{
+    const preflight=await remote(node,'jit_preflight',{port:segment.port})
+    if(!preflight?.safe){
+      const names=[...(preflight?.conflictingAllows||[]),...(preflight?.conflictingBlocks||[])].map(item=>item.name).slice(0,3).join(', ')
+      throw Object.assign(new Error(`Firewall gate is not ready for TCP ${segment.port}; check inbound profile defaults${names?` and overlapping rules: ${names}`:' and overlapping rules'}`),{status:409})
+    }
+    const args={grantId,sourceIp,port:segment.port,expiresAt}
+    try{await remote(node,'jit_start',args);ruleStarted=true}
+    catch(error){
+      const current=await remote(node,'rules',{group:`WinFireSecure:JIT:${grantId}`}).catch(()=>null)
+      if(!(Array.isArray(current)?current.length:current?1:0))throw error
+      ruleStarted=true
+    }
+    run('INSERT INTO jit_grants(id,segment_id,node_id,account_sid,src_ip,dst_port,rule_path,grant_type,ttl_seconds,granted_at,expires_at,mfa_challenge_id,prompt_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',grantId,segment.id,node.id,segment.account_sid||null,sourceIp,segment.port,`WinFireSecure:JIT:${grantId}`,'portal_firewall',segment.ttl_minutes*60,now(),expiresAt,challengeId,promptId)
+    grantRecorded=true
+    run("UPDATE mfa_challenges SET status='approved',resolved_at=? WHERE id=?",now(),challengeId)
+    if(promptId)run("UPDATE mfa_prompt_events SET status='consumed',consumed_at=? WHERE id=?",now(),promptId)
+    audit(req.user.id,'mfa.portal.granted','jit-grant',grantId,null,{segmentId:segment.id,nodeId:node.id,sourceIp,port:segment.port,expiresAt,provider,promptId})
+    return {grantId,nodeId:node.id,sourceIp,port:segment.port,expiresAt}
+  }catch(error){
+    if(ruleStarted){
+      try{
+        await remote(node,'jit_end',{grantId})
+        if(grantRecorded)run('UPDATE jit_grants SET revoked_at=? WHERE id=?',now(),grantId)
+      }catch(cleanupError){
+        audit(req.user.id,'mfa.portal.cleanup.failed','jit-grant',grantId,null,{nodeId:node.id,error:cleanupError.message})
+      }
+    }
+    run("UPDATE mfa_challenges SET status='denied',resolved_at=? WHERE id=?",now(),challengeId)
+    if(promptId)run("UPDATE mfa_prompt_events SET status='failed',error=? WHERE id=? AND status='consuming'",error.message,promptId)
+    audit(req.user.id,'mfa.portal.failed','challenge',challengeId,null,{segmentId:segment.id,nodeId:node.id,sourceIp,error:error.message,provider})
+    throw error
+  }
+}
+api.get('/segments/access',(req,res)=>{
+  const segments=all("SELECT * FROM identity_segments WHERE portal_enabled=1 AND mode='agentless' ORDER BY name")
+    .filter(segment=>(parse(segment.allowed_upns)||[]).includes(req.user.email.toLowerCase()))
+    .map(segment=>({id:segment.id,name:segment.name,nodeId:segment.node_id,nodeGroupId:segment.node_group_id,port:segment.port,ttlMinutes:segment.ttl_minutes,mfaProvider:segment.mfa_provider,nodes:segment.node_group_id?all('SELECT n.id,n.hostname FROM nodes n JOIN node_group_members m ON m.node_id=n.id WHERE m.group_id=? ORDER BY n.hostname',segment.node_group_id):[{id:segment.node_id,hostname:getNode(segment.node_id)?.hostname||segment.node_id}]}))
+  res.json(segments)
+})
+api.get('/segments/access/grants',(req,res)=>{
+  const admin=['owner','admin'].includes(req.user.role)
+  const grants=all(`SELECT g.id,g.node_id,g.src_ip,g.dst_port,g.granted_at,g.expires_at,g.segment_id,g.fallback_reason,c.user_upn,n.hostname FROM jit_grants g LEFT JOIN mfa_challenges c ON c.id=g.mfa_challenge_id LEFT JOIN nodes n ON n.id=g.node_id WHERE g.grant_type='portal_firewall' AND g.revoked_at IS NULL AND g.expires_at>? AND (?=1 OR c.user_upn=?) ORDER BY g.expires_at`,now(),Number(admin),req.user.email)
+  res.json(grants)
+})
+api.get('/segments/access/prompts/:promptId',(req,res)=>{
+  const prompt=one('SELECT * FROM mfa_prompt_events WHERE id=?',req.params.promptId)
+  if(!prompt||prompt.status!=='opened'||prompt.expires_at<=now()||prompt.source_ip!==normalizeSourceIp(req.ip))return notFound(res,'MFA prompt')
+  const segment=one('SELECT * FROM identity_segments WHERE id=?',prompt.segment_id)
+  if(!segment?.portal_enabled||!(parse(segment.allowed_upns)||[]).includes(req.user.email.toLowerCase()))return notFound(res,'MFA prompt')
+  res.json({id:prompt.id,segmentId:prompt.segment_id,nodeId:prompt.target_node_id,sourceIp:prompt.source_ip,sourceNode:one('SELECT hostname FROM nodes WHERE id=?',prompt.source_node_id)?.hostname||null,sessionUser:prompt.opened_user,sessionId:prompt.opened_session_id,processId:prompt.opened_process_id,port:segment.port,expiresAt:prompt.expires_at})
+})
+api.post('/segments/access/grants/:grantId/revoke',wrap(async(req,res)=>{
+  const grant=one(`SELECT g.*,c.user_upn FROM jit_grants g LEFT JOIN mfa_challenges c ON c.id=g.mfa_challenge_id WHERE g.id=? AND g.grant_type='portal_firewall'`,req.params.grantId)
+  if(!grant)return notFound(res,'Access grant')
+  if(!['owner','admin'].includes(req.user.role)&&grant.user_upn!==req.user.email)return res.status(403).json({error:'This grant belongs to another user'})
+  if(grant.revoked_at)return res.json({revoked:true})
+  const node=getNode(grant.node_id)
+  if(node)await remote(node,'jit_end',{grantId:grant.id})
+  run('UPDATE jit_grants SET revoked_at=? WHERE id=?',now(),grant.id)
+  audit(req.user.id,'mfa.portal.revoked','jit-grant',grant.id,null,{nodeId:grant.node_id})
+  res.json({revoked:true})
+}))
+api.post('/segments/:id/access',portalAccessLimit,wrap(async(req,res)=>{
+  const segment=one('SELECT * FROM identity_segments WHERE id=?',reqId(req))
+  const data=body(z.object({nodeId:z.string().optional(),promptId:z.uuid().optional(),code:z.string().regex(/^\d{6}$/)}),req)
+  const {node,sourceIp}=portalTarget(req,segment,data.nodeId)
+  portalPrompt(req,segment,node,sourceIp,data.promptId)
+  if(segment.mfa_provider!=='totp')return res.status(409).json({error:'Use the Entra sign-in action for this segment'})
+  if(!req.user.totp_secret)return res.status(409).json({error:'Set up Google Authenticator or another TOTP app in Administration → Security first'})
+  const counter=matchingTotpCounter(openSealed(req.user.totp_secret).secret,data.code)
+  if(counter===null){audit(req.user.id,'mfa.portal.denied','segment',segment.id,null,{nodeId:node.id,sourceIp,reason:'invalid-code'});return res.status(401).json({error:'Invalid authenticator code'})}
+  const consumed=run('INSERT INTO mfa_totp_replay(user_id,last_counter) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET last_counter=excluded.last_counter WHERE excluded.last_counter>mfa_totp_replay.last_counter',req.user.id,counter)
+  if(consumed.changes!==1)return res.status(401).json({error:'Authenticator code was already used; wait for a new code'})
+  res.status(201).json(await grantPortalAccess(req,segment,node,sourceIp,'totp',data.promptId))
+}))
+api.post('/segments/:id/entra/start',portalAccessLimit,wrap(async(req,res)=>{
+  const segment=one('SELECT * FROM identity_segments WHERE id=?',reqId(req))
+  const data=body(z.object({nodeId:z.string().optional(),promptId:z.uuid().optional()}),req)
+  const {node,sourceIp}=portalTarget(req,segment,data.nodeId)
+  portalPrompt(req,segment,node,sourceIp,data.promptId)
+  if(segment.mfa_provider!=='entra')return res.status(409).json({error:'This segment uses an authenticator code'})
+  if(!entraConfigured())return res.status(503).json({error:'Entra tenant, app, secret, and public URL are not configured'})
+  const flow=await startEntraAuthentication()
+  run('INSERT INTO mfa_entra_flows(state_hash,user_id,segment_id,node_id,source_ip,sealed_checks,expires_at,prompt_id) VALUES(?,?,?,?,?,?,?,?)',hashToken(flow.state),req.user.id,segment.id,node.id,sourceIp,seal({verifier:flow.verifier,nonce:flow.nonce}),new Date(Date.now()+5*60_000).toISOString(),data.promptId||null)
+  audit(req.user.id,'mfa.entra.start','segment',segment.id,null,{nodeId:node.id,sourceIp})
+  res.json({authorizationUrl:flow.url})
+}))
+api.post('/segments/entra/complete',portalAccessLimit,wrap(async(req,res)=>{
+  const data=body(z.object({code:z.string().min(8).max(4096),state:z.string().min(16).max(512)}),req)
+  const flow=one('SELECT * FROM mfa_entra_flows WHERE state_hash=?',hashToken(data.state))
+  if(!flow||flow.used_at||flow.expires_at<=now()||flow.user_id!==req.user.id)return res.status(401).json({error:'Entra sign-in has expired or was already used'})
+  if(normalizeSourceIp(req.ip)!==flow.source_ip)return res.status(403).json({error:'Entra sign-in source IP changed'})
+  const segment=one('SELECT * FROM identity_segments WHERE id=?',flow.segment_id)
+  const {node,sourceIp}=portalTarget(req,segment,flow.node_id)
+  portalPrompt(req,segment,node,sourceIp,flow.prompt_id)
+  if(segment.mfa_provider!=='entra')return res.status(409).json({error:'This segment no longer uses Entra'})
+  const reserved=run('UPDATE mfa_entra_flows SET used_at=? WHERE state_hash=? AND used_at IS NULL',now(),flow.state_hash)
+  if(reserved.changes!==1)return res.status(401).json({error:'Entra sign-in was already used'})
+  try{
+    const checks=openSealed(flow.sealed_checks)
+    const identity=await completeEntraAuthentication({code:data.code,state:data.state,...checks})
+    if(identity.email!==req.user.email.toLowerCase())throw Object.assign(new Error('Entra identity does not match your WinFire account'),{status:403})
+    res.status(201).json(await grantPortalAccess(req,segment,node,sourceIp,'entra',flow.prompt_id))
+  }catch(error){audit(req.user.id,'mfa.entra.failed','segment',segment.id,null,{nodeId:node.id,sourceIp,error:error.message});throw error}
+}))
 api.get('/segments/:id/challenges',(req,res)=>res.json(all('SELECT * FROM mfa_challenges WHERE segment_id=? ORDER BY challenged_at DESC LIMIT 200',reqId(req))))
 api.post('/segments/:id/challenges',requireRole('editor'),(req,res)=>{
   const segment=one('SELECT * FROM identity_segments WHERE id=?',reqId(req));if(!segment)return notFound(res,'Segment')
-  const data=body(z.object({userUpn:z.email(),connection:z.record(z.string(),z.any()).optional()}),req),challengeId=id(),expires=new Date(Date.now()+5*60*1000).toISOString()
-  run('INSERT INTO mfa_challenges(id,node_id,user_upn,segment_id,connection_5tuple,status,expires_at) VALUES(?,?,?,?,?,?,?)',challengeId,segment.node_id,data.userUpn,segment.id,json(data.connection),'pending',expires)
+  const data=body(z.object({userUpn:z.email(),nodeId:z.string().optional(),connection:z.record(z.string(),z.any()).optional()}),req),challengeId=id(),expires=new Date(Date.now()+5*60*1000).toISOString()
+  const nodeId=segment.node_id||data.nodeId
+  if(!nodeId||segment.node_group_id&&!one('SELECT 1 FROM node_group_members WHERE group_id=? AND node_id=?',segment.node_group_id,nodeId))return res.status(400).json({error:'Choose a node in this segment group'})
+  run('INSERT INTO mfa_challenges(id,node_id,user_upn,segment_id,connection_5tuple,status,expires_at) VALUES(?,?,?,?,?,?,?)',challengeId,nodeId,data.userUpn,segment.id,json(data.connection),'pending',expires)
   audit(req.user.id,'mfa.challenge.create','challenge',challengeId,null,{segmentId:segment.id,userUpn:data.userUpn});res.status(201).json({id:challengeId,status:'pending',expiresAt:expires})
 })
 api.post('/segments/:id/challenges/:challengeId/resolve',requireRole('admin'),(req,res)=>{
@@ -1102,45 +1403,79 @@ api.get('/logs/search',(req,res)=>{
     eventId:z.coerce.number().int().min(0).optional(),protocol:z.string().max(32).optional(),srcIp:z.string().max(128).optional(),dstIp:z.string().max(128).optional(),
     port:z.coerce.number().int().min(1).max(65535).optional(),from:z.iso.datetime({local:true,offset:true}).optional(),to:z.iso.datetime({local:true,offset:true}).optional(),
     page:z.coerce.number().int().min(1).default(1),pageSize:z.coerce.number().int().min(1).max(500).default(100),
-    sortBy:z.enum(['time','node','eventId','action','direction','srcIp','dstIp','port','program']).default('time'),sortDir:z.enum(['asc','desc']).default('desc')
+    sortBy:z.enum(['time','node','eventId','action','direction','srcIp','dstIp','port','program']).default('time'),sortDir:z.enum(['asc','desc']).default('desc'),hideLoopback:z.enum(['true','false']).optional()
   }).parse(req.query)
   if(query.from&&query.to&&new Date(query.from)>new Date(query.to))return res.status(400).json({error:'From must be earlier than To'})
   const filters=[],args=[]
-  for(const [key,column] of [['nodeId','e.node_id'],['action','e.action'],['direction','e.direction'],['challengeId','e.challenge_id'],['eventId','e.event_id'],['port','e.dst_port']])if(query[key]!==undefined){filters.push(`${column}=?`);args.push(query[key])}
-  for(const [key,column] of [['program','e.program'],['protocol','e.protocol'],['srcIp','e.src_ip'],['dstIp','e.dst_ip']])if(query[key]){filters.push(`${column} LIKE ? ESCAPE '\\'`);args.push(`%${query[key].replace(/[\\%_]/g,'\\$&')}%`)}
+  for(const [key,column] of [['nodeId','e.node_id'],['action','e.action'],['direction','COALESCE(e.direction,p.direction)'],['challengeId','e.challenge_id'],['eventId','e.event_id'],['port','COALESCE(e.dst_port,p.dst_port)']])if(query[key]!==undefined){filters.push(`${column}=?`);args.push(query[key])}
+  for(const [key,column] of [['program','COALESCE(e.program,p.program)'],['protocol','COALESCE(e.protocol,p.protocol)'],['srcIp','COALESCE(e.src_ip,p.src_ip)'],['dstIp','COALESCE(e.dst_ip,p.dst_ip)']])if(query[key]){filters.push(`${column} LIKE ? ESCAPE '\\'`);args.push(`%${query[key].replace(/[\\%_]/g,'\\$&')}%`)}
   if(query.from){filters.push('datetime(COALESCE(e.event_time,e.received_at))>=datetime(?)');args.push(query.from)}
   if(query.to){filters.push('datetime(COALESCE(e.event_time,e.received_at))<=datetime(?)');args.push(query.to)}
+  if((query.hideLoopback===undefined?observabilitySettings().hideLoopbackEvents:query.hideLoopback==='true'))filters.push("NOT ((COALESCE(e.src_ip,p.src_ip,'') LIKE '127.%' OR COALESCE(e.src_ip,p.src_ip,'') IN ('::1','0:0:0:0:0:0:0:1')) AND (COALESCE(e.dst_ip,p.dst_ip,'') LIKE '127.%' OR COALESCE(e.dst_ip,p.dst_ip,'') IN ('::1','0:0:0:0:0:0:0:1')))")
   const where=filters.length?'WHERE '+filters.join(' AND '):''
-  const sortColumns={time:'julianday(COALESCE(e.event_time,e.received_at))',node:'n.hostname COLLATE NOCASE',eventId:'e.event_id',action:'e.action COLLATE NOCASE',direction:'e.direction COLLATE NOCASE',srcIp:'e.src_ip COLLATE NOCASE',dstIp:'e.dst_ip COLLATE NOCASE',port:'e.dst_port',program:'e.program COLLATE NOCASE'}
-  const fromSql=`FROM log_events e LEFT JOIN nodes n ON n.id=e.node_id ${where}`
+  const sortColumns={time:'julianday(COALESCE(e.event_time,e.received_at))',node:'n.hostname COLLATE NOCASE',eventId:'e.event_id',action:'e.action COLLATE NOCASE',direction:'COALESCE(e.direction,p.direction) COLLATE NOCASE',srcIp:'COALESCE(e.src_ip,p.src_ip) COLLATE NOCASE',dstIp:'COALESCE(e.dst_ip,p.dst_ip) COLLATE NOCASE',port:'COALESCE(e.dst_port,p.dst_port)',program:'COALESCE(e.program,p.program) COLLATE NOCASE'}
+  const fromSql=`FROM log_events e LEFT JOIN nodes n ON n.id=e.node_id LEFT JOIN event_patterns p ON p.id=e.pattern_id ${where}`
   const total=one(`SELECT COUNT(*) AS count ${fromSql}`,...args).count
-  const items=all(`SELECT e.* ${fromSql} ORDER BY ${sortColumns[query.sortBy]} ${query.sortDir.toUpperCase()}, e.id DESC LIMIT ? OFFSET ?`,...args,query.pageSize,(query.page-1)*query.pageSize)
+  const items=all(`SELECT e.*,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,COALESCE(e.dst_ip,p.dst_ip) dst_ip,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.direction,p.direction) direction,COALESCE(e.program,p.program) program,COALESCE(e.event_type,p.event_type) event_type ${fromSql} ORDER BY ${sortColumns[query.sortBy]} ${query.sortDir.toUpperCase()}, e.id DESC LIMIT ? OFFSET ?`,...args,query.pageSize,(query.page-1)*query.pageSize)
   res.json({items,total,page:query.page,pageSize:query.pageSize,totalPages:Math.ceil(total/query.pageSize)})
+})
+api.post('/logs/:id/rule',requireRole('admin'),(req,res)=>{
+  const event=one('SELECT e.*,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,COALESCE(e.dst_ip,p.dst_ip) dst_ip,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.direction,p.direction) direction,COALESCE(e.program,p.program) program FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE e.id=?',reqId(req));if(!event)return notFound(res,'Event')
+  const node=getNode(event.node_id);if(!node)return notFound(res,'Node')
+  const data=body(z.object({action:z.enum(['allow','block']),policyId:z.string().optional()}),req)
+  if(!['in','out'].includes(event.direction)||!['TCP','UDP'].includes(event.protocol)||!Number.isInteger(event.dst_port)||event.dst_port<1||event.dst_port>65535)return res.status(400).json({error:'This event lacks a direction, TCP/UDP protocol, or valid destination port'})
+  const remoteAddress=event.direction==='in'?event.src_ip:event.dst_ip
+  if(!validateAddressExpression(remoteAddress))return res.status(400).json({error:'This event has no valid remote address for a scoped rule'})
+  const policy=data.policyId?getPolicy(data.policyId):ensurePersonalPolicy(node,req.user.id)
+  if(!policy)return notFound(res,'Policy')
+  if(data.policyId&&policy.origin==='learned'&&policy.source_node_id!==node.id)return res.status(400).json({error:'A personal policy belongs to a different node'})
+  if(data.policyId&&policy.origin!=='learned'&&!one('SELECT id FROM policy_assignments WHERE policy_id=? AND node_group_id IS NOT NULL',policy.id))return res.status(400).json({error:'Choose a group or global policy'})
+  if(!canWriteResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'})
+  if(hasActiveLearning(policy.id))return res.status(409).json({error:'This personal policy is still owned by host training. Finish training before adding a manual rule.'})
+  const previous=one('SELECT * FROM policy_versions WHERE id=?',policy.current_version_id)
+  const graph=parse(previous?.graph_json)||{nodes:[],edges:[]}
+  const ruleId=id(),port=String(event.dst_port)
+  graph.nodes.push({id:ruleId,type:data.action==='block'?'deny':'allow',position:{x:80+(graph.nodes.length%3)*230,y:80+Math.floor(graph.nodes.length/3)*140},data:{name:`${data.action==='block'?'Reject':'Allow'} ${event.protocol} ${port} from event ${event.event_id}`,direction:event.direction,protocol:event.protocol,localPort:event.direction==='in'?port:'Any',remotePort:event.direction==='out'?port:'Any',remoteAddress,profile:'Any',program:validateProgramPath(event.program)?event.program:'Any'}})
+  const rules=compilePolicy(graph,policy.id),conflicts=assignmentConflicts(policy.id,rules,assignedNodes(policy.id))
+  assertManagementAccess(rules)
+  if(conflicts.length)return rejectConflicts(res,conflicts)
+  const versionId=id(),versionNo=(one('SELECT MAX(version_no) n FROM policy_versions WHERE policy_id=?',policy.id)?.n||0)+1
+  db.transaction(()=>{
+    run('INSERT INTO policy_versions(id,policy_id,version_no,graph_json,rules_compiled_json,created_by,comment) VALUES(?,?,?,?,?,?,?)',versionId,policy.id,versionNo,json(graph),json(rules),req.user.id,`Rule from firewall event ${event.id}`)
+    run('UPDATE policies SET current_version_id=? WHERE id=?',versionId,policy.id)
+    if(!data.policyId&&!one('SELECT id FROM policy_assignments WHERE policy_id=? AND node_id=?',policy.id,node.id))run('INSERT INTO policy_assignments(id,policy_id,node_id,assigned_by) VALUES(?,?,?,?)',id(),policy.id,node.id,req.user.id)
+    audit(req.user.id,'policy.rule.from-event','policy',policy.id,null,{eventId:event.id,nodeId:node.id,action:data.action,versionId,versionNo})
+  })()
+  res.status(201).json({policyId:policy.id,versionId,versionNo,ruleCount:rules.length,pendingSync:true})
 })
 api.post('/logs/ingest',requireRole('editor'),(req,res)=>{
   const data=body(z.object({nodeId:z.string(),events:z.array(z.object({recordId:z.number().optional(),eventId:z.number().int(),action:z.string().optional(),protocol:z.string().optional(),srcIp:z.string().optional(),dstIp:z.string().optional(),dstPort:z.number().optional(),direction:z.string().optional(),program:z.string().optional(),accountSid:z.string().optional(),challengeId:z.string().optional()})).max(1000)}),req)
-  let inserted=0;db.transaction(()=>{for(const event of data.events){const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,dst_ip,dst_port,direction,program,account_sid,challenge_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),data.nodeId,event.recordId??null,event.eventId,event.action||null,event.protocol||null,event.srcIp||null,event.dstIp||null,event.dstPort||null,event.direction||null,event.program||null,event.accountSid||null,event.challengeId||null);inserted+=result.changes}})()
+  const ignoreLoopback=observabilitySettings().ignoreLoopbackIngest
+  let inserted=0;db.transaction(()=>{for(const event of data.events){if(ignoreLoopback&&isLoopbackEvent(event))continue;const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,dst_ip,dst_port,direction,program,account_sid,challenge_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),data.nodeId,event.recordId??null,event.eventId,event.action||null,event.protocol||null,event.srcIp||null,event.dstIp||null,event.dstPort||null,event.direction||null,event.program||null,event.accountSid||null,event.challengeId||null);inserted+=result.changes}})()
   res.status(201).json({inserted})
 })
 
-export async function pullLogs(nodeId,actorId=null,maxPages=5) {
+export async function pullLogs(nodeId,actorId=null,maxPages=5,quiet=false) {
   const node=getNode(nodeId);if(!node)throw Object.assign(new Error('Node not found'),{status:404})
-  let cursor=one('SELECT MAX(record_id) n FROM log_events WHERE node_id=?',nodeId)?.n||0
+  const ignoreLoopback=observabilitySettings().ignoreLoopbackIngest
+  let cursor=one('SELECT last_record_id FROM node_log_cursors WHERE node_id=?',nodeId)?.last_record_id??one('SELECT MAX(record_id) n FROM log_events WHERE node_id=?',nodeId)?.n??0
   let inserted=0,pages=0,caughtUp=false
   for(;pages<maxPages;pages++){
     const raw=await remote(node,'events',{after:cursor}),events=Array.isArray(raw)?raw:[raw].filter(Boolean)
     if(!events.length){caughtUp=true;break}
     db.transaction(()=>{for(const event of events){
       const item=normalizeWindowsEvent(event)
+      if(ignoreLoopback&&isLoopbackEvent(item))continue
       const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,program,account_sid,event_time,event_type,logon_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),nodeId,item.recordId,item.eventId,item.action,item.protocol,item.srcIp,item.srcPort,item.dstIp,item.dstPort,item.direction,item.program,item.accountSid,item.eventTime,item.eventType,item.logonType)
       inserted+=result.changes
     }})()
     const next=Number(events.at(-1).RecordId)
     if(next<=cursor)break
     cursor=next
+    run('INSERT INTO node_log_cursors(node_id,last_record_id,updated_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET last_record_id=excluded.last_record_id,updated_at=excluded.updated_at',nodeId,cursor,now())
     if(events.length<500){caughtUp=true;pages++;break}
   }
-  audit(actorId,'logs.pull','node',nodeId,null,{inserted,pages,lastRecordId:cursor,caughtUp})
+  if(!quiet)audit(actorId,'logs.pull','node',nodeId,null,{inserted,pages,lastRecordId:cursor,caughtUp})
   return {inserted,pages,lastRecordId:cursor,caughtUp}
 }
 api.post('/logs/pull',requireRole('editor'),wrap(async(req,res)=>{
@@ -1176,7 +1511,7 @@ function learningPreview(session) {
   const assigned=all(`SELECT DISTINCT v.rules_compiled_json FROM policy_versions v JOIN policies p ON p.current_version_id=v.id JOIN policy_assignments a ON a.policy_id=p.id WHERE p.id<>? AND (a.node_id=? OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?))`,policy.id,session.node_id,session.node_id)
   for(const row of assigned)for(const rule of parse(row.rules_compiled_json)||[])if(rule.action==='allow')known.add(ruleLearningKey(rule))
   const endAt=new Date(Math.min(Date.now(),Date.parse(session.ends_at))).toISOString()
-  const observations=all("SELECT DISTINCT direction,dst_port,protocol,src_ip,dst_ip FROM log_events WHERE node_id=? AND datetime(COALESCE(event_time,received_at)) BETWEEN datetime(?) AND datetime(?) AND action='allow' AND dst_port BETWEEN 1 AND 65535 AND protocol IN ('TCP','UDP') AND direction IN ('in','out') ORDER BY direction,protocol,dst_port,src_ip,dst_ip",session.node_id,session.started_at,endAt)
+  const observations=all("SELECT DISTINCT COALESCE(e.direction,p.direction) direction,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,COALESCE(e.dst_ip,p.dst_ip) dst_ip FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE e.node_id=? AND datetime(COALESCE(e.event_time,e.received_at)) BETWEEN datetime(?) AND datetime(?) AND e.action='allow' AND COALESCE(e.dst_port,p.dst_port) BETWEEN 1 AND 65535 AND COALESCE(e.protocol,p.protocol) IN ('TCP','UDP') AND COALESCE(e.direction,p.direction) IN ('in','out') ORDER BY direction,protocol,dst_port,src_ip,dst_ip",session.node_id,session.started_at,endAt)
   const additions=[],seen=new Set()
   for(const event of observations){
     const remoteAddress=event.direction==='in'?event.src_ip:event.dst_ip
@@ -1188,6 +1523,7 @@ function learningPreview(session) {
   }
   const nodes=[...base.nodes,...additions.map((event,index)=>({id:`learned-${crypto.createHash('sha256').update(event.key).digest('hex').slice(0,16)}`,type:'allow',position:{x:80+((base.nodes.length+index)%4)*180,y:80+Math.floor((base.nodes.length+index)/4)*100},data:{name:`Learned ${event.protocol} ${event.dst_port} ${event.direction}`,localPort:event.direction==='in'?String(event.dst_port):'Any',remotePort:event.direction==='out'?String(event.dst_port):'Any',protocol:event.protocol,remoteAddress:event.remoteAddress,direction:event.direction}}))]
   const graph={nodes,edges:base.edges||[]},rules=compilePolicy(graph,policy.id)
+  assertManagementAccess(rules)
   return {policyId:policy.id,nodeId:session.node_id,sessionId:session.id,status:session.status,graph,rules,newFlowCount:additions.length,observedFlowCount:observations.length,asOf:now(),endsAt:session.ends_at,progressiveEnabled:!!session.progressive_enabled,nextProgressiveAt:session.next_progressive_at,lastProgressiveAt:session.last_progressive_at}
 }
 function saveLearningVersion(session,preview,actorId,comment){
