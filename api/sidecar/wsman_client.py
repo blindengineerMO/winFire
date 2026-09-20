@@ -171,6 +171,89 @@ $result | ConvertTo-Json -Depth 12 -Compress
 '''
 
 
+def legacy_ps2(session, payload):
+    """PowerShell 2 compatible WinRM operations for Windows XP's limited host surface."""
+    operation = payload['operation']
+    if operation == 'auth':
+        script = '[Security.Principal.WindowsIdentity]::GetCurrent().Name'
+    elif operation == 'facts':
+        script = r'''
+$ErrorActionPreference='Stop'
+function Out-Field($name,$value) { $bytes=[Text.Encoding]::UTF8.GetBytes([string]$value); Write-Output ($name+'='+[Convert]::ToBase64String($bytes)) }
+$computer=Get-WmiObject Win32_ComputerSystem
+$os=Get-WmiObject Win32_OperatingSystem
+$bios=Get-WmiObject Win32_BIOS
+Out-Field 'NAME' $computer.Name; Out-Field 'DOMAIN' $computer.Domain; Out-Field 'JOINED' $computer.PartOfDomain
+Out-Field 'USER' $computer.UserName; Out-Field 'MODEL' $computer.Model; Out-Field 'MANUFACTURER' $computer.Manufacturer
+Out-Field 'CAPTION' $os.Caption; Out-Field 'VERSION' $os.Version; Out-Field 'BUILD' $os.BuildNumber
+Out-Field 'ARCH' $os.OSArchitecture; Out-Field 'SERIAL' $bios.SerialNumber
+try { Out-Field 'GUID' (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography').MachineGuid } catch {}
+foreach($adapter in @(Get-WmiObject Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True')) {
+  Out-Field 'NET' ((@([string]$adapter.Description,[string]$adapter.MACAddress,([string[]]$adapter.IPAddress -join ','),([string[]]$adapter.DefaultIPGateway -join ','),([string[]]$adapter.DNSServerSearchOrder -join ','),[string]$adapter.DNSDomain)) -join '|')
+}
+'''
+    elif operation in {'rights', 'rights_change'}:
+        source = (Path(__file__).resolve().parent / 'lsa_rights.ps1').read_text()
+        if operation == 'rights':
+            script = source + '\nGet-WinFireLogonRights\n'
+        else:
+            args = payload.get('args') or {}
+            sid = base64.b64encode(str(args.get('accountSid') or '').encode()).decode()
+            right = base64.b64encode(str(args.get('right') or '').encode()).decode()
+            present = '$true' if args.get('present') else '$false'
+            script = source + f"\n$sid=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{sid}'));$right=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{right}'));$result=Set-WinFireLogonRight @{{accountSid=$sid;right=$right;present={present}}};Write-Output ($result.accountSid+'|'+$result.right+'|'+$result.before+'|'+$result.present+'|'+$result.changed)\n"
+    else:
+        raise RuntimeError(f'{operation} is unavailable on Windows XP; this host requires a legacy firewall adapter')
+    # LSA P/Invoke source exceeds Windows' command-line limit. Send a short
+    # PowerShell 2 loader, then stream the compressed script through stdin.
+    loader = "$encoded=[Console]::In.ReadToEnd();$bytes=[Convert]::FromBase64String($encoded);$buffer=New-Object IO.MemoryStream;$buffer.Write($bytes,0,$bytes.Length);$buffer.Position=0;$zip=New-Object IO.Compression.GzipStream -ArgumentList $buffer,([IO.Compression.CompressionMode]::Decompress);$reader=New-Object IO.StreamReader -ArgumentList $zip,([Text.Encoding]::UTF8);try{Invoke-Expression $reader.ReadToEnd()}finally{$reader.Dispose();$zip.Dispose();$buffer.Dispose()}"
+    encoded_loader = base64.b64encode(loader.encode('utf-16le')).decode()
+    encoded_script = base64.b64encode(gzip.compress(script.encode('utf-8')))
+    protocol = session.protocol
+    shell_id = protocol.open_shell()
+    try:
+        command_id = protocol.run_command(shell_id, 'powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded_loader])
+        try:
+            for offset in range(0, len(encoded_script), 4096):
+                protocol.send_command_input(shell_id, command_id, encoded_script[offset:offset + 4096], end=offset + 4096 >= len(encoded_script))
+            stdout, stderr, status = protocol.get_command_output(shell_id, command_id)
+        finally:
+            protocol.cleanup_command(shell_id, command_id)
+    finally:
+        protocol.close_shell(shell_id)
+    if status != 0:
+        raise RuntimeError(stderr.decode('utf-8', 'replace').strip() or f'Windows XP WinRM operation exited {status}')
+    output = stdout.decode('utf-8-sig', 'replace').strip()
+    if operation == 'auth':
+        return output
+    if operation == 'rights':
+        if not output:
+            raise RuntimeError('LSA logon-rights query returned no data')
+        return output.splitlines()
+    if operation == 'rights_change':
+        parts = output.splitlines()[-1].split('|')
+        if len(parts) != 5:
+            raise RuntimeError('LSA change returned an invalid response')
+        return {'accountSid':parts[0], 'right':parts[1], 'before':parts[2].lower() == 'true', 'present':parts[3].lower() == 'true', 'changed':parts[4].lower() == 'true'}
+    fields = {}
+    adapters = []
+    for line in output.splitlines():
+        if '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        decoded = base64.b64decode(value).decode('utf-8', 'replace')
+        if key == 'NET':
+            parts = decoded.split('|')
+            if len(parts) == 6:
+                adapters.append({'description':parts[0], 'macAddress':parts[1], 'ipAddresses':parts[2].split(',') if parts[2] else [], 'gateways':parts[3].split(',') if parts[3] else [], 'dnsServers':parts[4].split(',') if parts[4] else [], 'dnsDomain':parts[5]})
+        else:
+            fields[key] = decoded
+    return {'computer':{'Name':fields.get('NAME'), 'Domain':fields.get('DOMAIN'), 'PartOfDomain':fields.get('JOINED', '').lower() == 'true', 'UserName':fields.get('USER'), 'Model':fields.get('MODEL'), 'Manufacturer':fields.get('MANUFACTURER')},
+            'os':{'Caption':fields.get('CAPTION'), 'Version':fields.get('VERSION'), 'BuildNumber':fields.get('BUILD'), 'OSArchitecture':fields.get('ARCH')},
+            'bios':{'SerialNumber':fields.get('SERIAL')}, 'identity':{'machineGuid':fields.get('GUID'), 'domainJoined':fields.get('JOINED', '').lower() == 'true', 'domainName':fields.get('DOMAIN'), 'currentInteractiveUser':fields.get('USER')},
+            'network':adapters, 'dnsSuffixes':[item['dnsDomain'] for item in adapters if item['dnsDomain']], 'firewall':[], 'service':None}
+
+
 def main():
     payload = json.load(sys.stdin)
     operation = payload['operation']
@@ -179,6 +262,23 @@ def main():
     host = payload['host']
     secure = payload.get('transport') == 'winrms'
     endpoint = f"{'https' if secure else 'http'}://{host}:{5986 if secure else 5985}/wsman"
+    slow = operation.startswith(('rights', 'jit_', 'breakglass_', 'prompt_')) or operation == 'agent_deploy'
+    session = winrm.Session(
+        endpoint,
+        auth=(payload['username'], payload['password']),
+        transport='ntlm',
+        server_cert_validation='ignore' if os.environ.get('WINRM_TLS_VERIFY') == 'false' else 'validate',
+        read_timeout_sec=90 if slow else 25,
+        operation_timeout_sec=80 if slow else 20,
+    )
+    os_version = str(payload.get('osVersion') or '')
+    if not os_version and operation in {'facts', 'rights', 'rights_change'}:
+        detected = session.run_ps('(Get-WmiObject Win32_OperatingSystem).Caption')
+        if detected.status_code == 0:
+            os_version = detected.std_out.decode('utf-8-sig', 'replace').strip()
+    if operation == 'auth' or 'windows xp' in os_version.lower():
+        print(json.dumps(legacy_ps2(session, payload)))
+        return
     args = base64.b64encode(json.dumps(payload.get('args') or {}).encode()).decode()
     shared_root = Path(__file__).resolve().parents[2] / 'packages' / 'shared'
     calls = {'jit_preflight':'Test-WinFireJitGate $argsData','jit_start':'Start-WinFireJitAccess $argsData','jit_end':'End-WinFireJitAccess $argsData',
@@ -191,14 +291,6 @@ def main():
     else:
         script = POWERSHELL.replace('__OPERATION__', operation).replace('# __WINFIRE_LSA_RIGHTS__', (Path(__file__).resolve().parent / 'lsa_rights.ps1').read_text() if operation.startswith('rights') else '')
     script = script.replace('[Console]::In.ReadToEnd()', f"'{args}'")
-    session = winrm.Session(
-        endpoint,
-        auth=(payload['username'], payload['password']),
-        transport='ntlm',
-        server_cert_validation='ignore' if os.environ.get('WINRM_TLS_VERIFY') == 'false' else 'validate',
-        read_timeout_sec=90 if operation in calls else 45 if operation.startswith('rights') else 25,
-        operation_timeout_sec=80 if operation in calls else 40 if operation.startswith('rights') else 20,
-    )
     loader = "$encoded=[Console]::In.ReadToEnd();$buffer=[IO.MemoryStream]::new([Convert]::FromBase64String($encoded));$zip=[IO.Compression.GzipStream]::new($buffer,[IO.Compression.CompressionMode]::Decompress);$reader=[IO.StreamReader]::new($zip,[Text.Encoding]::UTF8);try{Invoke-Expression $reader.ReadToEnd()}finally{$reader.Dispose();$zip.Dispose();$buffer.Dispose()}"
     encoded_loader = base64.b64encode(loader.encode('utf-16le')).decode()
     encoded_script = base64.b64encode(gzip.compress(script.encode('utf-8')))

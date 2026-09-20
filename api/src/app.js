@@ -709,6 +709,14 @@ api.patch('/settings/directory',requireRole('admin'),(req,res)=>{
   })()
   res.json(publicDirectory(directorySettings()))
 })
+api.patch('/settings/directory/action-credential',requireRole('admin'),(req,res)=>{
+  const {credentialId}=body(z.object({credentialId:z.string().uuid().nullable()}),req)
+  if(credentialId){const credential=one('SELECT * FROM credentials WHERE id=?',credentialId);if(!credential||!canUseCredential(req.user,credential))return res.status(400).json({error:'Selected account-control credential is unavailable'})}
+  const prior=directorySettings()
+  run("UPDATE directory_connections SET action_credential_id=? WHERE id='default'",credentialId)
+  audit(req.user.id,'directory.action-credential.update','directory','default',{credentialId:prior.action_credential_id||null},{credentialId})
+  res.json(publicDirectory(directorySettings()))
+})
 api.post('/directory/test',requireRole('admin'),wrap(async(req,res)=>{
   const settings=directorySettings()
   if(!settings?.url||!settings.base_dn)throw Object.assign(new Error('Configure the directory connection first'),{status:400})
@@ -794,6 +802,46 @@ api.get('/directory/users/:id',requireRole('auditor'),(req,res)=>{
   const {member_of_json,...publicUser}=user
   res.json({...publicUser,memberOf:parse(member_of_json)||[],mfaEnrolled:!!one('SELECT 1 FROM users WHERE ad_guid=? AND totp_secret IS NOT NULL',user.id),operatorImported:!!one("SELECT 1 FROM users WHERE ad_guid=? AND auth_source='ad'",user.id),mfaEvents:mfa,logonEvents:logons})
 })
+api.post('/directory/users/:id/status',requireRole('admin'),wrap(async(req,res)=>{
+  const data=body(z.object({enabled:z.boolean(),reason:z.string().trim().min(10).max(500),confirmation:z.enum(['ENABLE AD USER','DISABLE AD USER']),durationMinutes:z.number().int().min(5).max(10080).optional()}),req)
+  if(data.confirmation!==(data.enabled?'ENABLE AD USER':'DISABLE AD USER'))return res.status(400).json({error:'Confirmation does not match the requested action'})
+  if(data.enabled&&data.durationMinutes)return res.status(400).json({error:'A duration applies only when disabling an account'})
+  const user=one('SELECT * FROM directory_users WHERE id=?',reqId(req));if(!user)return notFound(res,'Directory user')
+  if(user.missing)return res.status(409).json({error:'Sync the directory before changing a missing AD user'})
+  if(!data.enabled&&one("SELECT id FROM ad_account_holds WHERE user_guid=? AND status='active'",user.id))return res.status(409).json({error:'A temporary account hold is already active'})
+  audit(req.user.id,'directory.user.status.attempt','directory_user',user.id,null,{enabled:data.enabled,reason:data.reason,durationMinutes:data.durationMinutes||null})
+  let result
+  try{result=await writeDirectoryUserStatus(directorySettings(),directoryActionCredential(directorySettings()),user,data.enabled)}
+  catch(error){audit(req.user.id,'directory.user.status.failed','directory_user',user.id,null,{enabled:data.enabled,reason:data.reason,error:error.message});throw error}
+  if(data.durationMinutes&&!result.changed)return res.status(409).json({error:'The account was already disabled; WinFire did not schedule an automatic re-enable'})
+  const expiresAt=data.durationMinutes?new Date(Date.now()+data.durationMinutes*60_000).toISOString():null
+  db.transaction(()=>{
+    run('UPDATE directory_users SET enabled=?,seen_at=? WHERE id=?',Number(data.enabled),now(),user.id)
+    if(data.enabled)run("UPDATE ad_account_holds SET status='resolved-manually',resolved_at=? WHERE user_guid=? AND status='active'",now(),user.id)
+    if(expiresAt)run('INSERT INTO ad_account_holds(id,user_guid,expected_uac,expires_at,status,created_by,created_at) VALUES(?,?,?,?,?,?,?)',id(),user.id,result.afterUac,expiresAt,'active',req.user.id,now())
+    audit(req.user.id,'directory.user.status.changed','directory_user',user.id,{enabled:!!user.enabled,uac:result.beforeUac},{enabled:data.enabled,uac:result.afterUac,reason:data.reason,expiresAt})
+  })()
+  res.json({enabled:data.enabled,changed:result.changed,expiresAt})
+}))
+export async function processDueAdAccountHolds(){
+  const due=all("SELECT h.*,d.sid,d.dn FROM ad_account_holds h JOIN directory_users d ON d.id=h.user_guid WHERE h.status='active' AND h.expires_at<=? AND (h.last_attempt_at IS NULL OR h.last_attempt_at<=?) ORDER BY h.expires_at LIMIT 20",now(),new Date(Date.now()-5*60_000).toISOString())
+  for(const hold of due){
+    run('UPDATE ad_account_holds SET last_attempt_at=? WHERE id=?',now(),hold.id)
+    try{
+      const result=await writeDirectoryUserStatus(directorySettings(),directoryActionCredential(directorySettings()),{id:hold.user_guid,sid:hold.sid,dn:hold.dn},true,{expectedUac:hold.expected_uac})
+      db.transaction(()=>{
+        run('UPDATE directory_users SET enabled=1,seen_at=? WHERE id=?',now(),hold.user_guid)
+        run("UPDATE ad_account_holds SET status='expired',resolved_at=?,error=NULL WHERE id=?",now(),hold.id)
+        audit(null,'directory.user.hold.expired','directory_user',hold.user_guid,{enabled:false,uac:result.beforeUac},{enabled:true,uac:result.afterUac})
+      })()
+    }catch(error){
+      const review=error.status===409
+      run('UPDATE ad_account_holds SET status=?,error=? WHERE id=?',review?'review':'active',error.message.slice(0,500),hold.id)
+      if(review||!hold.error)audit(null,'directory.user.hold.failed','directory_user',hold.user_guid,null,{error:error.message,manualReview:review})
+    }
+  }
+  return due.length
+}
 api.post('/directory/users/:id/import-operator',requireRole('admin'),wrap(async(req,res)=>{
   const {role}=body(z.object({role:z.enum(['admin','editor','auditor']).default('auditor')}),req)
   const directoryUser=one('SELECT * FROM directory_users WHERE id=?',reqId(req));if(!directoryUser)return notFound(res,'Directory user')

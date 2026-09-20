@@ -275,7 +275,7 @@ export async function remote(node,operation,args={},options={}) {
   const host=node.fqdn || node.ip || node.hostname
   let lastError
   for (const credential of nodeCredential(node.id,options.credentialId)) {
-    const input={host,transport:node.transport||'winrm',username:credential.username,password:credential.secret.password,operation,args}
+    const input={host,transport:node.transport||'winrm',osVersion:node.os_version||null,username:credential.username,password:credential.secret.password,operation,args}
     const mutating=operation==='apply'||operation.startsWith('breakglass_')||operation==='jit_start'||operation==='jit_end'||operation==='prompt_browser'||operation==='rights_change'||operation==='agent_deploy'
     const attempts=mutating?1:2
     for(let attempt=0;attempt<attempts;attempt++){

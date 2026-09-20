@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import supertest from 'supertest'
-import {guidFromDirectory,sidFromDirectory,normalizeDirectoryComputer,normalizeDirectoryUser,testDirectoryConnection,authenticateDirectoryUser,directoryConnectionError,ldapFallbackUsername} from '../src/directory.js'
+import {guidFromDirectory,sidFromDirectory,normalizeDirectoryComputer,normalizeDirectoryUser,testDirectoryConnection,authenticateDirectoryUser,writeDirectoryUserStatus,directoryConnectionError,ldapFallbackUsername} from '../src/directory.js'
 
 const dir=fs.mkdtempSync(path.join(os.tmpdir(),'winfire-directory-test-'))
 process.env.DATA_DIR=dir
@@ -56,6 +56,22 @@ test('AD users normalize with account status and group memberships',()=>{
   assert.equal(user.enabled,false)
   assert.deepEqual(user.memberOf,['CN=Operators,DC=example,DC=test'])
   assert.equal(normalizeDirectoryUser(computer('srv01'),'DC=example,DC=test'),null)
+})
+
+test('AD account-control writes preserve unrelated flags and require identity readback',async()=>{
+  const userSid=Buffer.from(sid);userSid.writeUInt32LE(1101,24)
+  const user={id:guidFromDirectory(guid),sid:sidFromDirectory(userSid),dn:'CN=Alice,OU=Users,DC=example,DC=test'}
+  let flags=512,modified=0
+  const clientFactory=()=>({async bind(){},async search(){return {searchEntries:[{objectGUID:guid,objectSid:userSid,userAccountControl:String(flags)}]}},async modify(_dn,change){flags=Number(change.modification.values[0]);modified++},async unbind(){}})
+  const config={enabled:1,url:'ldaps://dc.example.test:636/',base_dn:'DC=example,DC=test'}
+  const credential={username:'writer@example.test',password:'test-secret'}
+  assert.deepEqual(await writeDirectoryUserStatus(config,credential,user,false,{clientFactory}),{enabled:false,changed:true,beforeUac:512,afterUac:514})
+  await assert.rejects(writeDirectoryUserStatus(config,credential,user,true,{expectedUac:516,clientFactory}),error=>error.status===409)
+  assert.equal(flags,514)
+  assert.deepEqual(await writeDirectoryUserStatus(config,credential,user,true,{expectedUac:514,clientFactory}),{enabled:true,changed:true,beforeUac:514,afterUac:512})
+  assert.equal(modified,2)
+  const wrongClient=()=>({async bind(){},async search(){return {searchEntries:[{objectGUID:guid,objectSid:sid,userAccountControl:'512'}]}},async unbind(){}})
+  await assert.rejects(writeDirectoryUserStatus(config,credential,user,false,{clientFactory:wrongClient}),error=>error.status===409)
 })
 
 test('directory settings use vault credentials and sync AD as the first inventory source',async()=>{

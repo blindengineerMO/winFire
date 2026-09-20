@@ -49,33 +49,32 @@ public static class WinFireLsaRights {
     };
 
     public static string[] Read() {
-        var attributes = new LSA_OBJECT_ATTRIBUTES();
+        LSA_OBJECT_ATTRIBUTES attributes = new LSA_OBJECT_ATTRIBUTES();
         attributes.Length = (uint)Marshal.SizeOf(typeof(LSA_OBJECT_ATTRIBUTES));
         IntPtr policy;
         // POLICY_LOOKUP_NAMES | POLICY_VIEW_LOCAL_INFORMATION
         uint status = LsaOpenPolicy(IntPtr.Zero, ref attributes, 0x801, out policy);
         if (status != 0) throw new Win32Exception((int)LsaNtStatusToWinError(status), "LsaOpenPolicy failed");
-        var rows = new List<string>();
+        List<string> rows = new List<string>();
         try {
-            foreach (var name in Rights) {
+            foreach (string name in Rights) {
                 IntPtr nameBuffer = Marshal.StringToHGlobalUni(name);
                 IntPtr entries = IntPtr.Zero;
                 try {
-                    var right = new LSA_UNICODE_STRING {
-                        Length = checked((ushort)(name.Length * 2)),
-                        MaximumLength = checked((ushort)((name.Length + 1) * 2)),
-                        Buffer = nameBuffer
-                    };
+                    LSA_UNICODE_STRING right = new LSA_UNICODE_STRING();
+                    right.Length = checked((ushort)(name.Length * 2));
+                    right.MaximumLength = checked((ushort)((name.Length + 1) * 2));
+                    right.Buffer = nameBuffer;
                     uint count;
                     status = LsaEnumerateAccountsWithUserRight(policy, ref right, out entries, out count);
                     if (status == 0x8000001A) continue; // STATUS_NO_MORE_ENTRIES
                     if (status != 0) throw new Win32Exception((int)LsaNtStatusToWinError(status), "Cannot read " + name);
-                    var sids = new List<string>();
+                    List<string> sids = new List<string>();
                     for (uint i = 0; i < count; i++) {
                         IntPtr sid = Marshal.ReadIntPtr(entries, checked((int)i * IntPtr.Size));
                         sids.Add("*" + new SecurityIdentifier(sid).Value);
                     }
-                    if (sids.Count > 0) rows.Add(name + " = " + string.Join(",", sids));
+                    if (sids.Count > 0) rows.Add(name + " = " + string.Join(",", sids.ToArray()));
                 } finally {
                     if (entries != IntPtr.Zero) LsaFreeMemory(entries);
                     Marshal.FreeHGlobal(nameBuffer);
@@ -87,24 +86,23 @@ public static class WinFireLsaRights {
 
     public static void Change(string sidText, string rightName, bool present) {
         if (Array.IndexOf(Rights, rightName) < 0) throw new ArgumentException("Unsupported logon right", "rightName");
-        var sidValue = new SecurityIdentifier(sidText);
-        var sidBytes = new byte[sidValue.BinaryLength];
+        SecurityIdentifier sidValue = new SecurityIdentifier(sidText);
+        byte[] sidBytes = new byte[sidValue.BinaryLength];
         sidValue.GetBinaryForm(sidBytes, 0);
         IntPtr sid = Marshal.AllocHGlobal(sidBytes.Length);
         IntPtr nameBuffer = Marshal.StringToHGlobalUni(rightName);
         IntPtr policy = IntPtr.Zero;
         try {
             Marshal.Copy(sidBytes, 0, sid, sidBytes.Length);
-            var attributes = new LSA_OBJECT_ATTRIBUTES();
+            LSA_OBJECT_ATTRIBUTES attributes = new LSA_OBJECT_ATTRIBUTES();
             attributes.Length = (uint)Marshal.SizeOf(typeof(LSA_OBJECT_ATTRIBUTES));
             // POLICY_LOOKUP_NAMES | POLICY_CREATE_ACCOUNT
             uint status = LsaOpenPolicy(IntPtr.Zero, ref attributes, 0x810, out policy);
             if (status != 0) throw new Win32Exception((int)LsaNtStatusToWinError(status), "LsaOpenPolicy failed");
-            var right = new LSA_UNICODE_STRING {
-                Length = checked((ushort)(rightName.Length * 2)),
-                MaximumLength = checked((ushort)((rightName.Length + 1) * 2)),
-                Buffer = nameBuffer
-            };
+            LSA_UNICODE_STRING right = new LSA_UNICODE_STRING();
+            right.Length = checked((ushort)(rightName.Length * 2));
+            right.MaximumLength = checked((ushort)((rightName.Length + 1) * 2));
+            right.Buffer = nameBuffer;
             status = present ? LsaAddAccountRights(policy, sid, ref right, 1) : LsaRemoveAccountRights(policy, sid, false, ref right, 1);
             if (status != 0) throw new Win32Exception((int)LsaNtStatusToWinError(status), "Cannot change " + rightName);
         } finally {
@@ -131,14 +129,14 @@ function Set-WinFireLogonRight($argsData) {
   $sid=[string]$argsData.accountSid; $right=[string]$argsData.right; $present=[bool]$argsData.present
   if($sid -notmatch '^S-1-\d+-\d+(?:-\d+)+$'){throw 'A valid account SID is required'}
   $allowed=@('SeNetworkLogonRight','SeDenyNetworkLogonRight','SeRemoteInteractiveLogonRight','SeDenyRemoteInteractiveLogonRight','SeBatchLogonRight','SeDenyBatchLogonRight','SeServiceLogonRight','SeDenyServiceLogonRight')
-  if($right -cnotin $allowed){throw 'Unsupported logon right'}
+  if([Array]::IndexOf($allowed,$right) -lt 0){throw 'Unsupported logon right'}
   $before=Test-WinFireLogonRight (Get-WinFireLogonRights) $sid $right
-  if($before -eq $present){return [pscustomobject]@{accountSid=$sid;right=$right;before=$before;present=$before;changed=$false}}
+  if($before -eq $present){return (New-Object PSObject -Property @{accountSid=$sid;right=$right;before=$before;present=$before;changed=$false})}
   [WinFireLsaRights]::Change($sid,$right,$present)
   $after=Test-WinFireLogonRight (Get-WinFireLogonRights) $sid $right
   if($after -ne $present){
     try{[WinFireLsaRights]::Change($sid,$right,$before)}catch{throw "Logon right readback failed; rollback also failed: $($_.Exception.Message)"}
     throw 'Logon right readback failed; prior assignment restored'
   }
-  [pscustomobject]@{accountSid=$sid;right=$right;before=$before;present=$after;changed=$true}
+  New-Object PSObject -Property @{accountSid=$sid;right=$right;before=$before;present=$after;changed=$true}
 }
