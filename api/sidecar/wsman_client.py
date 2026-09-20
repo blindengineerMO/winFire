@@ -11,6 +11,14 @@ POWERSHELL = r'''
 $ErrorActionPreference = 'Stop'
 $argsData = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd())) | ConvertFrom-Json
 $operation = '__OPERATION__'
+function Get-WinFireAuditPolicy {
+  if(-not ('WinFireAuditPolicyQuery' -as [type])) {
+    $source='using System; using System.ComponentModel; using System.Runtime.InteropServices; public static class WinFireAuditPolicyQuery { [DllImport("advapi32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.U1)] private static extern bool AuditQuerySystemPolicy([In] Guid[] ids, uint count, out IntPtr policy); [DllImport("advapi32.dll")] private static extern void AuditFree(IntPtr policy); public static int Read(string text) { Guid id=new Guid(text); IntPtr policy; if(!AuditQuerySystemPolicy(new Guid[]{id},1,out policy)) throw new Win32Exception(Marshal.GetLastWin32Error()); try { if(policy==IntPtr.Zero || Marshal.PtrToStructure<Guid>(policy)!=id) throw new InvalidOperationException("Audit policy query returned an unexpected subcategory"); return Marshal.ReadInt32(policy,16); } finally { if(policy!=IntPtr.Zero) AuditFree(policy); } } }'
+    Add-Type -TypeDefinition $source -ErrorAction Stop
+  }
+  $setting=[WinFireAuditPolicyQuery]::Read('0CCE9226-69AE-11D9-BED3-505054503030')
+  [pscustomobject]@{subcategoryGuid='0CCE9226-69AE-11D9-BED3-505054503030';settingValue=$setting;successEnabled=[bool]($setting -band 1);failureEnabled=[bool]($setting -band 2)}
+}
 $result = switch ($operation) {
   'auth' { [Security.Principal.WindowsIdentity]::GetCurrent().Name }
   'facts' {
@@ -90,6 +98,29 @@ $result = switch ($operation) {
       [pscustomobject]@{RecordId=$event.RecordId;Id=$event.Id;TimeCreated=$event.TimeCreated.ToUniversalTime().ToString('o');Fields=$fields}
     })
   }
+  'audit_policy' { Get-WinFireAuditPolicy }
+  'audit_policy_enable' {
+    $before=Get-WinFireAuditPolicy
+    if($before.successEnabled -and $before.failureEnabled){$before}
+    else {
+      try {
+        auditpol /set '/subcategory:{0CCE9226-69AE-11D9-BED3-505054503030}' /success:enable /failure:enable | Out-Null
+        if($LASTEXITCODE -ne 0){throw "auditpol update failed with exit code $LASTEXITCODE"}
+        $after=Get-WinFireAuditPolicy
+        if(-not ($after.successEnabled -and $after.failureEnabled)){throw 'Audit policy readback did not confirm success and failure auditing'}
+        $after
+      } catch {
+        $cause=$_.Exception.Message
+        $successArg=if($before.successEnabled){'/success:enable'}else{'/success:disable'}
+        $failureArg=if($before.failureEnabled){'/failure:enable'}else{'/failure:disable'}
+        auditpol /set '/subcategory:{0CCE9226-69AE-11D9-BED3-505054503030}' $successArg $failureArg | Out-Null
+        if($LASTEXITCODE -ne 0){throw "Audit policy update failed: $cause; rollback failed with exit code $LASTEXITCODE"}
+        $restored=Get-WinFireAuditPolicy
+        if($restored.settingValue -ne $before.settingValue){throw "Audit policy update failed: $cause; rollback readback differs from prior state"}
+        throw "Audit policy update failed: $cause; prior state restored"
+      }
+    }
+  }
   'rights' {
     $file = Join-Path $env:TEMP ('winfire-'+[guid]::NewGuid().ToString()+'.inf')
     try {
@@ -110,7 +141,7 @@ $result | ConvertTo-Json -Depth 12 -Compress
 def main():
     payload = json.load(sys.stdin)
     operation = payload['operation']
-    if operation not in {'auth', 'facts', 'all_rules', 'rules', 'apply', 'events', 'rights'}:
+    if operation not in {'auth', 'facts', 'all_rules', 'rules', 'apply', 'events', 'audit_policy', 'audit_policy_enable', 'rights', 'breakglass_start', 'breakglass_end'}:
         raise ValueError('Unsupported operation')
     host = payload['host']
     secure = payload.get('transport') == 'winrms'

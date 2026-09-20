@@ -8,6 +8,7 @@ import {createServer} from 'node:net'
 import supertest from 'supertest'
 import {compilePolicy,rulesConflict,validateAddressExpression,validatePortExpression,validateProgramPath} from '@winfire/shared'
 import {normalizeWindowsEvent} from '../src/eventNormalizer.js'
+import {parseSeceditRights} from '../src/logonRights.js'
 
 const dir=fs.mkdtempSync(path.join(os.tmpdir(),'winfire-test-'))
 process.env.DATA_DIR=dir
@@ -18,7 +19,7 @@ const {app}=await import('../src/app.js')
 const {classifyVerification}=await import('../src/verifier.js')
 const {bootstrap}=await import('../src/security.js')
 const {db}=await import('../src/db.js')
-const {recordNodeSuccess,recordNodeTransportFailure}=await import('../src/connector.js')
+const {recordNodeSuccess,recordNodeTransportFailure,classifyProbe}=await import('../src/connector.js')
 const {processDueTraining}=await import('../src/app.js')
 const request=supertest(app)
 await bootstrap()
@@ -43,6 +44,20 @@ test('policy compiler validates the graph and emits tagged rules',()=>{
   assert.equal(outbound[0].remotePort,'443')
   assert.equal(rulesConflict({...outbound[0],action:'allow',remotePort:'443'},{...outbound[0],action:'block',remotePort:'3389'}),false)
   assert.equal(rulesConflict({...outbound[0],action:'allow',remotePort:'443'},{...outbound[0],action:'block',remotePort:'443'}),true)
+})
+
+test('OpenAPI lists registered control-plane and agent routes with their auth schemes',async()=>{
+  const response=await request.get('/api/v1/openapi.json').expect(200)
+  const spec=response.body
+  assert.equal(spec.openapi,'3.1.0')
+  assert.ok(Object.keys(spec.paths).length>60)
+  assert.deepEqual(spec.paths['/nodes/{id}/firewall-rules'].get.security,[{bearerAuth:[]}])
+  assert.deepEqual(spec.paths['/agents/{id}/events'].post.security,[{mutualTLS:[]}])
+  assert.deepEqual(spec.paths['/agents/{id}/revoke'].post.security,[{bearerAuth:[]}])
+  assert.ok(spec.paths['/policies/{id}/assignments/{assignmentId}'].delete.responses[202])
+  assert.ok(spec.paths['/node-groups/{id}/members/{nodeId}'].delete.responses[200])
+  assert.equal(spec.paths['/auth/login'].post.security,undefined)
+  assert.equal(spec.paths['/auth/login'].post.requestBody.content['application/json'].schema.$ref,'#/components/schemas/LoginRequest')
 })
 
 test('policy fields reject invalid ports, addresses and program paths before apply',()=>{
@@ -79,6 +94,30 @@ test('Windows Security events retain firewall and logon meaning',()=>{
   assert.equal(firewall.direction,'in')
 })
 
+test('logon-rights export preserves allow and deny assignments by SID',()=>{
+  const rights=parseSeceditRights([
+    'SeNetworkLogonRight = *S-1-5-32-544,*S-1-5-11',
+    'SeDenyRemoteInteractiveLogonRight = *S-1-5-32-546',
+    'SeNetworkLogonRight = *S-1-5-11'
+  ])
+  assert.deepEqual(rights,[
+    {accountSid:'S-1-5-32-544',logonType:'Network',assignment:'allow'},
+    {accountSid:'S-1-5-11',logonType:'Network',assignment:'allow'},
+    {accountSid:'S-1-5-32-546',logonType:'RemoteInteractive',assignment:'deny'}
+  ])
+  assert.throws(()=>parseSeceditRights(['[Privilege Rights]']),/no usable account assignments/)
+  assert.throws(()=>parseSeceditRights(['SeServiceLogonRight = PUCKNET\\service']),/unresolved account/)
+})
+
+test('authenticated RPC counts as reachable while retaining management evidence',()=>{
+  assert.deepEqual(classifyProbe('wmi','srvinfo response'),{status:'reachable',probeStatus:'rpc-authenticated'})
+  assert.deepEqual(classifyProbe('wmi',{error:'access denied'}),{status:'unverified',probeStatus:'rpc-unverified'})
+  assert.deepEqual(classifyProbe('winrm',null,true),{status:'reachable',probeStatus:'winrm-authenticated'})
+  assert.deepEqual(classifyProbe('winrms',null,true),{status:'reachable',probeStatus:'winrms-authenticated'})
+  assert.deepEqual(classifyProbe('winrm',null),{status:'port-open',probeStatus:'port-open'})
+  assert.deepEqual(classifyProbe(null,null),{status:'unreachable',probeStatus:'unreachable'})
+})
+
 test('repeated transport failures back off and a successful call restores node health',()=>{
   const nodeId=crypto.randomUUID()
   db.prepare('INSERT INTO nodes(id,hostname) VALUES(?,?)').run(nodeId,'health-test')
@@ -95,6 +134,36 @@ test('repeated transport failures back off and a successful call restores node h
   assert.equal(restored.status,'reachable')
   assert.equal(restored.next_retry_at,null)
   assert.ok(restored.last_seen_at)
+})
+
+test('node edits clear stale facts and deletion protects managed or assigned hosts',async()=>{
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@example.test',password:'test-password-12345'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
+  const created=await auth(request.post('/api/v1/nodes')).send({hostname:'editable-node',ip:'192.0.2.10'}).expect(201)
+  const nodeId=created.body.id
+  db.prepare('INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?)').run(nodeId,'{}',new Date().toISOString())
+  await auth(request.patch(`/api/v1/nodes/${nodeId}`)).send({hostname:'renamed-node',ip:'192.0.2.11'}).expect(200)
+  assert.equal(db.prepare('SELECT hostname,ip,status,transport FROM nodes WHERE id=?').get(nodeId).hostname,'renamed-node')
+  assert.equal(db.prepare('SELECT node_id FROM node_facts WHERE node_id=?').get(nodeId),undefined)
+  await auth(request.patch(`/api/v1/nodes/${nodeId}`)).send({ip:'not-an-ip'}).expect(400)
+  db.prepare('UPDATE nodes SET ad_guid=? WHERE id=?').run(crypto.randomUUID(),nodeId)
+  await auth(request.patch(`/api/v1/nodes/${nodeId}`)).send({hostname:'not-from-ad'}).expect(409)
+  await auth(request.delete(`/api/v1/nodes/${nodeId}`)).expect(409)
+  db.prepare('UPDATE nodes SET ad_guid=NULL WHERE id=?').run(nodeId)
+  const policyId=crypto.randomUUID(),assignmentId=crypto.randomUUID()
+  db.prepare('INSERT INTO policies(id,name) VALUES(?,?)').run(policyId,'Assigned policy')
+  db.prepare('INSERT INTO policy_assignments(id,policy_id,node_id) VALUES(?,?,?)').run(assignmentId,policyId,nodeId)
+  await auth(request.patch(`/api/v1/nodes/${nodeId}`)).send({ip:'192.0.2.12'}).expect(409)
+  await auth(request.delete(`/api/v1/nodes/${nodeId}`)).expect(409)
+  db.prepare('DELETE FROM policy_assignments WHERE id=?').run(assignmentId)
+  const agentId=crypto.randomUUID()
+  db.prepare('INSERT INTO agents(id,node_id,cert_thumbprint) VALUES(?,?,?)').run(agentId,nodeId,'test-thumbprint')
+  await auth(request.delete(`/api/v1/nodes/${nodeId}`)).expect(409)
+  db.prepare('UPDATE agents SET revoked_at=? WHERE id=?').run(new Date().toISOString(),agentId)
+  await auth(request.delete(`/api/v1/nodes/${nodeId}`)).expect(204)
+  assert.equal(db.prepare('SELECT id FROM nodes WHERE id=?').get(nodeId),undefined)
+  assert.equal(db.prepare('SELECT id FROM learning_sessions WHERE node_id=?').get(nodeId),undefined)
+  assert.equal(db.prepare('SELECT id FROM agents WHERE node_id=?').get(nodeId),undefined)
 })
 
 test('refresh tokens rotate once and reject replay',async()=>{
@@ -242,10 +311,10 @@ test('new hosts train automatically, then retraining adds only unseen allow rule
   const secondSweep=await processDueTraining()
   assert.ok(secondSweep.some(result=>result.sessionId===retry.body.id&&result.status==='applying'))
   const second=db.prepare('SELECT * FROM learning_sessions WHERE id=?').get(retry.body.id)
-  assert.notEqual(second.generated_policy_id,first.generated_policy_id)
-  const rules=JSON.parse(db.prepare('SELECT rules_compiled_json FROM policy_versions WHERE policy_id=?').get(second.generated_policy_id).rules_compiled_json)
-  assert.deepEqual(rules.map(rule=>[rule.direction,rule.remotePort,rule.remoteAddress]),[['out','443','192.0.2.20']])
-  assert.equal(db.prepare('SELECT COUNT(*) n FROM policy_assignments WHERE node_id=? AND policy_id IN (?,?)').get(node.body.id,first.generated_policy_id,second.generated_policy_id).n,2)
+  assert.equal(second.generated_policy_id,first.generated_policy_id)
+  const rules=JSON.parse(db.prepare('SELECT v.rules_compiled_json FROM policy_versions v JOIN policies p ON p.current_version_id=v.id WHERE p.id=?').get(second.generated_policy_id).rules_compiled_json)
+  assert.deepEqual(rules.map(rule=>[rule.direction,rule.remotePort,rule.remoteAddress]),[['in','Any','192.0.2.10'],['out','443','192.0.2.20']])
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM policy_assignments WHERE node_id=? AND policy_id=?').get(node.body.id,first.generated_policy_id).n,1)
   await auth(request.patch('/api/v1/settings/training')).send({newHostTrainingDays:30}).expect(200)
 })
 
@@ -269,9 +338,10 @@ test('automatic training remains pending without a working log transport and end
   db.prepare('UPDATE nodes SET agent_id=? WHERE id=?').run(agentId,agentNode.body.id)
   db.prepare('UPDATE learning_sessions SET last_attempt_at=NULL WHERE id=?').run(agentNode.body.training.id)
   const quiet=await processDueTraining()
-  assert.ok(quiet.some(result=>result.sessionId===agentNode.body.training.id&&result.status==='empty'))
-  assert.equal(db.prepare('SELECT firewall_state FROM nodes WHERE id=?').get(agentNode.body.id).firewall_state,'enforcing')
-  assert.equal(db.prepare('SELECT COUNT(*) n FROM policy_assignments WHERE node_id=?').get(agentNode.body.id).n,0)
+  assert.ok(quiet.some(result=>result.sessionId===agentNode.body.training.id&&result.status==='applying'))
+  assert.equal(db.prepare('SELECT firewall_state FROM nodes WHERE id=?').get(agentNode.body.id).firewall_state,'applying')
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM policy_assignments WHERE node_id=?').get(agentNode.body.id).n,1)
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM agent_jobs WHERE agent_id=? AND type='policy.apply'").get(agentId).n,1)
 })
 
 test('due WinRM training collects logs, applies learned rules, and marks the host enforced',async()=>{
@@ -285,11 +355,30 @@ test('due WinRM training collects logs, applies learned rules, and marks the hos
   const stub=path.join(dir,'training-transport')
   const rulesFile=path.join(dir,'training-rules.json')
   fs.writeFileSync(stub,`#!/usr/bin/env node
-const fs=require('fs');let text='';process.stdin.on('data',part=>text+=part);process.stdin.on('end',()=>{const input=JSON.parse(text);const file=process.env.WINFIRE_TEST_RULES_FILE;const existing=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):[];let result;if(input.operation==='events')result=[];else if(input.operation==='rules')result=existing.filter(rule=>rule.group===input.args.group);else if(input.operation==='apply'){const remove=new Set(input.args.remove);const next=existing.filter(rule=>!remove.has(rule.name)).concat(input.args.add);fs.writeFileSync(file,JSON.stringify(next));result={applied:true}}else throw Error('Unexpected operation');process.stdout.write(JSON.stringify(result))})
+const fs=require('fs');let text='';process.stdin.on('data',part=>text+=part);process.stdin.on('end',()=>{const input=JSON.parse(text);const file=process.env.WINFIRE_TEST_RULES_FILE;const existing=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):[];let result;if(input.operation==='audit_policy'){const enabled=process.env.WINFIRE_TEST_AUDIT_DISABLED!=='1'||fs.existsSync(file+'.audit');result={settingValue:enabled?3:0,successEnabled:enabled,failureEnabled:enabled}}else if(input.operation==='audit_policy_enable'){if(process.env.WINFIRE_TEST_AUDIT_ENABLE_FAIL==='1')process.exit(1);fs.writeFileSync(file+'.audit','enabled');result={settingValue:3,successEnabled:true,failureEnabled:true}}else if(input.operation==='events')result=[];else if(input.operation==='rules')result=existing.filter(rule=>rule.group===input.args.group);else if(input.operation==='apply'){const remove=new Set(input.args.remove);const next=existing.filter(rule=>!remove.has(rule.name)).concat(input.args.add);fs.writeFileSync(file,JSON.stringify(next));result={applied:true}}else throw Error('Unexpected operation');process.stdout.write(JSON.stringify(result))})
 `,{mode:0o700})
   const priorPython=process.env.WINRM_PYTHON,priorRules=process.env.WINFIRE_TEST_RULES_FILE
   process.env.WINRM_PYTHON=stub;process.env.WINFIRE_TEST_RULES_FILE=rulesFile
   try {
+    process.env.WINFIRE_TEST_AUDIT_DISABLED='1'
+    assert.equal((await auth(request.get(`/api/v1/nodes/${node.body.id}/audit-policy`)).expect(200)).body.successEnabled,false)
+    const blocked=await processDueTraining()
+    assert.ok(blocked.some(result=>result.sessionId===node.body.training.id&&result.status==='failed'))
+    assert.match(db.prepare('SELECT last_error FROM learning_sessions WHERE id=?').get(node.body.training.id).last_error,/success auditing is disabled/)
+    assert.equal(db.prepare('SELECT status FROM learning_sessions WHERE id=?').get(node.body.training.id).status,'active')
+    await auth(request.post(`/api/v1/nodes/${node.body.id}/audit-policy/enable`)).send({confirmation:'yes'}).expect(400)
+    process.env.WINFIRE_TEST_AUDIT_ENABLE_FAIL='1'
+    await auth(request.post(`/api/v1/nodes/${node.body.id}/audit-policy/enable`)).send({confirmation:'ENABLE WFP AUDITING'}).expect(500)
+    assert.equal(db.prepare("SELECT COUNT(*) n FROM audit_log WHERE action='node.audit-policy.enable.failed' AND entity_id=?").get(node.body.id).n,1)
+    assert.equal(db.prepare("SELECT status FROM policy_apply_runs WHERE node_id=? AND policy_id IS NULL ORDER BY rowid DESC LIMIT 1").get(node.body.id).status,'failed')
+    delete process.env.WINFIRE_TEST_AUDIT_ENABLE_FAIL
+    const enabled=await auth(request.post(`/api/v1/nodes/${node.body.id}/audit-policy/enable`)).send({confirmation:'ENABLE WFP AUDITING'}).expect(200)
+    assert.equal(enabled.body.successEnabled,true)
+    assert.equal((await auth(request.get(`/api/v1/nodes/${node.body.id}/audit-policy`)).expect(200)).body.failureEnabled,true)
+    assert.equal(db.prepare("SELECT COUNT(*) n FROM audit_log WHERE action='node.audit-policy.enable' AND entity_id=?").get(node.body.id).n,1)
+    assert.equal(db.prepare("SELECT status FROM policy_apply_runs WHERE node_id=? AND policy_id IS NULL ORDER BY rowid DESC LIMIT 1").get(node.body.id).status,'success')
+    delete process.env.WINFIRE_TEST_AUDIT_DISABLED
+    db.prepare('UPDATE learning_sessions SET last_attempt_at=NULL WHERE id=?').run(node.body.training.id)
     const results=await processDueTraining()
     assert.ok(results.some(result=>result.sessionId===node.body.training.id&&result.status==='enforced'))
     assert.equal(db.prepare('SELECT firewall_state FROM nodes WHERE id=?').get(node.body.id).firewall_state,'enforcing')
@@ -297,6 +386,8 @@ const fs=require('fs');let text='';process.stdin.on('data',part=>text+=part);pro
     assert.deepEqual(rules.map(rule=>[rule.direction,rule.localPort,rule.remoteAddress]),[['in','8443','192.0.2.50']])
     assert.equal(db.prepare('SELECT status FROM policy_apply_runs WHERE node_id=? ORDER BY started_at DESC LIMIT 1').get(node.body.id).status,'success')
   } finally {
+    delete process.env.WINFIRE_TEST_AUDIT_DISABLED
+    delete process.env.WINFIRE_TEST_AUDIT_ENABLE_FAIL
     if(priorPython===undefined)delete process.env.WINRM_PYTHON;else process.env.WINRM_PYTHON=priorPython
     if(priorRules===undefined)delete process.env.WINFIRE_TEST_RULES_FILE;else process.env.WINFIRE_TEST_RULES_FILE=priorRules
   }
@@ -315,6 +406,129 @@ test('group policy assignments count in coverage and compliance',async()=>{
   const compliance=await auth(request.get('/api/v1/reports/compliance')).expect(200)
   assert.equal(coverage.body.find(row=>row.id===node.body.id).policy_count,1)
   assert.equal(compliance.body.find(row=>row.hostname==='group-coverage').policies,1)
+  assert.equal((await auth(request.get(`/api/v1/nodes/${node.body.id}`)).expect(200)).body.groups.some(item=>item.id===group.body.id),true)
+})
+
+test('group member removal retains membership until its managed rules are cleared',async()=>{
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@example.test',password:'test-password-12345'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
+  const credential=await auth(request.post('/api/v1/credentials')).send({name:'Member removal transport',type:'local',username:'cleanup-user',password:'transport-test-password'}).expect(201)
+  const node=await auth(request.post('/api/v1/nodes')).send({hostname:'member-cleanup',ip:'127.0.0.1',credentialIds:[credential.body.id]}).expect(201)
+  const group=await auth(request.post('/api/v1/node-groups')).send({name:'Member cleanup group'}).expect(201)
+  await auth(request.post(`/api/v1/node-groups/${group.body.id}/members`)).send({nodeId:node.body.id}).expect(200)
+  const policy=await auth(request.post('/api/v1/policies')).send({name:'Member cleanup policy'}).expect(201)
+  await auth(request.post(`/api/v1/policies/${policy.body.id}/versions`)).send({graph:{nodes:[{id:'rule',type:'allow',data:{name:'HTTPS',localPort:'443'}}],edges:[]}}).expect(201)
+  await auth(request.post(`/api/v1/policies/${policy.body.id}/assignments`)).send({nodeGroupId:group.body.id}).expect(201)
+  const rule={name:'HTTPS',group:`WinFireSecure:${policy.body.id}`,action:'allow',direction:'in',protocol:'TCP',localPort:'443',remotePort:'Any',remoteAddress:'Any',program:'Any',profile:'Any'}
+  const rulesFile=path.join(dir,'member-removal-rules.json'),stub=path.join(dir,'member-removal-transport')
+  fs.writeFileSync(rulesFile,JSON.stringify([rule]))
+  fs.writeFileSync(stub,`#!/usr/bin/env node
+const fs=require('fs');let text='';process.stdin.on('data',part=>text+=part);process.stdin.on('end',()=>{const input=JSON.parse(text),file=process.env.WINFIRE_TEST_RULES_FILE,existing=JSON.parse(fs.readFileSync(file,'utf8'));if(input.operation==='rules')return process.stdout.write(JSON.stringify(existing.filter(rule=>rule.group===input.args.group)));if(input.operation!=='apply')throw Error('Unexpected operation');if(process.env.WINFIRE_TEST_APPLY_FAIL==='1')throw Error('simulated cleanup failure');const remove=new Set(input.args.remove);fs.writeFileSync(file,JSON.stringify(existing.filter(rule=>!remove.has(rule.name)).concat(input.args.add)));process.stdout.write('{}')})
+`,{mode:0o700})
+  const priorPython=process.env.WINRM_PYTHON,priorRules=process.env.WINFIRE_TEST_RULES_FILE
+  process.env.WINRM_PYTHON=stub;process.env.WINFIRE_TEST_RULES_FILE=rulesFile
+  db.prepare("UPDATE nodes SET transport='winrm' WHERE id=?").run(node.body.id)
+  try {
+    process.env.WINFIRE_TEST_APPLY_FAIL='1'
+    await auth(request.delete(`/api/v1/node-groups/${group.body.id}/members/${node.body.id}`)).expect(502)
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM node_group_members WHERE group_id=? AND node_id=?').get(group.body.id,node.body.id).n,1)
+    delete process.env.WINFIRE_TEST_APPLY_FAIL
+    const removed=await auth(request.delete(`/api/v1/node-groups/${group.body.id}/members/${node.body.id}`)).expect(200)
+    assert.deepEqual(removed.body.cleanedPolicies,[policy.body.id])
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM node_group_members WHERE group_id=? AND node_id=?').get(group.body.id,node.body.id).n,0)
+    assert.deepEqual(JSON.parse(fs.readFileSync(rulesFile,'utf8')),[])
+  } finally {
+    delete process.env.WINFIRE_TEST_APPLY_FAIL
+    if(priorPython===undefined)delete process.env.WINRM_PYTHON;else process.env.WINRM_PYTHON=priorPython
+    if(priorRules===undefined)delete process.env.WINFIRE_TEST_RULES_FILE;else process.env.WINFIRE_TEST_RULES_FILE=priorRules
+  }
+})
+
+test('policy unassignment removes managed rules only after successful cleanup',async()=>{
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@example.test',password:'test-password-12345'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
+  const credential=await auth(request.post('/api/v1/credentials')).send({name:'Removal transport',type:'local',username:'cleanup-user',password:'transport-test-password'}).expect(201)
+  const node=await auth(request.post('/api/v1/nodes')).send({hostname:'cleanup-winrm',ip:'127.0.0.1',credentialIds:[credential.body.id]}).expect(201)
+  const policy=await auth(request.post('/api/v1/policies')).send({name:'Removal policy'}).expect(201)
+  await auth(request.post(`/api/v1/policies/${policy.body.id}/versions`)).send({graph:{nodes:[{id:'cleanup-rule',type:'allow',data:{name:'HTTPS',localPort:'443'}}],edges:[]}}).expect(201)
+  const assignment=await auth(request.post(`/api/v1/policies/${policy.body.id}/assignments`)).send({nodeId:node.body.id}).expect(201)
+  const rule={name:'HTTPS',group:`WinFireSecure:${policy.body.id}`,action:'allow',direction:'in',protocol:'TCP',localPort:'443',remotePort:'Any',remoteAddress:'Any',program:'Any',profile:'Any'}
+  const rulesFile=path.join(dir,'removal-rules.json'),stub=path.join(dir,'removal-transport')
+  fs.writeFileSync(rulesFile,JSON.stringify([rule]))
+  fs.writeFileSync(stub,`#!/usr/bin/env node
+const fs=require('fs');let text='';process.stdin.on('data',part=>text+=part);process.stdin.on('end',()=>{const input=JSON.parse(text),file=process.env.WINFIRE_TEST_RULES_FILE,existing=JSON.parse(fs.readFileSync(file,'utf8'));if(input.operation==='rules')process.stdout.write(JSON.stringify(existing.filter(rule=>rule.group===input.args.group)));else if(input.operation==='apply'){if(process.env.WINFIRE_TEST_APPLY_FAIL==='1')throw Error('simulated apply failure');const remove=new Set(input.args.remove);fs.writeFileSync(file,JSON.stringify(existing.filter(rule=>!remove.has(rule.name)).concat(input.args.add)));process.stdout.write('{}')}else throw Error('Unexpected operation')})
+`,{mode:0o700})
+  const priorPython=process.env.WINRM_PYTHON,priorRules=process.env.WINFIRE_TEST_RULES_FILE
+  process.env.WINRM_PYTHON=stub;process.env.WINFIRE_TEST_RULES_FILE=rulesFile
+  db.prepare("UPDATE nodes SET transport='winrm' WHERE id=?").run(node.body.id)
+  try {
+    process.env.WINFIRE_TEST_APPLY_FAIL='1'
+    await auth(request.delete(`/api/v1/policies/${policy.body.id}/assignments/${assignment.body.id}`)).expect(502)
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM policy_assignments WHERE id=?').get(assignment.body.id).n,1)
+    assert.equal(JSON.parse(fs.readFileSync(rulesFile,'utf8')).length,1)
+    delete process.env.WINFIRE_TEST_APPLY_FAIL
+    const result=await auth(request.delete(`/api/v1/policies/${policy.body.id}/assignments/${assignment.body.id}`)).expect(200)
+    assert.deepEqual(result.body.cleanedNodes,[node.body.id])
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM policy_assignments WHERE id=?').get(assignment.body.id).n,0)
+    assert.deepEqual(JSON.parse(fs.readFileSync(rulesFile,'utf8')),[])
+    assert.equal(db.prepare('SELECT status FROM policy_apply_runs WHERE policy_id=? AND node_id=? ORDER BY rowid DESC LIMIT 1').get(policy.body.id,node.body.id).status,'success')
+  } finally {
+    delete process.env.WINFIRE_TEST_APPLY_FAIL
+    if(priorPython===undefined)delete process.env.WINRM_PYTHON;else process.env.WINRM_PYTHON=priorPython
+    if(priorRules===undefined)delete process.env.WINFIRE_TEST_RULES_FILE;else process.env.WINFIRE_TEST_RULES_FILE=priorRules
+  }
+})
+
+test('unassignment retains rules covered by another assignment and blocks agent cleanup',async()=>{
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@example.test',password:'test-password-12345'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
+  const node=await auth(request.post('/api/v1/nodes')).send({hostname:'overlap-agent',connectionMode:'agent'}).expect(201)
+  const group=await auth(request.post('/api/v1/node-groups')).send({name:'Overlap group'}).expect(201)
+  await auth(request.post(`/api/v1/node-groups/${group.body.id}/members`)).send({nodeId:node.body.id}).expect(200)
+  const policy=await auth(request.post('/api/v1/policies')).send({name:'Overlap policy'}).expect(201)
+  const direct=await auth(request.post(`/api/v1/policies/${policy.body.id}/assignments`)).send({nodeId:node.body.id}).expect(201)
+  const grouped=await auth(request.post(`/api/v1/policies/${policy.body.id}/assignments`)).send({nodeGroupId:group.body.id}).expect(201)
+  const safe=await auth(request.delete(`/api/v1/policies/${policy.body.id}/assignments/${direct.body.id}`)).expect(200)
+  assert.deepEqual(safe.body.cleanedNodes,[])
+  assert.equal(safe.body.retainedByOtherAssignment,1)
+  await auth(request.delete(`/api/v1/policies/${policy.body.id}/assignments/${grouped.body.id}`)).expect(409)
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM policy_assignments WHERE id=?').get(grouped.body.id).n,1)
+})
+
+test('group unassignment restores earlier hosts when a later host fails',async()=>{
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@example.test',password:'test-password-12345'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
+  const credential=await auth(request.post('/api/v1/credentials')).send({name:'Group cleanup transport',type:'local',username:'cleanup-user',password:'transport-test-password'}).expect(201)
+  const first=await auth(request.post('/api/v1/nodes')).send({hostname:'cleanup-first',ip:'127.0.0.1',credentialIds:[credential.body.id]}).expect(201)
+  const second=await auth(request.post('/api/v1/nodes')).send({hostname:'cleanup-second',ip:'127.0.0.2',credentialIds:[credential.body.id]}).expect(201)
+  const group=await auth(request.post('/api/v1/node-groups')).send({name:'Cleanup rollback group'}).expect(201)
+  for(const node of [first,second]){
+    await auth(request.post(`/api/v1/node-groups/${group.body.id}/members`)).send({nodeId:node.body.id}).expect(200)
+    db.prepare("UPDATE nodes SET transport='winrm' WHERE id=?").run(node.body.id)
+  }
+  const policy=await auth(request.post('/api/v1/policies')).send({name:'Group cleanup rollback'}).expect(201)
+  await auth(request.post(`/api/v1/policies/${policy.body.id}/versions`)).send({graph:{nodes:[{id:'rule',type:'allow',data:{name:'HTTPS',localPort:'443'}}],edges:[]}}).expect(201)
+  const assignment=await auth(request.post(`/api/v1/policies/${policy.body.id}/assignments`)).send({nodeGroupId:group.body.id}).expect(201)
+  const rule={name:'HTTPS',group:`WinFireSecure:${policy.body.id}`,action:'allow',direction:'in',protocol:'TCP',localPort:'443',remotePort:'Any',remoteAddress:'Any',program:'Any',profile:'Any'}
+  const stateFile=path.join(dir,'group-removal-state.json'),stub=path.join(dir,'group-removal-transport')
+  fs.writeFileSync(stateFile,JSON.stringify({hosts:{'127.0.0.1':[rule],'127.0.0.2':[rule]},applyCount:0}))
+  fs.writeFileSync(stub,`#!/usr/bin/env node
+const fs=require('fs');let text='';process.stdin.on('data',part=>text+=part);process.stdin.on('end',()=>{const input=JSON.parse(text),file=process.env.WINFIRE_TEST_RULES_FILE,state=JSON.parse(fs.readFileSync(file,'utf8')),old=state.hosts[input.host]||[];if(input.operation==='rules')return process.stdout.write(JSON.stringify(old.filter(rule=>rule.group===input.args.group)));if(input.operation!=='apply')throw Error('Unexpected operation');state.applyCount++;fs.writeFileSync(file,JSON.stringify(state));if(state.applyCount===2)throw Error('simulated second-host failure');const remove=new Set(input.args.remove);state.hosts[input.host]=old.filter(rule=>!remove.has(rule.name)).concat(input.args.add);fs.writeFileSync(file,JSON.stringify(state));process.stdout.write('{}')})
+`,{mode:0o700})
+  const priorPython=process.env.WINRM_PYTHON,priorRules=process.env.WINFIRE_TEST_RULES_FILE
+  process.env.WINRM_PYTHON=stub;process.env.WINFIRE_TEST_RULES_FILE=stateFile
+  try{
+    const result=await auth(request.delete(`/api/v1/policies/${policy.body.id}/assignments/${assignment.body.id}`)).expect(502)
+    assert.match(result.body.error,/cleanup failed/i)
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM policy_assignments WHERE id=?').get(assignment.body.id).n,1)
+    const state=JSON.parse(fs.readFileSync(stateFile,'utf8'))
+    assert.equal(state.applyCount,3)
+    assert.deepEqual(state.hosts['127.0.0.1'],[rule])
+    assert.deepEqual(state.hosts['127.0.0.2'],[rule])
+  } finally {
+    if(priorPython===undefined)delete process.env.WINRM_PYTHON;else process.env.WINRM_PYTHON=priorPython
+    if(priorRules===undefined)delete process.env.WINFIRE_TEST_RULES_FILE;else process.env.WINFIRE_TEST_RULES_FILE=priorRules
+  }
 })
 
 test('drift checks record unknown agent state and appear in coverage',async()=>{

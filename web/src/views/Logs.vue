@@ -2,15 +2,95 @@
 import {onMounted,ref,computed} from 'vue'
 import PageHeader from '../components/PageHeader.vue'
 import {api} from '../lib/api.js'
-const events=ref([]),nodes=ref([]),nodeId=ref(''),action=ref(''),direction=ref(''),program=ref(''),challengeId=ref(''),from=ref(''),to=ref(''),port=ref(''),error=ref(''),message=ref(''),loading=ref(false),sessions=ref([]),duration=ref(24)
+
+const events=ref([]),nodes=ref([]),sessions=ref([])
+const filters=ref({nodeId:'',eventId:'',action:'',direction:'',srcIp:'',dstIp:'',port:'',program:'',protocol:'',challengeId:'',from:'',to:''})
+const page=ref(1),pageSize=ref(100),total=ref(0),sortBy=ref('time'),sortDir=ref('desc')
+const error=ref(''),message=ref(''),loading=ref(false),duration=ref(24)
+let requestId=0
+const totalPages=computed(()=>Math.max(1,Math.ceil(total.value/pageSize.value)))
+const firstRow=computed(()=>total.value?(page.value-1)*pageSize.value+1:0)
+const lastRow=computed(()=>Math.min(page.value*pageSize.value,total.value))
 const totals=computed(()=>({allowed:events.value.filter(e=>e.action==='allow').length,blocked:events.value.filter(e=>e.action==='block').length}))
-const activeAuto=computed(()=>sessions.value.some(session=>session.node_id===nodeId.value&&session.mode==='auto'&&session.status==='active'))
-async function load(){loading.value=true;try{const query=new URLSearchParams(Object.entries({nodeId:nodeId.value,action:action.value,direction:direction.value,program:program.value,challengeId:challengeId.value,port:port.value,from:from.value?new Date(from.value).toISOString():'',to:to.value?new Date(to.value).toISOString():''}).filter(([,value])=>value!==''));[events.value,sessions.value]=await Promise.all([api(`/logs/search?${query}`),api('/learning-sessions')]);error.value=''}catch(e){error.value=e.message}finally{loading.value=false}}
-function clearFilters(){nodeId.value='';action.value='';direction.value='';program.value='';challengeId.value='';port.value='';from.value='';to.value='';load()}
-async function startLearning(){if(!nodeId.value)return;try{await api('/learning-sessions',{method:'POST',body:{nodeId:nodeId.value,durationHours:Number(duration.value)}});await load()}catch(e){error.value=e.message}}
-async function finalize(session){try{const result=await api(`/learning-sessions/${session.id}/finalize`,{method:'POST',body:{}});message.value=result.status==='empty'?'No supported traffic was observed during this session':`Proposal generated with ${result.ruleCount} rules. Review it in Policy Studio before approval.`;await load()}catch(e){error.value=e.message}}
+const activeAuto=computed(()=>sessions.value.some(session=>session.node_id===filters.value.nodeId&&session.mode==='auto'&&session.status==='active'))
+const nodeName=id=>nodes.value.find(node=>node.id===id)?.hostname||id?.slice(0,8)||'—'
+const columns=[{key:'time',label:'Time'},{key:'node',label:'Node'},{key:'eventId',label:'Event'},{key:'action',label:'Action'},{key:'direction',label:'Direction'},{key:'srcIp',label:'Source'},{key:'dstIp',label:'Destination'},{key:'port',label:'Port'},{key:'program',label:'Program'}]
+function queryString(){
+  const query={page:page.value,pageSize:pageSize.value,sortBy:sortBy.value,sortDir:sortDir.value,...filters.value}
+  for(const key of ['from','to'])if(query[key])query[key]=new Date(query[key]).toISOString()
+  return new URLSearchParams(Object.entries(query).filter(([,value])=>value!==''&&value!==null)).toString()
+}
+async function load(){
+  const current=++requestId
+  loading.value=true
+  try{
+    const [result,loadedSessions]=await Promise.all([api(`/logs/search?${queryString()}`),api('/learning-sessions')])
+    if(current!==requestId)return
+    events.value=result.items;total.value=result.total;sessions.value=loadedSessions;error.value=''
+  }catch(e){if(current===requestId)error.value=e.message}
+  finally{if(current===requestId)loading.value=false}
+}
+function searchEvents(){page.value=1;load()}
+function clearFilters(){filters.value={nodeId:'',eventId:'',action:'',direction:'',srcIp:'',dstIp:'',port:'',program:'',protocol:'',challengeId:'',from:'',to:''};searchEvents()}
+function sort(key){if(sortBy.value===key)sortDir.value=sortDir.value==='asc'?'desc':'asc';else{sortBy.value=key;sortDir.value=key==='time'?'desc':'asc'}page.value=1;load()}
+function changePage(next){if(next<1||next>totalPages.value||loading.value)return;page.value=next;load()}
+async function startLearning(){if(!filters.value.nodeId)return;try{await api('/learning-sessions',{method:'POST',body:{nodeId:filters.value.nodeId,durationHours:Number(duration.value)}});await load()}catch(e){error.value=e.message}}
+async function finalize(session){try{const result=await api(`/learning-sessions/${session.id}/finalize`,{method:'POST',body:{}});message.value=`Proposal generated with ${result.ruleCount} rules. Review it in Policy Studio before approval.`;await load()}catch(e){error.value=e.message}}
 async function approve(session){try{const result=await api(`/learning-sessions/${session.id}/approve`,{method:'POST',body:{}});message.value=result.status==='enforced'?'Learned policy applied':result.status==='applying'?'Policy queued for agent application':'Policy apply failed; review the run before retrying';await load()}catch(e){error.value=e.message}}
-async function pull(){if(!nodeId.value)return;try{await api('/logs/pull',{method:'POST',body:{nodeId:nodeId.value}});await load()}catch(e){error.value=e.message}}
-onMounted(async()=>{nodes.value=await api('/nodes');await load()})
+async function pull(){if(!filters.value.nodeId)return;try{await api('/logs/pull',{method:'POST',body:{nodeId:filters.value.nodeId}});searchEvents()}catch(e){error.value=e.message}}
+onMounted(async()=>{try{nodes.value=await api('/nodes');await load()}catch(e){error.value=e.message}})
 </script>
-<template><div class="view"><PageHeader eyebrow="OBSERVABILITY / EVENTS" title="Firewall events" description="Search collected traffic and train a policy from observed flows"><button class="button secondary" :disabled="!nodeId" @click="pull"><i class="mdi mdi-download-network-outline"></i> Pull from node</button><button class="button primary" @click="load"><i class="mdi mdi-refresh"></i> Refresh</button></PageHeader><div v-if="error" class="error-msg">{{error}}</div><div v-if="message" class="success-msg">{{message}}</div><div class="metric-grid compact"><div class="metric glass"><div class="metric-top"><span>EVENTS IN VIEW</span><i class="mdi mdi-text-box-search-outline"></i></div><strong>{{events.length}}</strong></div><div class="metric glass"><div class="metric-top"><span>ALLOWED</span><i class="mdi mdi-check"></i></div><strong>{{totals.allowed}}</strong></div><div class="metric glass"><div class="metric-top"><span>BLOCKED</span><i class="mdi mdi-cancel"></i></div><strong>{{totals.blocked}}</strong></div><div class="metric glass"><div class="metric-top"><span>LEARNING SESSIONS</span><i class="mdi mdi-brain"></i></div><strong>{{sessions.length}}</strong></div></div><section class="panel glass"><div class="panel-title"><div><span class="eyebrow">EVENT SEARCH</span><h2>Traffic log</h2></div><div class="table-tools"><select v-model="nodeId" @change="load"><option value="">All nodes</option><option v-for="node in nodes" :key="node.id" :value="node.id">{{node.hostname}}</option></select><select v-model="action" @change="load"><option value="">All actions</option><option value="allow">Allow</option><option value="block">Block</option><option value="success">Logon success</option><option value="failure">Logon failure</option></select><input v-model="port" type="number" min="1" max="65535" placeholder="Port" @keyup.enter="load"><button class="icon-button" @click="load" title="Search"><i class="mdi mdi-magnify"></i></button></div></div><form class="log-filters" @submit.prevent="load"><label>Direction<select v-model="direction"><option value="">Any direction</option><option value="in">Inbound</option><option value="out">Outbound</option></select></label><label>Program<input v-model.trim="program" placeholder="Exact program path"></label><label>Challenge ID<input v-model.trim="challengeId" placeholder="MFA challenge ID"></label><label>From<input v-model="from" type="datetime-local"></label><label>To<input v-model="to" type="datetime-local"></label><button class="button small primary" :disabled="loading">Search events</button><button type="button" class="button small secondary" @click="clearFilters">Clear filters</button></form><div class="table-wrap"><table><thead><tr><th>TIME</th><th>NODE</th><th>EVENT</th><th>ACTION</th><th>DIRECTION</th><th>SOURCE</th><th>DESTINATION</th><th>PORT</th><th>PROGRAM</th></tr></thead><tbody><tr v-for="event in events" :key="event.id"><td>{{new Date(event.event_time||event.received_at).toLocaleString()}}</td><td class="mono">{{nodes.find(n=>n.id===event.node_id)?.hostname||event.node_id?.slice(0,8)}}</td><td>{{event.event_id}}</td><td><span class="status" :class="event.action">{{event.action}}</span></td><td>{{event.direction||'—'}}</td><td class="mono">{{event.src_ip||'—'}}</td><td class="mono">{{event.dst_ip||'—'}}</td><td class="mono">{{event.dst_port||'—'}}</td><td class="mono">{{event.program||'—'}}</td></tr><tr v-if="!events.length"><td colspan="9" class="empty-table">No events found. Pull the Windows Security log or adjust filters.</td></tr></tbody></table></div></section><section class="panel glass"><div class="panel-title"><div><span class="eyebrow">POLICY DISCOVERY</span><h2>Learning sessions</h2></div><div class="table-tools"><input v-model.number="duration" type="number" min="1" max="720" aria-label="Duration in hours" style="width:90px"><span class="hint">hours</span><button class="button small secondary" :disabled="!nodeId" @click="startLearning">{{activeAuto?'Switch to manual review':'Start manual learning'}}</button></div></div><div v-for="session in sessions" :key="session.id" class="history-row"><div><strong>{{nodes.find(n=>n.id===session.node_id)?.hostname||session.node_id}}</strong><small>{{session.mode==='auto'?'Automatic':'Manual review'}} · {{session.status}} · ends {{new Date(session.ends_at).toLocaleString()}}</small><small v-if="session.last_error" class="danger-text">{{session.last_error}}</small></div><router-link v-if="session.generated_policy_id" class="button small secondary" :to="{path:'/policies',query:{policyId:session.generated_policy_id}}">Review policy</router-link><button v-if="session.status==='active'&&session.mode!=='auto'" class="button small secondary" @click="finalize(session)">Generate proposal</button><button v-if="['review','apply-failed'].includes(session.status)" class="button small primary" @click="approve(session)">{{session.mode==='auto'?'Retry apply':'Approve and apply'}}</button></div><div v-if="!sessions.length" class="empty-side">No learning sessions yet.</div></section></div></template>
+
+<template>
+  <div class="view">
+    <PageHeader eyebrow="OBSERVABILITY / EVENTS" title="Firewall events" description="Search collected traffic and train a policy from observed flows">
+      <button class="button secondary" :disabled="!filters.nodeId" @click="pull"><i class="mdi mdi-download-network-outline"></i> Pull from node</button>
+      <button class="button primary" :disabled="loading" @click="load"><i class="mdi mdi-refresh"></i> Refresh</button>
+    </PageHeader>
+    <div v-if="error" class="error-msg" role="alert">{{error}}</div>
+    <div v-if="message" class="success-msg">{{message}}</div>
+    <div class="metric-grid compact">
+      <div class="metric glass"><div class="metric-top"><span>EVENTS MATCHING</span><i class="mdi mdi-text-box-search-outline"></i></div><strong>{{total}}</strong></div>
+      <div class="metric glass"><div class="metric-top"><span>ALLOWED ON PAGE</span><i class="mdi mdi-check"></i></div><strong>{{totals.allowed}}</strong></div>
+      <div class="metric glass"><div class="metric-top"><span>BLOCKED ON PAGE</span><i class="mdi mdi-cancel"></i></div><strong>{{totals.blocked}}</strong></div>
+      <div class="metric glass"><div class="metric-top"><span>LEARNING SESSIONS</span><i class="mdi mdi-brain"></i></div><strong>{{sessions.length}}</strong></div>
+    </div>
+    <section class="panel glass">
+      <div class="panel-title"><div><span class="eyebrow">EVENT SEARCH</span><h2>Traffic log</h2></div><div class="table-tools"><label class="page-size">Rows per page <select v-model.number="pageSize" @change="searchEvents"><option :value="25">25</option><option :value="50">50</option><option :value="100">100</option><option :value="200">200</option><option :value="500">500</option></select></label></div></div>
+      <form class="log-filters" @submit.prevent="searchEvents">
+        <label>Protocol<input v-model.trim="filters.protocol" placeholder="TCP, UDP…"></label>
+        <label>Challenge ID<input v-model.trim="filters.challengeId" placeholder="MFA challenge ID"></label>
+        <label>From<input v-model="filters.from" type="datetime-local"></label>
+        <label>To<input v-model="filters.to" type="datetime-local"></label>
+        <button class="button small primary" :disabled="loading">Apply filters</button>
+        <button type="button" class="button small secondary" @click="clearFilters">Clear filters</button>
+      </form>
+      <div class="table-wrap events-table-wrap"><table class="events-table"><thead>
+        <tr><th v-for="column in columns" :key="column.key" :aria-sort="sortBy===column.key?(sortDir==='asc'?'ascending':'descending'):undefined"><button type="button" class="sort-heading" :aria-label="`Sort by ${column.label}`" @click="sort(column.key)">{{column.label}} <i :class="sortBy===column.key?(sortDir==='asc'?'mdi mdi-arrow-up':'mdi mdi-arrow-down'):'mdi mdi-swap-vertical'"></i></button></th></tr>
+        <tr class="column-filters">
+          <th><span class="filter-hint">Use dates above</span></th>
+          <th><select v-model="filters.nodeId" aria-label="Filter node" @change="searchEvents"><option value="">All nodes</option><option v-for="node in nodes" :key="node.id" :value="node.id">{{node.hostname}}</option></select></th>
+          <th><input v-model="filters.eventId" type="number" min="0" placeholder="ID" aria-label="Filter event ID" @keyup.enter="searchEvents"></th>
+          <th><select v-model="filters.action" aria-label="Filter action" @change="searchEvents"><option value="">All</option><option value="allow">Allow</option><option value="block">Block</option><option value="success">Success</option><option value="failure">Failure</option></select></th>
+          <th><select v-model="filters.direction" aria-label="Filter direction" @change="searchEvents"><option value="">All</option><option value="in">Inbound</option><option value="out">Outbound</option></select></th>
+          <th><input v-model.trim="filters.srcIp" placeholder="Source IP" aria-label="Filter source IP" @keyup.enter="searchEvents"></th>
+          <th><input v-model.trim="filters.dstIp" placeholder="Destination IP" aria-label="Filter destination IP" @keyup.enter="searchEvents"></th>
+          <th><input v-model="filters.port" type="number" min="1" max="65535" placeholder="Port" aria-label="Filter destination port" @keyup.enter="searchEvents"></th>
+          <th><input v-model.trim="filters.program" placeholder="Program" aria-label="Filter program" @keyup.enter="searchEvents"></th>
+        </tr>
+      </thead><tbody>
+        <tr v-for="event in events" :key="event.id"><td>{{new Date(event.event_time||event.received_at).toLocaleString()}}</td><td class="mono">{{nodeName(event.node_id)}}</td><td>{{event.event_id}}</td><td><span class="status" :class="event.action">{{event.action}}</span></td><td>{{event.direction||'—'}}</td><td class="mono">{{event.src_ip||'—'}}</td><td class="mono">{{event.dst_ip||'—'}}</td><td class="mono">{{event.dst_port||'—'}}</td><td class="mono">{{event.program||'—'}}</td></tr>
+        <tr v-if="!events.length"><td colspan="9" class="empty-table">{{loading?'Loading events…':'No events found. Pull the Windows Security log or adjust filters.'}}</td></tr>
+      </tbody></table></div>
+      <div class="event-pagination" role="navigation" aria-label="Firewall events pages"><span>Showing {{firstRow}}–{{lastRow}} of {{total}}</span><div><button type="button" class="button small secondary" :disabled="page<=1||loading" @click="changePage(page-1)">Previous</button><span>Page {{page}} of {{totalPages}}</span><button type="button" class="button small secondary" :disabled="page>=totalPages||loading" @click="changePage(page+1)">Next</button></div></div>
+    </section>
+    <section class="panel glass"><div class="panel-title"><div><span class="eyebrow">POLICY DISCOVERY</span><h2>Learning sessions</h2></div><div class="table-tools"><input v-model.number="duration" type="number" min="1" max="720" aria-label="Duration in hours" style="width:90px"><span class="hint">hours</span><button class="button small secondary" :disabled="!filters.nodeId" @click="startLearning">{{activeAuto?'Switch to manual review':'Start manual learning'}}</button></div></div><div v-for="session in sessions" :key="session.id" class="history-row"><div><strong>{{nodeName(session.node_id)}}</strong><small>{{session.mode==='auto'?'Automatic':'Manual review'}} · {{session.status}} · ends {{new Date(session.ends_at).toLocaleString()}}</small><small v-if="session.last_error" class="danger-text">{{session.last_error}}</small></div><router-link v-if="session.generated_policy_id" class="button small secondary" :to="{path:'/policies',query:{policyId:session.generated_policy_id}}">Review policy</router-link><button v-if="session.status==='active'&&session.mode!=='auto'" class="button small secondary" @click="finalize(session)">Generate proposal</button><button v-if="['review','apply-failed'].includes(session.status)" class="button small primary" @click="approve(session)">{{session.mode==='auto'?'Retry apply':'Approve and apply'}}</button></div><div v-if="!sessions.length" class="empty-side">No learning sessions yet.</div></section>
+  </div>
+</template>
+
+<style scoped>
+.page-size{display:flex;align-items:center;gap:.55rem;white-space:nowrap;font-size:.8rem}.page-size select{min-width:75px}
+.events-table{min-width:1150px}.events-table th{white-space:nowrap}.sort-heading{display:flex;align-items:center;gap:.4rem;border:0;background:none;color:inherit;font:inherit;font-weight:700;text-transform:uppercase;cursor:pointer;padding:0}.sort-heading i{font-size:1rem;opacity:.7}.sort-heading:hover,.sort-heading:focus-visible{color:var(--accent,#3864ae)}
+.column-filters th{padding:.45rem .35rem}.column-filters input,.column-filters select{width:100%;min-width:85px;box-sizing:border-box;font-size:.75rem}.column-filters th:first-child{min-width:130px}.column-filters th:nth-child(2){min-width:125px}.column-filters th:last-child{min-width:180px}.filter-hint{font-size:.72rem;font-weight:400;text-transform:none;opacity:.75}.event-pagination{display:flex;justify-content:space-between;align-items:center;gap:1rem;padding:.85rem 1rem;font-size:.8rem}.event-pagination>div{display:flex;align-items:center;gap:.7rem}
+@media(max-width:700px){.event-pagination{flex-direction:column;align-items:flex-start}.log-filters{grid-template-columns:repeat(auto-fit,minmax(130px,1fr))}}
+</style>

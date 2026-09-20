@@ -6,12 +6,14 @@ import path from 'node:path'
 import {fileURLToPath} from 'node:url'
 import {all, one, run, parse, now, audit} from './db.js'
 import {openSealed} from './security.js'
+import {breakGlassFunctions} from './breakGlassScript.js'
 
 const timeoutMs = 40000
 const pause=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds))
 const transientError=error=>/timed?\s*out|timeout|ECONNRESET|ECONNREFUSED|Max retries exceeded|unreachable/i.test(error?.message||'')
-export function recordNodeSuccess(nodeId) {
-  run("UPDATE nodes SET failures=0,status='reachable',next_retry_at=NULL,last_seen_at=? WHERE id=?",now(),nodeId)
+export function recordNodeSuccess(nodeId,probeStatus=null) {
+  if(probeStatus)run("UPDATE nodes SET failures=0,status='reachable',next_retry_at=NULL,last_seen_at=?,probe_status=?,last_probe_at=? WHERE id=?",now(),probeStatus,now(),nodeId)
+  else run("UPDATE nodes SET failures=0,status='reachable',next_retry_at=NULL,last_seen_at=? WHERE id=?",now(),nodeId)
 }
 export function recordNodeTransportFailure(nodeId) {
   const node=one('SELECT failures FROM nodes WHERE id=?',nodeId)
@@ -73,6 +75,15 @@ try {
   $result=Invoke-Command -Session $session -ArgumentList @($payload.operation,$payload.args) -ScriptBlock {
     param($operation,$argsData)
     $ErrorActionPreference='Stop'
+    function Get-WinFireAuditPolicy {
+      if(-not ('WinFireAuditPolicyQuery' -as [type])) {
+        $source='using System; using System.ComponentModel; using System.Runtime.InteropServices; public static class WinFireAuditPolicyQuery { [DllImport("advapi32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.U1)] private static extern bool AuditQuerySystemPolicy([In] Guid[] ids, uint count, out IntPtr policy); [DllImport("advapi32.dll")] private static extern void AuditFree(IntPtr policy); public static int Read(string text) { Guid id=new Guid(text); IntPtr policy; if(!AuditQuerySystemPolicy(new Guid[]{id},1,out policy)) throw new Win32Exception(Marshal.GetLastWin32Error()); try { if(policy==IntPtr.Zero || Marshal.PtrToStructure<Guid>(policy)!=id) throw new InvalidOperationException("Audit policy query returned an unexpected subcategory"); return Marshal.ReadInt32(policy,16); } finally { if(policy!=IntPtr.Zero) AuditFree(policy); } } }'
+        Add-Type -TypeDefinition $source -ErrorAction Stop
+      }
+      $setting=[WinFireAuditPolicyQuery]::Read('0CCE9226-69AE-11D9-BED3-505054503030')
+      [pscustomobject]@{subcategoryGuid='0CCE9226-69AE-11D9-BED3-505054503030';settingValue=$setting;successEnabled=[bool]($setting -band 1);failureEnabled=[bool]($setting -band 2)}
+    }
+    ${breakGlassFunctions}
     switch($operation) {
       'auth' { [Security.Principal.WindowsIdentity]::GetCurrent().Name }
       'facts' {
@@ -115,6 +126,10 @@ try {
     @{applied = $true}
   }
   'events' { $after=[long]$argsData.after; $xpath="*[System[((EventID=5156 or EventID=5157 or EventID=5150 or EventID=5151 or EventID=4624 or EventID=4625 or EventID=5712) and EventRecordID > $after)]]"; @(Get-WinEvent -LogName Security -FilterXPath $xpath -Oldest -MaxEvents 500 -ErrorAction SilentlyContinue | ForEach-Object { $event=$_; $xml=[xml]$event.ToXml(); $fields=@{}; foreach($data in @($xml.Event.EventData.Data)) { if($data.Name) {$fields[$data.Name]=[string]$data.'#text'} }; [pscustomobject]@{RecordId=$event.RecordId;Id=$event.Id;TimeCreated=$event.TimeCreated.ToUniversalTime().ToString('o');Fields=$fields} }) }
+      'audit_policy' { Get-WinFireAuditPolicy }
+      'breakglass_start' { Start-WinFireBreakGlass $argsData }
+      'breakglass_end' { End-WinFireBreakGlass $argsData }
+      'audit_policy_enable' { $before=Get-WinFireAuditPolicy; if($before.successEnabled -and $before.failureEnabled){$before}else{try{auditpol /set '/subcategory:{0CCE9226-69AE-11D9-BED3-505054503030}' /success:enable /failure:enable | Out-Null; if($LASTEXITCODE -ne 0){throw "auditpol update failed with exit code $LASTEXITCODE"}; $after=Get-WinFireAuditPolicy; if(-not ($after.successEnabled -and $after.failureEnabled)){throw 'Audit policy readback did not confirm success and failure auditing'}; $after}catch{$cause=$_.Exception.Message; $successArg=if($before.successEnabled){'/success:enable'}else{'/success:disable'}; $failureArg=if($before.failureEnabled){'/failure:enable'}else{'/failure:disable'}; auditpol /set '/subcategory:{0CCE9226-69AE-11D9-BED3-505054503030}' $successArg $failureArg | Out-Null; if($LASTEXITCODE -ne 0){throw "Audit policy update failed: $cause; rollback failed with exit code $LASTEXITCODE"}; $restored=Get-WinFireAuditPolicy; if($restored.settingValue -ne $before.settingValue){throw "Audit policy update failed: $cause; rollback readback differs from prior state"}; throw "Audit policy update failed: $cause; prior state restored"}} }
       'rights' { $file=Join-Path $env:TEMP ('winfire-'+[guid]::NewGuid().ToString()+'.inf'); try {secedit /export /mergedpolicy /cfg $file /areas USER_RIGHTS | Out-Null; if($LASTEXITCODE -ne 0){throw "secedit export failed with exit code $LASTEXITCODE"}; $content=@(Get-Content $file); $rights=@($content | Where-Object {$_ -match '^\\s*Se\\w*LogonRight\\s*='}); if(!$rights.Count){throw "secedit export contained no logon rights across $($content.Count) lines"}; $rights} finally {Remove-Item $file -Force -ErrorAction SilentlyContinue} }
       default { throw 'Unsupported operation' }
     }
@@ -133,17 +148,17 @@ export async function remote(node,operation,args={},options={}) {
   let lastError
   for (const credential of nodeCredential(node.id,options.credentialId)) {
     const input={host,transport:node.transport||'winrm',username:credential.username,password:credential.secret.password,operation,args}
-    const attempts=operation==='apply'?1:2
+    const attempts=operation==='apply'||operation.startsWith('breakglass_')?1:2
     for(let attempt=0;attempt<attempts;attempt++){
       try {
         const result=process.platform==='win32' ? await pwsh(remoteScript,input) : await pywinrm(input)
-        recordNodeSuccess(node.id)
+        recordNodeSuccess(node.id,input.transport==='winrms'?'winrms-authenticated':'winrm-authenticated')
         return result
       }
       catch(error) {
         lastError=error
         if(!transientError(error))break
-        if(operation==='apply'){
+        if(operation==='apply'||operation.startsWith('breakglass_')){
           recordNodeTransportFailure(node.id)
           throw error // Outcome may be ambiguous; re-read state before retrying.
         }
@@ -154,7 +169,13 @@ export async function remote(node,operation,args={},options={}) {
   if(transientError(lastError))recordNodeTransportFailure(node.id)
   throw lastError
 }
-export async function probeNode(node) {
+export function classifyProbe(transport,rpc,winrmAuthenticated=false) {
+  if(transport==='wmi')return typeof rpc==='string'?{status:'reachable',probeStatus:'rpc-authenticated'}:{status:'unverified',probeStatus:'rpc-unverified'}
+  if(winrmAuthenticated&&['winrm','winrms'].includes(transport))return {status:'reachable',probeStatus:`${transport}-authenticated`}
+  if(transport)return {status:'port-open',probeStatus:'port-open'}
+  return {status:'unreachable',probeStatus:'unreachable'}
+}
+export async function probeNode(node,{verifyWinrm=true}={}) {
   const host=node.fqdn || node.ip || node.hostname
   const winrm=await tcpProbe(host,5985)
   const winrms=await tcpProbe(host,5986)
@@ -162,10 +183,15 @@ export async function probeNode(node) {
   const transport=winrms.status==='open'?'winrms':winrm.status==='open'?'winrm':wmi.status==='open'?'wmi':null
   let rpc=null
   if(transport==='wmi')try{rpc=await rpcProbe(host,node.id)}catch(error){rpc={error:error.message}}
-  const status=transport==='wmi'?(typeof rpc==='string'?'rpc-authenticated':'unverified'):transport?'port-open':'unreachable'
-  run('UPDATE nodes SET transport=?,status=?,last_seen_at=?,failures=?,next_retry_at=NULL WHERE id=?',transport,status,transport?now():node.last_seen_at,transport?0:(node.failures||0)+1,node.id)
-  audit(null,'node.probe','node',node.id,null,{transport,status})
-  return {transport,status,ports:{winrm,winrms,wmi},rpc,note:transport==='wmi'?'RPC authentication checked; WMI/DCOM operations remain unverified.':transport?'WinRM port is open; authenticate and collect facts to verify access.':'No supported management port responded.'}
+  let winrmAuthenticated=false,winrmError=null
+  if(verifyWinrm&&['winrm','winrms'].includes(transport)){
+    try{await remote({...node,transport},'auth');winrmAuthenticated=true}
+    catch(error){winrmError=error.message}
+  }
+  const {status,probeStatus}=classifyProbe(transport,rpc,winrmAuthenticated),probedAt=now()
+  run('UPDATE nodes SET transport=?,status=?,probe_status=?,last_probe_at=?,last_seen_at=?,failures=?,next_retry_at=NULL WHERE id=?',transport,status,probeStatus,probedAt,transport?probedAt:node.last_seen_at,transport?0:(node.failures||0)+1,node.id)
+  audit(null,'node.probe','node',node.id,null,{transport,status,probeStatus})
+  return {transport,status,probeStatus,ports:{winrm,winrms,wmi},rpc,winrmAuthenticated,winrmError,note:transport==='wmi'?'RPC authentication checked; WMI/DCOM operations remain unverified.':winrmAuthenticated?'WinRM authentication confirmed.':transport?'WinRM port is open; authentication was not confirmed.':'No supported management port responded.'}
 }
 export async function collectFacts(node) {
   const facts=await remote(node,'facts')
@@ -175,7 +201,7 @@ export async function collectFacts(node) {
 }
 export async function enrichNode(node) {
   if(node.connection_mode==='agent')throw new Error('Agent nodes require agent-reported facts')
-  const probe=await probeNode(node)
+  const probe=await probeNode(node,{verifyWinrm:false})
   if(!['winrm','winrms'].includes(probe.transport))throw new Error('No working WinRM transport for inventory collection')
   return collectFacts(one('SELECT * FROM nodes WHERE id=?',node.id))
 }

@@ -12,4 +12,7 @@
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.12" />
     <PackageReference Include="System.Diagnostics.EventLog" Version="10.0.12" />
   </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="../../packages/shared/breakGlass.ps1" LogicalName="WinFire.Agent.BreakGlass.ps1" />
+  </ItemGroup>
 </Project>

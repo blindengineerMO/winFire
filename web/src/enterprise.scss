@@ -126,19 +126,23 @@
 :root[data-theme=enterprise] .hacker-dashboard{display:none}
 :root[data-theme=enterprise] .dashboard-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
 :root[data-theme=enterprise] .metric{background:#f1f2f4}
-:root[data-theme=enterprise] .login-screen{background:#eceef1;grid-template-columns:minmax(0,1.05fr) minmax(340px,520px);padding:clamp(18px,5vw,70px);gap:clamp(20px,5vw,95px)}
-:root[data-theme=enterprise] .login-art{background:#252a40;border-radius:6px;padding:clamp(24px,5vw,70px);min-height:590px;color:#f6f8fb}
-:root[data-theme=enterprise] .login-art h1{font-size:clamp(2.4rem,4vw,4.5rem);color:#fff}
-:root[data-theme=enterprise] .login-art h1 em{color:#72c7a1}
-:root[data-theme=enterprise] .login-art p{color:#d6dce8}
+:root[data-theme=enterprise] .login-screen{background-image:linear-gradient(90deg,rgba(248,251,253,.91) 0%,rgba(248,251,253,.72) 28%,rgba(248,251,253,.18) 64%,rgba(238,247,252,.08) 100%),url('/enterprise-login-light.png');background-size:cover;background-position:center;grid-template-columns:minmax(0,1fr) minmax(340px,480px);padding:clamp(24px,5vw,105px);gap:clamp(24px,5vw,100px)}
+:root[data-theme=enterprise] .login-art{min-height:0;max-width:800px;padding:0;color:#1e344d}
+:root[data-theme=enterprise] .login-art h1{font-size:clamp(2.8rem,4vw,4.7rem);color:#17314c;text-shadow:0 1px 0 #ffffff88}
+:root[data-theme=enterprise] .login-art h1 em{color:#26745e}
+:root[data-theme=enterprise] .login-art p{color:#304b60;font-weight:600;max-width:520px}
 :root[data-theme=enterprise] .login-grid{display:none}
-:root[data-theme=enterprise] .login-form{background:#f8f9fa;border:1px solid #d5dce2;box-shadow:0 10px 30px #42536b1e;color:#273d5d}
+:root[data-theme=enterprise] .login-form{background:#fffffff2;border:1px solid #ffffffd9;box-shadow:0 24px 70px #1e3c5a40;backdrop-filter:blur(18px);color:#273d5d}
 :root[data-theme=enterprise] .login-form h2{color:#263b5c}
 :root[data-theme=enterprise] .login-form label{color:#4a6079}
 :root[data-theme=enterprise] .login-form small{color:#65758a}
-:root[data-theme=enterprise] .login-symbol{color:#72c7a1}
+:root[data-theme=enterprise] .login-symbol{display:grid;place-items:center;width:100px;height:100px;margin-bottom:28px;border-radius:16px;background:#23364e;box-shadow:0 14px 30px #1939583b;filter:none}
+:root[data-theme=enterprise] .login-symbol img{width:84px;height:84px}
+:root[data-theme=enterprise] .enterprise-brand-mark{width:42px;height:42px;flex:none}
+:root[data-theme=enterprise] .enterprise-brand-mark img{display:block;width:100%;height:100%;object-fit:contain}
 
 @media(max-width:1250px){:root[data-theme=enterprise] .enterprise-flow{gap:14px}:root[data-theme=enterprise] .enterprise-distribution{grid-template-columns:1fr 1fr}:root[data-theme=enterprise] .enterprise-data-summary{grid-column:1/-1;min-height:0}}
 @media(max-width:900px){:root[data-theme=enterprise] .enterprise-flow{grid-template-columns:1fr 1fr;align-items:stretch}:root[data-theme=enterprise] .enterprise-flow-assets,:root[data-theme=enterprise] .enterprise-flow-progress{grid-template-columns:repeat(3,1fr)}:root[data-theme=enterprise] .enterprise-flow-assets,:root[data-theme=enterprise] .enterprise-flow-progress{grid-column:1/-1}:root[data-theme=enterprise] .enterprise-overview{min-height:0}:root[data-theme=enterprise] .enterprise-distribution{grid-template-columns:1fr}:root[data-theme=enterprise] .enterprise-data-summary{grid-column:auto}}
 @media(max-width:700px){:root[data-theme=enterprise] .shell{display:block}:root[data-theme=enterprise] .enterprise-side{position:fixed;z-index:30;top:0;left:0;width:220px;transform:translateX(-230px);transition:transform .2s}:root[data-theme=enterprise] .enterprise-side.side-open{transform:none}:root[data-theme=enterprise] .page-wrap{padding:0 12px}:root[data-theme=enterprise] .top{height:63px}:root[data-theme=enterprise] .top .breadcrumb strong{font-size:.95rem}:root[data-theme=enterprise] .panel-title{flex-wrap:wrap}:root[data-theme=enterprise] .enterprise-flow{grid-template-columns:1fr}:root[data-theme=enterprise] .enterprise-flow-outcomes{grid-column:auto}:root[data-theme=enterprise] .enterprise-flow-breakdown{grid-column:auto}:root[data-theme=enterprise] .login-screen{grid-template-columns:1fr;display:grid;padding:15px}:root[data-theme=enterprise] .login-art{min-height:230px;padding:27px}:root[data-theme=enterprise] .login-art h1{font-size:2.2rem}:root[data-theme=enterprise] .login-symbol{display:none}}
 @media(max-width:480px){:root[data-theme=enterprise] .enterprise-flow-assets,:root[data-theme=enterprise] .enterprise-flow-progress{grid-template-columns:1fr}:root[data-theme=enterprise] .enterprise-donut-row{flex-direction:column;align-items:flex-start}:root[data-theme=enterprise] .enterprise-data-card{padding:18px}:root[data-theme=enterprise] .enterprise-data-summary{grid-column:auto}:root[data-theme=enterprise] .environment{display:none}:root[data-theme=enterprise] .table-tools{min-width:0;width:100%}:root[data-theme=enterprise] .table-tools .search{width:100%;flex:1}}
+@media(max-width:900px){:root[data-theme=enterprise] .login-screen{display:flex;flex-direction:column;align-items:stretch;justify-content:center;min-height:100svh;padding:clamp(20px,5vw,44px);gap:24px;background-position:42% center}:root[data-theme=enterprise] .login-art{margin:0;min-height:0;padding:0}:root[data-theme=enterprise] .login-art h1{font-size:clamp(2.2rem,6vw,3.3rem)}:root[data-theme=enterprise] .login-form{width:100%;max-width:500px;margin:0}:root[data-theme=enterprise] .login-symbol{display:grid;width:68px;height:68px;margin-bottom:16px;border-radius:11px}:root[data-theme=enterprise] .login-symbol img{width:58px;height:58px}}

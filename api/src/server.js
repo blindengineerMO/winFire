@@ -3,7 +3,7 @@ import path from 'node:path'
 import {fileURLToPath} from 'node:url'
 import express from 'express'
 import https from 'node:https'
-import {app,runVerification,runDriftCheck,pullLogs,finalizeLearning,processDueTraining,syncDirectory} from './app.js'
+import {app,runVerification,runDriftCheck,pullLogs,processDueTraining,processDueBreakGlass,syncDirectory} from './app.js'
 import {bootstrap,ensureBootstrapAdmin} from './security.js'
 import {all,one,run,now,audit} from './db.js'
 import {agentTlsOptions} from './agentPki.js'
@@ -36,6 +36,17 @@ async function sweepTraining(){
 setTimeout(sweepTraining,1000).unref()
 const trainingTimer=setInterval(sweepTraining,Math.max(1,Number(process.env.TRAINING_SWEEP_INTERVAL_MINUTES||5))*60*1000)
 trainingTimer.unref()
+let breakGlassRunning=false
+async function sweepBreakGlass(){
+  if(breakGlassRunning)return
+  breakGlassRunning=true
+  try{await processDueBreakGlass()}
+  catch(error){console.error('Break-glass sweep failed:',error)}
+  finally{breakGlassRunning=false}
+}
+setTimeout(sweepBreakGlass,1000).unref()
+const breakGlassTimer=setInterval(sweepBreakGlass,60_000)
+breakGlassTimer.unref()
 let inventoryRunning=false
 async function sweepNewNodes(){
   if(inventoryRunning)return
@@ -76,13 +87,7 @@ async function sweepDns(){
 setTimeout(sweepDns,5000).unref()
 const dnsTimer=setInterval(sweepDns,15*60_000)
 dnsTimer.unref()
-const timer=setInterval(()=>{
-  pruneOldEvents()
-  for(const session of all("SELECT id FROM learning_sessions WHERE status='active' AND ends_at<?",now())){
-    try {finalizeLearning(session.id)}
-    catch(error){audit(null,'learning.finalize.failed','learning-session',session.id,null,{error:error.message})}
-  }
-},60*60*1000)
+const timer=setInterval(()=>pruneOldEvents(),60*60*1000)
 timer.unref()
 const agentHealth=setInterval(()=>sweepAgentHealth(),60_000)
 agentHealth.unref()

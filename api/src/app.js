@@ -22,6 +22,9 @@ import {readDirectoryComputers,testDirectoryConnection} from './directory.js'
 import {observabilitySettings} from './maintenance.js'
 import {resourceRecord,canReadResource,canWriteResource} from './access.js'
 import {emitNotification,notificationSummary,preferenceKeys} from './notifications.js'
+import {buildOpenApi} from './openapi.js'
+import {parseSeceditRights} from './logonRights.js'
+import {normalizeProfileSnapshot,publicBreakGlass} from './breakGlass.js'
 
 export const app=express()
 app.disable('x-powered-by')
@@ -34,7 +37,7 @@ const wrap=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next)
 const body=(schema,req)=>schema.parse(req.body)
 const reqId=req=>String(req.params.id)
 const notFound=(res,label='Record')=>res.status(404).json({error:`${label} not found`})
-const latestTraining=nodeId=>one('SELECT id,mode,status,started_at,ends_at,generated_policy_id,last_error FROM learning_sessions WHERE node_id=? ORDER BY started_at DESC,rowid DESC LIMIT 1',nodeId)
+const latestTraining=nodeId=>one('SELECT id,mode,status,started_at,ends_at,generated_policy_id,last_error,progressive_enabled,progressive_start_at,progressive_interval_hours,next_progressive_at,last_progressive_at FROM learning_sessions WHERE node_id=? ORDER BY started_at DESC,rowid DESC LIMIT 1',nodeId)
 const latestVerification=nodeId=>one('SELECT status,reason,run_at FROM verifier_results WHERE node_id=? ORDER BY run_at DESC,rowid DESC LIMIT 1',nodeId)||null
 function policyVerification(policyId){
   const latest=one('SELECT run_id FROM verifier_results WHERE policy_id=? ORDER BY run_at DESC,rowid DESC LIMIT 1',policyId)
@@ -46,7 +49,14 @@ const publicNode=node=>node && ({...node,failures:Number(node.failures),facts:pa
 const canUseCredential=(user,credential)=>credential&&(user.role==='owner'||user.role==='admin'||credential.owner_user_id===user.id||credential.visibility==='team'&&credential.team_id&&credential.team_id===user.team_id||canWriteResource(user,'credential',credential))
 function getNode(idValue) {return one('SELECT * FROM nodes WHERE id=?',idValue)}
 function getPolicy(idValue) {return one('SELECT * FROM policies WHERE id=?',idValue)}
+function hasActiveLearning(policyId) {return !!one("SELECT id FROM learning_sessions WHERE generated_policy_id=? AND status='active'",policyId)}
+function readablePolicyIds(user) {return new Set(all('SELECT * FROM policies').filter(policy=>canReadResource(user,'policy',policy)).map(policy=>policy.id))}
 function trainingDays() {return Number(one("SELECT value FROM app_settings WHERE key='new_host_training_days'")?.value||30)}
+function progressiveSettings() {return {
+  enabled:one("SELECT value FROM app_settings WHERE key='progressive_learning_enabled'")?.value==='true',
+  startDays:Number(one("SELECT value FROM app_settings WHERE key='progressive_learning_start_days'")?.value||15),
+  intervalHours:Number(one("SELECT value FROM app_settings WHERE key='progressive_learning_interval_hours'")?.value||24)
+}}
 const directorySettings=()=>one("SELECT * FROM directory_connections WHERE id='default'")
 const publicDirectory=settings=>settings&&({url:settings.url||'',baseDn:settings.base_dn||'',bindCredentialId:settings.bind_credential_id||null,nodeCredentialId:settings.node_credential_id||null,enabled:!!settings.enabled,syncIntervalMinutes:settings.sync_interval_minutes,allowLdapFallback:!!settings.allow_ldap_fallback,ldapFallbackApprovedBy:settings.ldap_fallback_approved_by||null,ldapFallbackApprovedAt:settings.ldap_fallback_approved_at||null,lastTransport:settings.last_transport||null,lastSyncedAt:settings.last_synced_at,lastSyncAttemptAt:settings.last_sync_attempt_at,lastSyncStatus:settings.last_sync_status,lastSyncError:settings.last_sync_error,lastSyncCount:settings.last_sync_count})
 function directoryCredential(settings) {
@@ -56,11 +66,21 @@ function directoryCredential(settings) {
 }
 function startTraining(node,days,mode,actorId=null) {
   if(one("SELECT id FROM learning_sessions WHERE node_id=? AND status IN ('active','review','applying','apply-failed')",node.id))throw Object.assign(new Error('Finish the current learning session before starting another'),{status:409})
-  const sessionId=id(),endsAt=new Date(Date.now()+days*864e5).toISOString()
-  run('INSERT INTO learning_sessions(id,node_id,ends_at,status,mode) VALUES(?,?,?,?,?)',sessionId,node.id,endsAt,'active',mode)
+  const sessionId=id(),endsAt=new Date(Date.now()+days*864e5).toISOString(),policy=ensurePersonalPolicy(node,actorId)
+  const progressive=progressiveSettings(),progressiveEnabled=mode==='auto'&&progressive.enabled&&days>progressive.startDays
+  const progressiveStartAt=progressiveEnabled?new Date(Date.now()+progressive.startDays*864e5).toISOString():null
+  run('INSERT INTO learning_sessions(id,node_id,ends_at,status,mode,generated_policy_id,progressive_enabled,progressive_start_at,progressive_interval_hours,next_progressive_at) VALUES(?,?,?,?,?,?,?,?,?,?)',sessionId,node.id,endsAt,'active',mode,policy.id,Number(progressiveEnabled),progressiveStartAt,progressiveEnabled?progressive.intervalHours:null,progressiveStartAt)
   run("UPDATE nodes SET firewall_state='learning' WHERE id=?",node.id)
-  audit(actorId,'learning.start','node',node.id,null,{sessionId,endsAt,days,mode})
-  return {id:sessionId,nodeId:node.id,endsAt,days,mode,status:'active'}
+  audit(actorId,'learning.start','node',node.id,null,{sessionId,endsAt,days,mode,policyId:policy.id,progressiveEnabled})
+  return {id:sessionId,nodeId:node.id,endsAt,days,mode,status:'active',generatedPolicyId:policy.id,progressiveEnabled}
+}
+function ensurePersonalPolicy(node,actorId=null) {
+  const existing=one("SELECT * FROM policies WHERE origin='learned' AND source_node_id=?",node.id)
+  if(existing)return existing
+  const policyId=id(),versionId=id(),empty={nodes:[],edges:[]}
+  run("INSERT INTO policies(id,name,description,owner_user_id,current_version_id,origin,source_node_id) VALUES(?,?,?,?,?,'learned',?)",policyId,`Learned ${node.hostname}`,`Personal learned firewall policy for ${node.hostname}`,actorId,versionId,node.id)
+  run('INSERT INTO policy_versions(id,policy_id,version_no,graph_json,rules_compiled_json,created_by,comment) VALUES(?,?,?,?,?,?,?)',versionId,policyId,1,json(empty),json([]),actorId,'Learning started')
+  return getPolicy(policyId)
 }
 async function requestEmailVerification(user,email,actorId) {
   if(!process.env.SMTP_HOST)throw Object.assign(new Error('Email verification requires SMTP configuration'),{status:503})
@@ -85,13 +105,15 @@ function assignmentConflicts(policyId,rules,nodes) {
   return conflicts
 }
 function rejectConflicts(res,conflicts) {return res.status(409).json({error:'Conflicting firewall rules on assigned nodes',conflicts})}
-async function applyPolicy(policy,actorId=null) {
+async function applyPolicy(policy,actorId=null,targetNodes=null,context={}) {
+  if(one('SELECT id FROM policy_assignments WHERE policy_id=? AND removal_job_id IS NOT NULL',policy.id))throw Object.assign(new Error('Wait for pending agent firewall cleanup before applying this policy'),{status:409})
   const version=one('SELECT * FROM policy_versions WHERE id=? AND policy_id=?',policy.current_version_id,policy.id)
   if (!version) throw Object.assign(new Error('Policy has no version'),{status:400})
   const rules=parse(version.rules_compiled_json)||[], results=[]
-  const conflicts=assignmentConflicts(policy.id,rules,assignedNodes(policy.id))
+  const targets=targetNodes||assignedNodes(policy.id)
+  const conflicts=assignmentConflicts(policy.id,rules,targets)
   if(conflicts.length)throw Object.assign(new Error('Conflicting firewall rules on assigned nodes'),{status:409,conflicts})
-  for (const node of assignedNodes(policy.id)) {
+  for (const node of targets) {
     const runId=id()
     run('INSERT INTO policy_apply_runs(id,policy_id,version_id,node_id,status) VALUES(?,?,?,?,?)',runId,policy.id,version.id,node.id,'running')
     try {
@@ -99,7 +121,7 @@ async function applyPolicy(policy,actorId=null) {
         const agent=one('SELECT * FROM agents WHERE id=? AND revoked_at IS NULL',node.agent_id)
         if(!agent)throw new Error('No active enrolled agent for node')
         const jobId=id()
-        run('INSERT INTO agent_jobs(id,agent_id,type,payload_json) VALUES(?,?,?,?)',jobId,agent.id,'policy.apply',json({applyRunId:runId,policyId:policy.id,versionId:version.id,group:`WinFireSecure:${policy.id}`,rules}))
+        run('INSERT INTO agent_jobs(id,agent_id,type,payload_json) VALUES(?,?,?,?)',jobId,agent.id,'policy.apply',json({applyRunId:runId,policyId:policy.id,versionId:version.id,group:`WinFireSecure:${policy.id}`,rules,...context}))
         run("UPDATE policy_apply_runs SET status='queued' WHERE id=?",runId)
         audit(actorId,'policy.apply.queued','node',node.id,null,{policyId:policy.id,versionId:version.id,jobId})
         results.push({nodeId:node.id,status:'queued',jobId})
@@ -119,7 +141,7 @@ async function applyPolicy(policy,actorId=null) {
 }
 
 api.get('/health',(req,res)=>res.json({status:'ok',service:'winfire',time:now()}))
-api.get('/openapi.json',(req,res)=>res.json({openapi:'3.1.0',info:{title:'WinFire Secure API',version:'0.1.0'},servers:[{url:'/api/v1'}],paths:{'/health':{get:{responses:{200:{description:'Healthy'}}}},'/auth/login':{post:{responses:{200:{description:'Access and refresh tokens'}}}},'/nodes':{get:{security:[{bearerAuth:[]}],responses:{200:{description:'Node inventory'}}}},'/policies':{get:{security:[{bearerAuth:[]}],responses:{200:{description:'Policies'}}}}},components:{securitySchemes:{bearerAuth:{type:'http',scheme:'bearer',bearerFormat:'JWT'}}}}))
+api.get('/openapi.json',(_req,res)=>res.json(buildOpenApi(api,agentRoutes)))
 const loginLimit=rateLimit({windowMs:15*60*1000,limit:Number(process.env.AUTH_RATE_LIMIT||20),standardHeaders:'draft-8',legacyHeaders:false})
 api.post('/auth/login',loginLimit,wrap(async(req,res)=>{
   const {email,password,totp}=body(z.object({email:z.email(),password:z.string().min(1),totp:z.string().optional()}),req)
@@ -341,7 +363,7 @@ api.get('/access/users',requireRole('editor'),(req,res)=>res.json(all('SELECT id
 api.get('/access/resources',requireRole('editor'),(req,res)=>{
   const resources=[
     ...all('SELECT id,name,owner_user_id FROM policies').map(item=>({...item,type:'policy'})),
-    ...all('SELECT id,name,owner_user_id FROM node_groups').map(item=>({...item,type:'node_group'})),
+    ...all("SELECT id,name,owner_user_id FROM node_groups WHERE id<>'winfire-global-all-nodes'").map(item=>({...item,type:'node_group'})),
     ...all('SELECT id,name,owner_user_id FROM credentials').map(item=>({...item,type:'credential'}))
   ]
   res.json(resources.filter(item=>canWriteResource(req.user,item.type,item)).map(({id,name,type})=>({id,name,type})).sort((a,b)=>a.type.localeCompare(b.type)||a.name.localeCompare(b.name)))
@@ -355,6 +377,7 @@ api.get('/access/grants',requireRole('editor'),(req,res)=>{
 })
 api.post('/access/grants',requireRole('editor'),(req,res)=>{
   const data=body(z.object({type:resourceType,resourceId:z.string().min(1),userId:z.string().min(1),permission:z.enum(['read','write'])}),req)
+  if(data.type==='node_group'&&data.resourceId==='winfire-global-all-nodes')return res.status(409).json({error:'Global policy scope is managed by administrators'})
   const resource=resourceRecord(data.type,data.resourceId);if(!resource)return notFound(res,'Resource')
   if(!canWriteResource(req.user,data.type,resource))return res.status(403).json({error:'Insufficient permission'})
   const grantee=one('SELECT id,role,suspended FROM users WHERE id=?',data.userId);if(!grantee)return notFound(res,'User')
@@ -375,13 +398,20 @@ api.delete('/access/grants/:id',requireRole('editor'),(req,res)=>{
   res.status(204).end()
 })
 api.get('/audit',requireRole('auditor'),(req,res)=>res.json(all('SELECT * FROM audit_log ORDER BY at DESC LIMIT 500')))
-api.get('/settings/training',(_req,res)=>res.json({newHostTrainingDays:trainingDays()}))
+const publicTrainingSettings=()=>({newHostTrainingDays:trainingDays(),progressiveLearning:progressiveSettings()})
+api.get('/settings/training',(_req,res)=>res.json(publicTrainingSettings()))
 api.patch('/settings/training',requireRole('admin'),(req,res)=>{
-  const {newHostTrainingDays}=body(z.object({newHostTrainingDays:z.number().int().min(1).max(365)}),req)
-  const before=trainingDays()
-  run("UPDATE app_settings SET value=? WHERE key='new_host_training_days'",String(newHostTrainingDays))
-  audit(req.user.id,'training.settings.update','app-settings','new_host_training_days',{days:before},{days:newHostTrainingDays})
-  res.json({newHostTrainingDays})
+  const data=body(z.object({newHostTrainingDays:z.number().int().min(1).max(365),progressiveLearning:z.object({enabled:z.boolean(),startDays:z.number().int().min(1).max(364),intervalHours:z.number().int().min(1).max(168)}).optional()}),req)
+  const before=publicTrainingSettings()
+  if(data.progressiveLearning?.enabled&&data.progressiveLearning.startDays>=data.newHostTrainingDays)return res.status(400).json({error:'Progressive learning must start before the training period ends'})
+  db.transaction(()=>{
+    run("UPDATE app_settings SET value=? WHERE key='new_host_training_days'",String(data.newHostTrainingDays))
+    if(data.progressiveLearning){
+      for(const [key,value] of [['progressive_learning_enabled',data.progressiveLearning.enabled],['progressive_learning_start_days',data.progressiveLearning.startDays],['progressive_learning_interval_hours',data.progressiveLearning.intervalHours]])run('UPDATE app_settings SET value=? WHERE key=?',String(value),key)
+    }
+    audit(req.user.id,'training.settings.update','app-settings','training',before,{newHostTrainingDays:data.newHostTrainingDays,progressiveLearning:data.progressiveLearning||before.progressiveLearning})
+  })()
+  res.json(publicTrainingSettings())
 })
 api.get('/settings/observability',requireRole('admin'),(_req,res)=>res.json(observabilitySettings()))
 api.patch('/settings/observability',requireRole('admin'),(req,res)=>{
@@ -535,17 +565,157 @@ api.post('/nodes',requireRole('editor'),wrap(async(req,res)=>{
   })()
   const node=getNode(nodeId),dns=await lookupDns(node);res.status(201).json({...node,dns,training})
 }))
-api.get('/nodes/:id',(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json({...node,ad:parse(node.ad_snapshot_json),training:latestTraining(node.id)||null,verification:latestVerification(node.id),facts:parse(one('SELECT snapshot_json FROM node_facts WHERE node_id=?',node.id)?.snapshot_json),dns:one('SELECT * FROM dns_lookups WHERE node_id=?',node.id)})})
+api.get('/nodes/:id',(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json({...node,ad:parse(node.ad_snapshot_json),training:latestTraining(node.id)||null,verification:latestVerification(node.id),facts:parse(one('SELECT snapshot_json FROM node_facts WHERE node_id=?',node.id)?.snapshot_json),dns:one('SELECT * FROM dns_lookups WHERE node_id=?',node.id),groups:all('SELECT g.* FROM node_groups g JOIN node_group_members m ON m.group_id=g.id WHERE m.node_id=? ORDER BY g.name',node.id).filter(group=>canReadResource(req.user,'node_group',group)).map(group=>({id:group.id,name:group.name,canWrite:canWriteResource(req.user,'node_group',group)}))})})
 api.post('/nodes/:id/training',requireRole('editor'),(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
   const {durationDays}=body(z.object({durationDays:z.number().int().min(1).max(365)}),req)
   const session=db.transaction(()=>startTraining(node,durationDays,'auto',req.user.id))()
   res.status(201).json(session)
 })
-api.patch('/nodes/:id',requireRole('editor'),(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');const data=body(z.object({hostname:z.string().min(1).optional(),fqdn:z.string().nullable().optional(),ip:z.string().nullable().optional(),connectionMode:z.enum(['agentless','agent']).optional()}),req);run('UPDATE nodes SET hostname=?,fqdn=?,ip=?,connection_mode=? WHERE id=?',data.hostname||node.hostname,data.fqdn===undefined?node.fqdn:data.fqdn,data.ip===undefined?node.ip:data.ip,data.connectionMode||node.connection_mode,node.id);audit(req.user.id,'node.update','node',node.id,node,data);res.json(getNode(node.id))})
-api.delete('/nodes/:id',requireRole('admin'),(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');run('DELETE FROM nodes WHERE id=?',node.id);audit(req.user.id,'node.delete','node',node.id,node,null);res.status(204).end()})
+api.patch('/nodes/:id',requireRole('editor'),wrap(async(req,res)=>{
+  const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
+  const data=body(z.object({hostname:z.string().trim().min(1).optional(),fqdn:z.string().trim().nullable().optional(),ip:z.string().refine(value=>isIP(value)!==0,'Invalid IP address').nullable().optional(),connectionMode:z.enum(['agentless','agent']).optional()}),req)
+  const hostname=data.hostname??node.hostname,fqdn=data.fqdn===undefined?node.fqdn:data.fqdn,ip=data.ip===undefined?node.ip:data.ip,mode=data.connectionMode||node.connection_mode
+  if(node.ad_guid&&(hostname!==node.hostname||fqdn!==node.fqdn))return res.status(409).json({error:'Active Directory manages this computer name and FQDN; edit them in the directory'})
+  if(mode==='agent'&&!node.agent_id)return res.status(409).json({error:'Enroll an agent before switching to agent mode'})
+  if(mode==='agentless'&&node.agent_id)return res.status(409).json({error:'Revoke the agent before switching to agentless mode'})
+  const targetChanged=(fqdn||ip||hostname)!==(node.fqdn||node.ip||node.hostname)
+  if(targetChanged&&one('SELECT id FROM policy_assignments WHERE node_id=? OR node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?)',node.id,node.id))return res.status(409).json({error:'Remove assigned policies before changing the management address; existing firewall rules may still be present on the old host'})
+  const identityChanged=hostname!==node.hostname||fqdn!==node.fqdn||ip!==node.ip
+  db.transaction(()=>{
+    run('UPDATE nodes SET hostname=?,fqdn=?,ip=?,connection_mode=?,transport=?,status=?,failures=?,next_retry_at=? WHERE id=?',hostname,fqdn,ip,mode,targetChanged?null:node.transport,targetChanged?'unknown':node.status,targetChanged?0:node.failures,targetChanged?null:node.next_retry_at,node.id)
+    if(targetChanged)run('DELETE FROM node_facts WHERE node_id=?',node.id)
+    audit(req.user.id,'node.update','node',node.id,node,{hostname,fqdn,ip,connectionMode:mode,targetChanged})
+  })()
+  if(identityChanged)await lookupDns(getNode(node.id))
+  res.json(getNode(node.id))
+}))
+api.delete('/nodes/:id',requireRole('admin'),(req,res)=>{
+  const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
+  if(node.ad_guid)return res.status(409).json({error:'This computer is managed by Active Directory and will be imported again. Remove it from the directory search scope first.'})
+  if(one('SELECT id FROM agents WHERE node_id=? AND revoked_at IS NULL',node.id))return res.status(409).json({error:'Revoke the enrolled agent before removing this node'})
+  if(one("SELECT id FROM break_glass_sessions WHERE node_id=? AND status IN ('activating','activation-unknown','active','ending')",node.id))return res.status(409).json({error:'End break glass before removing this node'})
+  if(one('SELECT id FROM identity_segments WHERE node_id=?',node.id))return res.status(409).json({error:'Remove identity segments for this node before deleting it'})
+  if(one('SELECT id FROM policy_assignments WHERE node_id=? OR node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?)',node.id,node.id))return res.status(409).json({error:'Remove policy assignments for this node and its groups before deleting it; managed firewall rules may still be present on the host'})
+  db.transaction(()=>{
+    run('DELETE FROM credential_assignments WHERE node_id=?',node.id)
+    run('DELETE FROM enrollment_tokens WHERE node_id=?',node.id)
+    run('DELETE FROM node_group_members WHERE node_id=?',node.id)
+    run('DELETE FROM learning_sessions WHERE node_id=?',node.id)
+    run('DELETE FROM agent_jobs WHERE agent_id IN (SELECT id FROM agents WHERE node_id=?)',node.id)
+    run('DELETE FROM agents WHERE node_id=?',node.id)
+    run('DELETE FROM nodes WHERE id=?',node.id)
+    audit(req.user.id,'node.delete','node',node.id,node,{inventoryRemoved:true,historyRetained:true})
+  })()
+  res.status(204).end()
+})
 api.post('/nodes/:id/probe',requireRole('editor'),wrap(async(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json(await probeNode(node))}))
+function queueBreakGlassJob(node,type,payload){
+  const agent=one('SELECT id,last_checkin_at FROM agents WHERE id=? AND revoked_at IS NULL',node.agent_id)
+  if(!agent)throw Object.assign(new Error('No active agent is enrolled on this node'),{status:409})
+  if(!agent.last_checkin_at||Date.parse(agent.last_checkin_at)<Date.now()-5*60_000)throw Object.assign(new Error('Agent is offline; break glass requires an online agent'),{status:409})
+  const jobId=id()
+  run('INSERT INTO agent_jobs(id,agent_id,type,payload_json) VALUES(?,?,?,?)',jobId,agent.id,type,json(payload))
+  return jobId
+}
+async function endBreakGlass(session,actorId=null,finalStatus='ended'){
+  const node=getNode(session.node_id)
+  if(!node)throw Object.assign(new Error('Node is missing'),{status:404})
+  if(node.connection_mode==='agent'){
+    if(session.status==='ending')return {queued:true,session:publicBreakGlass(session)}
+    const jobId=queueBreakGlassJob(node,'breakglass.end',{action:'end',breakGlassSessionId:session.id,sessionId:session.id,profiles:parse(session.profile_snapshot_json)||[],finalStatus})
+    run("UPDATE break_glass_sessions SET status='ending',agent_job_id=?,last_error=NULL WHERE id=?",jobId,session.id)
+    audit(actorId,'break-glass.end.queued','node',node.id,null,{sessionId:session.id,jobId,finalStatus})
+    return {queued:true,session:publicBreakGlass(one('SELECT * FROM break_glass_sessions WHERE id=?',session.id))}
+  }
+  try{
+    const result=await remote(node,'breakglass_end',{sessionId:session.id,profiles:parse(session.profile_snapshot_json)||[]})
+    if(result?.restored!==true)throw new Error('Firewall profile restore was not confirmed')
+    run('UPDATE break_glass_sessions SET status=?,ended_at=?,last_error=NULL WHERE id=?',finalStatus,now(),session.id)
+    audit(actorId,finalStatus==='expired'?'break-glass.expired':'break-glass.end','node',node.id,null,{sessionId:session.id,profiles:result.profiles})
+    return {queued:false,session:publicBreakGlass(one('SELECT * FROM break_glass_sessions WHERE id=?',session.id))}
+  }catch(error){
+    run('UPDATE break_glass_sessions SET last_error=? WHERE id=?',error.message,session.id)
+    audit(actorId,'break-glass.end.failed','node',node.id,null,{sessionId:session.id,error:error.message})
+    throw Object.assign(new Error(`Firewall restoration was not confirmed: ${error.message}`),{status:502})
+  }
+}
+api.get('/nodes/:id/break-glass',requireRole('admin'),(req,res)=>{
+  const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
+  const sessions=all('SELECT * FROM break_glass_sessions WHERE node_id=? ORDER BY started_at DESC LIMIT 10',node.id).map(publicBreakGlass)
+  res.json({active:sessions.find(session=>['activating','activation-unknown','active','ending'].includes(session.status))||null,history:sessions})
+})
+api.post('/nodes/:id/break-glass',requireRole('admin'),wrap(async(req,res)=>{
+  const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
+  const data=body(z.object({durationMinutes:z.number().int().min(5).max(240),reason:z.string().trim().min(10).max(500),confirmation:z.literal('OPEN FIREWALL')}),req)
+  if(node.connection_mode!=='agent'&&!['winrm','winrms'].includes(node.transport))return res.status(409).json({error:'Break glass requires WinRM or an enrolled agent'})
+  if(one("SELECT id FROM break_glass_sessions WHERE node_id=? AND status IN ('activating','activation-unknown','active','ending')",node.id))return res.status(409).json({error:'Break glass is already active or pending for this node'})
+  const sessionId=id(),startedAt=now(),expiresAt=new Date(Date.now()+data.durationMinutes*60_000).toISOString()
+  run("INSERT INTO break_glass_sessions(id,node_id,actor_user_id,reason,started_at,expires_at,status) VALUES(?,?,?,?,?,?,'activating')",sessionId,node.id,req.user.id,data.reason,startedAt,expiresAt)
+  audit(req.user.id,'break-glass.request','node',node.id,null,{sessionId,reason:data.reason,durationMinutes:data.durationMinutes,expiresAt})
+  try{
+    if(node.connection_mode==='agent'){
+      const jobId=queueBreakGlassJob(node,'breakglass.start',{action:'start',breakGlassSessionId:sessionId,sessionId,expiresAt})
+      run('UPDATE break_glass_sessions SET agent_job_id=? WHERE id=?',jobId,sessionId)
+      return res.status(202).json({queued:true,session:publicBreakGlass(one('SELECT * FROM break_glass_sessions WHERE id=?',sessionId))})
+    }
+    const result=await remote(node,'breakglass_start',{sessionId,expiresAt})
+    const profiles=normalizeProfileSnapshot(result?.profiles)
+    if(result?.active!==true||!profiles)throw new Error('Firewall disable readback or profile snapshot was invalid')
+    run("UPDATE break_glass_sessions SET status='active',profile_snapshot_json=? WHERE id=?",json(profiles),sessionId)
+    audit(req.user.id,'break-glass.active','node',node.id,null,{sessionId,expiresAt,profiles})
+    res.status(201).json({queued:false,session:publicBreakGlass(one('SELECT * FROM break_glass_sessions WHERE id=?',sessionId))})
+  }catch(error){
+    run('UPDATE break_glass_sessions SET status=?,last_error=? WHERE id=?',node.connection_mode==='agent'?'failed':'activation-unknown',error.message,sessionId)
+    audit(req.user.id,'break-glass.start.failed','node',node.id,null,{sessionId,error:error.message})
+    res.status(error.status||502).json({error:error.message})
+  }
+}))
+api.post('/nodes/:id/break-glass/end',requireRole('admin'),wrap(async(req,res)=>{
+  const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
+  const {sessionId}=body(z.object({sessionId:z.string().uuid()}),req)
+  const session=one('SELECT * FROM break_glass_sessions WHERE id=? AND node_id=?',sessionId,node.id)
+  if(!session)return notFound(res,'Break-glass session')
+  if(!['activating','activation-unknown','active','ending'].includes(session.status))return res.status(409).json({error:'Break glass is not active'})
+  if(session.status==='activating'&&node.connection_mode==='agent'){
+    const job=one('SELECT status FROM agent_jobs WHERE id=?',session.agent_job_id)
+    if(job?.status==='queued'){
+      run("UPDATE agent_jobs SET status='failed',error='Cancelled before activation',finished_at=? WHERE id=?",now(),session.agent_job_id)
+      run("UPDATE break_glass_sessions SET status='ended',ended_at=? WHERE id=?",now(),session.id)
+      audit(req.user.id,'break-glass.cancel','node',node.id,null,{sessionId:session.id})
+      return res.json({queued:false,session:publicBreakGlass(one('SELECT * FROM break_glass_sessions WHERE id=?',session.id))})
+    }
+    return res.status(409).json({error:'Wait for the agent to finish activating break glass before ending it'})
+  }
+  const result=await endBreakGlass(session,req.user.id)
+  res.status(result.queued?202:200).json(result)
+}))
 api.get('/nodes/:id/facts',(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json(parse(one('SELECT snapshot_json FROM node_facts WHERE node_id=?',node.id)?.snapshot_json)||{})})
+api.get('/nodes/:id/audit-policy',wrap(async(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');if(node.connection_mode==='agent')return res.status(409).json({error:'Audit policy inspection requires a WinRM node'});res.json(await remote(node,'audit_policy'))}))
+api.post('/nodes/:id/audit-policy/enable',requireRole('admin'),wrap(async(req,res)=>{
+  const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
+  if(node.connection_mode==='agent')return res.status(409).json({error:'Audit policy changes require a WinRM node'})
+  body(z.object({confirmation:z.literal('ENABLE WFP AUDITING')}),req)
+  const runId=id()
+  run('INSERT INTO policy_apply_runs(id,node_id,status) VALUES(?,?,?)',runId,node.id,'running')
+  let before=null
+  try {
+    before=await remote(node,'audit_policy')
+    const after=await remote(node,'audit_policy_enable')
+    if(after?.successEnabled!==true||after?.failureEnabled!==true)throw Object.assign(new Error('Audit policy readback did not confirm success and failure auditing'),{status:502})
+    db.transaction(()=>{
+      run('UPDATE policy_apply_runs SET status=?,diff_json=?,finished_at=? WHERE id=?','success',json({operation:'audit_policy_enable',before,after}),now(),runId)
+      audit(req.user.id,'node.audit-policy.enable','node',node.id,before,{...after,runId})
+    })()
+    res.json(after)
+  } catch(error){
+    db.transaction(()=>{
+      run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?','failed',error.message,now(),runId)
+      audit(req.user.id,'node.audit-policy.enable.failed','node',node.id,before,{runId,error:error.message})
+    })()
+    throw error
+  }
+}))
 api.post('/nodes/:id/facts/refresh',requireRole('editor'),wrap(async(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');const facts=await collectFacts(node);audit(req.user.id,'node.facts.refresh','node',node.id,null,facts);res.json(facts)}))
 api.get('/nodes/:id/firewall-rules',wrap(async(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
@@ -564,6 +734,7 @@ api.post('/node-groups/:id/members',requireRole('editor'),(req,res)=>{
   if(!group)return notFound(res,'Node group')
   if(!canWriteResource(req.user,'node_group',group))return res.status(403).json({error:'Insufficient permission for node group'})
   const assigned=all(`SELECT DISTINCT p.id,p.name,v.rules_compiled_json FROM policies p JOIN policy_assignments a ON a.policy_id=p.id JOIN policy_versions v ON v.id=p.current_version_id WHERE a.node_group_id=?`,group.id)
+  if(assigned.some(policy=>one('SELECT id FROM policy_assignments WHERE policy_id=? AND removal_job_id IS NOT NULL',policy.id)))return res.status(409).json({error:'Wait for pending agent firewall cleanup before changing this group'})
   const conflicts=[]
   for(const policy of assigned)conflicts.push(...assignmentConflicts(policy.id,parse(policy.rules_compiled_json)||[],[node]))
   for(let i=0;i<assigned.length;i++)for(let j=i+1;j<assigned.length;j++)for(const match of findRuleConflicts(parse(assigned[i].rules_compiled_json)||[],parse(assigned[j].rules_compiled_json)||[]))conflicts.push({nodeId:node.id,hostname:node.hostname,otherPolicyId:assigned[j].id,otherPolicy:assigned[j].name,...match})
@@ -571,14 +742,66 @@ api.post('/node-groups/:id/members',requireRole('editor'),(req,res)=>{
   run('INSERT OR IGNORE INTO node_group_members(group_id,node_id) VALUES(?,?)',group.id,nodeId)
   audit(req.user.id,'node-group.member','node-group',group.id,null,{nodeId});res.json({ok:true})
 })
+api.delete('/node-groups/:id/members/:nodeId',requireRole('editor'),wrap(async(req,res)=>{
+  const group=one('SELECT * FROM node_groups WHERE id=?',reqId(req)),node=getNode(req.params.nodeId)
+  if(!group)return notFound(res,'Node group')
+  if(!node)return notFound(res,'Node')
+  if(group.id==='winfire-global-all-nodes')return res.status(409).json({error:'Every node belongs to the global policy scope'})
+  if(!canWriteResource(req.user,'node_group',group))return res.status(403).json({error:'Insufficient permission for node group'})
+  if(!one('SELECT 1 FROM node_group_members WHERE group_id=? AND node_id=?',group.id,node.id))return notFound(res,'Group membership')
+  const policies=all('SELECT DISTINCT p.* FROM policies p JOIN policy_assignments a ON a.policy_id=p.id WHERE a.node_group_id=?',group.id)
+  if(policies.some(policy=>!canWriteResource(req.user,'policy',policy)))return res.status(403).json({error:'Write access to each assigned policy is required to remove this member'})
+  if(policies.some(policy=>one('SELECT id FROM policy_assignments WHERE policy_id=? AND removal_job_id IS NOT NULL',policy.id)))return res.status(409).json({error:'Wait for pending agent firewall cleanup before changing this group'})
+  const cleanup=policies.filter(policy=>!one(`SELECT a.id FROM policy_assignments a WHERE a.policy_id=? AND (a.node_id=? OR a.node_group_id IN (SELECT m.group_id FROM node_group_members m WHERE m.node_id=? AND m.group_id<>?))`,policy.id,node.id,node.id,group.id))
+  if(cleanup.length&&node.connection_mode==='agent')return res.status(409).json({error:'Removing an agent node from a policy group needs coordinated agent cleanup and is not available yet'})
+  const snapshots=[]
+  try {
+    for(const policy of cleanup){
+      const observed=await remote(node,'rules',{group:`WinFireSecure:${policy.id}`})
+      snapshots.push({policy,rules:Array.isArray(observed)?observed:observed?[observed]:[]})
+    }
+  } catch(error){return res.status(502).json({error:`Could not read managed rules before membership removal: ${error.message}`})}
+  const completed=[]
+  for(const snapshot of snapshots){
+    const runId=id()
+    run('INSERT INTO policy_apply_runs(id,policy_id,version_id,node_id,status) VALUES(?,?,?,?,?)',runId,snapshot.policy.id,snapshot.policy.current_version_id,node.id,'running')
+    try {completed.push({...snapshot,runId,diff:await applyRules(node,snapshot.policy.id,[])})}
+    catch(error){
+      run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?','failed',error.message,now(),runId)
+      const rollbackErrors=[]
+      for(const prior of completed.reverse()){
+        try {await applyRules(node,prior.policy.id,prior.rules)}
+        catch(rollbackError){rollbackErrors.push({policyId:prior.policy.id,error:rollbackError.message})}
+        run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?','failed',rollbackErrors.find(item=>item.policyId===prior.policy.id)?.error||'Membership removal aborted; original rules restored',now(),prior.runId)
+      }
+      audit(req.user.id,'node-group.member.remove.failed','node-group',group.id,null,{nodeId:node.id,policyId:snapshot.policy.id,error:error.message,rollbackErrors})
+      return res.status(502).json({error:'Firewall cleanup failed; group membership retained',policyId:snapshot.policy.id,detail:error.message,rollbackErrors})
+    }
+  }
+  db.transaction(()=>{
+    run('DELETE FROM node_group_members WHERE group_id=? AND node_id=?',group.id,node.id)
+    for(const item of completed)run('UPDATE policy_apply_runs SET status=?,diff_json=?,finished_at=? WHERE id=?','success',json(item.diff),now(),item.runId)
+    audit(req.user.id,'node-group.member.remove','node-group',group.id,{nodeId:node.id},{cleanedPolicies:completed.map(item=>item.policy.id),retainedByOtherAssignment:policies.length-completed.length})
+  })()
+  res.json({removed:true,cleanedPolicies:completed.map(item=>item.policy.id),retainedByOtherAssignment:policies.length-completed.length})
+}))
 
-api.get('/policies',(req,res)=>res.json(all('SELECT p.*,v.version_no FROM policies p LEFT JOIN policy_versions v ON v.id=p.current_version_id ORDER BY p.created_at DESC').filter(policy=>canReadResource(req.user,'policy',policy)).map(policy=>({...policy,verificationStatus:policyVerification(policy.id)}))))
+api.get('/policies',(req,res)=>res.json(all('SELECT p.*,v.version_no FROM policies p LEFT JOIN policy_versions v ON v.id=p.current_version_id ORDER BY p.created_at DESC').filter(policy=>canReadResource(req.user,'policy',policy)).map(policy=>({...policy,verificationStatus:policyVerification(policy.id),learning:policy.origin==='learned'?one('SELECT id,status,ends_at,progressive_enabled,next_progressive_at,last_progressive_at FROM learning_sessions WHERE generated_policy_id=? ORDER BY started_at DESC,rowid DESC LIMIT 1',policy.id):null}))))
 api.post('/policies',requireRole('editor'),(req,res)=>{const data=body(z.object({name:z.string().min(1),description:z.string().default('')}),req),policyId=id();run('INSERT INTO policies(id,name,description,owner_user_id) VALUES(?,?,?,?)',policyId,data.name,data.description,req.user.id);audit(req.user.id,'policy.create','policy',policyId,null,data);res.status(201).json(getPolicy(policyId))})
 api.get('/policies/:id',(req,res)=>{const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy');if(!canReadResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});res.json({...policy,versions:all('SELECT id,version_no,created_at,comment FROM policy_versions WHERE policy_id=? ORDER BY version_no DESC',policy.id),assignments:all('SELECT * FROM policy_assignments WHERE policy_id=?',policy.id)})})
 api.get('/policies/:id/versions',(req,res)=>{const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy');if(!canReadResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});res.json(all('SELECT * FROM policy_versions WHERE policy_id=? ORDER BY version_no DESC',policy.id).map(v=>({...v,graph:parse(v.graph_json),rules:parse(v.rules_compiled_json)})))})
+api.get('/policies/:id/learning-preview',(req,res)=>{
+  const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy')
+  if(!canReadResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'})
+  const session=one("SELECT * FROM learning_sessions WHERE generated_policy_id=? AND status='active' ORDER BY started_at DESC,rowid DESC LIMIT 1",policy.id)
+  if(!session)return res.status(409).json({error:'This policy has no active learning session'})
+  res.json(learningPreview(session))
+})
 api.post('/policies/:id/versions',requireRole('editor'),(req,res)=>{
   const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy')
   if(!canWriteResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'})
+  if(hasActiveLearning(policy.id))return res.status(409).json({error:'Automatic learning owns this policy until training ends'})
+  if(one('SELECT id FROM policy_assignments WHERE policy_id=? AND removal_job_id IS NOT NULL',policy.id))return res.status(409).json({error:'Wait for pending agent firewall cleanup before changing this policy'})
   const data=body(z.object({graph:graphSchema,comment:z.string().default('')}),req),rules=compilePolicy(data.graph,policy.id),versionId=id()
   const conflicts=assignmentConflicts(policy.id,rules,assignedNodes(policy.id))
   if(conflicts.length)return rejectConflicts(res,conflicts)
@@ -586,9 +809,74 @@ api.post('/policies/:id/versions',requireRole('editor'),(req,res)=>{
   db.transaction(()=>{run('INSERT INTO policy_versions(id,policy_id,version_no,graph_json,rules_compiled_json,created_by,comment) VALUES(?,?,?,?,?,?,?)',versionId,policy.id,last+1,json(data.graph),json(rules),req.user.id,data.comment);run('UPDATE policies SET current_version_id=? WHERE id=?',versionId,policy.id);audit(req.user.id,'policy.version.create','policy',policy.id,null,{versionId,versionNo:last+1,rules})})()
   res.status(201).json({id:versionId,versionNo:last+1,rules})
 })
-api.post('/policies/:id/versions/:versionId/recall',requireRole('editor'),wrap(async(req,res)=>{const policy=getPolicy(reqId(req)),version=one('SELECT * FROM policy_versions WHERE id=? AND policy_id=?',req.params.versionId,reqId(req));if(!policy||!version)return notFound(res,'Version');if(!canWriteResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});const conflicts=assignmentConflicts(policy.id,parse(version.rules_compiled_json)||[],assignedNodes(policy.id));if(conflicts.length)return rejectConflicts(res,conflicts);run('UPDATE policies SET current_version_id=? WHERE id=?',version.id,policy.id);audit(req.user.id,'policy.recall','policy',policy.id,{versionId:policy.current_version_id},{versionId:version.id});res.json({versionId:version.id,results:await applyPolicy(getPolicy(policy.id),req.user.id)})}))
-api.post('/policies/:id/assignments',requireRole('editor'),(req,res)=>{const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy');if(!canWriteResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});if(one("SELECT id FROM learning_sessions WHERE generated_policy_id=? AND status IN ('review','apply-failed')",policy.id))return res.status(409).json({error:'Approve the learning proposal before assigning it'});const data=body(z.object({nodeId:z.string().optional(),nodeGroupId:z.string().optional()}),req);if(Number(!!data.nodeId)+Number(!!data.nodeGroupId)!==1)return res.status(400).json({error:'Specify exactly one nodeId or nodeGroupId'});const targets=data.nodeId?[getNode(data.nodeId)].filter(Boolean):all('SELECT n.* FROM nodes n JOIN node_group_members m ON m.node_id=n.id WHERE m.group_id=?',data.nodeGroupId);if(data.nodeId&&!targets.length)return notFound(res,'Node');const targetGroup=data.nodeGroupId?one('SELECT * FROM node_groups WHERE id=?',data.nodeGroupId):null;if(data.nodeGroupId&&!targetGroup)return notFound(res,'Node group');if(targetGroup&&!canWriteResource(req.user,'node_group',targetGroup))return res.status(403).json({error:'Insufficient permission for node group'});const rules=parse(one('SELECT rules_compiled_json FROM policy_versions WHERE id=?',policy.current_version_id)?.rules_compiled_json)||[];const conflicts=assignmentConflicts(policy.id,rules,targets);if(conflicts.length)return rejectConflicts(res,conflicts);const assignmentId=id();run('INSERT INTO policy_assignments(id,policy_id,node_id,node_group_id,assigned_by) VALUES(?,?,?,?,?)',assignmentId,policy.id,data.nodeId||null,data.nodeGroupId||null,req.user.id);audit(req.user.id,'policy.assign','policy',policy.id,null,data);res.status(201).json({id:assignmentId,...data})})
-api.post('/policies/:id/apply',requireRole('editor'),wrap(async(req,res)=>{const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy');if(!canWriteResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});if(one("SELECT id FROM learning_sessions WHERE generated_policy_id=? AND status IN ('review','apply-failed')",policy.id))return res.status(409).json({error:'Approve the learning proposal before applying it'});res.json({results:await applyPolicy(policy,req.user.id)})}))
+api.post('/policies/:id/versions/:versionId/recall',requireRole('editor'),wrap(async(req,res)=>{const policy=getPolicy(reqId(req)),version=one('SELECT * FROM policy_versions WHERE id=? AND policy_id=?',req.params.versionId,reqId(req));if(!policy||!version)return notFound(res,'Version');if(!canWriteResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});if(hasActiveLearning(policy.id))return res.status(409).json({error:'Automatic learning owns this policy until training ends'});if(one('SELECT id FROM policy_assignments WHERE policy_id=? AND removal_job_id IS NOT NULL',policy.id))return res.status(409).json({error:'Wait for pending agent firewall cleanup before changing this policy'});const conflicts=assignmentConflicts(policy.id,parse(version.rules_compiled_json)||[],assignedNodes(policy.id));if(conflicts.length)return rejectConflicts(res,conflicts);run('UPDATE policies SET current_version_id=? WHERE id=?',version.id,policy.id);audit(req.user.id,'policy.recall','policy',policy.id,{versionId:policy.current_version_id},{versionId:version.id});res.json({versionId:version.id,results:await applyPolicy(getPolicy(policy.id),req.user.id)})}))
+api.post('/policies/:id/assignments',requireRole('editor'),(req,res)=>{const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy');if(!canWriteResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});if(hasActiveLearning(policy.id))return res.status(409).json({error:'Automatic learning owns this policy until training ends'});if(one('SELECT id FROM policy_assignments WHERE policy_id=? AND removal_job_id IS NOT NULL',policy.id))return res.status(409).json({error:'Wait for pending agent firewall cleanup before assigning this policy'});if(one("SELECT id FROM learning_sessions WHERE generated_policy_id=? AND status IN ('review','apply-failed')",policy.id))return res.status(409).json({error:'Approve the learning proposal before assigning it'});const data=body(z.object({nodeId:z.string().optional(),nodeGroupId:z.string().optional()}),req);if(Number(!!data.nodeId)+Number(!!data.nodeGroupId)!==1)return res.status(400).json({error:'Specify exactly one nodeId or nodeGroupId'});const targets=data.nodeId?[getNode(data.nodeId)].filter(Boolean):all('SELECT n.* FROM nodes n JOIN node_group_members m ON m.node_id=n.id WHERE m.group_id=?',data.nodeGroupId);if(data.nodeId&&!targets.length)return notFound(res,'Node');const targetGroup=data.nodeGroupId?one('SELECT * FROM node_groups WHERE id=?',data.nodeGroupId):null;if(data.nodeGroupId&&!targetGroup)return notFound(res,'Node group');if(targetGroup&&!canWriteResource(req.user,'node_group',targetGroup))return res.status(403).json({error:'Insufficient permission for node group'});const rules=parse(one('SELECT rules_compiled_json FROM policy_versions WHERE id=?',policy.current_version_id)?.rules_compiled_json)||[];const conflicts=assignmentConflicts(policy.id,rules,targets);if(conflicts.length)return rejectConflicts(res,conflicts);const assignmentId=id();run('INSERT INTO policy_assignments(id,policy_id,node_id,node_group_id,assigned_by) VALUES(?,?,?,?,?)',assignmentId,policy.id,data.nodeId||null,data.nodeGroupId||null,req.user.id);audit(req.user.id,'policy.assign','policy',policy.id,null,data);res.status(201).json({id:assignmentId,...data})})
+api.delete('/policies/:id/assignments/:assignmentId',requireRole('editor'),wrap(async(req,res)=>{
+  const policy=getPolicy(reqId(req))
+  if(!policy)return notFound(res,'Policy')
+  if(!canWriteResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'})
+  if(hasActiveLearning(policy.id))return res.status(409).json({error:'Automatic learning owns this policy until training ends'})
+  const assignment=one('SELECT * FROM policy_assignments WHERE id=? AND policy_id=?',req.params.assignmentId,policy.id)
+  if(!assignment)return notFound(res,'Assignment')
+  const group=assignment.node_group_id?one('SELECT * FROM node_groups WHERE id=?',assignment.node_group_id):null
+  if(group&&!canWriteResource(req.user,'node_group',group))return res.status(403).json({error:'Insufficient permission for node group'})
+  if(assignment.removal_job_id)return res.status(202).json({queued:true,jobId:assignment.removal_job_id})
+  const targets=assignment.node_id?[getNode(assignment.node_id)].filter(Boolean):all('SELECT n.* FROM nodes n JOIN node_group_members m ON m.node_id=n.id WHERE m.group_id=?',assignment.node_group_id)
+  const cleanup=targets.filter(node=>!one(`SELECT id FROM policy_assignments WHERE policy_id=? AND id<>? AND (node_id=? OR node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?))`,policy.id,assignment.id,node.id,node.id))
+  if(cleanup.some(node=>node.connection_mode==='agent')){
+    if(!assignment.node_id||cleanup.length!==1)return res.status(409).json({error:'Group removal with agent nodes needs coordinated cleanup and is not available yet'})
+    const node=cleanup[0],agent=one('SELECT * FROM agents WHERE id=? AND revoked_at IS NULL',node.agent_id)
+    if(!agent)return res.status(409).json({error:'No active enrolled agent can remove these firewall rules'})
+    const pendingApply=all("SELECT * FROM agent_jobs WHERE agent_id=? AND type='policy.apply' AND status IN ('queued','leased') AND json_extract(payload_json,'$.policyId')=?",agent.id,policy.id)
+    if(pendingApply.some(job=>job.status==='leased'))return res.status(409).json({error:'Wait for the current agent policy apply job before removing this assignment'})
+    const runId=id(),jobId=id()
+    db.transaction(()=>{
+      for(const job of pendingApply){
+        run("UPDATE agent_jobs SET status='failed',error='Superseded by policy unassignment',finished_at=? WHERE id=?",now(),job.id)
+        const oldRunId=parse(job.payload_json)?.applyRunId
+        if(oldRunId)run("UPDATE policy_apply_runs SET status='failed',error='Superseded by policy unassignment',finished_at=? WHERE id=?",now(),oldRunId)
+      }
+      run('INSERT INTO policy_apply_runs(id,policy_id,version_id,node_id,status) VALUES(?,?,?,?,?)',runId,policy.id,policy.current_version_id,node.id,'queued')
+      run('INSERT INTO agent_jobs(id,agent_id,type,payload_json) VALUES(?,?,?,?)',jobId,agent.id,'policy.apply',json({applyRunId:runId,policyId:policy.id,versionId:policy.current_version_id,group:`WinFireSecure:${policy.id}`,rules:[],removalAssignmentId:assignment.id}))
+      run('UPDATE policy_assignments SET removal_job_id=? WHERE id=?',jobId,assignment.id)
+      audit(req.user.id,'policy.unassign.queued','policy',policy.id,assignment,{assignmentId:assignment.id,nodeId:node.id,jobId})
+    })()
+    return res.status(202).json({queued:true,jobId,nodeId:node.id})
+  }
+  const snapshots=[]
+  try {
+    for(const node of cleanup){
+      const observed=await remote(node,'rules',{group:`WinFireSecure:${policy.id}`})
+      snapshots.push({node,rules:Array.isArray(observed)?observed:observed?[observed]:[]})
+    }
+  } catch(error){return res.status(502).json({error:`Could not read managed rules before removal: ${error.message}`})}
+  const completed=[]
+  for(const snapshot of snapshots){
+    const runId=id()
+    run('INSERT INTO policy_apply_runs(id,policy_id,version_id,node_id,status) VALUES(?,?,?,?,?)',runId,policy.id,policy.current_version_id,snapshot.node.id,'running')
+    try {
+      const diff=await applyRules(snapshot.node,policy.id,[])
+      completed.push({...snapshot,runId,diff})
+    } catch(error){
+      run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?','failed',error.message,now(),runId)
+      const rollbackErrors=[]
+      for(const prior of completed.reverse()){
+        try {await applyRules(prior.node,policy.id,prior.rules)}
+        catch(rollbackError){rollbackErrors.push({nodeId:prior.node.id,error:rollbackError.message})}
+        run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?','failed',rollbackErrors.find(item=>item.nodeId===prior.node.id)?.error||'Removal aborted; original rules restored',now(),prior.runId)
+      }
+      audit(req.user.id,'policy.unassign.failed','policy',policy.id,null,{assignmentId:assignment.id,nodeId:snapshot.node.id,error:error.message,rollbackErrors})
+      return res.status(502).json({error:'Firewall cleanup failed; assignment retained',nodeId:snapshot.node.id,detail:error.message,rollbackErrors})
+    }
+  }
+  db.transaction(()=>{
+    run('DELETE FROM policy_assignments WHERE id=?',assignment.id)
+    for(const item of completed)run('UPDATE policy_apply_runs SET status=?,diff_json=?,finished_at=? WHERE id=?','success',json(item.diff),now(),item.runId)
+    audit(req.user.id,'policy.unassign','policy',policy.id,assignment,{assignmentId:assignment.id,cleanedNodes:completed.map(item=>item.node.id),retainedByOtherAssignment:targets.length-completed.length})
+  })()
+  res.json({removed:true,cleanedNodes:completed.map(item=>item.node.id),retainedByOtherAssignment:targets.length-completed.length})
+}))
+api.post('/policies/:id/apply',requireRole('editor'),wrap(async(req,res)=>{const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy');if(!canWriteResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});if(hasActiveLearning(policy.id))return res.status(409).json({error:'Automatic learning owns this policy until training ends'});if(one("SELECT id FROM learning_sessions WHERE generated_policy_id=? AND status IN ('review','apply-failed')",policy.id))return res.status(409).json({error:'Approve the learning proposal before applying it'});res.json({results:await applyPolicy(policy,req.user.id)})}))
 api.get('/policies/:id/diff',(req,res)=>{
   const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy')
   if(!canReadResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'})
@@ -613,10 +901,10 @@ api.get('/policies/:id/diff',(req,res)=>{
   })
 })
 
-export async function runDriftCheck(data={},actorId=null) {
+export async function runDriftCheck(data={},actorId=null,canCheckPolicy=()=>true) {
   if(data.policyId&&!getPolicy(data.policyId))throw Object.assign(new Error('Policy not found'),{status:404})
   if(data.nodeId&&!getNode(data.nodeId))throw Object.assign(new Error('Node not found'),{status:404})
-  const policies=data.policyId?[getPolicy(data.policyId)]:all('SELECT * FROM policies WHERE current_version_id IS NOT NULL')
+  const policies=(data.policyId?[getPolicy(data.policyId)]:all('SELECT * FROM policies WHERE current_version_id IS NOT NULL')).filter(canCheckPolicy)
   const checks=[]
   for(const policy of policies){
     const version=one('SELECT * FROM policy_versions WHERE id=?',policy.current_version_id)
@@ -654,13 +942,15 @@ export async function runDriftCheck(data={},actorId=null) {
 }
 api.post('/drift/checks',requireRole('editor'),wrap(async(req,res)=>{
   const data=body(z.object({nodeId:z.string().optional(),policyId:z.string().optional()}),req)
-  res.status(201).json(await runDriftCheck(data,req.user.id))
+  if(data.policyId&&!canWriteResource(req.user,'policy',getPolicy(data.policyId)))return res.status(403).json({error:'Insufficient permission for policy'})
+  res.status(201).json(await runDriftCheck(data,req.user.id,policy=>canWriteResource(req.user,'policy',policy)))
 }))
 api.get('/drift/checks',(req,res)=>{
   const filters=[],args=[]
   if(req.query.nodeId){filters.push('node_id=?');args.push(String(req.query.nodeId))}
   if(req.query.policyId){filters.push('policy_id=?');args.push(String(req.query.policyId))}
-  res.json(all(`SELECT * FROM policy_drift_checks ${filters.length?'WHERE '+filters.join(' AND '):''} ORDER BY datetime(checked_at) DESC LIMIT 500`,...args).map(row=>({...row,diff:parse(row.diff_json)})))
+  const visible=readablePolicyIds(req.user)
+  res.json(all(`SELECT * FROM policy_drift_checks ${filters.length?'WHERE '+filters.join(' AND '):''} ORDER BY datetime(checked_at) DESC LIMIT 500`,...args).filter(row=>visible.has(row.policy_id)).map(row=>({...row,diff:parse(row.diff_json)})))
 })
 
 async function verifyOne(node,policy,rule,runId,actualRules) {
@@ -677,10 +967,10 @@ async function verifyOne(node,policy,rule,runId,actualRules) {
   if(result.status==='fail'&&previous!=='fail')emitNotification({eventKey:`verifier:${result.id}`,category:'verifier_failure',title:'Firewall verification failed',body:`${policy.name} on ${node.hostname}: ${rule.protocol} ${port||'rule'} — ${result.reason}.`,entityType:'node',entityId:node.id})
   return result
 }
-export async function runVerification(data={},actorId=null) {
+export async function runVerification(data={},actorId=null,canCheckPolicy=()=>true) {
   const runId=id()
   run('INSERT INTO verifier_runs(id,status,requested_by) VALUES(?,?,?)',runId,'running',actorId)
-  const policies=data.policyId?[getPolicy(data.policyId)].filter(Boolean):all('SELECT * FROM policies WHERE current_version_id IS NOT NULL')
+  const policies=(data.policyId?[getPolicy(data.policyId)].filter(Boolean):all('SELECT * FROM policies WHERE current_version_id IS NOT NULL')).filter(canCheckPolicy)
   const results=[]
   for(const policy of policies){
     const version=one('SELECT * FROM policy_versions WHERE id=?',policy.current_version_id)
@@ -700,10 +990,11 @@ export async function runVerification(data={},actorId=null) {
 }
 api.post('/verifier/runs',requireRole('editor'),wrap(async(req,res)=>{
   const data=body(z.object({nodeId:z.string().optional(),policyId:z.string().optional()}),req)
-  res.status(201).json(await runVerification(data,req.user.id))
+  if(data.policyId&&!canWriteResource(req.user,'policy',getPolicy(data.policyId)))return res.status(403).json({error:'Insufficient permission for policy'})
+  res.status(201).json(await runVerification(data,req.user.id,policy=>canWriteResource(req.user,'policy',policy)))
 }))
-api.get('/verifier/runs/:id',(req,res)=>{const result=one('SELECT * FROM verifier_runs WHERE id=?',reqId(req));return result?res.json({...result,results:all('SELECT * FROM verifier_results WHERE run_id=?',result.id)}):notFound(res,'Verifier run')})
-api.get('/verifier/results',(req,res)=>res.json(all('SELECT * FROM verifier_results ORDER BY run_at DESC LIMIT 500')))
+api.get('/verifier/runs/:id',(req,res)=>{const result=one('SELECT * FROM verifier_runs WHERE id=?',reqId(req));if(!result)return notFound(res,'Verifier run');const visible=readablePolicyIds(req.user),results=all('SELECT * FROM verifier_results WHERE run_id=?',result.id).filter(row=>visible.has(row.policy_id));if(!results.length&&result.requested_by!==req.user.id&&!['owner','admin'].includes(req.user.role))return notFound(res,'Verifier run');res.json({...result,results})})
+api.get('/verifier/results',(req,res)=>{const visible=readablePolicyIds(req.user);res.json(all('SELECT * FROM verifier_results ORDER BY run_at DESC LIMIT 500').filter(row=>visible.has(row.policy_id)))})
 
 function driftSummaryByNode() {
   const assignments=all(`SELECT DISTINCT a.policy_id,COALESCE(a.node_id,m.node_id) node_id FROM policy_assignments a LEFT JOIN node_group_members m ON m.group_id=a.node_group_id WHERE COALESCE(a.node_id,m.node_id) IS NOT NULL`)
@@ -717,8 +1008,8 @@ function driftSummaryByNode() {
   }
   return new Map([...byNode].map(([nodeId,statuses])=>[nodeId,statuses.includes('drift')?'drift':statuses.includes('unknown')?'unknown':statuses.includes('pending')?'pending':statuses.includes('unchecked')?'unchecked':'in-sync']))
 }
-function report(name) {
-  if(name==='inventory')return all(`SELECT n.id,n.hostname,n.fqdn,n.ip,n.os_version,n.os_build,n.status,n.last_seen_at,n.connection_mode,n.inventory_source,n.ad_enabled,n.ad_missing,n.firewall_state,f.snapshot_json,f.collected_at,(SELECT status FROM policy_apply_runs WHERE node_id=n.id ORDER BY started_at DESC,rowid DESC LIMIT 1) last_apply_status,(SELECT finished_at FROM policy_apply_runs WHERE node_id=n.id ORDER BY started_at DESC,rowid DESC LIMIT 1) last_apply_at,(SELECT status FROM verifier_results WHERE node_id=n.id ORDER BY run_at DESC,rowid DESC LIMIT 1) last_verify_status FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id ORDER BY n.hostname`).map(({snapshot_json,...row})=>{
+function report(name,user=null) {
+  if(name==='inventory')return all(`SELECT n.id,n.hostname,n.fqdn,n.ip,n.os_version,n.os_build,n.status,n.last_seen_at,n.connection_mode,n.inventory_source,n.ad_enabled,n.ad_missing,n.firewall_state,f.snapshot_json,f.collected_at,(SELECT status FROM policy_apply_runs WHERE node_id=n.id AND policy_id IS NOT NULL ORDER BY started_at DESC,rowid DESC LIMIT 1) last_apply_status,(SELECT finished_at FROM policy_apply_runs WHERE node_id=n.id AND policy_id IS NOT NULL ORDER BY started_at DESC,rowid DESC LIMIT 1) last_apply_at,(SELECT status FROM verifier_results WHERE node_id=n.id ORDER BY run_at DESC,rowid DESC LIMIT 1) last_verify_status FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id ORDER BY n.hostname`).map(({snapshot_json,...row})=>{
     const facts=parse(snapshot_json)||{}
     const profiles=Array.isArray(facts.firewall)?facts.firewall:facts.firewall?[facts.firewall]:[]
     return {...row,model:facts.computer?.Model||null,manufacturer:facts.computer?.Manufacturer||null,bios_serial:facts.bios?.SerialNumber||null,firewall_service:facts.service?.Status||null,firewall_profiles:profiles.map(profile=>`${profile.Name}: ${profile.Enabled?'on':'off'}`).join(', ')||null}
@@ -733,9 +1024,12 @@ function report(name) {
   })
   if(name==='coverage'){
     const drift=driftSummaryByNode()
-    return all(`SELECT n.id,n.hostname,n.status,COUNT(DISTINCT a.policy_id) AS policy_count,(SELECT status FROM policy_apply_runs WHERE node_id=n.id ORDER BY started_at DESC LIMIT 1) AS last_apply_status,(SELECT passed FROM verifier_results WHERE node_id=n.id ORDER BY run_at DESC LIMIT 1) AS last_verify_passed FROM nodes n LEFT JOIN policy_assignments a ON a.node_id=n.id OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=n.id) GROUP BY n.id ORDER BY n.hostname`).map(row=>({...row,drift_status:drift.get(row.id)||null}))
+    return all(`SELECT n.id,n.hostname,n.status,COUNT(DISTINCT a.policy_id) AS policy_count,(SELECT status FROM policy_apply_runs WHERE node_id=n.id AND policy_id IS NOT NULL ORDER BY started_at DESC LIMIT 1) AS last_apply_status,(SELECT passed FROM verifier_results WHERE node_id=n.id ORDER BY run_at DESC LIMIT 1) AS last_verify_passed FROM nodes n LEFT JOIN policy_assignments a ON a.node_id=n.id OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=n.id) GROUP BY n.id ORDER BY n.hostname`).map(row=>({...row,drift_status:drift.get(row.id)||null}))
   }
-  if(name==='verification')return all(`SELECT n.hostname,p.name AS policy,r.port,r.proto,r.expected,r.actual,r.status,r.reason,r.managed_rule_present,r.run_at FROM verifier_results r LEFT JOIN nodes n ON n.id=r.node_id LEFT JOIN policies p ON p.id=r.policy_id ORDER BY r.run_at DESC LIMIT 1000`)
+  if(name==='verification'){
+    const visible=user?readablePolicyIds(user):null
+    return all(`SELECT n.hostname,p.id AS policy_id,p.name AS policy,r.port,r.proto,r.expected,r.actual,r.status,r.reason,r.managed_rule_present,r.run_at FROM verifier_results r LEFT JOIN nodes n ON n.id=r.node_id LEFT JOIN policies p ON p.id=r.policy_id ORDER BY r.run_at DESC LIMIT 1000`).filter(row=>!visible||visible.has(row.policy_id)).map(({policy_id,...row})=>row)
+  }
   const drift=driftSummaryByNode()
   return all(`SELECT n.id,n.hostname,n.status,COUNT(DISTINCT a.policy_id) AS policies,COALESCE((SELECT SUM(passed) FROM verifier_results WHERE node_id=n.id),0) AS checks_passed,COALESCE((SELECT COUNT(passed) FROM verifier_results WHERE node_id=n.id),0) AS checks_decisive,COALESCE((SELECT COUNT(*) FROM verifier_results WHERE node_id=n.id AND passed IS NULL),0) AS checks_inconclusive FROM nodes n LEFT JOIN policy_assignments a ON a.node_id=n.id OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=n.id) GROUP BY n.id ORDER BY n.hostname`).map(row=>({...row,drift_status:drift.get(row.id)||null}))
 }
@@ -752,10 +1046,10 @@ function exportReport(req,res,name,data) {
   }
   res.json(data)
 }
-for(const name of ['inventory','dns','coverage','compliance','verification'])api.get(`/reports/${name}`,(req,res)=>exportReport(req,res,name,report(name)))
+for(const name of ['inventory','dns','coverage','compliance','verification'])api.get(`/reports/${name}`,(req,res)=>exportReport(req,res,name,report(name,req.user)))
 api.get('/reports/dashboard',(_req,res)=>{
   const total=one('SELECT COUNT(*) n FROM nodes').n, reachable=one("SELECT COUNT(*) n FROM nodes WHERE status='reachable'").n
-  const policies=one('SELECT COUNT(*) n FROM policies').n, failed=one("SELECT COUNT(*) n FROM policy_apply_runs WHERE status='failed'").n
+  const policies=one('SELECT COUNT(*) n FROM policies').n, failed=one("SELECT COUNT(*) n FROM policy_apply_runs WHERE status='failed' AND policy_id IS NOT NULL").n
   const checks=one('SELECT COUNT(passed) n,COALESCE(SUM(passed),0) passed,COUNT(*)-COUNT(passed) inconclusive FROM verifier_results')
   const agentCutoff=new Date(Date.now()-120_000).toISOString()
   const agents=one('SELECT COUNT(*) total,COALESCE(SUM(CASE WHEN revoked_at IS NULL AND last_checkin_at>=? THEN 1 ELSE 0 END),0) online FROM agents',agentCutoff)
@@ -790,24 +1084,38 @@ api.get('/logon-rights',(req,res)=>res.json(all('SELECT * FROM logon_rights WHER
 api.post('/logon-rights/baseline',requireRole('admin'),wrap(async(req,res)=>{
   const {nodeId}=body(z.object({nodeId:z.string()}),req),node=getNode(nodeId);if(!node)return notFound(res,'Node')
   const raw=await remote(node,'rights'),lines=Array.isArray(raw)?raw:[raw].filter(Boolean)
-  if(!lines.length)throw Object.assign(new Error('Logon-rights export returned no data; baseline was not collected'),{status:502})
-  const rights=[];for(const line of lines){const [name,accounts]=String(line).split('=');for(const account of (accounts||'').split(',').map(s=>s.trim()).filter(Boolean)){const rightId=id();run('INSERT INTO logon_rights(id,node_id,account_sid,logon_type,right_assignment,source,baseline,created_by) VALUES(?,?,?,?,?,?,1,?)',rightId,node.id,account,name.trim(),'allow','secedit',req.user.id);rights.push({id:rightId,account,logonType:name.trim()})}}
-  audit(req.user.id,'logon-rights.baseline','node',node.id,null,{count:rights.length});res.status(201).json(rights)
+  let parsed
+  try{parsed=parseSeceditRights(lines)}catch(error){throw Object.assign(error,{status:502})}
+  const rights=db.transaction(()=>{
+    run('DELETE FROM logon_rights WHERE node_id=? AND baseline=1',node.id)
+    const collected=parsed.map(right=>{const rightId=id();run('INSERT INTO logon_rights(id,node_id,account_sid,logon_type,right_assignment,source,baseline,created_by) VALUES(?,?,?,?,?,?,1,?)',rightId,node.id,right.accountSid,right.logonType,right.assignment,'secedit',req.user.id);return {id:rightId,...right}})
+    audit(req.user.id,'logon-rights.baseline','node',node.id,null,{count:collected.length,allow:collected.filter(right=>right.assignment==='allow').length,deny:collected.filter(right=>right.assignment==='deny').length})
+    return collected
+  })()
+  res.status(201).json(rights)
 }))
 
 api.get('/logs/search',(req,res)=>{
   const query=z.object({
     nodeId:z.string().optional(),action:z.enum(['allow','block','success','failure']).optional(),direction:z.enum(['in','out']).optional(),
     program:z.string().max(1024).optional(),challengeId:z.string().max(128).optional(),
-    port:z.coerce.number().int().min(1).max(65535).optional(),from:z.iso.datetime({local:true,offset:true}).optional(),to:z.iso.datetime({local:true,offset:true}).optional()
+    eventId:z.coerce.number().int().min(0).optional(),protocol:z.string().max(32).optional(),srcIp:z.string().max(128).optional(),dstIp:z.string().max(128).optional(),
+    port:z.coerce.number().int().min(1).max(65535).optional(),from:z.iso.datetime({local:true,offset:true}).optional(),to:z.iso.datetime({local:true,offset:true}).optional(),
+    page:z.coerce.number().int().min(1).default(1),pageSize:z.coerce.number().int().min(1).max(500).default(100),
+    sortBy:z.enum(['time','node','eventId','action','direction','srcIp','dstIp','port','program']).default('time'),sortDir:z.enum(['asc','desc']).default('desc')
   }).parse(req.query)
   if(query.from&&query.to&&new Date(query.from)>new Date(query.to))return res.status(400).json({error:'From must be earlier than To'})
   const filters=[],args=[]
-  for(const [key,column] of [['nodeId','node_id'],['action','action'],['direction','direction'],['program','program'],['challengeId','challenge_id']])if(query[key]){filters.push(`${column}=?`);args.push(query[key])}
-  if(query.port){filters.push('dst_port=?');args.push(query.port)}
-  if(query.from){filters.push('datetime(COALESCE(event_time,received_at))>=datetime(?)');args.push(query.from)}
-  if(query.to){filters.push('datetime(COALESCE(event_time,received_at))<=datetime(?)');args.push(query.to)}
-  res.json(all(`SELECT * FROM log_events ${filters.length?'WHERE '+filters.join(' AND '):''} ORDER BY datetime(COALESCE(event_time,received_at)) DESC LIMIT 1000`,...args))
+  for(const [key,column] of [['nodeId','e.node_id'],['action','e.action'],['direction','e.direction'],['challengeId','e.challenge_id'],['eventId','e.event_id'],['port','e.dst_port']])if(query[key]!==undefined){filters.push(`${column}=?`);args.push(query[key])}
+  for(const [key,column] of [['program','e.program'],['protocol','e.protocol'],['srcIp','e.src_ip'],['dstIp','e.dst_ip']])if(query[key]){filters.push(`${column} LIKE ? ESCAPE '\\'`);args.push(`%${query[key].replace(/[\\%_]/g,'\\$&')}%`)}
+  if(query.from){filters.push('datetime(COALESCE(e.event_time,e.received_at))>=datetime(?)');args.push(query.from)}
+  if(query.to){filters.push('datetime(COALESCE(e.event_time,e.received_at))<=datetime(?)');args.push(query.to)}
+  const where=filters.length?'WHERE '+filters.join(' AND '):''
+  const sortColumns={time:'julianday(COALESCE(e.event_time,e.received_at))',node:'n.hostname COLLATE NOCASE',eventId:'e.event_id',action:'e.action COLLATE NOCASE',direction:'e.direction COLLATE NOCASE',srcIp:'e.src_ip COLLATE NOCASE',dstIp:'e.dst_ip COLLATE NOCASE',port:'e.dst_port',program:'e.program COLLATE NOCASE'}
+  const fromSql=`FROM log_events e LEFT JOIN nodes n ON n.id=e.node_id ${where}`
+  const total=one(`SELECT COUNT(*) AS count ${fromSql}`,...args).count
+  const items=all(`SELECT e.* ${fromSql} ORDER BY ${sortColumns[query.sortBy]} ${query.sortDir.toUpperCase()}, e.id DESC LIMIT ? OFFSET ?`,...args,query.pageSize,(query.page-1)*query.pageSize)
+  res.json({items,total,page:query.page,pageSize:query.pageSize,totalPages:Math.ceil(total/query.pageSize)})
 })
 api.post('/logs/ingest',requireRole('editor'),(req,res)=>{
   const data=body(z.object({nodeId:z.string(),events:z.array(z.object({recordId:z.number().optional(),eventId:z.number().int(),action:z.string().optional(),protocol:z.string().optional(),srcIp:z.string().optional(),dstIp:z.string().optional(),dstPort:z.number().optional(),direction:z.string().optional(),program:z.string().optional(),accountSid:z.string().optional(),challengeId:z.string().optional()})).max(1000)}),req)
@@ -849,46 +1157,63 @@ api.post('/learning-sessions',requireRole('editor'),(req,res)=>{
   const endsAt=new Date(Date.now()+durationHours*360e4).toISOString()
   const sessionId=active?.id||id()
   db.transaction(()=>{
-    if(active)run("UPDATE learning_sessions SET mode='manual',ends_at=?,last_error=NULL WHERE id=?",endsAt,sessionId)
-    else run("INSERT INTO learning_sessions(id,node_id,ends_at,status,mode) VALUES(?,?,?,'active','manual')",sessionId,nodeId,endsAt)
+    const policy=ensurePersonalPolicy(node,req.user.id)
+    if(active)run("UPDATE learning_sessions SET mode='manual',ends_at=?,last_error=NULL,progressive_enabled=0,next_progressive_at=NULL,generated_policy_id=? WHERE id=?",endsAt,policy.id,sessionId)
+    else run("INSERT INTO learning_sessions(id,node_id,ends_at,status,mode,generated_policy_id) VALUES(?,?,?,'active','manual',?)",sessionId,nodeId,endsAt,policy.id)
     run("UPDATE nodes SET firewall_state='learning' WHERE id=?",nodeId)
     audit(req.user.id,active?'learning.switch-to-manual':'learning.start','node',nodeId,null,{sessionId,endsAt,durationHours,mode:'manual'})
   })()
   res.status(201).json({id:sessionId,nodeId,endsAt,mode:'manual',status:'active'})
 })
+function learningRuleKey(direction,protocol,port,address){return [direction,String(protocol).toUpperCase(),String(port),String(address).toLowerCase()].join('|')}
+function ruleLearningKey(rule){return learningRuleKey(rule.direction,rule.protocol,rule.direction==='in'?rule.localPort:rule.remotePort,rule.remoteAddress)}
+function learningPreview(session) {
+  const policy=getPolicy(session.generated_policy_id)
+  if(!policy)throw Object.assign(new Error('Personal learning policy is missing'),{status:409})
+  const current=one('SELECT * FROM policy_versions WHERE id=?',policy.current_version_id)
+  const base=parse(current?.graph_json)||{nodes:[],edges:[]}
+  const known=new Set((parse(current?.rules_compiled_json)||[]).filter(rule=>rule.action==='allow').map(ruleLearningKey))
+  const assigned=all(`SELECT DISTINCT v.rules_compiled_json FROM policy_versions v JOIN policies p ON p.current_version_id=v.id JOIN policy_assignments a ON a.policy_id=p.id WHERE p.id<>? AND (a.node_id=? OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?))`,policy.id,session.node_id,session.node_id)
+  for(const row of assigned)for(const rule of parse(row.rules_compiled_json)||[])if(rule.action==='allow')known.add(ruleLearningKey(rule))
+  const endAt=new Date(Math.min(Date.now(),Date.parse(session.ends_at))).toISOString()
+  const observations=all("SELECT DISTINCT direction,dst_port,protocol,src_ip,dst_ip FROM log_events WHERE node_id=? AND datetime(COALESCE(event_time,received_at)) BETWEEN datetime(?) AND datetime(?) AND action='allow' AND dst_port BETWEEN 1 AND 65535 AND protocol IN ('TCP','UDP') AND direction IN ('in','out') ORDER BY direction,protocol,dst_port,src_ip,dst_ip",session.node_id,session.started_at,endAt)
+  const additions=[],seen=new Set()
+  for(const event of observations){
+    const remoteAddress=event.direction==='in'?event.src_ip:event.dst_ip
+    if(!isIP(remoteAddress||''))continue
+    const key=learningRuleKey(event.direction,event.protocol,event.dst_port,remoteAddress)
+    if(known.has(key)||seen.has(key))continue
+    seen.add(key);additions.push({...event,remoteAddress,key})
+    if(additions.length>500)throw Object.assign(new Error('Learning preview exceeds 500 distinct new flows; narrow the session'),{status:409})
+  }
+  const nodes=[...base.nodes,...additions.map((event,index)=>({id:`learned-${crypto.createHash('sha256').update(event.key).digest('hex').slice(0,16)}`,type:'allow',position:{x:80+((base.nodes.length+index)%4)*180,y:80+Math.floor((base.nodes.length+index)/4)*100},data:{name:`Learned ${event.protocol} ${event.dst_port} ${event.direction}`,localPort:event.direction==='in'?String(event.dst_port):'Any',remotePort:event.direction==='out'?String(event.dst_port):'Any',protocol:event.protocol,remoteAddress:event.remoteAddress,direction:event.direction}}))]
+  const graph={nodes,edges:base.edges||[]},rules=compilePolicy(graph,policy.id)
+  return {policyId:policy.id,nodeId:session.node_id,sessionId:session.id,status:session.status,graph,rules,newFlowCount:additions.length,observedFlowCount:observations.length,asOf:now(),endsAt:session.ends_at,progressiveEnabled:!!session.progressive_enabled,nextProgressiveAt:session.next_progressive_at,lastProgressiveAt:session.last_progressive_at}
+}
+function saveLearningVersion(session,preview,actorId,comment){
+  const policy=getPolicy(session.generated_policy_id),current=one('SELECT * FROM policy_versions WHERE id=?',policy.current_version_id)
+  if(current?.graph_json===json(preview.graph))return current
+  const versionId=id(),versionNo=(one('SELECT MAX(version_no) n FROM policy_versions WHERE policy_id=?',policy.id)?.n||0)+1
+  db.transaction(()=>{
+    run('INSERT INTO policy_versions(id,policy_id,version_no,graph_json,rules_compiled_json,created_by,comment) VALUES(?,?,?,?,?,?,?)',versionId,policy.id,versionNo,json(preview.graph),json(preview.rules),actorId,comment)
+    run('UPDATE policies SET current_version_id=? WHERE id=?',versionId,policy.id)
+    audit(actorId,'learning.version','policy',policy.id,null,{sessionId:session.id,versionId,versionNo,ruleCount:preview.rules.length})
+  })()
+  return one('SELECT * FROM policy_versions WHERE id=?',versionId)
+}
 export function finalizeLearning(sessionId,actorId=null) {
   const session=one('SELECT * FROM learning_sessions WHERE id=?',sessionId)
   if(!session)throw Object.assign(new Error('Learning session not found'),{status:404})
   if(!['active','expired'].includes(session.status))throw Object.assign(new Error('Session already finalized'),{status:409})
-  const endAt=new Date(Math.min(Date.now(),Date.parse(session.ends_at))).toISOString()
-  const observations=db.prepare("SELECT DISTINCT direction,dst_port,protocol,src_ip,dst_ip FROM log_events WHERE node_id=? AND datetime(COALESCE(event_time,received_at)) BETWEEN datetime(?) AND datetime(?) AND action='allow' AND dst_port BETWEEN 1 AND 65535 AND protocol IN ('TCP','UDP') AND direction IN ('in','out')")
-  const keyFor=(direction,protocol,port,address)=>[direction,String(protocol).toUpperCase(),String(port),String(address).toLowerCase()].join('|')
-  const existing=all(`SELECT DISTINCT v.rules_compiled_json FROM policy_versions v JOIN policies p ON p.current_version_id=v.id JOIN policy_assignments a ON a.policy_id=p.id WHERE a.node_id=? OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?)`,session.node_id,session.node_id)
-  const known=new Set(existing.flatMap(row=>(parse(row.rules_compiled_json)||[]).filter(rule=>rule.action==='allow').map(rule=>keyFor(rule.direction,rule.protocol,rule.direction==='in'?rule.localPort:rule.remotePort,rule.remoteAddress))))
-  const flows=[];const seen=new Set()
-  for(const event of observations.iterate(session.node_id,session.started_at,endAt)){
-    const remoteAddress=event.direction==='in'?event.src_ip:event.dst_ip
-    if(!isIP(remoteAddress||''))continue
-    const key=keyFor(event.direction,event.protocol,event.dst_port,remoteAddress)
-    if(known.has(key)||seen.has(key))continue
-    seen.add(key)
-    flows.push({...event,remoteAddress})
-    if(flows.length>500)throw Object.assign(new Error('Learning proposal exceeds 500 distinct flows; narrow the session before finalizing'),{status:409})
-  }
-  if(!flows.length){
-    db.transaction(()=>{run("UPDATE learning_sessions SET status='empty',last_error=NULL WHERE id=?",session.id);run('UPDATE nodes SET firewall_state=? WHERE id=?',session.mode==='auto'?'enforcing':'review',session.node_id);audit(actorId,'learning.empty','node',session.node_id,null,{sessionId:session.id,mode:session.mode})})()
-    return {status:'empty',ruleCount:0}
-  }
-  const policyId=id(),versionId=id(),nodes=flows.map((event,i)=>({id:`learned-${i}`,type:'allow',position:{x:80+(i%4)*180,y:80+Math.floor(i/4)*100},data:{name:`Learned ${event.protocol} ${event.dst_port} ${event.direction}`,localPort:event.direction==='in'?String(event.dst_port):'Any',remotePort:event.direction==='out'?String(event.dst_port):'Any',protocol:event.protocol,remoteAddress:event.remoteAddress,direction:event.direction}}))
-  const graph={nodes,edges:[]},rules=compilePolicy(graph,policyId)
+  if(!session.generated_policy_id){const policy=ensurePersonalPolicy(getNode(session.node_id),actorId);run('UPDATE learning_sessions SET generated_policy_id=? WHERE id=?',policy.id,session.id);session.generated_policy_id=policy.id}
+  const preview=learningPreview(session)
+  const version=saveLearningVersion(session,preview,actorId,'Final learning snapshot')
   db.transaction(()=>{
-    run('INSERT INTO policies(id,name,description,owner_user_id,current_version_id) VALUES(?,?,?,?,?)',policyId,`Learned ${one('SELECT hostname FROM nodes WHERE id=?',session.node_id)?.hostname||'node'}`,`Generated from learning session ${session.id}`,actorId,versionId)
-    run('INSERT INTO policy_versions(id,policy_id,version_no,graph_json,rules_compiled_json,created_by,comment) VALUES(?,?,?,?,?,?,?)',versionId,policyId,1,json(graph),json(rules),actorId,'Learning proposal, review before applying')
-    run("UPDATE learning_sessions SET status='review',generated_policy_id=?,last_error=NULL WHERE id=?",policyId,session.id)
+    run("UPDATE learning_sessions SET status='review',last_error=NULL WHERE id=?",session.id)
     run("UPDATE nodes SET firewall_state='review' WHERE id=?",session.node_id)
-    audit(actorId,'learning.finalize','node',session.node_id,null,{policyId,observations:flows.length,mode:session.mode})
+    audit(actorId,'learning.finalize','node',session.node_id,null,{policyId:preview.policyId,observations:preview.newFlowCount,mode:session.mode})
   })()
-  return {policyId,versionId,ruleCount:rules.length,status:'review'}
+  return {policyId:preview.policyId,versionId:version.id,ruleCount:preview.rules.length,status:'review'}
 }
 api.post('/learning-sessions/:id/finalize',requireRole('editor'),(req,res)=>{
   const session=one('SELECT * FROM learning_sessions WHERE id=?',reqId(req))
@@ -896,6 +1221,7 @@ api.post('/learning-sessions/:id/finalize',requireRole('editor'),(req,res)=>{
   if(session.mode==='auto')return res.status(409).json({error:'Automatic training finalizes at its scheduled end'})
   res.json(finalizeLearning(session.id,req.user.id))
 })
+function assignedPoliciesForNode(nodeId){return all(`SELECT DISTINCT p.* FROM policies p JOIN policy_assignments a ON a.policy_id=p.id WHERE a.node_id=? OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?) ORDER BY CASE WHEN p.origin='learned' THEN 0 ELSE 1 END,p.name`,nodeId,nodeId)}
 export async function approveLearning(sessionId,actorId=null) {
   const session=one('SELECT * FROM learning_sessions WHERE id=?',sessionId)
   if(!session)throw Object.assign(new Error('Learning session not found'),{status:404})
@@ -905,12 +1231,15 @@ export async function approveLearning(sessionId,actorId=null) {
   const rules=parse(one('SELECT rules_compiled_json FROM policy_versions WHERE id=?',policy.current_version_id)?.rules_compiled_json)||[]
   const conflicts=assignmentConflicts(policy.id,rules,[node])
   if(conflicts.length)throw Object.assign(new Error('Conflicting firewall rules on assigned nodes'),{status:409,conflicts})
+  const attemptId=id()
   db.transaction(()=>{
     if(!one('SELECT id FROM policy_assignments WHERE policy_id=? AND node_id=?',policy.id,node.id))run('INSERT INTO policy_assignments(id,policy_id,node_id,assigned_by) VALUES(?,?,?,?)',id(),policy.id,node.id,actorId)
-    run("UPDATE learning_sessions SET status='applying',last_attempt_at=?,last_error=NULL WHERE id=?",now(),session.id)
+    run("UPDATE learning_sessions SET status='applying',last_attempt_at=?,last_error=NULL,current_apply_attempt_id=? WHERE id=?",now(),attemptId,session.id)
     audit(actorId,session.mode==='auto'?'learning.auto-apply':'learning.approve','node',node.id,null,{sessionId:session.id,policyId:policy.id})
   })()
-  const results=await applyPolicy(policy,actorId)
+  const results=[],assignedPolicies=assignedPoliciesForNode(node.id)
+  try{for(const assigned of assignedPolicies)results.push(...await applyPolicy(assigned,actorId,[node],{learningSessionId:session.id,learningAttemptId:attemptId,learningExpectedJobs:assignedPolicies.length}))}
+  catch(error){run("UPDATE learning_sessions SET status='apply-failed',last_error=? WHERE id=?",error.message,session.id);run("UPDATE nodes SET firewall_state='review' WHERE id=?",node.id);throw error}
   const status=results.every(result=>result.status==='success')?'enforced':results.some(result=>result.status==='failed')?'apply-failed':'applying'
   run('UPDATE learning_sessions SET status=?,last_error=? WHERE id=?',status,results.find(result=>result.status==='failed')?.error||null,session.id)
   run('UPDATE nodes SET firewall_state=? WHERE id=?',status==='enforced'?'enforcing':status==='applying'?'applying':'review',node.id)
@@ -918,33 +1247,81 @@ export async function approveLearning(sessionId,actorId=null) {
 }
 api.post('/learning-sessions/:id/approve',requireRole('editor'),wrap(async(req,res)=>res.json(await approveLearning(reqId(req),req.user.id))))
 
+async function collectTrainingTelemetry(node){
+  if(node.connection_mode==='agent'){
+    const agent=one('SELECT last_checkin_at FROM agents WHERE id=? AND revoked_at IS NULL',node.agent_id)
+    if(!agent?.last_checkin_at||Date.parse(agent.last_checkin_at)<Date.now()-5*60_000)throw new Error('Agent is not online to confirm training telemetry')
+  }else{
+    if(!['winrm','winrms'].includes(node.transport))throw new Error('No working event collection transport; probe the node before training can finish')
+    const auditPolicy=await remote(node,'audit_policy')
+    if(auditPolicy?.successEnabled!==true)throw new Error('Filtering Platform Connection success auditing is disabled; enable it before automatic training can finish')
+    const collection=await pullLogs(node.id)
+    if(!collection.caughtUp)throw new Error('Security event backlog remains; training will finish after collection catches up')
+  }
+}
+async function applyProgressiveLearning(session,node){
+  const pending=one("SELECT id FROM agent_jobs WHERE agent_id=? AND type='policy.apply' AND status IN ('queued','leased') AND json_extract(payload_json,'$.policyId')=?",node.agent_id,session.generated_policy_id)
+  if(pending)throw new Error('Previous agent learning apply is still pending')
+  const preview=learningPreview(session),policy=getPolicy(session.generated_policy_id)
+  const conflicts=assignmentConflicts(policy.id,preview.rules,[node])
+  if(conflicts.length)throw Object.assign(new Error('Learned rules conflict with another assigned policy'),{status:409,conflicts})
+  const current=one('SELECT graph_json FROM policy_versions WHERE id=?',policy.current_version_id)
+  const changed=current?.graph_json!==json(preview.graph)
+  if(changed)saveLearningVersion(session,preview,null,'Progressive learning snapshot')
+  if(preview.rules.length&&!one('SELECT id FROM policy_assignments WHERE policy_id=? AND node_id=?',policy.id,node.id))run('INSERT INTO policy_assignments(id,policy_id,node_id) VALUES(?,?,?)',id(),policy.id,node.id)
+  let result={status:'unchanged'}
+  if(preview.rules.length&&(changed||session.last_error)){
+    result=(await applyPolicy(getPolicy(policy.id),null,[node],{progressiveSessionId:session.id}))[0]
+    if(result.status==='failed')throw new Error(result.error)
+  }
+  const at=now(),next=new Date(Math.min(Date.parse(session.ends_at),Date.now()+session.progressive_interval_hours*36e5)).toISOString()
+  run('UPDATE learning_sessions SET last_progressive_at=?,next_progressive_at=?,last_attempt_at=?,last_error=NULL WHERE id=?',at,next,at,session.id)
+  audit(null,'learning.progressive','node',node.id,null,{sessionId:session.id,policyId:policy.id,newFlows:preview.newFlowCount,ruleCount:preview.rules.length,status:result.status,next})
+  return {sessionId:session.id,status:result.status==='queued'?'queued':changed?'updated':'unchanged',ruleCount:preview.rules.length,nextProgressiveAt:next}
+}
 export async function processDueTraining(limit=25) {
   const cutoff=now(),retryBefore=new Date(Date.now()-60*60*1000).toISOString()
-  const due=all("SELECT id,node_id,status FROM learning_sessions WHERE mode='auto' AND ((status='active' AND ends_at<=? AND (last_attempt_at IS NULL OR last_attempt_at<=?)) OR (status IN ('review','apply-failed') AND (last_attempt_at IS NULL OR last_attempt_at<=?))) ORDER BY ends_at LIMIT ?",cutoff,retryBefore,retryBefore,limit)
+  const due=all("SELECT * FROM learning_sessions WHERE mode='auto' AND (((status='active' AND (ends_at<=? OR (progressive_enabled=1 AND next_progressive_at<=?))) OR status IN ('review','apply-failed')) AND (last_attempt_at IS NULL OR last_attempt_at<=?)) ORDER BY ends_at LIMIT ?",cutoff,cutoff,retryBefore,limit)
   const results=[]
   for(const session of due){
-    try {
+    try{
       if(session.status==='active'){
         const node=getNode(session.node_id)
         if(!node)throw new Error('Node is missing')
-        if(node.connection_mode==='agent'){
-          const agent=one('SELECT last_checkin_at FROM agents WHERE id=? AND revoked_at IS NULL',node.agent_id)
-          if(!agent?.last_checkin_at||Date.parse(agent.last_checkin_at)<Date.now()-5*60_000)throw new Error('Agent is not online to confirm training telemetry')
-        } else {
-          if(!['winrm','winrms'].includes(node.transport))throw new Error('No working event collection transport; probe the node before training can finish')
-          const collection=await pullLogs(node.id)
-          if(!collection.caughtUp)throw new Error('Security event backlog remains; training will finish after collection catches up')
-        }
-        const finalized=finalizeLearning(session.id)
-        if(finalized.status==='empty'){results.push({sessionId:session.id,status:'empty'});continue}
+        await collectTrainingTelemetry(node)
+        if(session.ends_at>cutoff){results.push(await applyProgressiveLearning(session,node));continue}
+        if(node.connection_mode==='agent'&&one("SELECT id FROM agent_jobs WHERE agent_id=? AND type='policy.apply' AND status IN ('queued','leased') AND json_extract(payload_json,'$.progressiveSessionId')=?",node.agent_id,session.id))throw new Error('Wait for the previous progressive apply before finalizing learning')
+        finalizeLearning(session.id)
       }
       const applied=await approveLearning(session.id)
       results.push({sessionId:session.id,status:applied.status})
-    } catch(error) {
+    }catch(error){
       run('UPDATE learning_sessions SET last_error=?,last_attempt_at=? WHERE id=?',error.message,now(),session.id)
       audit(null,'learning.auto-failed','node',session.node_id,null,{sessionId:session.id,error:error.message})
       results.push({sessionId:session.id,status:'failed',error:error.message})
     }
+  }
+  return results
+}
+
+export async function processDueBreakGlass(limit=25){
+  const due=all("SELECT * FROM break_glass_sessions WHERE status IN ('activating','activation-unknown','active','ending') AND expires_at<=? ORDER BY expires_at LIMIT ?",now(),limit)
+  const results=[]
+  for(const session of due){
+    try{
+      if(session.status==='ending'){results.push({sessionId:session.id,status:'ending'});continue}
+      if(session.status==='activating'&&getNode(session.node_id)?.connection_mode==='agent'){
+        const job=one('SELECT status FROM agent_jobs WHERE id=?',session.agent_job_id)
+        if(job?.status==='queued'){
+          run("UPDATE agent_jobs SET status='failed',error='Break-glass window expired before activation',finished_at=? WHERE id=?",now(),session.agent_job_id)
+          run("UPDATE break_glass_sessions SET status='failed',last_error='Expired before agent activation' WHERE id=?",session.id)
+          results.push({sessionId:session.id,status:'failed'})
+        }else results.push({sessionId:session.id,status:'activation-pending'})
+        continue
+      }
+      const result=await endBreakGlass(session,null,'expired')
+      results.push({sessionId:session.id,status:result.queued?'ending':'expired'})
+    }catch(error){results.push({sessionId:session.id,status:'failed',error:error.message})}
   }
   return results
 }
@@ -962,14 +1339,24 @@ api.post('/logon-rights/jit-grant',requireRole('admin'),(req,res)=>res.status(50
 api.get('/agents',(_req,res)=>res.json(all('SELECT * FROM agents ORDER BY last_checkin_at DESC')))
 api.post('/agents/:id/revoke',requireRole('admin'),(req,res)=>{
   const agent=one('SELECT * FROM agents WHERE id=?',reqId(req));if(!agent)return notFound(res,'Agent')
-  run('UPDATE agents SET revoked_at=? WHERE id=?',now(),agent.id)
-  run("UPDATE nodes SET status='unreachable' WHERE id=?",agent.node_id)
-  audit(req.user.id,'agent.revoke','agent',agent.id,null,{nodeId:agent.node_id})
+  db.transaction(()=>{
+    for(const assignment of all(`SELECT a.* FROM policy_assignments a JOIN agent_jobs j ON j.id=a.removal_job_id WHERE j.agent_id=?`,agent.id)){
+      run("UPDATE agent_jobs SET status='failed',error='Agent revoked before firewall cleanup',finished_at=? WHERE id=?",now(),assignment.removal_job_id)
+      const applyRunId=parse(one('SELECT payload_json FROM agent_jobs WHERE id=?',assignment.removal_job_id)?.payload_json)?.applyRunId
+      if(applyRunId)run("UPDATE policy_apply_runs SET status='failed',error='Agent revoked before firewall cleanup',finished_at=? WHERE id=?",now(),applyRunId)
+      run('UPDATE policy_assignments SET removal_job_id=NULL WHERE id=?',assignment.id)
+      audit(req.user.id,'policy.unassign.failed','policy',assignment.policy_id,assignment,{reason:'agent_revoked',nodeId:agent.node_id})
+    }
+    run('UPDATE agents SET revoked_at=? WHERE id=?',now(),agent.id)
+    run("UPDATE nodes SET status='unreachable' WHERE id=?",agent.node_id)
+    audit(req.user.id,'agent.revoke','agent',agent.id,null,{nodeId:agent.node_id})
+  })()
   res.json({revoked:true})
 })
 api.post('/agents/enrollment-tokens',requireRole('admin'),(req,res)=>{
   if(!agentPkiReady())return res.status(503).json({error:'Configure HTTPS and agent PKI before generating enrollment tokens'})
   const {nodeId}=body(z.object({nodeId:z.string()}),req);if(!getNode(nodeId))return notFound(res,'Node')
+  if(one('SELECT id FROM agents WHERE node_id=?',nodeId))return res.status(409).json({error:'This node already has an agent; use certificate renewal'})
   const token=crypto.randomBytes(32).toString('base64url'),tokenId=id(),expires=new Date(Date.now()+15*60*1000).toISOString()
   run('INSERT INTO enrollment_tokens(id,node_id,token_hash,expires_at) VALUES(?,?,?,?)',tokenId,nodeId,hashToken(token),expires)
   audit(req.user.id,'agent.token.create','node',nodeId,null,{expires});res.status(201).json({token,expiresAt:expires})
@@ -979,7 +1366,7 @@ api.get('/agents/:id',(req,res)=>{const agent=one('SELECT * FROM agents WHERE id
 app.use((error,req,res,_next)=>{
   if(error instanceof z.ZodError)return res.status(400).json({error:'Validation failed',issues:error.issues})
   if(error?.code==='SQLITE_CONSTRAINT_UNIQUE'||error?.code==='SQLITE_CONSTRAINT_PRIMARYKEY')return res.status(409).json({error:'Record already exists'})
-  if([400,401,403,404,409,413,429,503].includes(error.status))return res.status(error.status).json({error:error.message,...(error.conflicts?{conflicts:error.conflicts}:{})})
+  if([400,401,403,404,409,413,429,502,503].includes(error.status))return res.status(error.status).json({error:error.message,...(error.conflicts?{conflicts:error.conflicts}:{})})
   console.error(error)
   res.status(500).json({error:'Internal server error'})
 })

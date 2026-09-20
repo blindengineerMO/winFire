@@ -8,7 +8,7 @@ import EnterpriseDashboard from '../components/EnterpriseDashboard.vue'
 import {api} from '../lib/api.js'
 ChartJS.register(ArcElement,BarElement,CategoryScale,LinearScale,Tooltip,Legend)
 const stats=ref(null),coverage=ref([]),events=ref([]),error=ref('')
-onMounted(async()=>{try{[stats.value,coverage.value,events.value]=await Promise.all([api('/reports/dashboard'),api('/reports/coverage'),api('/logs/search')])}catch(e){error.value=e.message}})
+onMounted(async()=>{try{const [dashboard,loadedCoverage,recent]=await Promise.all([api('/reports/dashboard'),api('/reports/coverage'),api('/logs/search?pageSize=6')]);stats.value=dashboard;coverage.value=loadedCoverage;events.value=recent.items}catch(e){error.value=e.message}})
 const donutOptions={responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom',labels:{color:'#aab8c8',boxWidth:10}}},cutout:'75%'}
 const barOptions={responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#8494a8'},grid:{display:false}},y:{ticks:{color:'#8494a8'},grid:{color:'#26354a'}}}}
 </script>

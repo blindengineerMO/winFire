@@ -8,6 +8,7 @@ import {agentPkiReady,signAgentCsr} from './agentPki.js'
 import {normalizeWindowsEvent} from './eventNormalizer.js'
 import {diffRules} from './connector.js'
 import {emitNotification} from './notifications.js'
+import {normalizeProfileSnapshot} from './breakGlass.js'
 
 export const agentRoutes=express.Router()
 const wrap=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next)
@@ -76,8 +77,22 @@ agentRoutes.get('/:id/jobs',requireAgent,(req,res)=>{
       run("UPDATE agent_jobs SET status='failed',error='Job lease expired after five attempts',finished_at=?,lease_token=NULL WHERE id=?",now(),job.id)
       const payload=parse(job.payload_json)||{}
       if(payload.applyRunId)run("UPDATE policy_apply_runs SET status='failed',error='Agent did not complete job after five attempts',finished_at=? WHERE id=?",now(),payload.applyRunId)
+      if(payload.removalAssignmentId){
+        run('UPDATE policy_assignments SET removal_job_id=NULL WHERE id=? AND removal_job_id=?',payload.removalAssignmentId,job.id)
+        audit(null,'policy.unassign.failed','policy',payload.policyId,null,{assignmentId:payload.removalAssignmentId,jobId:job.id,error:'Agent did not complete job after five attempts'})
+      }
       if(payload.driftCheckId)run("UPDATE policy_drift_checks SET status='unknown',error='Agent did not complete readback after five attempts',checked_at=? WHERE id=?",now(),payload.driftCheckId)
-      if(payload.policyId){
+      if(payload.learningAttemptId){
+        const learning=one("SELECT id FROM learning_sessions WHERE id=? AND node_id=? AND current_apply_attempt_id=? AND status='applying'",payload.learningSessionId,req.agent.node_id,payload.learningAttemptId)
+        if(learning){run("UPDATE learning_sessions SET status='apply-failed',last_error='Agent did not complete the apply job' WHERE id=?",learning.id);run("UPDATE nodes SET firewall_state='review' WHERE id=?",req.agent.node_id)}
+      }
+      if(payload.progressiveSessionId)run("UPDATE learning_sessions SET last_error='Agent did not complete progressive apply',next_progressive_at=?,last_attempt_at=? WHERE id=? AND status='active'",now(),now(),payload.progressiveSessionId)
+      if(payload.breakGlassSessionId){
+        if(job.type==='breakglass.start')run("UPDATE break_glass_sessions SET status='failed',last_error='Agent did not confirm activation' WHERE id=? AND status='activating'",payload.breakGlassSessionId)
+        if(job.type==='breakglass.end')run("UPDATE break_glass_sessions SET status='active',last_error='Agent did not confirm firewall restoration' WHERE id=? AND status='ending'",payload.breakGlassSessionId)
+        audit(null,'break-glass.agent-job.abandoned','node',req.agent.node_id,null,{sessionId:payload.breakGlassSessionId,jobId:job.id})
+      }
+      if(payload.policyId&&!payload.learningAttemptId){
         const learning=one("SELECT id FROM learning_sessions WHERE generated_policy_id=? AND node_id=? AND status='applying'",payload.policyId,req.agent.node_id)
         if(learning){run("UPDATE learning_sessions SET status='apply-failed',last_error='Agent did not complete the apply job' WHERE id=?",learning.id);run("UPDATE nodes SET firewall_state='review' WHERE id=?",req.agent.node_id)}
       }
@@ -102,6 +117,14 @@ agentRoutes.post('/:id/jobs/:jobId/result',requireAgent,(req,res)=>{
   db.transaction(()=>{
     run('UPDATE agent_jobs SET status=?,result_json=?,error=?,finished_at=?,lease_until=NULL,lease_token=NULL WHERE id=?',status,json(data.result||data.diff||null),data.error||null,now(),job.id)
     if(payload.applyRunId)run('UPDATE policy_apply_runs SET status=?,diff_json=?,error=?,finished_at=? WHERE id=?',status,json(data.diff||null),data.error||null,now(),payload.applyRunId)
+    if(payload.removalAssignmentId){
+      const assignment=one('SELECT * FROM policy_assignments WHERE id=? AND removal_job_id=?',payload.removalAssignmentId,job.id)
+      if(assignment){
+        if(data.success)run('DELETE FROM policy_assignments WHERE id=?',assignment.id)
+        else run('UPDATE policy_assignments SET removal_job_id=NULL WHERE id=?',assignment.id)
+        audit(null,data.success?'policy.unassign':'policy.unassign.failed','policy',assignment.policy_id,assignment,{assignmentId:assignment.id,jobId:job.id,nodeId:req.agent.node_id,error:data.error||null})
+      }
+    }
     if(payload.driftCheckId){
       const check=one('SELECT * FROM policy_drift_checks WHERE id=? AND node_id=?',payload.driftCheckId,req.agent.node_id)
       if(check){
@@ -119,12 +142,41 @@ agentRoutes.post('/:id/jobs/:jobId/result',requireAgent,(req,res)=>{
         if(driftStatus==='drift'&&previous!=='drift')emitNotification({eventKey:`drift:${check.id}`,category:'policy_drift',title:'Policy drift detected',body:`${one('SELECT name FROM policies WHERE id=?',check.policy_id)?.name||'Policy'} differs from the firewall rules on ${one('SELECT hostname FROM nodes WHERE id=?',check.node_id)?.hostname||check.node_id}.`,entityType:'node',entityId:check.node_id})
       }
     }
-    if(payload.policyId){
+    if(payload.learningAttemptId){
+      const learning=one("SELECT id FROM learning_sessions WHERE id=? AND node_id=? AND current_apply_attempt_id=? AND status='applying'",payload.learningSessionId,req.agent.node_id,payload.learningAttemptId)
+      if(learning){
+        const jobs=all("SELECT status FROM agent_jobs WHERE json_extract(payload_json,'$.learningAttemptId')=?",payload.learningAttemptId)
+        const completed=jobs.length>=Number(payload.learningExpectedJobs||1)&&jobs.every(item=>item.status==='success'),failed=jobs.some(item=>item.status==='failed')
+        if(completed||failed){
+          run('UPDATE learning_sessions SET status=?,last_error=? WHERE id=?',completed?'enforced':'apply-failed',completed?null:data.error||'Agent policy apply failed',learning.id)
+          run('UPDATE nodes SET firewall_state=? WHERE id=?',completed?'enforcing':'review',req.agent.node_id)
+          audit(null,completed?'learning.enforced':'learning.apply.failed','node',req.agent.node_id,null,{sessionId:learning.id,jobId:job.id})
+        }
+      }
+    }else if(payload.policyId&&!payload.progressiveSessionId){
       const learning=one("SELECT id FROM learning_sessions WHERE generated_policy_id=? AND node_id=? AND status='applying'",payload.policyId,req.agent.node_id)
       if(learning){
         run('UPDATE learning_sessions SET status=?,last_error=? WHERE id=?',data.success?'enforced':'apply-failed',data.success?null:data.error||'Agent apply failed',learning.id)
         run('UPDATE nodes SET firewall_state=? WHERE id=?',data.success?'enforcing':'review',req.agent.node_id)
         audit(null,data.success?'learning.enforced':'learning.apply.failed','node',req.agent.node_id,null,{sessionId:learning.id,jobId:job.id})
+      }
+    }
+    if(payload.progressiveSessionId){
+      if(!data.success)run('UPDATE learning_sessions SET last_error=?,next_progressive_at=?,last_attempt_at=? WHERE id=? AND status=\'active\'',data.error||'Agent progressive apply failed',now(),now(),payload.progressiveSessionId)
+      audit(null,data.success?'learning.progressive.applied':'learning.progressive.failed','node',req.agent.node_id,null,{sessionId:payload.progressiveSessionId,jobId:job.id,error:data.error||null})
+    }
+    if(payload.breakGlassSessionId){
+      const session=one('SELECT * FROM break_glass_sessions WHERE id=? AND node_id=?',payload.breakGlassSessionId,req.agent.node_id)
+      if(session&&job.type==='breakglass.start'&&session.status==='activating'){
+        const profiles=normalizeProfileSnapshot(data.result?.profiles)
+        const active=data.success&&data.result?.active===true&&!!profiles
+        run('UPDATE break_glass_sessions SET status=?,profile_snapshot_json=?,last_error=? WHERE id=?',active?'active':'failed',active?json(profiles):null,active?null:data.error||'Agent did not confirm firewall state',session.id)
+        audit(null,active?'break-glass.active':'break-glass.start.failed','node',req.agent.node_id,null,{sessionId:session.id,jobId:job.id,expiresAt:session.expires_at,error:active?null:data.error||'Invalid agent readback'})
+      }
+      if(session&&job.type==='breakglass.end'&&session.status==='ending'){
+        const restored=data.success&&data.result?.restored===true
+        run('UPDATE break_glass_sessions SET status=?,ended_at=?,last_error=? WHERE id=?',restored?payload.finalStatus||'ended':'active',restored?now():null,restored?null:data.error||'Agent did not confirm firewall restoration',session.id)
+        audit(null,restored?(payload.finalStatus==='expired'?'break-glass.expired':'break-glass.end'):'break-glass.end.failed','node',req.agent.node_id,null,{sessionId:session.id,jobId:job.id,error:restored?null:data.error||'Invalid agent readback'})
       }
     }
     audit(null,data.success?'agent.job.success':'agent.job.failed','agent-job',job.id,null,{agentId:req.agent.id,type:job.type,error:data.error||null})

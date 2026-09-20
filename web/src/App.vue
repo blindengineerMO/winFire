@@ -16,12 +16,12 @@ async function logout(){try{await api('/auth/logout',{method:'POST',body:{refres
   <router-view v-if="route.meta.public" />
   <div v-else class="shell">
     <aside class="side glass hacker-side" :class="{'side-open':menuOpen}">
-      <div class="brand"><span class="brand-mark"><i class="mdi mdi-fire"></i></span><span class="brand-name">WIN<span>FIRE</span><small>SECURE CONTROL PLANE</small></span></div>
+      <div class="brand"><span class="brand-mark"><img src="/winfire-mark.png" alt=""></span><span class="brand-name">WIN<span>FIRE</span><small>SECURE CONTROL PLANE</small></span></div>
       <nav aria-label="Main navigation"><router-link v-for="link in links" :key="link[0]" :to="link[0]" @click="menuOpen=false" :title="link[2]"><i class="mdi" :class="`mdi-${link[1]}`"></i><span>{{link[2]}}</span></router-link></nav>
       <div class="side-foot"><span class="online-dot"></span> SYSTEM ONLINE <span class="version">v0.1</span></div>
     </aside>
     <aside class="enterprise-side" :class="{'side-open':menuOpen}">
-      <router-link to="/" class="enterprise-brand" @click="menuOpen=false"><span class="enterprise-brand-mark"><i class="mdi mdi-shield-fire-outline"></i></span><span><strong>WINFIRE</strong><small>SECURE</small></span></router-link>
+      <router-link to="/" class="enterprise-brand" @click="menuOpen=false"><span class="enterprise-brand-mark"><img src="/winfire-mark.png" alt=""></span><span><strong>WINFIRE</strong><small>SECURE</small></span></router-link>
       <router-link to="/" class="enterprise-back" @click="menuOpen=false"><i class="mdi mdi-arrow-left"></i> Back to main menu</router-link>
       <nav class="enterprise-nav" aria-label="Enterprise navigation">
         <div class="enterprise-nav-group"><span class="enterprise-nav-label">WORKSPACE</span><router-link to="/" @click="menuOpen=false"><i class="mdi mdi-view-dashboard-outline"></i> Dashboard</router-link></div>

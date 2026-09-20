@@ -60,6 +60,12 @@ public sealed class Worker(ILogger<Worker> logger) : BackgroundService
                 response = await client.PostAsJsonAsync($"api/v1/agents/{config.AgentId}/jobs/{job.Id}/result",
                     new { leaseToken = job.LeaseToken, success = true, result }, JsonOptions, cancellationToken);
             }
+            else if (job.Type is "breakglass.start" or "breakglass.end")
+            {
+                var result = await BreakGlass.RunAsync(job.Payload, cancellationToken);
+                response = await client.PostAsJsonAsync($"api/v1/agents/{config.AgentId}/jobs/{job.Id}/result",
+                    new { leaseToken = job.LeaseToken, success = true, result }, JsonOptions, cancellationToken);
+            }
             else throw new InvalidOperationException($"Unsupported job type: {job.Type}");
             using (response) response.EnsureSuccessStatusCode();
             logger.LogInformation("Completed agent job {JobId}", job.Id);
