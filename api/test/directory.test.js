@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import supertest from 'supertest'
-import {guidFromDirectory,sidFromDirectory,normalizeDirectoryComputer,testDirectoryConnection,authenticateDirectoryUser,directoryConnectionError,ldapFallbackUsername} from '../src/directory.js'
+import {guidFromDirectory,sidFromDirectory,normalizeDirectoryComputer,normalizeDirectoryUser,testDirectoryConnection,authenticateDirectoryUser,directoryConnectionError,ldapFallbackUsername} from '../src/directory.js'
 
 const dir=fs.mkdtempSync(path.join(os.tmpdir(),'winfire-directory-test-'))
 process.env.DATA_DIR=dir
@@ -48,6 +48,16 @@ test('interactive AD authentication binds the user over LDAPS and never uses app
   await assert.rejects(authenticateDirectoryUser(config,'operator@example.test','bad-password',invalidFactory),error=>error.status===401&&/Invalid directory credentials/.test(error.message))
 })
 
+test('AD users normalize with account status and group memberships',()=>{
+  const userSid=Buffer.from(sid);userSid.writeUInt32LE(501,24)
+  const user=normalizeDirectoryUser({objectGUID:guid,objectSid:userSid,distinguishedName:'CN=Alice,OU=Users,DC=example,DC=test',sAMAccountName:'alice',userPrincipalName:'alice@example.test',mail:'alice@example.test',displayName:'Alice',memberOf:['CN=Operators,DC=example,DC=test'],userAccountControl:'514'})
+  assert.equal(user.guid,'12345678-9abc-def0-1122-334455667788')
+  assert.equal(user.sid,'S-1-5-21-100-200-300-501')
+  assert.equal(user.enabled,false)
+  assert.deepEqual(user.memberOf,['CN=Operators,DC=example,DC=test'])
+  assert.equal(normalizeDirectoryUser(computer('srv01'),'DC=example,DC=test'),null)
+})
+
 test('directory settings use vault credentials and sync AD as the first inventory source',async()=>{
   const login=await request.post('/api/v1/auth/login').send({email:'owner@directory.test',password:'directory-test-password-123'}).expect(200)
   const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
@@ -66,7 +76,7 @@ test('directory settings use vault credentials and sync AD as the first inventor
   const connection=await testDirectoryConnection({url:'ldaps://dc.example.test:636/',base_dn:'DC=example,DC=test'},{username:'reader@example.test',password:'directory-secret'},factory)
   assert.equal(connection.connected,true)
   const first=await syncDirectory(login.body.user.id,factory)
-  assert.deepEqual(first,{found:2,created:1,updated:1,missing:0,transport:'ldaps',fallbackUsed:false})
+  assert.deepEqual(first,{found:2,created:1,updated:1,missing:0,transport:'ldaps',fallbackUsed:false,users:{count:0,transport:'ldaps'}})
   assert.equal(seen.options[0].tlsOptions.minVersion,'TLSv1.2')
   assert.ok(seen.binds.every(([username,password])=>username==='reader@example.test'&&password==='directory-secret'))
   const linked=db.prepare('SELECT * FROM nodes WHERE id=?').get(manual.body.id)
@@ -80,7 +90,7 @@ test('directory settings use vault credentials and sync AD as the first inventor
   assert.equal(db.prepare('SELECT COUNT(*) n FROM credential_assignments WHERE credential_id=? AND node_id=?').get(credential.body.id,disabled.id).n,1)
   entries.current=[computer('srv01-new')]
   const second=await syncDirectory(login.body.user.id,factory)
-  assert.deepEqual(second,{found:1,created:0,updated:1,missing:1,transport:'ldaps',fallbackUsed:false})
+  assert.deepEqual(second,{found:1,created:0,updated:1,missing:1,transport:'ldaps',fallbackUsed:false,users:{count:0,transport:'ldaps'}})
   assert.equal(db.prepare('SELECT hostname FROM nodes WHERE id=?').get(manual.body.id).hostname,'srv01-new')
   assert.equal(db.prepare('SELECT ad_missing FROM nodes WHERE id=?').get(disabled.id).ad_missing,1)
   const publicSettings=await auth(request.get('/api/v1/settings/directory')).expect(200)
@@ -160,4 +170,29 @@ test('an admin must explicitly approve LDAP 389 fallback for the directory host 
   assert.equal(changedBind.body.ldapFallbackApprovedAt,null)
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action='directory.ldap_fallback.revoke' AND after_json LIKE '%bind_credential_changed%'").get().n,1)
   await auth(request.patch('/api/v1/settings/directory')).send({...body,url:'ldaps://other.example.test:636/',bindCredentialId:secondCredential.body.id}).expect(400)
+})
+
+test('directory inventory pages users and imports an AD-only operator',async()=>{
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@directory.test',password:'directory-test-password-123'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
+  const userGuid=Buffer.from('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','hex')
+  const userSid=Buffer.from(sid);userSid.writeUInt32LE(1101,24)
+  const entry={objectGUID:userGuid,objectSid:userSid,distinguishedName:'CN=Alice,OU=Users,DC=example,DC=test',sAMAccountName:'alice',userPrincipalName:'alice@example.test',mail:'alice@example.test',displayName:'Alice Operator',userAccountControl:'512',memberOf:['CN=Operators,OU=Groups,DC=example,DC=test']}
+  const factory=()=>({async bind(){},async *searchPaginated(_base,options){yield {searchEntries:options.filter.includes('objectCategory=person')?[entry]:[]}},async unbind(){}})
+  const result=await syncDirectory(login.body.user.id,factory)
+  assert.equal(result.users.count,1)
+  const list=await auth(request.get('/api/v1/directory/users?q=alice&page=1&pageSize=10&sortBy=username')).expect(200)
+  assert.equal(list.body.total,1)
+  assert.equal(list.body.items[0].sam_account_name,'alice')
+  assert.equal(list.body.items[0].operator_imported,0)
+  const userId=list.body.items[0].id
+  const detail=await auth(request.get(`/api/v1/directory/users/${userId}`)).expect(200)
+  assert.deepEqual(detail.body.memberOf,['CN=Operators,OU=Groups,DC=example,DC=test'])
+  await auth(request.post(`/api/v1/directory/users/${userId}/import-operator`)).send({role:'auditor'}).expect(201)
+  const operator=db.prepare('SELECT * FROM users WHERE ad_guid=?').get(userId)
+  assert.equal(operator.auth_source,'ad')
+  await request.post('/api/v1/auth/login').send({email:'alice@example.test',password:'arbitrary-password'}).expect(401)
+  db.prepare('UPDATE directory_users SET enabled=0 WHERE id=?').run(userId)
+  const disabled=await auth(request.get('/api/v1/directory/users?enabled=false&pageSize=10')).expect(200)
+  assert.equal(disabled.body.items.some(user=>user.id===userId),true)
 })

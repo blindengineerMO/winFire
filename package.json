@@ -17,6 +17,7 @@
     "test": "node --test api/test/*.test.js",
     "test:winrm:live": "node api/test/live_winrm_smoke.mjs",
     "test:winrm:rights": "node api/test/live_rights_read.mjs",
+    "test:winrm:rights:write": "node api/test/live_rights_write.mjs",
     "audit:deps": "npm audit --omit=dev --audit-level=high"
   },
   "dependencies": {

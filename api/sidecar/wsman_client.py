@@ -1,5 +1,6 @@
 """Small WSMan transport for the Node control plane. Reads one JSON request on stdin."""
 import base64
+import gzip
 import json
 import os
 import sys
@@ -24,15 +25,18 @@ function Get-WinFireAuditPolicy {
 $result = switch ($operation) {
   'auth' { [Security.Principal.WindowsIdentity]::GetCurrent().Name }
   'tcp_probe' {
-    $client=[System.Net.Sockets.TcpClient]::new();$watch=[Diagnostics.Stopwatch]::StartNew();$status='unreachable'
+    $addresses=@([System.Net.Dns]::GetHostAddresses([string]$argsData.host));$address=@($addresses | Where-Object AddressFamily -EQ InterNetwork | Select-Object -First 1)[0];if(-not $address){$address=$addresses[0]}
+    $route=[System.Net.Sockets.Socket]::new($address.AddressFamily,[System.Net.Sockets.SocketType]::Dgram,[System.Net.Sockets.ProtocolType]::Udp)
+    try{$route.Connect($address,[int]$argsData.port);$localAddress=([System.Net.IPEndPoint]$route.LocalEndPoint).Address}finally{$route.Dispose()}
+    $client=[System.Net.Sockets.TcpClient]::new($address.AddressFamily);$client.Client.Bind([System.Net.IPEndPoint]::new($localAddress,0));$watch=[Diagnostics.Stopwatch]::StartNew();$status='unreachable'
     try {
-      $task=$client.ConnectAsync([string]$argsData.host,[int]$argsData.port)
+      $task=$client.ConnectAsync($address,[int]$argsData.port)
       if($task.Wait([Math]::Min(5000,[Math]::Max(250,[int]$argsData.timeoutMs)))){$status='open'}else{$status='timeout'}
     } catch {
       $cause=$_.Exception;while($cause.InnerException){$cause=$cause.InnerException}
       if($cause -is [System.Net.Sockets.SocketException] -and $cause.SocketErrorCode -eq [System.Net.Sockets.SocketError]::ConnectionRefused){$status='refused'}
-    } finally {$watch.Stop();$client.Dispose()}
-    [pscustomobject]@{status=$status;latencyMs=$watch.ElapsedMilliseconds}
+    } finally {$watch.Stop();$endpoint=$client.Client.LocalEndPoint;$sourceIp=if($endpoint){$endpoint.Address.ToString()}else{$null};$sourcePort=if($endpoint){$endpoint.Port}else{$null};$client.Dispose()}
+    [pscustomobject]@{status=$status;latencyMs=$watch.ElapsedMilliseconds;sourceIp=$sourceIp;sourcePort=$sourcePort}
   }
   'facts' {
     $computer = Get-CimInstance Win32_ComputerSystem
@@ -70,7 +74,7 @@ $result = switch ($operation) {
       $r = $_; $p = $r | Get-NetFirewallPortFilter
       $a = $r | Get-NetFirewallAddressFilter; $app = $r | Get-NetFirewallApplicationFilter
       [pscustomobject]@{
-        name = $r.DisplayName; group = $r.Group
+        internalName = $r.Name; name = $r.DisplayName; group = $r.Group
         action = ([string]$r.Action).ToLower(); direction = $(if($r.Direction -eq 'Inbound'){'in'}else{'out'})
         protocol = [string]$p.Protocol; localPort = [string]$p.LocalPort; remotePort = [string]$p.RemotePort
         remoteAddress = [string]$a.RemoteAddress; program = [string]$app.Program
@@ -104,7 +108,7 @@ $result = switch ($operation) {
   }
   'events' {
     $after=[long]$argsData.after
-    $xpath="*[System[((EventID=5156 or EventID=5157 or EventID=5150 or EventID=5151 or EventID=4624 or EventID=4625 or EventID=5712) and EventRecordID > $after)]]"
+    $xpath="*[System[((EventID=5156 or EventID=5157 or EventID=5150 or EventID=5151 or EventID=4624 or EventID=4625 or EventID=4634 or EventID=4647 or EventID=5712) and EventRecordID > $after)]]"
     @(Get-WinEvent -LogName Security -FilterXPath $xpath -Oldest -MaxEvents 500 -ErrorAction SilentlyContinue | ForEach-Object {
       $event=$_; $xml=[xml]$event.ToXml(); $fields=@{}
       foreach($data in @($xml.Event.EventData.Data)) { if($data.Name) {$fields[$data.Name]=[string]$data.'#text'} }
@@ -113,13 +117,21 @@ $result = switch ($operation) {
   }
   'events_recent' {
     $firewall=@(Get-WinEvent -LogName Security -FilterXPath '*[System[(EventID=5156 or EventID=5157 or EventID=5150 or EventID=5151)]]' -MaxEvents 500 -ErrorAction SilentlyContinue)
-    $other=@(Get-WinEvent -LogName Security -FilterXPath '*[System[(EventID=4624 or EventID=4625 or EventID=5712)]]' -MaxEvents 100 -ErrorAction SilentlyContinue)
+    $other=@(Get-WinEvent -LogName Security -FilterXPath '*[System[(EventID=4624 or EventID=4625 or EventID=4634 or EventID=4647 or EventID=5712)]]' -MaxEvents 100 -ErrorAction SilentlyContinue)
     @($firewall+$other | Sort-Object RecordId | ForEach-Object {
       $event=$_; $xml=[xml]$event.ToXml(); $fields=@{}
       foreach($data in @($xml.Event.EventData.Data)) { if($data.Name) {$fields[$data.Name]=[string]$data.'#text'} }
       [pscustomobject]@{RecordId=$event.RecordId;Id=$event.Id;TimeCreated=$event.TimeCreated.ToUniversalTime().ToString('o');Fields=$fields}
     })
   }
+  'events_probe' {
+    @(Get-WinEvent -LogName Security -FilterXPath '*[System[EventID=5157]]' -MaxEvents 500 -ErrorAction SilentlyContinue | ForEach-Object {
+      $event=$_; $xml=[xml]$event.ToXml(); $fields=@{}
+      foreach($data in @($xml.Event.EventData.Data)) { if($data.Name) {$fields[$data.Name]=[string]$data.'#text'} }
+      [pscustomobject]@{RecordId=$event.RecordId;Id=$event.Id;TimeCreated=$event.TimeCreated.ToUniversalTime().ToString('o');Fields=$fields}
+    })
+  }
+  'event_cursor' { [long](Get-WinEvent -LogName Security -MaxEvents 1 -ErrorAction Stop).RecordId }
   'audit_policy' { Get-WinFireAuditPolicy }
   'audit_policy_enable' {
     $before=Get-WinFireAuditPolicy
@@ -162,7 +174,7 @@ $result | ConvertTo-Json -Depth 12 -Compress
 def main():
     payload = json.load(sys.stdin)
     operation = payload['operation']
-    if operation not in {'auth', 'tcp_probe', 'facts', 'all_rules', 'rules', 'apply', 'events', 'events_recent', 'audit_policy', 'audit_policy_enable', 'rights', 'rights_change', 'breakglass_start', 'breakglass_end', 'jit_preflight', 'jit_start', 'jit_end', 'prompt_browser', 'prompt_session'}:
+    if operation not in {'auth', 'tcp_probe', 'facts', 'all_rules', 'rules', 'apply', 'events', 'events_recent', 'events_probe', 'event_cursor', 'audit_policy', 'audit_policy_enable', 'rights', 'rights_change', 'breakglass_start', 'breakglass_end', 'jit_preflight', 'jit_start', 'jit_end', 'prompt_browser', 'prompt_session', 'agent_deploy'}:
         raise ValueError('Unsupported operation')
     host = payload['host']
     secure = payload.get('transport') == 'winrms'
@@ -171,10 +183,11 @@ def main():
     shared_root = Path(__file__).resolve().parents[2] / 'packages' / 'shared'
     calls = {'jit_preflight':'Test-WinFireJitGate $argsData','jit_start':'Start-WinFireJitAccess $argsData','jit_end':'End-WinFireJitAccess $argsData',
              'breakglass_start':'Start-WinFireBreakGlass $argsData','breakglass_end':'End-WinFireBreakGlass $argsData',
-             'prompt_browser':'Open-WinFireMfaPortal $argsData','prompt_session':'@(Get-WinFireActiveSession)'}
+             'prompt_browser':'Open-WinFireMfaPortal $argsData','prompt_session':'@(Get-WinFireActiveSession)',
+             'agent_deploy':'Install-WinFireAgentRemote $argsData'}
     if operation in calls:
-        source = 'jitAccess.ps1' if operation.startswith('jit_') else 'mfaPrompt.ps1' if operation.startswith('prompt_') else 'breakGlass.ps1'
-        script = SHARED_POWERSHELL.replace('__WINFIRE_SHARED_FUNCTIONS__',(shared_root / source).read_text()).replace('__WINFIRE_CALL__',calls[operation])
+        source = (Path(__file__).resolve().parent / 'agent_deploy.ps1') if operation == 'agent_deploy' else shared_root / ('jitAccess.ps1' if operation.startswith('jit_') else 'mfaPrompt.ps1' if operation.startswith('prompt_') else 'breakGlass.ps1')
+        script = SHARED_POWERSHELL.replace('__WINFIRE_SHARED_FUNCTIONS__',source.read_text()).replace('__WINFIRE_CALL__',calls[operation])
     else:
         script = POWERSHELL.replace('__OPERATION__', operation).replace('# __WINFIRE_LSA_RIGHTS__', (Path(__file__).resolve().parent / 'lsa_rights.ps1').read_text() if operation.startswith('rights') else '')
     script = script.replace('[Console]::In.ReadToEnd()', f"'{args}'")
@@ -186,15 +199,19 @@ def main():
         read_timeout_sec=90 if operation in calls else 45 if operation.startswith('rights') else 25,
         operation_timeout_sec=80 if operation in calls else 40 if operation.startswith('rights') else 20,
     )
-    loader = "$encoded=[Console]::In.ReadToEnd(); Invoke-Expression ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded)))"
+    loader = "$encoded=[Console]::In.ReadToEnd();$buffer=[IO.MemoryStream]::new([Convert]::FromBase64String($encoded));$zip=[IO.Compression.GzipStream]::new($buffer,[IO.Compression.CompressionMode]::Decompress);$reader=[IO.StreamReader]::new($zip,[Text.Encoding]::UTF8);try{Invoke-Expression $reader.ReadToEnd()}finally{$reader.Dispose();$zip.Dispose();$buffer.Dispose()}"
     encoded_loader = base64.b64encode(loader.encode('utf-16le')).decode()
-    encoded_script = base64.b64encode(script.encode('utf-16le'))
+    encoded_script = base64.b64encode(gzip.compress(script.encode('utf-8')))
     protocol = session.protocol
     shell_id = protocol.open_shell()
     try:
         command_id = protocol.run_command(shell_id, 'powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded_loader])
         try:
-            protocol.send_command_input(shell_id, command_id, encoded_script, end=True)
+            # Keep WS-Man input envelopes small. Even compressed scripts may
+            # exceed a host's per-envelope input limit when sent at once.
+            for offset in range(0, len(encoded_script), 4096):
+                chunk = encoded_script[offset:offset + 4096]
+                protocol.send_command_input(shell_id, command_id, chunk, end=offset + 4096 >= len(encoded_script))
             stdout, stderr, status = protocol.get_command_output(shell_id, command_id)
         finally:
             protocol.cleanup_command(shell_id, command_id)

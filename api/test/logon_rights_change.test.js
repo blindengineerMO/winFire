@@ -61,6 +61,8 @@ test('administrator LSA change is confirmed and recorded as an apply run',async(
   const valid={nodeId,accountSid:'S-1-5-21-1-2-3-999',right:'SeBatchLogonRight',present:true,reason:'Temporary lab account validation',confirmation:'CHANGE LOGON RIGHT'}
   await post({...valid,confirmation:'yes'}).expect(400)
   await post({...valid,accountSid:'S-1-5-32-544'}).expect(409)
+  await post({...valid,right:'SeNetworkLogonRight',present:false}).expect(409)
+  await post({...valid,right:'SeDenyNetworkLogonRight',present:true}).expect(409)
   const changed=await post(valid).expect(200)
   assert.equal(changed.body.present,true)
   assert.equal(one('SELECT status FROM policy_apply_runs WHERE id=?',changed.body.runId).status,'success')

@@ -103,7 +103,7 @@ export function rotateRefresh(token) {
     const row = one('SELECT * FROM refresh_tokens WHERE token_hash=?',hashToken(token || ''))
     if (!row || row.revoked_at || row.expires_at <= now()) return null
     const user = one('SELECT * FROM users WHERE id=? AND suspended=0',row.user_id)
-    if (!user || user.directory_only) return null
+    if (!user || user.directory_only || user.auth_source==='ad'&&!one('SELECT 1 FROM directory_users WHERE id=? AND enabled=1 AND missing=0',user.ad_guid)) return null
     const consumed=run('UPDATE refresh_tokens SET revoked_at=? WHERE id=? AND revoked_at IS NULL',now(),row.id)
     if(consumed.changes!==1)return null
     audit(user.id,'auth.refresh','user',user.id,null,null)
@@ -117,7 +117,7 @@ export function auth(req,res,next) {
   try {
     const payload = verifyAccess(token)
     const user = one('SELECT * FROM users WHERE id=? AND suspended=0',payload.sub)
-    if (!user || user.directory_only || user.session_version!==payload.sv) return res.status(401).json({error:'Session revoked'})
+    if (!user || user.directory_only || user.session_version!==payload.sv || user.auth_source==='ad'&&!one('SELECT 1 FROM directory_users WHERE id=? AND enabled=1 AND missing=0',user.ad_guid)) return res.status(401).json({error:'Session revoked'})
     req.user = user; next()
   } catch { res.status(401).json({error:'Invalid or expired token'}) }
 }

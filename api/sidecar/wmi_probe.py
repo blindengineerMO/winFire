@@ -21,12 +21,15 @@ def main():
     host = request["host"]
     username = request["username"]
     password = request["password"]
+    mode = request.get("mode", "probe")
     domain, account = credentials(username)
     socket.setdefaulttimeout(8)
     connection = None
     login = None
     services = None
     enumeration = None
+    process_class = None
+    process_result = None
     try:
         connection = DCOMConnection(host, account, password, domain, oxidResolver=False)
         interface = connection.CoCreateInstanceEx(
@@ -39,11 +42,30 @@ def main():
         name = str(result.get("Name", {}).get("value") or "")
         if not name:
             raise RuntimeError("WMI did not return a computer name")
-        print(json.dumps({"success": True, "transport": "wmi", "computerName": name}))
+        expected = str(request.get("expectedName") or "").split(".", 1)[0]
+        if expected and name.casefold() != expected.casefold():
+            raise RuntimeError("WMI computer name does not match the directory inventory record")
+        response = {"success": True, "transport": "wmi", "computerName": name}
+        if mode == "enable_winrm":
+            process_class, _ = services.GetObject("Win32_Process")
+            command = 'powershell.exe -NoProfile -NonInteractive -Command "Enable-PSRemoting -Force"'
+            process_result = process_class.Create(command, "C:\\", None)
+            values = process_result.getProperties()
+            raw_return = values.get("ReturnValue", {}).get("value")
+            if raw_return is None:
+                raise RuntimeError("Win32_Process.Create did not return a status")
+            return_value = int(raw_return)
+            if return_value != 0:
+                raise RuntimeError(f"Win32_Process.Create returned {return_value}")
+            response["processId"] = values.get("ProcessId", {}).get("value")
+            response["activationStarted"] = True
+        elif mode != "probe":
+            raise RuntimeError("Unsupported WMI operation")
+        print(json.dumps(response))
     except Exception as error:
         raise RuntimeError(str(error).replace(password, "[redacted]")) from None
     finally:
-        for item in (enumeration, services, login):
+        for item in (process_result, process_class, enumeration, services, login):
             if item is not None:
                 try:
                     item.RemRelease()

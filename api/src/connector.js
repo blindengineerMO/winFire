@@ -14,6 +14,7 @@ import {emitNotification} from './notifications.js'
 
 const timeoutMs = 40000
 const lsaRightsFunctions=fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../sidecar/lsa_rights.ps1'),'utf8')
+const agentDeployFunctions=fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../sidecar/agent_deploy.ps1'),'utf8')
 const pause=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds))
 const transientError=error=>/timed?\s*out|timeout|ECONNRESET|ECONNREFUSED|Max retries exceeded|unreachable/i.test(error?.message||'')
 export function recordNodeSuccess(nodeId,probeStatus=null) {
@@ -34,7 +35,7 @@ export function recordNodeTransportFailure(nodeId) {
 export function tcpProbe(host, port, timeout=2500) {
   return new Promise(resolve => {
     const started=Date.now(), socket=connect({host,port:Number(port)})
-    const finish = status => { socket.destroy(); resolve({status,latencyMs:Date.now()-started}) }
+    const finish = status => { const sourceIp=socket.localAddress||null,sourcePort=socket.localPort||null; socket.destroy(); resolve({status,latencyMs:Date.now()-started,sourceIp,sourcePort}) }
     socket.setTimeout(timeout); socket.once('connect',()=>finish('open')); socket.once('timeout',()=>finish('timeout')); socket.once('error',e=>finish(e.code === 'ECONNREFUSED' ? 'refused':'unreachable'))
   })
 }
@@ -56,7 +57,7 @@ async function pwsh(script, input) {
   return new Promise((resolve,reject) => {
     const encoded=Buffer.from(script,'utf16le').toString('base64')
     const child=spawn('pwsh',['-NoProfile','-NonInteractive','-EncodedCommand',encoded],{stdio:['pipe','pipe','pipe']})
-    let stdout='',stderr=''; const timer=setTimeout(()=>child.kill(),input?.operation?.startsWith('rights')||input?.operation?.startsWith('jit_')||input?.operation==='prompt_browser'?120000:timeoutMs)
+    let stdout='',stderr=''; const timer=setTimeout(()=>child.kill(),input?.operation?.startsWith('rights')||input?.operation?.startsWith('jit_')||input?.operation==='prompt_browser'||input?.operation==='agent_deploy'?120000:timeoutMs)
     child.stdout.on('data',chunk=>stdout+=chunk); child.stderr.on('data',chunk=>stderr+=chunk)
     child.once('error',reject); child.once('close',code=>{clearTimeout(timer); if(code) reject(new Error(stderr.trim() || `PowerShell exited ${code}`)); else {try {resolve(JSON.parse(stdout || 'null'))} catch {reject(new Error(`Invalid PowerShell response: ${stdout.slice(0,300)}`))}}})
     child.stdin.end(JSON.stringify(input))
@@ -68,7 +69,7 @@ async function pywinrm(input) {
   const python=process.env.WINRM_PYTHON || (fs.existsSync(localPython)?localPython:'python3')
   return new Promise((resolve,reject)=>{
     const child=spawn(python,[sidecar],{stdio:['pipe','pipe','pipe']})
-    let stdout='',stderr='';const timer=setTimeout(()=>child.kill('SIGKILL'),input?.operation?.startsWith('rights')||input?.operation?.startsWith('jit_')||input?.operation==='prompt_browser'?120000:timeoutMs)
+    let stdout='',stderr='';const timer=setTimeout(()=>child.kill('SIGKILL'),input?.operation?.startsWith('rights')||input?.operation?.startsWith('jit_')||input?.operation==='prompt_browser'||input?.operation==='agent_deploy'?120000:timeoutMs)
     child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk)
     child.once('error',reject);child.once('close',code=>{clearTimeout(timer);if(code)reject(new Error(stderr.trim()||`WinRM sidecar exited ${code}`));else {try{resolve(JSON.parse(stdout||'null'))}catch{reject(new Error(`Invalid WinRM response: ${stdout.slice(0,300)}`))}}})
     child.stdin.end(JSON.stringify(input))
@@ -95,7 +96,7 @@ async function wmiProbePython(input){
   })
 }
 async function wmiProbePowerShell(input){
-  const script=`$ErrorActionPreference='Stop';$payload=[Console]::In.ReadToEnd()|ConvertFrom-Json;$secure=ConvertTo-SecureString $payload.password -AsPlainText -Force;$credential=[pscredential]::new($payload.username,$secure);$computer=Get-WmiObject -Class Win32_ComputerSystem -ComputerName $payload.host -Credential $credential -ErrorAction Stop|Select-Object -First 1 -ExpandProperty Name;@{success=$true;transport='wmi';computerName=[string]$computer}|ConvertTo-Json -Compress`
+  const script=`$ErrorActionPreference='Stop';$payload=[Console]::In.ReadToEnd()|ConvertFrom-Json;$secure=ConvertTo-SecureString $payload.password -AsPlainText -Force;$credential=New-Object System.Management.Automation.PSCredential($payload.username,$secure);$computer=Get-WmiObject -Class Win32_ComputerSystem -ComputerName $payload.host -Credential $credential -ErrorAction Stop|Select-Object -First 1 -ExpandProperty Name;if($payload.expectedName -and $computer -ine ($payload.expectedName -split '\\.')[0]){throw 'WMI computer name does not match the directory inventory record'};$result=@{success=$true;transport='wmi';computerName=[string]$computer};if($payload.mode -eq 'enable_winrm'){$command='powershell.exe -NoProfile -NonInteractive -Command "Enable-PSRemoting -Force"';$started=Invoke-WmiMethod -Class Win32_Process -Name Create -ArgumentList $command,$null,$null -ComputerName $payload.host -Credential $credential -ErrorAction Stop;if($started.ReturnValue -ne 0){throw "Win32_Process.Create returned $($started.ReturnValue)"};$result.activationStarted=$true;$result.processId=$started.ProcessId};$result|ConvertTo-Json -Compress`
   const encoded=Buffer.from(script,'utf16le').toString('base64')
   return new Promise((resolve,reject)=>{
     const child=spawn('powershell.exe',['-NoProfile','-NonInteractive','-EncodedCommand',encoded],{stdio:['pipe','pipe','pipe']})
@@ -133,22 +134,27 @@ try {
     }
     ${breakGlassFunctions}
     ${jitAccessFunctions}
+    __WINFIRE_AGENT_DEPLOY__
     __WINFIRE_PROMPT_FUNCTIONS__
     # __WINFIRE_LSA_RIGHTS__
     switch($operation) {
       'prompt_browser' { Open-WinFireMfaPortal $argsData }
       'prompt_session' { @(Get-WinFireActiveSession) }
+      'agent_deploy' { Install-WinFireAgentRemote $argsData }
       'auth' { [Security.Principal.WindowsIdentity]::GetCurrent().Name }
       'tcp_probe' {
-        $client=[System.Net.Sockets.TcpClient]::new();$watch=[Diagnostics.Stopwatch]::StartNew();$status='unreachable'
+        $addresses=@([System.Net.Dns]::GetHostAddresses([string]$argsData.host));$address=@($addresses | Where-Object AddressFamily -EQ InterNetwork | Select-Object -First 1)[0];if(-not $address){$address=$addresses[0]}
+        $route=[System.Net.Sockets.Socket]::new($address.AddressFamily,[System.Net.Sockets.SocketType]::Dgram,[System.Net.Sockets.ProtocolType]::Udp)
+        try{$route.Connect($address,[int]$argsData.port);$localAddress=([System.Net.IPEndPoint]$route.LocalEndPoint).Address}finally{$route.Dispose()}
+        $client=[System.Net.Sockets.TcpClient]::new($address.AddressFamily);$client.Client.Bind([System.Net.IPEndPoint]::new($localAddress,0));$watch=[Diagnostics.Stopwatch]::StartNew();$status='unreachable'
         try {
-          $task=$client.ConnectAsync([string]$argsData.host,[int]$argsData.port)
+          $task=$client.ConnectAsync($address,[int]$argsData.port)
           if($task.Wait([Math]::Min(5000,[Math]::Max(250,[int]$argsData.timeoutMs)))){$status='open'}else{$status='timeout'}
         } catch {
           $cause=$_.Exception;while($cause.InnerException){$cause=$cause.InnerException}
           if($cause -is [System.Net.Sockets.SocketException] -and $cause.SocketErrorCode -eq [System.Net.Sockets.SocketError]::ConnectionRefused){$status='refused'}
-        } finally {$watch.Stop();$client.Dispose()}
-        [pscustomobject]@{status=$status;latencyMs=$watch.ElapsedMilliseconds}
+        } finally {$watch.Stop();$endpoint=$client.Client.LocalEndPoint;$sourceIp=if($endpoint){$endpoint.Address.ToString()}else{$null};$sourcePort=if($endpoint){$endpoint.Port}else{$null};$client.Dispose()}
+        [pscustomobject]@{status=$status;latencyMs=$watch.ElapsedMilliseconds;sourceIp=$sourceIp;sourcePort=$sourcePort}
       }
       'facts' {
         $computer=Get-CimInstance Win32_ComputerSystem; $osInfo=Get-CimInstance Win32_OperatingSystem; $biosInfo=Get-CimInstance Win32_BIOS
@@ -164,7 +170,7 @@ try {
         $page=@(Get-NetFirewallRule | Select-Object -Skip $offset -First $limit | ForEach-Object { $r=$_; $p=$r | Get-NetFirewallPortFilter; $a=$r | Get-NetFirewallAddressFilter; $app=$r | Get-NetFirewallApplicationFilter; [pscustomobject]@{name=$r.Name;displayName=$r.DisplayName;group=$r.Group;enabled=[bool]($r.Enabled -eq 'True');action=[string]$r.Action;direction=[string]$r.Direction;profile=[string]$r.Profile;protocol=[string]$p.Protocol;localPort=[string]$p.LocalPort;remotePort=[string]$p.RemotePort;remoteAddress=[string]$a.RemoteAddress;program=[string]$app.Program;source=[string]$r.PolicyStoreSourceType} })
         [pscustomobject]@{total=$total;offset=$offset;rules=$page}
       }
-      'rules' { @(Get-NetFirewallRule -Group $argsData.group -ErrorAction SilentlyContinue | ForEach-Object { $r=$_; $p=$r | Get-NetFirewallPortFilter; $a=$r | Get-NetFirewallAddressFilter; $app=$r | Get-NetFirewallApplicationFilter; [pscustomobject]@{name=$r.DisplayName;group=$r.Group;action=([string]$r.Action).ToLower();direction=$(if($r.Direction -eq 'Inbound'){'in'}else{'out'});protocol=[string]$p.Protocol;localPort=[string]$p.LocalPort;remotePort=[string]$p.RemotePort;remoteAddress=[string]$a.RemoteAddress;program=[string]$app.Program;profile=[string]$r.Profile} }) }
+      'rules' { @(Get-NetFirewallRule -Group $argsData.group -ErrorAction SilentlyContinue | ForEach-Object { $r=$_; $p=$r | Get-NetFirewallPortFilter; $a=$r | Get-NetFirewallAddressFilter; $app=$r | Get-NetFirewallApplicationFilter; [pscustomobject]@{internalName=$r.Name;name=$r.DisplayName;group=$r.Group;action=([string]$r.Action).ToLower();direction=$(if($r.Direction -eq 'Inbound'){'in'}else{'out'});protocol=[string]$p.Protocol;localPort=[string]$p.LocalPort;remotePort=[string]$p.RemotePort;remoteAddress=[string]$a.RemoteAddress;program=[string]$app.Program;profile=[string]$r.Profile} }) }
   'apply' {
     $old=@(Get-NetFirewallRule -Group $argsData.group -ErrorAction SilentlyContinue | Where-Object { $argsData.remove -contains $_.DisplayName } | ForEach-Object {
       $r=$_; $p=$r | Get-NetFirewallPortFilter; $a=$r | Get-NetFirewallAddressFilter; $app=$r | Get-NetFirewallApplicationFilter
@@ -189,8 +195,10 @@ try {
     }
     @{applied = $true}
   }
-  'events' { $after=[long]$argsData.after; $xpath="*[System[((EventID=5156 or EventID=5157 or EventID=5150 or EventID=5151 or EventID=4624 or EventID=4625 or EventID=5712) and EventRecordID > $after)]]"; @(Get-WinEvent -LogName Security -FilterXPath $xpath -Oldest -MaxEvents 500 -ErrorAction SilentlyContinue | ForEach-Object { $event=$_; $xml=[xml]$event.ToXml(); $fields=@{}; foreach($data in @($xml.Event.EventData.Data)) { if($data.Name) {$fields[$data.Name]=[string]$data.'#text'} }; [pscustomobject]@{RecordId=$event.RecordId;Id=$event.Id;TimeCreated=$event.TimeCreated.ToUniversalTime().ToString('o');Fields=$fields} }) }
-  'events_recent' { $firewall=@(Get-WinEvent -LogName Security -FilterXPath '*[System[(EventID=5156 or EventID=5157 or EventID=5150 or EventID=5151)]]' -MaxEvents 500 -ErrorAction SilentlyContinue); $other=@(Get-WinEvent -LogName Security -FilterXPath '*[System[(EventID=4624 or EventID=4625 or EventID=5712)]]' -MaxEvents 100 -ErrorAction SilentlyContinue); @($firewall+$other | Sort-Object RecordId | ForEach-Object { $event=$_; $xml=[xml]$event.ToXml(); $fields=@{}; foreach($data in @($xml.Event.EventData.Data)) { if($data.Name) {$fields[$data.Name]=[string]$data.'#text'} }; [pscustomobject]@{RecordId=$event.RecordId;Id=$event.Id;TimeCreated=$event.TimeCreated.ToUniversalTime().ToString('o');Fields=$fields} }) }
+  'events' { $after=[long]$argsData.after; $xpath="*[System[((EventID=5156 or EventID=5157 or EventID=5150 or EventID=5151 or EventID=4624 or EventID=4625 or EventID=4634 or EventID=4647 or EventID=5712) and EventRecordID > $after)]]"; @(Get-WinEvent -LogName Security -FilterXPath $xpath -Oldest -MaxEvents 500 -ErrorAction SilentlyContinue | ForEach-Object { $event=$_; $xml=[xml]$event.ToXml(); $fields=@{}; foreach($data in @($xml.Event.EventData.Data)) { if($data.Name) {$fields[$data.Name]=[string]$data.'#text'} }; [pscustomobject]@{RecordId=$event.RecordId;Id=$event.Id;TimeCreated=$event.TimeCreated.ToUniversalTime().ToString('o');Fields=$fields} }) }
+  'events_recent' { $firewall=@(Get-WinEvent -LogName Security -FilterXPath '*[System[(EventID=5156 or EventID=5157 or EventID=5150 or EventID=5151)]]' -MaxEvents 500 -ErrorAction SilentlyContinue); $other=@(Get-WinEvent -LogName Security -FilterXPath '*[System[(EventID=4624 or EventID=4625 or EventID=4634 or EventID=4647 or EventID=5712)]]' -MaxEvents 100 -ErrorAction SilentlyContinue); @($firewall+$other | Sort-Object RecordId | ForEach-Object { $event=$_; $xml=[xml]$event.ToXml(); $fields=@{}; foreach($data in @($xml.Event.EventData.Data)) { if($data.Name) {$fields[$data.Name]=[string]$data.'#text'} }; [pscustomobject]@{RecordId=$event.RecordId;Id=$event.Id;TimeCreated=$event.TimeCreated.ToUniversalTime().ToString('o');Fields=$fields} }) }
+  'events_probe' { @(Get-WinEvent -LogName Security -FilterXPath '*[System[EventID=5157]]' -MaxEvents 500 -ErrorAction SilentlyContinue | ForEach-Object { $event=$_; $xml=[xml]$event.ToXml(); $fields=@{}; foreach($data in @($xml.Event.EventData.Data)) { if($data.Name) {$fields[$data.Name]=[string]$data.'#text'} }; [pscustomobject]@{RecordId=$event.RecordId;Id=$event.Id;TimeCreated=$event.TimeCreated.ToUniversalTime().ToString('o');Fields=$fields} }) }
+  'event_cursor' { [long](Get-WinEvent -LogName Security -MaxEvents 1 -ErrorAction Stop).RecordId }
       'audit_policy' { Get-WinFireAuditPolicy }
       'breakglass_start' { Start-WinFireBreakGlass $argsData }
       'breakglass_end' { End-WinFireBreakGlass $argsData }
@@ -230,17 +238,49 @@ export async function testNodeCredential(node,credentialId){
   recordNodeSuccess(node.id,'wmi-authenticated')
   return {success:true,transport:'wmi',account:credential.username,computerName:result.computerName}
 }
+function directoryWinrmCredentialId(node){
+  if(!node.ad_guid||node.ad_missing||!node.ad_enabled)throw new Error('Active Directory computer must be present and enabled for automatic WinRM activation')
+  const settings=one("SELECT node_credential_id FROM directory_connections WHERE id='default' AND enabled=1")
+  if(!settings?.node_credential_id)throw new Error('Set a default node WinRM credential in Administration → Directory')
+  return settings.node_credential_id
+}
+export async function activateWinrmViaWmi(node){
+  if(node.connection_mode!=='agentless')throw new Error('Only agentless nodes can be activated through WMI')
+  const credentialId=directoryWinrmCredentialId(node),credential=nodeCredential(node.id,credentialId)[0]
+  const host=node.fqdn||node.ip||node.hostname
+  const input={host,username:credential.username,password:credential.secret.password,mode:'enable_winrm',expectedName:node.hostname}
+  let activation
+  try{activation=process.platform==='win32'?await wmiProbePowerShell(input):await wmiProbePython(input)}
+  catch(error){error.message=String(error.message).replaceAll(input.password,'[redacted]');throw error}
+  if(!activation?.success||!activation.activationStarted)throw new Error('WMI did not confirm the WinRM activation request')
+  for(let attempt=0;attempt<12;attempt++){
+    await pause(2500)
+    const port=await tcpProbe(host,5985,1500)
+    if(port.status!=='open')continue
+    try{
+      const managed={...node,transport:'winrm'}
+      await remote(managed,'auth',{}, {credentialId})
+      const facts=await remote(managed,'facts',{}, {credentialId})
+      if(String(facts?.computer?.Name||'').toLowerCase()!==String(node.hostname).toLowerCase())throw new Error('WinRM host identity does not match the directory computer')
+      run("UPDATE nodes SET transport='winrm',probe_status='winrm-authenticated',status='reachable',last_probe_at=?,last_seen_at=?,next_retry_at=NULL WHERE id=?",now(),now(),node.id)
+      await collectFacts(managed,{suppliedFacts:facts})
+      audit(null,'node.agentless.activate','node',node.id,{transport:node.transport,probeStatus:node.probe_status},{transport:'winrm',credentialId,computerName:facts.computer.Name})
+      return {transport:'winrm',status:'reachable',probeStatus:'winrm-authenticated',facts,activation}
+    }catch(error){if(attempt===11)throw error}
+  }
+  throw new Error('WMI started WinRM activation, but WinRM did not become reachable within 30 seconds')
+}
 export async function remote(node,operation,args={},options={}) {
   if(node.transport==='wmi')throw new Error('WMI/DCOM transport is detected but authenticated WMI operations are not implemented')
   const host=node.fqdn || node.ip || node.hostname
   let lastError
   for (const credential of nodeCredential(node.id,options.credentialId)) {
     const input={host,transport:node.transport||'winrm',username:credential.username,password:credential.secret.password,operation,args}
-    const mutating=operation==='apply'||operation.startsWith('breakglass_')||operation==='jit_start'||operation==='jit_end'||operation==='prompt_browser'||operation==='rights_change'
+    const mutating=operation==='apply'||operation.startsWith('breakglass_')||operation==='jit_start'||operation==='jit_end'||operation==='prompt_browser'||operation==='rights_change'||operation==='agent_deploy'
     const attempts=mutating?1:2
     for(let attempt=0;attempt<attempts;attempt++){
       try {
-        const script=remoteScript.replace('__WINFIRE_PROMPT_FUNCTIONS__',operation.startsWith('prompt_')?mfaPromptFunctions:'').replace('# __WINFIRE_LSA_RIGHTS__',operation.startsWith('rights')?lsaRightsFunctions:'')
+        const script=remoteScript.replace('__WINFIRE_PROMPT_FUNCTIONS__',operation.startsWith('prompt_')?mfaPromptFunctions:'').replace('__WINFIRE_AGENT_DEPLOY__',operation==='agent_deploy'?agentDeployFunctions:'').replace('# __WINFIRE_LSA_RIGHTS__',operation.startsWith('rights')?lsaRightsFunctions:'')
         const result=process.platform==='win32' ? await pwsh(script,input) : await pywinrm(input)
         recordNodeSuccess(node.id,input.transport==='winrms'?'winrms-authenticated':'winrm-authenticated')
         return result
@@ -283,8 +323,8 @@ export async function probeNode(node,{verifyWinrm=true}={}) {
   audit(null,'node.probe','node',node.id,null,{transport,status,probeStatus})
   return {transport,status,probeStatus,ports:{winrm,winrms,wmi},rpc,winrmAuthenticated,winrmError,note:transport==='wmi'?'RPC authentication checked; WMI/DCOM operations remain unverified.':winrmAuthenticated?'WinRM authentication confirmed.':transport?'WinRM port is open; authentication was not confirmed.':'No supported management port responded.'}
 }
-export async function collectFacts(node) {
-  const facts=await remote(node,'facts')
+export async function collectFacts(node,{credentialId,suppliedFacts}={}) {
+  const facts=suppliedFacts||await remote(node,'facts',{}, {credentialId})
   run('INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET snapshot_json=excluded.snapshot_json,collected_at=excluded.collected_at',node.id,JSON.stringify(facts),now())
   run('UPDATE nodes SET os_version=?,os_build=?,last_seen_at=?,status=? WHERE id=?',facts?.os?.Version||null,facts?.os?.BuildNumber||null,now(),'reachable',node.id)
   return facts
@@ -292,6 +332,7 @@ export async function collectFacts(node) {
 export async function enrichNode(node) {
   if(node.connection_mode==='agent')throw new Error('Agent nodes require agent-reported facts')
   const probe=await probeNode(node,{verifyWinrm:false})
+  if(probe.transport==='wmi'&&probe.probeStatus==='rpc-authenticated'&&node.ad_guid)return (await activateWinrmViaWmi({...node,transport:'wmi'})).facts
   if(!['winrm','winrms'].includes(probe.transport))throw new Error('No working WinRM transport for inventory collection')
   return collectFacts(one('SELECT * FROM nodes WHERE id=?',node.id))
 }

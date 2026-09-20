@@ -16,7 +16,7 @@ process.env.BOOTSTRAP_EMAIL='owner@example.test'
 process.env.BOOTSTRAP_PASSWORD='test-password-12345'
 process.env.AUTH_RATE_LIMIT='100'
 const {app}=await import('../src/app.js')
-const {classifyVerification}=await import('../src/verifier.js')
+const {classifyVerification,findMatchingDenyEvent}=await import('../src/verifier.js')
 const {bootstrap}=await import('../src/security.js')
 const {db}=await import('../src/db.js')
 const {recordNodeSuccess,recordNodeTransportFailure,classifyProbe}=await import('../src/connector.js')
@@ -76,7 +76,18 @@ test('policy fields reject invalid ports, addresses and program paths before app
 test('deny checks require managed-rule evidence',()=>{
   assert.equal(classifyVerification({action:'block'},'timeout',null).status,'inconclusive')
   assert.equal(classifyVerification({action:'block'},'refused',false).status,'inconclusive')
-  assert.equal(classifyVerification({action:'block'},'timeout',true).status,'pass')
+  assert.equal(classifyVerification({action:'block'},'timeout',true).status,'inconclusive')
+  const event={record_id:44,event_id:5157,event_time:'2026-09-19T12:00:01.000Z',action:'block',direction:'in',protocol:'TCP',src_ip:'192.0.2.10',src_port:51234,dst_port:3389,filter_origin:'{WINFIRE-RULE}'}
+  const probe={sourceIp:'192.0.2.10',sourcePort:51234}
+  assert.equal(findMatchingDenyEvent([event],probe,3389,'2026-09-19T12:00:00.000Z','2026-09-19T12:00:02.000Z')?.record_id,44)
+  assert.equal(findMatchingDenyEvent([{...event,event_time:'2026-09-19T11:55:00.000Z'}],probe,3389,'2026-09-19T12:00:00.000Z','2026-09-19T12:00:02.000Z',43)?.record_id,44)
+  assert.equal(findMatchingDenyEvent([event],probe,3389,'2026-09-19T12:00:00.000Z','2026-09-19T12:00:02.000Z',44),null)
+  assert.equal(classifyVerification({action:'block'},'timeout',true,event,'{WINFIRE-RULE}').status,'pass')
+  assert.match(classifyVerification({action:'block'},'timeout',true,{...event,filter_origin:'Query User Default'},'{WINFIRE-RULE}').reason,/another filter/)
+  assert.equal(classifyVerification({action:'block'},'timeout',true,{...event,filter_origin:null},'{WINFIRE-RULE}').status,'inconclusive')
+  assert.equal(findMatchingDenyEvent([{...event,src_port:51235}],probe,3389,'2026-09-19T12:00:00.000Z','2026-09-19T12:00:02.000Z'),null)
+  assert.equal(findMatchingDenyEvent([{...event,event_time:'2026-09-19T11:59:00.000Z'}],probe,3389,'2026-09-19T12:00:00.000Z','2026-09-19T12:00:02.000Z'),null)
+  assert.equal(findMatchingDenyEvent([{...event,event_id:5156}],probe,3389,'2026-09-19T12:00:00.000Z','2026-09-19T12:00:02.000Z'),null)
   assert.equal(classifyVerification({action:'block'},'open',true).status,'fail')
 })
 
@@ -86,7 +97,7 @@ test('Windows Security events retain firewall and logon meaning',()=>{
   assert.equal(logon.action,'failure')
   assert.equal(logon.srcPort,49152)
   assert.equal(logon.accountSid,'S-1-5-21-123')
-  const firewall=normalizeWindowsEvent({RecordId:43,Id:5157,Fields:{Protocol:'6',Direction:'%%14592',SourceAddress:'10.2.3.4',SourcePort:'3389',DestAddress:'10.2.3.5',DestPort:'49152'}})
+  const firewall=normalizeWindowsEvent({RecordId:43,Id:5157,Fields:{Protocol:'6',Direction:'%%14592',InterfaceIndex:'11',SourceAddress:'10.2.3.5',SourcePort:'49152',DestAddress:'10.2.3.4',DestPort:'3389',FilterOrigin:'{TEST-RULE}',FilterRTID:'123456789'}})
   assert.equal(firewall.eventType,'firewall')
   assert.equal(firewall.action,'block')
   assert.equal(firewall.protocol,'TCP')
@@ -94,6 +105,12 @@ test('Windows Security events retain firewall and logon meaning',()=>{
   assert.equal(firewall.srcIp,'10.2.3.5')
   assert.equal(firewall.srcPort,49152)
   assert.equal(firewall.direction,'in')
+  assert.equal(firewall.filterOrigin,'{TEST-RULE}')
+  assert.equal(firewall.filterRuntimeId,'123456789')
+  const legacy=normalizeWindowsEvent({RecordId:44,Id:5157,Fields:{Protocol:'6',Direction:'%%14592',SourceAddress:'10.2.3.4',SourcePort:'3389',DestAddress:'10.2.3.5',DestPort:'49152'}})
+  assert.equal(legacy.srcIp,'10.2.3.5')
+  assert.equal(legacy.srcPort,49152)
+  assert.equal(legacy.dstPort,3389)
 })
 
 test('logon-rights export preserves allow and deny assignments by SID',()=>{
@@ -577,6 +594,9 @@ test('verifier records real TCP evidence and reports it',async()=>{
     const verify=await auth(request.post('/api/v1/verifier/runs')).send({nodeId:node.body.id,policyId:policy.body.id}).expect(201)
     assert.equal(verify.body.results[0].status,'pass')
     assert.equal(verify.body.results[0].probeStatus,'open')
+    assert.equal(verify.body.results[0].probeSourceIp,'127.0.0.1')
+    assert.ok(verify.body.results[0].probeSourcePort>0)
+    assert.equal(db.prepare('SELECT probe_source_ip,probe_source_port FROM verifier_results WHERE id=?').get(verify.body.results[0].id).probe_source_port,verify.body.results[0].probeSourcePort)
     const report=await auth(request.get('/api/v1/reports/verification')).expect(200)
     assert.equal(report.body.find(row=>row.policy==='Verifier local').status,'pass')
   } finally {await new Promise(resolve=>listener.close(resolve))}
@@ -607,6 +627,53 @@ let input='';process.stdin.on('data',part=>input+=part);process.stdin.on('end',(
     const report=await auth(request.get('/api/v1/reports/verification')).expect(200)
     assert.equal(report.body.find(row=>row.policy==='Peer vantage policy').vantage,'verifier-peer')
   }finally{if(priorPython===undefined)delete process.env.WINRM_PYTHON;else process.env.WINRM_PYTHON=priorPython}
+})
+
+test('deny verification requires a matching target WFP event for the probe tuple',async()=>{
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@example.test',password:'test-password-12345'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
+  const credential=await auth(request.post('/api/v1/credentials')).send({name:'Deny verifier test',type:'local',username:'test-user',password:'test-password-12345'}).expect(201)
+  const target=await auth(request.post('/api/v1/nodes')).send({hostname:'deny-target',ip:'192.0.2.70',credentialIds:[credential.body.id]}).expect(201)
+  const peer=await auth(request.post('/api/v1/nodes')).send({hostname:'deny-peer',ip:'192.0.2.71',credentialIds:[credential.body.id]}).expect(201)
+  db.prepare("UPDATE nodes SET transport='winrm' WHERE id IN (?,?)").run(target.body.id,peer.body.id)
+  const policy=await auth(request.post('/api/v1/policies')).send({name:'Deny event correlation'}).expect(201)
+  await auth(request.post(`/api/v1/policies/${policy.body.id}/versions`)).send({graph:{nodes:[{id:'deny',type:'deny',data:{name:'Test deny',localPort:'3389'}}],edges:[]}}).expect(201)
+  await auth(request.post(`/api/v1/policies/${policy.body.id}/assignments`)).send({nodeId:target.body.id}).expect(201)
+  const rules=JSON.parse(db.prepare('SELECT rules_compiled_json FROM policy_versions WHERE policy_id=?').get(policy.body.id).rules_compiled_json).map(rule=>({...rule,internalName:'{WINFIRE-RULE}'}))
+  const stub=path.join(dir,'deny-verifier-transport')
+  fs.writeFileSync(stub,`#!/usr/bin/env node
+let input='';process.stdin.on('data',part=>input+=part);process.stdin.on('end',()=>{
+ const request=JSON.parse(input);let result
+ if(request.operation==='rules')result=JSON.parse(process.env.WINFIRE_VERIFIER_RULES)
+ else if(request.operation==='event_cursor')result=9000
+ else if(request.operation==='tcp_probe')result={status:'timeout',latencyMs:4,sourceIp:'192.0.2.71',sourcePort:54321}
+ else if(request.operation==='events_probe')result=process.env.WINFIRE_VERIFIER_EVENT?[{RecordId:process.env.WINFIRE_VERIFIER_EVENT==='other'?9001:9002,Id:5157,TimeCreated:new Date().toISOString(),Fields:{InterfaceIndex:'11',SourceAddress:'192.0.2.71',SourcePort:'54321',DestAddress:'192.0.2.70',DestPort:'3389',Protocol:'6',Direction:'%%14592',FilterOrigin:process.env.WINFIRE_VERIFIER_EVENT==='other'?'Query User Default':'{WINFIRE-RULE}',FilterRTID:'123456'}}]:[]
+ else throw Error('Unexpected operation: '+request.operation)
+ process.stdout.write(JSON.stringify(result))
+})
+`,{mode:0o700})
+  const priorPython=process.env.WINRM_PYTHON
+  process.env.WINRM_PYTHON=stub
+  process.env.WINFIRE_VERIFIER_RULES=JSON.stringify(rules)
+  try{
+    const body={policyId:policy.body.id,nodeId:target.body.id,vantageNodeId:peer.body.id}
+    const missing=await auth(request.post('/api/v1/verifier/runs')).send(body).expect(201)
+    assert.equal(missing.body.results[0].status,'inconclusive')
+    process.env.WINFIRE_VERIFIER_EVENT='other'
+    const other=await auth(request.post('/api/v1/verifier/runs')).send(body).expect(201)
+    assert.equal(other.body.results[0].status,'inconclusive')
+    assert.match(other.body.results[0].reason,/another filter/)
+    process.env.WINFIRE_VERIFIER_EVENT='managed'
+    const observed=await auth(request.post('/api/v1/verifier/runs')).send(body).expect(201)
+    assert.equal(observed.body.results[0].status,'pass')
+    assert.equal(observed.body.results[0].firewallEventRecordId,9002)
+    const stored=db.prepare('SELECT probe_source_ip,probe_source_port,firewall_event_record_id,firewall_event_filter_origin FROM verifier_results WHERE id=?').get(observed.body.results[0].id)
+    assert.deepEqual(stored,{probe_source_ip:'192.0.2.71',probe_source_port:54321,firewall_event_record_id:9002,firewall_event_filter_origin:'{WINFIRE-RULE}'})
+  }finally{
+    if(priorPython===undefined)delete process.env.WINRM_PYTHON;else process.env.WINRM_PYTHON=priorPython
+    delete process.env.WINFIRE_VERIFIER_RULES
+    delete process.env.WINFIRE_VERIFIER_EVENT
+  }
 })
 
 test('auth, vault, nodes, version history and reports work together',async()=>{

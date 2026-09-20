@@ -1,4 +1,6 @@
 import express from 'express'
+import fs from 'node:fs'
+import path from 'node:path'
 import cors from 'cors'
 import helmet from 'helmet'
 import {rateLimit} from 'express-rate-limit'
@@ -10,8 +12,8 @@ import {z} from 'zod'
 import {compilePolicy, graphSchema, findRuleConflicts,validateAddressExpression,validateProgramPath} from '@winfire/shared'
 import {db, all, one, run, id, now, audit, json, parse} from './db.js'
 import {auth, requireRole, publicUser, issueAccess, issueRefresh, rotateRefresh, hashToken, seal, openSealed} from './security.js'
-import {probeNode, collectFacts, lookupDns, remote, applyRules, diffRules, tcpProbe,testNodeCredential} from './connector.js'
-import {classifyVerification,hasManagedRule} from './verifier.js'
+import {probeNode, collectFacts, enrichNode, lookupDns, remote, applyRules, diffRules, tcpProbe,testNodeCredential} from './connector.js'
+import {classifyVerification,findMatchingDenyEvent,hasManagedRule} from './verifier.js'
 import {makeTotpSecret,verifyTotp,matchingTotpCounter} from './totp.js'
 import {agentRoutes} from './agentRoutes.js'
 import {agentPkiReady} from './agentPki.js'
@@ -19,7 +21,7 @@ import {normalizeWindowsEvent} from './eventNormalizer.js'
 import {isLoopbackEvent} from './eventPattern.js'
 import {deliverInvite,deliverVerification,inviteLink} from './mailer.js'
 import {saveAvatar,readAvatar,removeAvatar} from './avatar.js'
-import {readDirectoryComputers,testDirectoryConnection,authenticateDirectoryUser} from './directory.js'
+import {readDirectoryComputers,readDirectoryUsers,testDirectoryConnection,authenticateDirectoryUser,writeDirectoryUserStatus} from './directory.js'
 import {observabilitySettings} from './maintenance.js'
 import {resourceRecord,canReadResource,canWriteResource} from './access.js'
 import {emitNotification,notificationSummary,preferenceKeys} from './notifications.js'
@@ -34,6 +36,7 @@ import {assertManagementAccess} from './managementGuard.js'
 import {mfaPromptSettings} from './mfaPromptSettings.js'
 import {createMfaChallenge,resolveMfaChallenge} from './mfaChallenges.js'
 import {beginAdAuthenticatorEnrollment,confirmAdAuthenticatorEnrollment} from './adAuthenticatorEnrollment.js'
+import {validateExportDestination,exportSelectedEvents} from './eventExport.js'
 
 export const app=express()
 app.disable('x-powered-by')
@@ -68,10 +71,15 @@ function progressiveSettings() {return {
   intervalHours:Number(one("SELECT value FROM app_settings WHERE key='progressive_learning_interval_hours'")?.value||24)
 }}
 const directorySettings=()=>one("SELECT * FROM directory_connections WHERE id='default'")
-const publicDirectory=settings=>settings&&({url:settings.url||'',baseDn:settings.base_dn||'',bindCredentialId:settings.bind_credential_id||null,nodeCredentialId:settings.node_credential_id||null,enabled:!!settings.enabled,syncIntervalMinutes:settings.sync_interval_minutes,allowLdapFallback:!!settings.allow_ldap_fallback,ldapFallbackApprovedBy:settings.ldap_fallback_approved_by||null,ldapFallbackApprovedAt:settings.ldap_fallback_approved_at||null,lastTransport:settings.last_transport||null,lastSyncedAt:settings.last_synced_at,lastSyncAttemptAt:settings.last_sync_attempt_at,lastSyncStatus:settings.last_sync_status,lastSyncError:settings.last_sync_error,lastSyncCount:settings.last_sync_count})
+const publicDirectory=settings=>settings&&({url:settings.url||'',baseDn:settings.base_dn||'',bindCredentialId:settings.bind_credential_id||null,nodeCredentialId:settings.node_credential_id||null,actionCredentialId:settings.action_credential_id||null,enabled:!!settings.enabled,syncIntervalMinutes:settings.sync_interval_minutes,allowLdapFallback:!!settings.allow_ldap_fallback,ldapFallbackApprovedBy:settings.ldap_fallback_approved_by||null,ldapFallbackApprovedAt:settings.ldap_fallback_approved_at||null,lastTransport:settings.last_transport||null,lastSyncedAt:settings.last_synced_at,lastSyncAttemptAt:settings.last_sync_attempt_at,lastSyncStatus:settings.last_sync_status,lastSyncError:settings.last_sync_error,lastSyncCount:settings.last_sync_count})
 function directoryCredential(settings) {
   const credential=one('SELECT * FROM credentials WHERE id=?',settings.bind_credential_id)
   if(!credential)throw Object.assign(new Error('Directory bind credential is missing'),{status:400})
+  return {username:credential.username,password:openSealed(credential.encrypted_blob).password}
+}
+function directoryActionCredential(settings){
+  const credential=settings?.action_credential_id?one('SELECT * FROM credentials WHERE id=?',settings.action_credential_id):null
+  if(!credential)throw Object.assign(new Error('Configure a separate AD account-control credential in Administration → Directory'),{status:503})
   return {username:credential.username,password:openSealed(credential.encrypted_blob).password}
 }
 function startTraining(node,days,mode,actorId=null) {
@@ -188,13 +196,19 @@ async function applyPolicy(policy,actorId=null,targetNodes=null,context={}) {
 }
 
 api.get('/health',(req,res)=>res.json({status:'ok',service:'winfire',time:now()}))
+api.get('/agent-package/WinFire.Agent.exe',(req,res)=>{
+  if(!req.secure||!agentPkiReady()||!process.env.AGENT_PACKAGE_PATH)return res.status(503).json({error:'Signed agent package requires HTTPS and configured agent PKI'})
+  const packagePath=path.resolve(process.env.AGENT_PACKAGE_PATH)
+  if(!fs.existsSync(packagePath)||!fs.statSync(packagePath).isFile())return notFound(res,'Agent package')
+  res.set('Cache-Control','private, no-store').type('application/octet-stream').sendFile(packagePath)
+})
 api.get('/openapi.json',(_req,res)=>res.json(buildOpenApi(api,agentRoutes)))
 const loginLimit=rateLimit({windowMs:15*60*1000,limit:Number(process.env.AUTH_RATE_LIMIT||20),standardHeaders:'draft-8',legacyHeaders:false})
 const publicMfaLimit=rateLimit({windowMs:15*60*1000,limit:10,standardHeaders:'draft-8',legacyHeaders:false})
 api.post('/auth/login',loginLimit,wrap(async(req,res)=>{
   const {email,password,totp}=body(z.object({email:z.email(),password:z.string().min(1),totp:z.string().optional()}),req)
   const user=one('SELECT * FROM users WHERE email=?',email.toLowerCase())
-  if (!user || user.directory_only || user.suspended || user.locked_until && user.locked_until>now() || !await argon2.verify(user.password_hash,password)) {
+  if (!user || user.directory_only || user.auth_source==='ad' || user.suspended || user.locked_until && user.locked_until>now() || !await argon2.verify(user.password_hash,password)) {
     if(user && !user.directory_only && !user.suspended) {
       const attempts=user.failed_attempts+1
       run('UPDATE users SET failed_attempts=?,locked_until=? WHERE id=?',attempts,attempts>=5?new Date(Date.now()+15*60*1000).toISOString():null,user.id)
@@ -219,6 +233,26 @@ function requireEnrollmentHttps(req,res,next){
   if(process.env.NODE_ENV==='production'&&!req.secure&&!['127.0.0.1','::1'].includes(req.ip))return res.status(426).json({error:'Authenticator enrollment requires HTTPS'})
   next()
 }
+api.post('/auth/ad/login',loginLimit,requireEnrollmentHttps,wrap(async(req,res)=>{
+  const {email,password,totp}=body(z.object({email:z.email(),password:z.string().min(1).max(512),totp:z.string().optional()}),req)
+  const user=one("SELECT u.*,d.upn,d.enabled ad_enabled,d.missing ad_missing FROM users u LEFT JOIN directory_users d ON d.id=u.ad_guid WHERE u.email=? AND u.auth_source='ad'",email.toLowerCase())
+  if(!user||user.suspended||user.locked_until&&user.locked_until>now()||!user.ad_enabled||user.ad_missing||!user.upn)return res.status(401).json({error:'Invalid credentials or account locked'})
+  try{await authenticateDirectoryUser(directorySettings(),user.upn,password)}
+  catch(error){
+    if(error.status!==401)throw error
+    const attempts=user.failed_attempts+1
+    run('UPDATE users SET failed_attempts=?,locked_until=? WHERE id=?',attempts,attempts>=5?new Date(Date.now()+15*60*1000).toISOString():null,user.id)
+    return res.status(401).json({error:'Invalid credentials or account locked'})
+  }
+  if(user.totp_secret&&!verifyTotp(openSealed(user.totp_secret).secret,totp)){
+    const attempts=user.failed_attempts+1
+    run('UPDATE users SET failed_attempts=?,locked_until=? WHERE id=?',attempts,attempts>=5?new Date(Date.now()+15*60*1000).toISOString():null,user.id)
+    return res.status(401).json({error:'TOTP code required or invalid',totpRequired:true})
+  }
+  run('UPDATE users SET failed_attempts=0,locked_until=NULL WHERE id=?',user.id)
+  audit(user.id,'auth.ad.login','user',user.id,null,{directoryGuid:user.ad_guid})
+  res.set('Cache-Control','no-store').json({accessToken:issueAccess(user),refreshToken:issueRefresh(user.id),user:publicUser(user)})
+}))
 api.post('/auth/ad-totp/enroll',enrollmentLimit,requireEnrollmentHttps,wrap(async(req,res)=>{
   const {email,password}=body(z.object({email:z.email(),password:z.string().min(1).max(512)}),req)
   const result=await beginAdAuthenticatorEnrollment({settings:directorySettings(),email,password,sourceIp:normalizeSourceIp(req.ip)})
@@ -461,6 +495,7 @@ api.post('/users',requireRole('admin'),wrap(async(req,res)=>{
 api.patch('/users/:id',requireRole('admin'),wrap(async(req,res)=>{
   const user=one('SELECT * FROM users WHERE id=?',reqId(req));if(!user)return notFound(res)
   const data=body(z.object({role:z.enum(['owner','admin','editor','auditor']).optional(),suspended:z.boolean().optional(),password:z.string().min(12).optional()}),req)
+  if(user.auth_source==='ad'&&data.password)return res.status(409).json({error:'Active Directory operators must change their password in Active Directory'})
   if((user.role==='owner'||data.role==='owner')&&req.user.role!=='owner')return res.status(403).json({error:'Only an owner can manage owner accounts'})
   if(user.id===req.user.id && data.suspended) return res.status(400).json({error:'Cannot suspend yourself'})
   if(user.role==='owner'&&!user.suspended&&(data.role&&data.role!=='owner'||data.suspended)&&!one("SELECT id FROM users WHERE role='owner' AND suspended=0 AND id<>? LIMIT 1",user.id))return res.status(400).json({error:'At least one active owner is required'})
@@ -479,6 +514,7 @@ api.patch('/users/:id/profile',wrap(async(req,res)=>{
   if(reqId(req)!==req.user.id && !['owner','admin'].includes(req.user.role))return res.status(403).json({error:'Insufficient permission'})
   const data=body(z.object({theme:z.enum(['system','hacker','enterprise','dark','light']).optional(),notificationPrefs:z.record(z.string(),z.boolean()).refine(value=>Object.keys(value).every(key=>preferenceKeys.includes(key)),'Unknown notification preference').optional(),email:z.email().optional(),password:z.string().min(12).optional(),currentPassword:z.string().optional()}),req)
   const user=one('SELECT * FROM users WHERE id=?',reqId(req));if(!user)return notFound(res)
+  if(user.auth_source==='ad'&&(data.password||data.email))return res.status(409).json({error:'Active Directory manages this operator’s email and password'})
   if(user.role==='owner'&&req.user.role!=='owner')return res.status(403).json({error:'Only an owner can manage owner accounts'})
   if(data.password&&user.id===req.user.id&&(!data.currentPassword||!await argon2.verify(user.password_hash,data.currentPassword)))return res.status(401).json({error:'Current password is incorrect'})
   const emailChangeRequested=!!(data.email&&data.email.toLowerCase()!==user.email)
@@ -681,6 +717,17 @@ api.post('/directory/test',requireRole('admin'),wrap(async(req,res)=>{
   res.json(result)
 }))
 let directorySyncInFlight=false
+async function syncDirectoryUserInventory(settings,actorId,clientFactory){
+  const {users,transport}=await readDirectoryUsers(settings,directoryCredential(settings),clientFactory)
+  const seenAt=now()
+  db.transaction(()=>{
+    run('UPDATE directory_users SET missing=1')
+    for(const user of users)run(`INSERT INTO directory_users(id,sid,dn,sam_account_name,upn,email,display_name,member_of_json,enabled,missing,last_logon_at,changed_at,seen_at)
+      VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?) ON CONFLICT(id) DO UPDATE SET sid=excluded.sid,dn=excluded.dn,sam_account_name=excluded.sam_account_name,upn=excluded.upn,email=excluded.email,display_name=excluded.display_name,member_of_json=excluded.member_of_json,enabled=excluded.enabled,missing=0,last_logon_at=excluded.last_logon_at,changed_at=excluded.changed_at,seen_at=excluded.seen_at`,user.guid,user.sid,user.dn,user.samAccountName,user.upn,user.email,user.displayName,json(user.memberOf),Number(user.enabled),user.lastLogonAt,user.changedAt,seenAt)
+    audit(actorId,'directory.users.sync','directory','default',null,{count:users.length,transport})
+  })()
+  return {count:users.length,transport}
+}
 export async function syncDirectory(actorId=null,clientFactory=undefined) {
   if(directorySyncInFlight)throw Object.assign(new Error('Directory sync is already running'),{status:409})
   directorySyncInFlight=true
@@ -717,6 +764,8 @@ export async function syncDirectory(actorId=null,clientFactory=undefined) {
       run("UPDATE directory_connections SET last_synced_at=?,last_sync_status='success',last_sync_error=NULL,last_sync_count=?,last_transport=? WHERE id='default'",seenAt,stats.found,transport)
       audit(actorId,'directory.sync','directory','default',null,stats)
     })()
+    try{stats.users=await syncDirectoryUserInventory(settings,actorId,clientFactory)}
+    catch(error){stats.userSyncError=error.message;run("UPDATE directory_connections SET last_sync_error=? WHERE id='default'",`User inventory: ${error.message}`.slice(0,2000));audit(actorId,'directory.users.sync.failed','directory','default',null,{error:error.message})}
     return stats
   } catch(error) {
     run("UPDATE directory_connections SET last_sync_status='failed',last_sync_error=? WHERE id='default'",error.message.slice(0,2000))
@@ -726,6 +775,42 @@ export async function syncDirectory(actorId=null,clientFactory=undefined) {
   } finally {directorySyncInFlight=false}
 }
 api.post('/directory/sync',requireRole('admin'),wrap(async(req,res)=>res.json(await syncDirectory(req.user.id))))
+api.get('/directory/users',requireRole('auditor'),(req,res)=>{
+  const query=z.object({q:z.string().max(200).default(''),enabled:z.enum(['all','true','false']).default('all'),mfa:z.enum(['all','enrolled','missing']).default('all'),page:z.coerce.number().int().min(1).default(1),pageSize:z.coerce.number().int().min(10).max(250).default(50),sortBy:z.enum(['name','username','email','lastLogon','status']).default('name'),sortDir:z.enum(['asc','desc']).default('asc')}).parse(req.query)
+  const clauses=[],args=[]
+  if(query.q.trim()){const term=`%${query.q.trim().replace(/[\\%_]/g,'\\$&')}%`;clauses.push("(d.display_name LIKE ? ESCAPE '\\' OR d.sam_account_name LIKE ? ESCAPE '\\' OR d.upn LIKE ? ESCAPE '\\' OR d.email LIKE ? ESCAPE '\\')");args.push(term,term,term,term)}
+  if(query.enabled!=='all'){clauses.push('d.enabled=?');args.push(query.enabled==='true'?1:0)}
+  if(query.mfa!=='all')clauses.push(query.mfa==='enrolled'?"EXISTS(SELECT 1 FROM users u WHERE u.ad_guid=d.id AND u.totp_secret IS NOT NULL)":"NOT EXISTS(SELECT 1 FROM users u WHERE u.ad_guid=d.id AND u.totp_secret IS NOT NULL)")
+  const where=clauses.length?`WHERE ${clauses.join(' AND ')}`:''
+  const order={name:'d.display_name',username:'d.sam_account_name',email:'d.email',lastLogon:'d.last_logon_at',status:'d.enabled'}[query.sortBy]
+  const total=one(`SELECT COUNT(*) count FROM directory_users d ${where}`,...args).count
+  const items=all(`SELECT d.*,EXISTS(SELECT 1 FROM users u WHERE u.ad_guid=d.id AND u.totp_secret IS NOT NULL) mfa_enrolled,EXISTS(SELECT 1 FROM users u WHERE u.ad_guid=d.id AND u.auth_source='ad') operator_imported FROM directory_users d ${where} ORDER BY ${order} ${query.sortDir.toUpperCase()},d.id LIMIT ? OFFSET ?`,...args,query.pageSize,(query.page-1)*query.pageSize).map(({member_of_json,...row})=>({...row,memberOf:parse(member_of_json)||[]}))
+  res.json({items,total,page:query.page,pageSize:query.pageSize,totalPages:Math.max(1,Math.ceil(total/query.pageSize))})
+})
+api.get('/directory/users/:id',requireRole('auditor'),(req,res)=>{
+  const user=one('SELECT * FROM directory_users WHERE id=?',reqId(req));if(!user)return notFound(res,'Directory user')
+  const mfa=all('SELECT id,segment_id,node_id,status,challenged_at,resolved_at FROM mfa_challenges WHERE lower(user_upn) IN (?,?) ORDER BY challenged_at DESC LIMIT 100',String(user.upn||'').toLowerCase(),String(user.email||'').toLowerCase())
+  const logons=all('SELECT e.id,e.node_id,n.hostname,e.event_id,e.action,e.src_ip,e.event_time,e.logon_type FROM log_events e LEFT JOIN nodes n ON n.id=e.node_id WHERE e.account_sid=? AND e.event_id IN (4624,4625,4634,4647) ORDER BY e.event_time DESC,e.record_id DESC LIMIT 100',user.sid)
+  const {member_of_json,...publicUser}=user
+  res.json({...publicUser,memberOf:parse(member_of_json)||[],mfaEnrolled:!!one('SELECT 1 FROM users WHERE ad_guid=? AND totp_secret IS NOT NULL',user.id),operatorImported:!!one("SELECT 1 FROM users WHERE ad_guid=? AND auth_source='ad'",user.id),mfaEvents:mfa,logonEvents:logons})
+})
+api.post('/directory/users/:id/import-operator',requireRole('admin'),wrap(async(req,res)=>{
+  const {role}=body(z.object({role:z.enum(['admin','editor','auditor']).default('auditor')}),req)
+  const directoryUser=one('SELECT * FROM directory_users WHERE id=?',reqId(req));if(!directoryUser)return notFound(res,'Directory user')
+  if(directoryUser.missing||!directoryUser.enabled||!directoryUser.upn||!directoryUser.email||!z.email().safeParse(directoryUser.email).success)return res.status(409).json({error:'Directory user must be present, enabled, and have a valid email and UPN'})
+  let user=one('SELECT * FROM users WHERE ad_guid=?',directoryUser.id)
+  const byEmail=one('SELECT * FROM users WHERE email=?',directoryUser.email)
+  if(byEmail&&byEmail.id!==user?.id&&!byEmail.directory_only)return res.status(409).json({error:'An existing local operator uses this email; resolve that account before importing'})
+  if(!user&&byEmail?.directory_only)user=byEmail
+  const userId=user?.id||id(),passwordHash=user?.password_hash||await argon2.hash(crypto.randomBytes(48).toString('base64url'))
+  db.transaction(()=>{
+    if(user)run("UPDATE users SET email=?,role=?,auth_source='ad',ad_guid=?,directory_only=0,email_verified=1,session_version=session_version+1 WHERE id=?",directoryUser.email,role,directoryUser.id,user.id)
+    else{run("INSERT INTO users(id,email,password_hash,role,email_verified,auth_source,ad_guid) VALUES(?,?,?,?,1,'ad',?)",userId,directoryUser.email,passwordHash,role,directoryUser.id);run('INSERT INTO user_profiles(user_id) VALUES(?)',userId)}
+    run('UPDATE refresh_tokens SET revoked_at=? WHERE user_id=?',now(),userId)
+    audit(req.user.id,'directory.operator.import','user',userId,null,{directoryGuid:directoryUser.id,email:directoryUser.email,role})
+  })()
+  res.status(user?200:201).json(publicUser(one('SELECT * FROM users WHERE id=?',userId)))
+}))
 
 const visibleCredentials=user=>(user.role==='owner'||user.role==='admin' ? all('SELECT id,name,type,username,owner_user_id,visibility,team_id,priority,created_at FROM credentials ORDER BY priority,name') : all(`SELECT id,name,type,username,owner_user_id,visibility,team_id,priority,created_at FROM credentials WHERE owner_user_id=? OR (visibility='team' AND team_id=?) OR EXISTS (SELECT 1 FROM resource_grants g WHERE g.resource_type='credential' AND g.resource_id=credentials.id AND g.grantee_user_id=?) ORDER BY priority,name`,user.id,user.team_id,user.id)).map(credential=>({...credential,canWrite:canWriteResource(user,'credential',credential)}))
 api.get('/credentials',(req,res)=>res.json(visibleCredentials(req.user)))
@@ -833,6 +918,39 @@ api.delete('/nodes/:id',requireRole('admin'),(req,res)=>{
   res.status(204).end()
 })
 api.post('/nodes/:id/probe',requireRole('editor'),wrap(async(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json(await probeNode(node))}))
+api.post('/nodes/:id/activate-agentless',requireRole('admin'),wrap(async(req,res)=>{
+  const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
+  if(!node.ad_guid||node.ad_missing||!node.ad_enabled||node.connection_mode!=='agentless')return res.status(409).json({error:'This action requires an enabled AD-discovered agentless computer'})
+  const facts=await enrichNode(node)
+  audit(req.user.id,'node.agentless.verify','node',node.id,null,{transport:one('SELECT transport FROM nodes WHERE id=?',node.id)?.transport,computerName:facts?.computer?.Name})
+  res.json({managed:true,transport:one('SELECT transport FROM nodes WHERE id=?',node.id)?.transport,computerName:facts?.computer?.Name})
+}))
+api.post('/nodes/:id/deploy-agent',requireRole('admin'),wrap(async(req,res)=>{
+  const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
+  if(node.connection_mode!=='agentless'||!['winrm','winrms'].includes(node.transport)||node.agent_id||one('SELECT id FROM agents WHERE node_id=?',node.id))return res.status(409).json({error:'Agent deployment requires an unenrolled WinRM agentless node'})
+  if(!req.secure||!agentPkiReady())return res.status(503).json({error:'Agent deployment requires HTTPS and configured agent PKI'})
+  const base=process.env.PUBLIC_BASE_URL
+  if(!base||!base.startsWith('https://'))return res.status(503).json({error:'Set an HTTPS PUBLIC_BASE_URL for agent deployment'})
+  if(!process.env.AGENT_PACKAGE_PATH)return res.status(503).json({error:'Set AGENT_PACKAGE_PATH to a signed Windows agent executable'})
+  const packagePath=path.resolve(process.env.AGENT_PACKAGE_PATH)
+  if(!fs.existsSync(packagePath)||!fs.statSync(packagePath).isFile())return res.status(503).json({error:'The signed agent executable was not found'})
+  const digest=crypto.createHash('sha256')
+  for await(const chunk of fs.createReadStream(packagePath))digest.update(chunk)
+  const token=crypto.randomBytes(32).toString('base64url'),tokenId=id(),expiresAt=new Date(Date.now()+15*60_000).toISOString()
+  run('INSERT INTO enrollment_tokens(id,node_id,token_hash,expires_at) VALUES(?,?,?,?)',tokenId,node.id,hashToken(token),expiresAt)
+  audit(req.user.id,'agent.remote-deploy.start','node',node.id,null,{packageSha256:digest.copy().digest('hex'),expiresAt})
+  try{
+    const result=await remote(node,'agent_deploy',{serverUrl:base.replace(/\/$/,''),packageUrl:new URL('/api/v1/agent-package/WinFire.Agent.exe',base).toString(),sha256:digest.digest('hex'),token})
+    const agent=one('SELECT id FROM agents WHERE node_id=?',node.id)
+    if(!result?.installed||!agent)throw new Error('The agent service or certificate enrollment was not confirmed')
+    audit(req.user.id,'agent.remote-deploy.success','node',node.id,null,{agentId:agent.id,serviceStatus:result.status})
+    res.json({installed:true,serviceStatus:result.status,agentId:agent.id})
+  }catch(error){
+    run('DELETE FROM enrollment_tokens WHERE id=? AND used_at IS NULL',tokenId)
+    audit(req.user.id,'agent.remote-deploy.failed','node',node.id,null,{error:error.message,agentEnrolled:!!one('SELECT id FROM agents WHERE node_id=?',node.id)})
+    throw Object.assign(new Error(error.message),{status:502})
+  }
+}))
 function queueBreakGlassJob(node,type,payload){
   const agent=one('SELECT id,last_checkin_at FROM agents WHERE id=? AND revoked_at IS NULL',node.agent_id)
   if(!agent)throw Object.assign(new Error('No active agent is enrolled on this node'),{status:409})
@@ -1207,6 +1325,14 @@ async function verifyOne(node,policy,rule,runId,actualRules,vantageNode=null) {
   const port=singleTcpPort?Number(rule.localPort):null
   const supported=port!==null && port>=1 && port<=65535
   const started=Date.now()
+  let baselineRecordId=null,eventError=null
+  if(rule.action==='block'&&supported&&node.connection_mode==='agentless'){
+    try{
+      baselineRecordId=Number(await remote(node,'event_cursor'))
+      if(!Number.isSafeInteger(baselineRecordId)||baselineRecordId<0)throw new Error('Invalid Security log cursor')
+    }catch(error){baselineRecordId=null;eventError=`Security log cursor unavailable: ${error.message}`}
+  }
+  const probeStartedAt=now()
   let probe=null,probeError=null
   if(supported){
     if(vantageNode?.id===node.id)probeError='The verifier peer is the target node; choose another peer for a network-path check'
@@ -1217,12 +1343,29 @@ async function verifyOne(node,policy,rule,runId,actualRules,vantageNode=null) {
       }catch(error){probe=null;probeError=`Verifier peer unavailable: ${error.message}`}
     }else probe=await tcpProbe(node.ip||node.fqdn||node.hostname,port,1500)
   }
+  const probeFinishedAt=now()
   const managedRulePresent=actualRules===null?null:hasManagedRule(rule,actualRules)
-  const evidence=probeError?{status:'inconclusive',reason:probeError}:supported?classifyVerification(rule,probe.status,managedRulePresent):{status:'inconclusive',reason:'Only single-port inbound TCP rules have a network probe'}
+  let firewallEvent=null
+  if(rule.action==='block'&&supported&&['refused','timeout'].includes(probe?.status)&&probe?.sourceIp&&probe?.sourcePort){
+    if(node.connection_mode==='agentless'&&baselineRecordId!==null){
+      try{
+        const collected=await remote(node,'events_probe')
+        insertCollectedEvents(node.id,Array.isArray(collected)?collected:collected?[collected]:[],false)
+      }catch(error){eventError=error.message}
+    }
+    if(node.connection_mode!=='agentless'||baselineRecordId!==null){
+      const candidates=all(`SELECT e.record_id,e.event_id,e.event_time,e.action,e.filter_origin,e.filter_runtime_id,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.direction,p.direction) direction,COALESCE(e.src_ip,p.src_ip) src_ip,e.src_port,COALESCE(e.dst_port,p.dst_port) dst_port
+        FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE e.node_id=? AND e.event_id=5157 AND e.src_port=? AND COALESCE(e.dst_port,p.dst_port)=? AND (? IS NULL OR e.record_id>?) AND (? IS NOT NULL OR datetime(e.event_time)>=datetime(?)) ORDER BY e.record_id DESC LIMIT 100`,node.id,probe.sourcePort,port,baselineRecordId,baselineRecordId,baselineRecordId,new Date(Date.parse(probeStartedAt)-2000).toISOString())
+      firewallEvent=findMatchingDenyEvent(candidates,probe,port,probeStartedAt,probeFinishedAt,baselineRecordId)
+    }
+  }
+  const managedRuleName=managedRulePresent?actualRules.find(item=>item.name===rule.name)?.internalName:null
+  const evidence=probeError?{status:'inconclusive',reason:probeError}:supported?classifyVerification(rule,probe.status,managedRulePresent,firewallEvent,managedRuleName):{status:'inconclusive',reason:'Only single-port inbound TCP rules have a network probe'}
+  if(eventError&&evidence.status==='inconclusive'&&rule.action==='block')evidence.reason+=`; event collection failed: ${eventError}`
   const expected=rule.action==='allow'?'open':'closed',actual=probe?.status==='open'?'open':probe?.status||'not-probed'
-  const result={id:id(),runId,nodeId:node.id,policyId:policy.id,vantageNodeId:vantageNode?.id||null,port,proto:rule.protocol,expected,actual,probeStatus:probe?.status||null,managedRulePresent,latencyMs:Date.now()-started,...evidence,passed:evidence.status==='inconclusive'?null:evidence.status==='pass'}
+  const result={id:id(),runId,nodeId:node.id,policyId:policy.id,vantageNodeId:vantageNode?.id||null,port,proto:rule.protocol,expected,actual,probeStatus:probe?.status||null,probeSourceIp:probe?.sourceIp||null,probeSourcePort:probe?.sourcePort||null,firewallEventRecordId:firewallEvent?.record_id||null,firewallEventTime:firewallEvent?.event_time||null,firewallEventFilterOrigin:firewallEvent?.filter_origin||null,managedRulePresent,latencyMs:Date.now()-started,...evidence,passed:evidence.status==='inconclusive'?null:evidence.status==='pass'}
   const previous=one('SELECT status FROM verifier_results WHERE node_id=? AND policy_id=? AND port IS ? AND proto=? AND expected=? ORDER BY run_at DESC,rowid DESC LIMIT 1',node.id,policy.id,port,rule.protocol,expected)?.status
-  run('INSERT INTO verifier_results(id,run_id,node_id,policy_id,vantage_node_id,port,proto,expected,actual,latency_ms,passed,status,reason,probe_status,managed_rule_present) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',result.id,runId,node.id,policy.id,result.vantageNodeId,port,rule.protocol,expected,actual,result.latencyMs,result.passed===null?null:Number(result.passed),result.status,result.reason,result.probeStatus,result.managedRulePresent===null?null:Number(result.managedRulePresent))
+  run('INSERT INTO verifier_results(id,run_id,node_id,policy_id,vantage_node_id,port,proto,expected,actual,latency_ms,passed,status,reason,probe_status,managed_rule_present,probe_source_ip,probe_source_port,firewall_event_record_id,firewall_event_time,firewall_event_filter_origin) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',result.id,runId,node.id,policy.id,result.vantageNodeId,port,rule.protocol,expected,actual,result.latencyMs,result.passed===null?null:Number(result.passed),result.status,result.reason,result.probeStatus,result.managedRulePresent===null?null:Number(result.managedRulePresent),result.probeSourceIp,result.probeSourcePort,result.firewallEventRecordId,result.firewallEventTime,result.firewallEventFilterOrigin)
   if(result.status==='fail'&&previous!=='fail')emitNotification({eventKey:`verifier:${result.id}`,category:'verifier_failure',title:'Firewall verification failed',body:`${policy.name} on ${node.hostname}: ${rule.protocol} ${port||'rule'} — ${result.reason}.`,entityType:'node',entityId:node.id})
   return result
 }
@@ -1290,7 +1433,7 @@ function report(name,user=null) {
   }
   if(name==='verification'){
     const visible=user?readablePolicyIds(user):null
-    return all(`SELECT n.hostname,p.id AS policy_id,p.name AS policy,COALESCE(v.hostname,'Control plane') AS vantage,r.port,r.proto,r.expected,r.actual,r.status,r.reason,r.managed_rule_present,r.run_at FROM verifier_results r LEFT JOIN nodes n ON n.id=r.node_id LEFT JOIN nodes v ON v.id=r.vantage_node_id LEFT JOIN policies p ON p.id=r.policy_id ORDER BY r.run_at DESC LIMIT 1000`).filter(row=>!visible||visible.has(row.policy_id)).map(({policy_id,...row})=>row)
+    return all(`SELECT n.hostname,p.id AS policy_id,p.name AS policy,COALESCE(v.hostname,'Control plane') AS vantage,r.port,r.proto,r.expected,r.actual,r.status,r.reason,r.managed_rule_present,r.probe_source_ip,r.probe_source_port,r.firewall_event_record_id,r.firewall_event_time,r.firewall_event_filter_origin,r.run_at FROM verifier_results r LEFT JOIN nodes n ON n.id=r.node_id LEFT JOIN nodes v ON v.id=r.vantage_node_id LEFT JOIN policies p ON p.id=r.policy_id ORDER BY r.run_at DESC LIMIT 1000`).filter(row=>!visible||visible.has(row.policy_id)).map(({policy_id,...row})=>row)
   }
   const drift=driftSummaryByNode()
   return all(`SELECT n.id,n.hostname,n.status,COUNT(DISTINCT a.policy_id) AS policies,COALESCE((SELECT SUM(passed) FROM verifier_results WHERE node_id=n.id),0) AS checks_passed,COALESCE((SELECT COUNT(passed) FROM verifier_results WHERE node_id=n.id),0) AS checks_decisive,COALESCE((SELECT COUNT(*) FROM verifier_results WHERE node_id=n.id AND passed IS NULL),0) AS checks_inconclusive FROM nodes n LEFT JOIN policy_assignments a ON a.node_id=n.id OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=n.id) GROUP BY n.id ORDER BY n.hostname`).map(row=>({...row,drift_status:drift.get(row.id)||null}))
@@ -1533,7 +1676,7 @@ api.post('/segments/:id/challenges/:challengeId/resolve',requireRole('admin'),(r
   res.json({ok:true})
 })
 
-api.get('/logon-rights',(req,res)=>res.json(all('SELECT * FROM logon_rights WHERE (? IS NULL OR node_id=?) ORDER BY at DESC LIMIT 500',req.query.nodeId||null,req.query.nodeId||null)))
+api.get('/logon-rights',(req,res)=>res.json(all('SELECT r.*,COALESCE(d.sam_account_name,d.upn) ad_username FROM logon_rights r LEFT JOIN directory_users d ON d.sid=r.account_sid WHERE (? IS NULL OR r.node_id=?) ORDER BY r.at DESC LIMIT 500',req.query.nodeId||null,req.query.nodeId||null)))
 // LSA changes use the authenticated WinRM connector and require readback.
 api.post('/logon-rights/baseline',requireRole('admin'),wrap(async(req,res)=>{
   const {nodeId}=body(z.object({nodeId:z.string()}),req),node=getNode(nodeId);if(!node)return notFound(res,'Node')
@@ -1553,6 +1696,7 @@ api.post('/logon-rights/change',requireRole('admin'),wrap(async(req,res)=>{
   const data=body(z.object({nodeId:z.string().uuid(),accountSid:z.string().regex(/^S-1-\d+-\d+(?:-\d+)+$/),right:z.enum(['SeNetworkLogonRight','SeDenyNetworkLogonRight','SeRemoteInteractiveLogonRight','SeDenyRemoteInteractiveLogonRight','SeBatchLogonRight','SeDenyBatchLogonRight','SeServiceLogonRight','SeDenyServiceLogonRight']),present:z.boolean(),reason:z.string().trim().min(10).max(500),confirmation:z.literal('CHANGE LOGON RIGHT')}),req)
   const node=getNode(data.nodeId);if(!node)return notFound(res,'Node')
   if(!['winrm','winrms'].includes(node.transport)||node.connection_mode!=='agentless')return res.status(409).json({error:'Logon rights changes require an agentless WinRM node'})
+  if(data.right==='SeNetworkLogonRight'&&!data.present||data.right==='SeDenyNetworkLogonRight'&&data.present)return res.status(409).json({error:'This network logon change could block WinRM administration; use a separately validated enforcement workflow'})
   const critical=new Set(['S-1-1-0','S-1-5-9','S-1-5-11','S-1-5-18','S-1-5-19','S-1-5-20','S-1-5-32-544','S-1-5-32-548','S-1-5-32-580'])
   if(critical.has(data.accountSid)||/-(?:500|512|518|519)$/.test(data.accountSid))return res.status(409).json({error:'This account is protected from direct logon-right changes'})
   const runId=id()
@@ -1597,6 +1741,48 @@ api.get('/logs/search',(req,res)=>{
   const items=all(`SELECT e.*,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,COALESCE(e.dst_ip,p.dst_ip) dst_ip,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.direction,p.direction) direction,COALESCE(e.program,p.program) program,COALESCE(e.event_type,p.event_type) event_type ${fromSql} ORDER BY ${sortColumns[query.sortBy]} ${query.sortDir.toUpperCase()}, e.id DESC LIMIT ? OFFSET ?`,...args,query.pageSize,(query.page-1)*query.pageSize)
   res.json({items,total,page:query.page,pageSize:query.pageSize,totalPages:Math.ceil(total/query.pageSize)})
 })
+const publicEventExport=destination=>({id:destination.id,name:destination.name,kind:destination.kind,endpoint:destination.endpoint,hasToken:!!destination.token_blob,createdAt:destination.created_at,updatedAt:destination.updated_at})
+api.get('/event-export/destinations',requireRole('admin'),(_req,res)=>res.json(all('SELECT * FROM event_export_destinations ORDER BY name').map(publicEventExport)))
+api.post('/event-export/destinations',requireRole('admin'),(req,res)=>{
+  const data=body(z.object({name:z.string().trim().min(1).max(100),kind:z.enum(['syslog_tls','splunk_hec']),endpoint:z.string().trim().min(1).max(2048),token:z.string().min(16).max(512).optional()}),req)
+  const endpoint=validateExportDestination(data.kind,data.endpoint)
+  if(data.kind==='splunk_hec'&&!data.token)return res.status(400).json({error:'A Splunk HEC token is required'})
+  const destinationId=id(),timestamp=now()
+  run('INSERT INTO event_export_destinations(id,name,kind,endpoint,token_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?)',destinationId,data.name,data.kind,endpoint,data.token?seal({token:data.token}):null,timestamp,timestamp)
+  audit(req.user.id,'event-export.destination.create','event-export',destinationId,null,{name:data.name,kind:data.kind,endpoint})
+  res.status(201).json(publicEventExport(one('SELECT * FROM event_export_destinations WHERE id=?',destinationId)))
+})
+api.patch('/event-export/destinations/:id',requireRole('admin'),(req,res)=>{
+  const before=one('SELECT * FROM event_export_destinations WHERE id=?',reqId(req));if(!before)return notFound(res,'Export destination')
+  const data=body(z.object({name:z.string().trim().min(1).max(100),kind:z.enum(['syslog_tls','splunk_hec']),endpoint:z.string().trim().min(1).max(2048),token:z.string().min(16).max(512).optional()}),req)
+  const endpoint=validateExportDestination(data.kind,data.endpoint),tokenBlob=data.token?seal({token:data.token}):data.kind===before.kind?before.token_blob:null
+  if(data.kind==='splunk_hec'&&!tokenBlob)return res.status(400).json({error:'A Splunk HEC token is required'})
+  run('UPDATE event_export_destinations SET name=?,kind=?,endpoint=?,token_blob=?,updated_at=? WHERE id=?',data.name,data.kind,endpoint,tokenBlob,now(),before.id)
+  audit(req.user.id,'event-export.destination.update','event-export',before.id,publicEventExport(before),{name:data.name,kind:data.kind,endpoint,tokenChanged:!!data.token})
+  res.json(publicEventExport(one('SELECT * FROM event_export_destinations WHERE id=?',before.id)))
+})
+api.delete('/event-export/destinations/:id',requireRole('admin'),(req,res)=>{
+  const destination=one('SELECT * FROM event_export_destinations WHERE id=?',reqId(req));if(!destination)return notFound(res,'Export destination')
+  run('DELETE FROM event_export_destinations WHERE id=?',destination.id)
+  audit(req.user.id,'event-export.destination.delete','event-export',destination.id,publicEventExport(destination),null)
+  res.json({ok:true})
+})
+api.post('/event-export/send',requireRole('admin'),wrap(async(req,res)=>{
+  const data=body(z.object({destinationId:z.string().uuid(),eventIds:z.array(z.string().uuid()).min(1).max(500)}),req)
+  const eventIds=[...new Set(data.eventIds)],destination=one('SELECT * FROM event_export_destinations WHERE id=?',data.destinationId)
+  if(!destination)return notFound(res,'Export destination')
+  const events=all(`SELECT e.*,n.hostname,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,COALESCE(e.dst_ip,p.dst_ip) dst_ip,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.direction,p.direction) direction,COALESCE(e.program,p.program) program FROM log_events e LEFT JOIN nodes n ON n.id=e.node_id LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE e.id IN (${eventIds.map(()=>'?').join(',')})`,...eventIds)
+  if(events.length!==eventIds.length)return res.status(404).json({error:'One or more selected events no longer exist'})
+  audit(req.user.id,'event-export.send.attempt','event-export',destination.id,null,{eventIds,count:events.length})
+  try{
+    const result=await exportSelectedEvents(destination,events,destination.token_blob?openSealed(destination.token_blob).token:null)
+    audit(req.user.id,'event-export.send.success','event-export',destination.id,null,{eventIds,count:result.sent,kind:result.kind})
+    res.json(result)
+  }catch(error){
+    audit(req.user.id,'event-export.send.failed','event-export',destination.id,null,{eventIds,count:events.length,error:error.message})
+    throw Object.assign(new Error(error.message),{status:502})
+  }
+}))
 api.post('/logs/:id/rule',requireRole('admin'),(req,res)=>{
   const event=one('SELECT e.*,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,COALESCE(e.dst_ip,p.dst_ip) dst_ip,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.direction,p.direction) direction,COALESCE(e.program,p.program) program FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE e.id=?',reqId(req));if(!event)return notFound(res,'Event')
   const node=getNode(event.node_id);if(!node)return notFound(res,'Node')
@@ -1638,8 +1824,10 @@ function insertCollectedEvents(nodeId,events,ignoreLoopback){
   db.transaction(()=>{for(const event of events){
     const item=normalizeWindowsEvent(event)
     if(ignoreLoopback&&isLoopbackEvent(item))continue
-    const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,program,account_sid,event_time,event_type,logon_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),nodeId,item.recordId,item.eventId,item.action,item.protocol,item.srcIp,item.srcPort,item.dstIp,item.dstPort,item.direction,item.program,item.accountSid,item.eventTime,item.eventType,item.logonType)
+    const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,program,account_sid,event_time,event_type,logon_type,filter_origin,filter_runtime_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),nodeId,item.recordId,item.eventId,item.action,item.protocol,item.srcIp,item.srcPort,item.dstIp,item.dstPort,item.direction,item.program,item.accountSid,item.eventTime,item.eventType,item.logonType,item.filterOrigin,item.filterRuntimeId)
     inserted+=result.changes
+    if(!result.changes&&item.filterOrigin)run('UPDATE log_events SET filter_origin=COALESCE(filter_origin,?),filter_runtime_id=COALESCE(filter_runtime_id,?) WHERE node_id=? AND record_id=? AND filter_origin IS NULL',item.filterOrigin,item.filterRuntimeId,nodeId,item.recordId)
+    if(!result.changes&&item.eventType==='firewall'&&item.direction==='in')run('UPDATE log_events SET src_ip=?,src_port=?,dst_ip=?,dst_port=? WHERE node_id=? AND record_id=? AND pattern_id IS NULL AND (src_ip IS NOT ? OR src_port IS NOT ? OR dst_ip IS NOT ? OR dst_port IS NOT ?)',item.srcIp,item.srcPort,item.dstIp,item.dstPort,nodeId,item.recordId,item.srcIp,item.srcPort,item.dstIp,item.dstPort)
   }})()
   return inserted
 }

@@ -1,8 +1,10 @@
-import {Client} from 'ldapts'
+import {Client,Attribute,Change} from 'ldapts'
 
 const directoryAttributes=['objectGUID','objectSid','distinguishedName','name','dNSHostName','operatingSystem','operatingSystemVersion','lastLogonTimestamp','userAccountControl','whenChanged']
+const userAttributes=['objectGUID','objectSid','distinguishedName','sAMAccountName','userPrincipalName','mail','displayName','memberOf','lastLogonTimestamp','userAccountControl','whenChanged']
 const first=value=>Array.isArray(value)?value[0]:value
 const attribute=(entry,name)=>first(entry[Object.keys(entry).find(key=>key.toLowerCase()===name.toLowerCase())])
+const attributeValues=(entry,name)=>{const value=entry[Object.keys(entry).find(key=>key.toLowerCase()===name.toLowerCase())];return value===undefined?[]:Array.isArray(value)?value:[value]}
 
 export function guidFromDirectory(value) {
   if(!value)return null
@@ -45,6 +47,21 @@ export function normalizeDirectoryComputer(entry,baseDn) {
     operatingSystem:String(attribute(entry,'operatingSystem')||''),operatingSystemVersion:String(attribute(entry,'operatingSystemVersion')||''),
     lastLogonAt:fileTime(attribute(entry,'lastLogonTimestamp')),enabled:!(flags&2),changedAt:attribute(entry,'whenChanged')||null
   }
+}
+
+export function normalizeDirectoryUser(entry) {
+  const guid=guidFromDirectory(attribute(entry,'objectGUID'))
+  const sid=sidFromDirectory(attribute(entry,'objectSid'))
+  const dn=String(attribute(entry,'distinguishedName')||entry.dn||'').trim()
+  if(!guid||!sid||!dn)return null
+  const flags=Number(attribute(entry,'userAccountControl')||0)
+  const samAccountName=String(attribute(entry,'sAMAccountName')||'').trim()
+  const upn=String(attribute(entry,'userPrincipalName')||'').trim().toLowerCase()
+  if(!samAccountName&&!upn)return null
+  const email=String(attribute(entry,'mail')||upn).trim().toLowerCase()
+  return {guid,sid,dn,samAccountName,upn,email,displayName:String(attribute(entry,'displayName')||samAccountName||upn).trim(),
+    memberOf:attributeValues(entry,'memberOf').map(value=>String(value)).filter(Boolean),enabled:!(flags&2),
+    lastLogonAt:fileTime(attribute(entry,'lastLogonTimestamp')),changedAt:attribute(entry,'whenChanged')||null}
 }
 
 const defaultClientFactory=options=>new Client(options)
@@ -131,4 +148,45 @@ export async function readDirectoryComputers(config,credential,clientFactory=def
     return computers
   },clientFactory)
   return {computers:result.value,transport:result.transport}
+}
+
+export async function readDirectoryUsers(config,credential,clientFactory=defaultClientFactory) {
+  const result=await runWithDirectory(config,credential,async client=>{
+    const users=[]
+    for await(const page of client.searchPaginated(config.base_dn,{scope:'sub',filter:'(&(objectCategory=person)(objectClass=user))',attributes:userAttributes,explicitBufferAttributes:['objectGUID','objectSid'],paged:{pageSize:500},timeLimit:30})){
+      for(const entry of page.searchEntries){
+        const user=normalizeDirectoryUser(entry)
+        if(user)users.push(user)
+        if(users.length>100000)throw new Error('Directory user inventory exceeds 100,000 users; narrow the search base')
+      }
+    }
+    return users
+  },clientFactory)
+  return {users:result.value,transport:result.transport}
+}
+
+export async function writeDirectoryUserStatus(config,credential,user,enabled,{expectedUac=null,clientFactory=defaultClientFactory}={}){
+  if(!config?.enabled||!config.url||new URL(config.url).protocol!=='ldaps:')throw Object.assign(new Error('AD account changes require an enabled LDAPS directory connection'),{status:503})
+  if(!credential?.username||!credential?.password)throw Object.assign(new Error('A separate AD account-control credential is required'),{status:503})
+  const client=makeClient(config,clientFactory)
+  const read=async()=>{
+    const result=await client.search(user.dn,{scope:'base',filter:'(objectClass=user)',attributes:['objectGUID','objectSid','userAccountControl'],explicitBufferAttributes:['objectGUID','objectSid'],sizeLimit:1})
+    const entry=result.searchEntries[0]
+    if(!entry||guidFromDirectory(attribute(entry,'objectGUID'))!==user.id||sidFromDirectory(attribute(entry,'objectSid'))!==user.sid)throw Object.assign(new Error('AD user identity changed; sync the directory before changing this account'),{status:409})
+    const flags=Number(attribute(entry,'userAccountControl'))
+    if(!Number.isSafeInteger(flags)||flags<0)throw Object.assign(new Error('AD did not return a valid userAccountControl value'),{status:502})
+    return flags
+  }
+  try{
+    await client.bind(credential.username,credential.password)
+    const before=await read()
+    if(expectedUac!==null&&before!==expectedUac)throw Object.assign(new Error('AD account flags changed since WinFire disabled the account; manual review is required'),{status:409})
+    const after=enabled?before&~2:before|2
+    if(after!==before){
+      await client.modify(user.dn,new Change({operation:'replace',modification:new Attribute({type:'userAccountControl',values:[String(after)]})}))
+      if(await read()!==after)throw Object.assign(new Error('AD account-control readback did not confirm the change'),{status:502})
+    }
+    return {enabled,changed:after!==before,beforeUac:before,afterUac:after}
+  }catch(error){if(error.status)throw error;throw directoryConnectionError(error,config.url)}
+  finally{try{await client.unbind()}catch{}}
 }

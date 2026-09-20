@@ -4,6 +4,7 @@ import {createRouter,createWebHistory} from 'vue-router'
 import App from './App.vue'
 import Dashboard from './views/Dashboard.vue'
 import Inventory from './views/Inventory.vue'
+import Directory from './views/Directory.vue'
 import Policies from './views/Policies.vue'
 import Reports from './views/Reports.vue'
 import Logs from './views/Logs.vue'
@@ -29,6 +30,7 @@ const routes=[
   {path:'/mfa/:promptId',component:MfaPrompt,meta:{public:true}},
   {path:'/',component:Dashboard},
   {path:'/inventory',component:Inventory},
+  {path:'/directory',component:Directory},
   {path:'/policies',component:Policies},
   {path:'/reports',component:Reports},
   {path:'/logs',component:Logs},

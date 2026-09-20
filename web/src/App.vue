@@ -7,10 +7,10 @@ import NotificationCenter from './components/NotificationCenter.vue'
 import GlassWindow from './components/GlassWindow.vue'
 const route=useRoute(),router=useRouter(),menuOpen=ref(false)
 const syncOpen=ref(false),syncState=ref({pending:[],schedules:[]}),syncAt=ref(''),syncBusy=ref(false),syncError=ref(''),syncMessage=ref('')
-const links=[['/','view-dashboard-outline','Overview'],['/inventory','server-network','Inventory'],['/policies','source-branch','Policy Studio'],['/reports','chart-box-outline','Reports'],['/logs','text-box-search-outline','Event logs'],['/identity','shield-account-outline','Identity'],['/admin','cog-outline','Administration']]
+const links=[['/','view-dashboard-outline','Overview'],['/inventory','server-network','Inventory'],['/directory','account-group-outline','Directory'],['/policies','source-branch','Policy Studio'],['/reports','chart-box-outline','Reports'],['/logs','text-box-search-outline','Event logs'],['/identity','shield-account-outline','Identity'],['/admin','cog-outline','Administration']]
 const title=computed(()=>links.find(l=>l[0]===route.path)?.[2]||'WinFire Secure')
 const isEnterprise=computed(()=>activeTheme.value==='enterprise')
-const enterpriseTitle=computed(()=>({'/':'Dashboard','/inventory':'Network / Assets','/policies':'Network / Policies','/reports':'Reporting','/logs':'Network / Visibility','/identity':'Identity','/admin':'Administration'})[route.path]||title.value)
+const enterpriseTitle=computed(()=>({'/':'Dashboard','/inventory':'Network / Assets','/directory':'Entities / Directory','/policies':'Network / Policies','/reports':'Reporting','/logs':'Network / Visibility','/identity':'Identity','/admin':'Administration'})[route.path]||title.value)
 watch(()=>route.meta.public,async publicPage=>{if(publicPage||!session.token)return;try{const me=await api('/auth/me');applyTheme(me.profile?.theme)}catch{}},{immediate:true})
 async function logout(){try{await api('/auth/logout',{method:'POST',body:{refreshToken:session.refresh}})}catch{}session.clear();router.push('/login')}
 async function loadSync(){if(!session.token)return;try{syncState.value=await api('/policies/sync');syncError.value=''}catch(error){syncError.value=error.message}}
@@ -32,7 +32,7 @@ function toggleTheme(){setLocalTheme(isEnterprise.value?'hacker':'enterprise')}
       <router-link to="/" class="enterprise-back" @click="menuOpen=false"><i class="mdi mdi-arrow-left"></i> Back to main menu</router-link>
       <nav class="enterprise-nav" aria-label="Enterprise navigation">
         <div class="enterprise-nav-group"><span class="enterprise-nav-label">WORKSPACE</span><router-link to="/" @click="menuOpen=false"><i class="mdi mdi-view-dashboard-outline"></i> Dashboard</router-link></div>
-        <div class="enterprise-nav-group"><span class="enterprise-nav-label">ENTITIES</span><router-link to="/inventory" @click="menuOpen=false"><i class="mdi mdi-server-network"></i> Monitored assets</router-link><router-link to="/identity" @click="menuOpen=false"><i class="mdi mdi-account-key-outline"></i> Identity</router-link></div>
+        <div class="enterprise-nav-group"><span class="enterprise-nav-label">ENTITIES</span><router-link to="/inventory" @click="menuOpen=false"><i class="mdi mdi-server-network"></i> Monitored assets</router-link><router-link to="/directory" @click="menuOpen=false"><i class="mdi mdi-account-group-outline"></i> Directory</router-link><router-link to="/identity" @click="menuOpen=false"><i class="mdi mdi-account-key-outline"></i> Identity</router-link></div>
         <div class="enterprise-nav-group"><span class="enterprise-nav-label">NETWORK</span><router-link to="/policies" @click="menuOpen=false"><i class="mdi mdi-source-branch"></i> Policies</router-link><router-link to="/reports" @click="menuOpen=false"><i class="mdi mdi-chart-box-outline"></i> Reports</router-link></div>
         <div class="enterprise-nav-group"><span class="enterprise-nav-label">VISIBILITY</span><router-link to="/logs" @click="menuOpen=false"><i class="mdi mdi-eye-outline"></i> Activities</router-link></div>
       </nav>
