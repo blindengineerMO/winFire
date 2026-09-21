@@ -73,8 +73,8 @@ const time=item=>item&&!Number.isNaN(new Date(item).getTime())?new Date(item).to
       </section>
     </template>
     <section class="node-facts-section">
-      <div class="node-facts-heading"><h3>Current firewall rules</h3><button class="button small secondary" :disabled="rulesLoading||!['winrm','winrms'].includes(node.transport)" @click="emit('rulesPage',0)"><i class="mdi mdi-refresh"></i> Refresh</button></div>
-      <p v-if="!['winrm','winrms'].includes(node.transport)" class="muted">Live firewall rule inventory is available after WinRM connects.</p>
+      <div class="node-facts-heading"><h3>Current firewall rules</h3><button class="button small secondary" :disabled="rulesLoading||!['winrm','winrms','netsh'].includes(node.transport)" @click="emit('rulesPage',0)"><i class="mdi mdi-refresh"></i> Refresh</button></div>
+      <p v-if="!['winrm','winrms','netsh'].includes(node.transport)" class="muted">Live firewall rule inventory is available after a supported management transport connects.</p>
       <p v-else-if="rulesError" class="error-msg">{{rulesError}}</p>
       <p v-else-if="rulesLoading" class="muted">Loading firewall rules…</p>
       <template v-if="rulePage?.rules?.length">

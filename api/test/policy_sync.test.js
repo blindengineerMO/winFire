@@ -11,7 +11,7 @@ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'winfire-sync-test-'))
 process.env.DATA_DIR=dir
 process.env.BOOTSTRAP_EMAIL='owner@sync.test'
 process.env.BOOTSTRAP_PASSWORD='sync-test-password-123'
-const {app,processDuePolicySync,matchesJitRule}=await import('../src/app.js')
+const {app,processDuePolicySync,processDuePolicySchedules,matchesJitRule}=await import('../src/app.js')
 const {bootstrap,seal}=await import('../src/security.js')
 const {db}=await import('../src/db.js')
 const {ensureLoopbackBaseline,loopbackRules}=await import('../src/loopbackBaseline.js')
@@ -111,6 +111,31 @@ test('policy revisions wait for explicit or scheduled administrator sync and eve
   const rule=JSON.parse(db.prepare('SELECT rules_compiled_json FROM policy_versions WHERE id=?').get(fromEvent.versionId).rules_compiled_json)[0]
   assert.equal(rule.localPort,'8443')
   assert.equal(rule.remoteAddress,'198.51.100.8')
+})
+
+test('schedule transitions queue active firewall rules and remove them outside the window',async()=>{
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@sync.test',password:'sync-test-password-123'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
+  const node=(await auth(request.post('/api/v1/nodes')).send({hostname:'schedule-node',connectionMode:'agent'}).expect(201)).body
+  db.prepare("UPDATE nodes SET firewall_state='enforcing' WHERE id=?").run(node.id)
+  const agentId=crypto.randomUUID()
+  db.prepare('INSERT INTO agents(id,node_id,cert_thumbprint,version,last_checkin_at) VALUES(?,?,?,?,?)').run(agentId,node.id,'SCHEDULE-TEST','test',new Date().toISOString())
+  db.prepare('UPDATE nodes SET agent_id=? WHERE id=?').run(agentId,node.id)
+  const policy=(await auth(request.post('/api/v1/policies')).send({name:'Scheduled RDP'}).expect(201)).body
+  const graph={nodes:[
+    {id:'hours',type:'schedule',data:{name:'Business hours',days:'1,2,3,4,5',startTime:'09:00',endTime:'17:00',timezone:'UTC'}},
+    {id:'rdp',type:'allow',data:{name:'Scheduled RDP',direction:'in',protocol:'TCP',localPort:'3389',remoteAddress:'192.0.2.5'}}
+  ],edges:[{id:'hours-rdp',source:'hours',target:'rdp'}]}
+  await auth(request.post(`/api/v1/policies/${policy.id}/versions`)).send({graph}).expect(201)
+  await auth(request.post(`/api/v1/policies/${policy.id}/assignments`)).send({nodeId:node.id}).expect(201)
+  await processDuePolicySchedules(null,new Date('2026-09-21T12:00:00Z'))
+  const jobs=()=>db.prepare("SELECT payload_json FROM agent_jobs WHERE agent_id=? AND type='policy.apply' ORDER BY created_at,rowid").all(agentId).map(row=>JSON.parse(row.payload_json))
+  assert.equal(jobs().length,1)
+  assert.equal(jobs()[0].rules.length,1)
+  await processDuePolicySchedules(null,new Date('2026-09-21T18:00:00Z'))
+  assert.equal(jobs().length,2)
+  assert.equal(jobs()[1].rules.length,0)
+  assert.ok(db.prepare('SELECT state_key FROM policy_schedule_state WHERE policy_id=? AND node_id=?').get(policy.id,node.id))
 })
 
 test('group details, group identity targets, and audit search exports resolve correctly',async()=>{

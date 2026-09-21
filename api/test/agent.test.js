@@ -234,6 +234,40 @@ test('mTLS enrollment, job polling, completion and revocation',async()=>{
   assert.equal((await request('POST',`/agents/${enrolled.body.agentId}/heartbeat`,{version:'test-2'},null,renewedClient)).status,401)
 })
 
+test('agent heartbeat advertises a pinned signed update and serves it only over mTLS',async()=>{
+  const login=await request('POST','/auth/login',{email:'owner@agent.test',password:'agent-test-password-123'})
+  const token=login.body.accessToken
+  const node=await request('POST','/nodes',{hostname:'agent-update-node'},token)
+  const enrollment=await request('POST','/agents/enrollment-tokens',{nodeId:node.body.id},token)
+  const enrolled=await request('POST','/agents/enroll',{token:enrollment.body.token,csr:fs.readFileSync(file('agent.csr'),'utf8')})
+  const client={cert:enrolled.body.certificate,key:fs.readFileSync(file('agent.key'))}
+  const packagePath=file('signed-update-fixture.exe')
+  fs.writeFileSync(packagePath,'signed update package')
+  const previous={path:process.env.AGENT_PACKAGE_PATH,updatePath:process.env.AGENT_UPDATE_PACKAGE_PATH,version:process.env.AGENT_PACKAGE_VERSION,updateVersion:process.env.AGENT_UPDATE_VERSION,signer:process.env.AGENT_SIGNER_THUMBPRINT}
+  process.env.AGENT_PACKAGE_PATH=packagePath
+  delete process.env.AGENT_UPDATE_PACKAGE_PATH
+  process.env.AGENT_PACKAGE_VERSION='0.2.0'
+  delete process.env.AGENT_UPDATE_VERSION
+  process.env.AGENT_SIGNER_THUMBPRINT='AB'.repeat(20)
+  try {
+    const heartbeat=await request('POST',`/agents/${enrolled.body.agentId}/heartbeat`,{version:'0.1.0'},null,client)
+    assert.equal(heartbeat.status,200)
+    assert.equal(heartbeat.body.update.available,true)
+    assert.equal(heartbeat.body.update.version,'0.2.0')
+    assert.equal(heartbeat.body.update.sha256,crypto.createHash('sha256').update('signed update package').digest('hex'))
+    assert.equal(heartbeat.body.update.signerThumbprint,'AB'.repeat(20))
+    assert.equal((await request('GET',`/agents/${enrolled.body.agentId}/update`,undefined,null,client)).body.available,true)
+    assert.equal((await request('GET',`/agents/${enrolled.body.agentId}/update/package`,undefined,null,client)).status,200)
+    assert.equal((await request('GET',`/agents/${enrolled.body.agentId}/update/package`)).status,401)
+    const current=await request('POST',`/agents/${enrolled.body.agentId}/heartbeat`,{version:'0.2.0'},null,client)
+    assert.equal(current.body.update.available,false)
+  } finally {
+    for(const [key,value] of Object.entries({AGENT_PACKAGE_PATH:previous.path,AGENT_UPDATE_PACKAGE_PATH:previous.updatePath,AGENT_PACKAGE_VERSION:previous.version,AGENT_UPDATE_VERSION:previous.updateVersion,AGENT_SIGNER_THUMBPRINT:previous.signer})) {
+      if(value===undefined)delete process.env[key];else process.env[key]=value
+    }
+  }
+})
+
 test('agent break glass is queued, confirmed, restored, and expires',async()=>{
   const login=await request('POST','/auth/login',{email:'owner@agent.test',password:'agent-test-password-123'})
   const token=login.body.accessToken

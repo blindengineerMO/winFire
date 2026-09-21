@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "WinFIRE Internet Visibility",
+  "description": "Privately report browser navigation metadata to an enrolled WinFIRE control plane.",
+  "version": "0.1.0",
+  "permissions": ["storage", "alarms", "webNavigation", "declarativeNetRequest", "declarativeNetRequestWithHostAccess"],
+  "optional_host_permissions": ["*://*/*"],
+  "background": { "scripts": ["service-worker.js"], "type": "module" },
+  "options_ui": { "page": "options.html", "open_in_tab": true },
+  "incognito": "not_allowed",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "internet-visibility@winfire.local",
+      "strict_min_version": "109.0",
+      "data_collection_permissions": { "required": ["websiteActivity"] }
+    }
+  }
+}

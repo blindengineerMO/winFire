@@ -56,6 +56,14 @@ async function rpcProbe(host,nodeId) {
   }
   throw lastError||new Error('No credential assigned')
 }
+async function netshProbe(host,nodeId){
+  let lastError
+  for(const credential of nodeCredential(nodeId)){
+    try{return await netshExecPython({host,username:credential.username,password:credential.secret.password,mode:'probe'})}
+    catch(error){lastError=error;error.message=String(error.message).replaceAll(credential.secret.password,'[redacted]')}
+  }
+  throw lastError||new Error('No credential assigned')
+}
 async function pwsh(script, input) {
   return new Promise((resolve,reject) => {
     const encoded=Buffer.from(script,'utf16le').toString('base64')
@@ -94,6 +102,25 @@ async function wmiProbePython(input){
       if(timedOut)return reject(new Error('WMI/DCOM probe timed out; check the dynamic RPC port range and firewall'))
       if(code)return reject(new Error(stderr.trim().slice(0,500)||`WMI probe exited ${code}`))
       try{resolve(JSON.parse(stdout))}catch{reject(new Error('Invalid WMI probe response'))}
+    })
+    child.stdin.end(JSON.stringify(input))
+  })
+}
+async function netshExecPython(input){
+  const sidecar=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../sidecar/netsh_exec.py')
+  const localPython=path.resolve('.venv/bin/python')
+  const python=process.env.NETSH_PYTHON||process.env.WINRM_PYTHON||(fs.existsSync(localPython)?localPython:process.platform==='win32'?'python':'python3')
+  return new Promise((resolve,reject)=>{
+    const child=spawn(python,[sidecar],{stdio:['pipe','pipe','pipe']})
+    let stdout='',stderr='',timedOut=false
+    const timer=setTimeout(()=>{timedOut=true;child.kill('SIGKILL')},Number(input.timeoutSeconds||45)*1000)
+    child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk)
+    child.once('error',error=>{clearTimeout(timer);reject(error)})
+    child.once('close',code=>{
+      clearTimeout(timer)
+      if(timedOut)return reject(new Error('SMB netsh command timed out; check TCP 445 and service-control permissions'))
+      if(code)return reject(new Error(stderr.trim().slice(0,500)||`SMB netsh sidecar exited ${code}`))
+      try{resolve(JSON.parse(stdout||'null'))}catch{reject(new Error('Invalid SMB netsh response'))}
     })
     child.stdin.end(JSON.stringify(input))
   })
@@ -143,6 +170,38 @@ try {
     # __WINFIRE_LSA_RIGHTS__
     # __WINFIRE_ACCOUNT_INVENTORY__
     # __WINFIRE_FIREWALL_USER__
+    function Invoke-WinFireRpcNetsh($arguments) {
+      $output = & netsh @arguments 2>&1 | Out-String
+      if($LASTEXITCODE -ne 0){ throw "netsh RPC command failed with exit code \${LASTEXITCODE}: $output" }
+      return $output.Trim()
+    }
+    function Invoke-WinFireRpcFilter($operation,$argsData) {
+      if($operation -eq 'rpc_filters') {
+        return [pscustomobject]@{raw=(Invoke-WinFireRpcNetsh @('rpc','filter','show','filter'))}
+      }
+      if($operation -eq 'rpc_filter_remove') {
+        $removed=@()
+        foreach($key in @($argsData.filterKeys)) {
+          Invoke-WinFireRpcNetsh @('rpc','filter','delete','filter',"filterkey=$key") | Out-Null
+          $removed+=,[string]$key
+        }
+        return [pscustomobject]@{removed=$removed}
+      }
+      $applied=@()
+      foreach($rule in @($argsData.rules)) {
+        $action=if([string]$rule.action -eq 'allow'){'permit'}else{[string]$rule.action}
+        $ruleArgs=@('rpc','filter','add','rule',"layer=$($rule.layer)","actiontype=$action","filterkey=$($rule.filterKey)",'persistence=yes')
+        if([bool]$rule.audit -and $action -eq 'permit' -and [string]$rule.layer -ne 'ep_add'){$ruleArgs+='audit=enable'}
+        Invoke-WinFireRpcNetsh $ruleArgs | Out-Null
+        foreach($condition in @($rule.conditions)) {
+          $conditionArgs=@('rpc','filter','add','condition',"field=$($condition.field)","matchtype=$($condition.matchType)","data=$($condition.data)")
+          Invoke-WinFireRpcNetsh $conditionArgs | Out-Null
+        }
+        Invoke-WinFireRpcNetsh @('rpc','filter','add','filter') | Out-Null
+        $applied+=,[string]$rule.filterKey
+      }
+      return [pscustomobject]@{applied=$applied}
+    }
     switch($operation) {
       'account_inventory' { Get-WinFireAccountInventory $argsData }
       'prompt_browser' { Open-WinFireMfaPortal $argsData }
@@ -151,6 +210,9 @@ try {
       'auth' { [Security.Principal.WindowsIdentity]::GetCurrent().Name }
       'security_process_owner' { Get-WinFireProcessOwner $argsData }
       'security_session_logoff' { End-WinFireClientSession $argsData }
+      'rpc_filters' { Invoke-WinFireRpcFilter $operation $argsData }
+      'rpc_filter_apply' { Invoke-WinFireRpcFilter $operation $argsData }
+      'rpc_filter_remove' { Invoke-WinFireRpcFilter $operation $argsData }
       'tcp_probe' {
         $addresses=@([System.Net.Dns]::GetHostAddresses([string]$argsData.host));$address=@($addresses | Where-Object AddressFamily -EQ InterNetwork | Select-Object -First 1)[0];if(-not $address){$address=$addresses[0]}
         $route=[System.Net.Sockets.Socket]::new($address.AddressFamily,[System.Net.Sockets.SocketType]::Dgram,[System.Net.Sockets.ProtocolType]::Udp)
@@ -310,8 +372,36 @@ export async function activateWinrmViaWmi(node,{wmi=process.platform==='win32'?w
   }
 }
 export async function remote(node,operation,args={},options={}) {
+  if(node.transport==='netsh'){
+    const eventOperation=['events','events_recent','events_probe','event_cursor'].includes(operation)
+    const supported=['auth','facts','audit_policy','audit_policy_enable','all_rules','rules','apply','events','events_recent','events_probe','event_cursor','rpc_filters','rpc_filter_apply','rpc_filter_remove']
+    if(!supported.includes(operation))throw new Error('Netsh fallback supports host facts, audit policy, firewall rules and Security events only')
+    if(operation==='apply')assertManagementAccess(args.add||[])
+    let lastError
+    for(const credential of nodeCredential(node.id,options.credentialId)){
+      const input={host:node.fqdn||node.ip||node.hostname,username:credential.username,password:credential.secret.password,mode:operation,args,timeoutSeconds:operation==='facts'||eventOperation?60:45}
+      try{
+        const result=await netshExecPython(input)
+        if(operation==='event_cursor'){
+          if(!Number.isSafeInteger(result)||result<0)throw new Error('Netsh Security event cursor was invalid')
+          recordNodeSuccess(node.id,'netsh-authenticated');return result
+        }
+        if(result?.success!==true||result.transport!=='netsh'||!result.computerName)throw new Error('Netsh fallback did not confirm the computer identity')
+        if(eventOperation&&!Array.isArray(result.eventResult))throw new Error('Netsh Security event query returned an invalid result')
+        if(operation==='facts'&&!result.factsResult?.computer?.Name)throw new Error('Netsh facts did not return the computer identity')
+        if(['rules','all_rules'].includes(operation)&&!result.ruleResult)throw new Error('Netsh firewall inventory returned an invalid result')
+        if(operation==='apply'&&result.applyResult?.applied!==true)throw new Error('Netsh firewall apply was not confirmed')
+        if(['rpc_filters','rpc_filter_apply','rpc_filter_remove'].includes(operation)&&!result.rpcFilterResult)throw new Error('Netsh RPC filter operation returned no result')
+        recordNodeSuccess(node.id,'netsh-authenticated')
+        return operation==='auth'?{success:true,transport:'netsh',account:credential.username,computerName:result.computerName}:operation==='facts'?result.factsResult:operation==='audit_policy'||operation==='audit_policy_enable'?result.auditResult:operation==='apply'?result.applyResult:eventOperation?result.eventResult:['rpc_filters','rpc_filter_apply','rpc_filter_remove'].includes(operation)?result.rpcFilterResult:result.ruleResult
+      }catch(error){lastError=error;error.message=String(error.message).replaceAll(credential.secret.password,'[redacted]')}
+    }
+    if(transientError(lastError))recordNodeTransportFailure(node.id)
+    throw lastError||new Error('No credential authenticated over SMB netsh fallback')
+  }
   if(node.transport==='wmi'){
     const eventOperation=['events','events_recent','events_probe','event_cursor'].includes(operation)
+    if(['rpc_filters','rpc_filter_apply','rpc_filter_remove'].includes(operation))throw new Error('Native RPC filter management requires WinRM or SMB/netsh; WMI is read-only for this operation')
     if(!['facts','audit_policy','audit_policy_enable','all_rules','rules','apply'].includes(operation)&&!eventOperation)throw new Error('WMI/DCOM supports host facts, audit policy, firewall rules and Security events; other operations require WinRM or an agent')
     if(operation==='apply')assertManagementAccess(args.add||[])
     const host=node.fqdn||node.ip||node.hostname
@@ -366,7 +456,7 @@ export async function remote(node,operation,args={},options={}) {
   let lastError
   for (const credential of nodeCredential(node.id,options.credentialId)) {
     const input={host,transport:node.transport||'winrm',osVersion:node.os_version||null,username:credential.username,password:credential.secret.password,operation,args}
-    const mutating=operation==='apply'||operation.startsWith('breakglass_')||operation==='jit_start'||operation==='jit_end'||operation==='prompt_browser'||operation==='rights_change'||operation==='audit_policy_enable'||operation==='agent_deploy'||operation==='security_session_logoff'
+    const mutating=operation==='apply'||operation.startsWith('breakglass_')||operation==='jit_start'||operation==='jit_end'||operation==='prompt_browser'||operation==='rights_change'||operation==='audit_policy_enable'||operation==='agent_deploy'||operation==='security_session_logoff'||operation==='rpc_filter_apply'||operation==='rpc_filter_remove'
     const attempts=mutating?1:2
     for(let attempt=0;attempt<attempts;attempt++){
       try {
@@ -390,19 +480,20 @@ export async function remote(node,operation,args={},options={}) {
   if(transientError(lastError))recordNodeTransportFailure(node.id)
   throw lastError
 }
-export function classifyProbe(transport,rpc,winrmAuthenticated=false) {
+export function classifyProbe(transport,rpc,winrmAuthenticated=false,netshAuthenticated=false) {
   if(transport==='wmi')return typeof rpc==='string'?{status:'reachable',probeStatus:'rpc-authenticated'}:{status:'unverified',probeStatus:'rpc-unverified'}
+  if(transport==='netsh'&&netshAuthenticated)return {status:'reachable',probeStatus:'netsh-authenticated'}
   if(winrmAuthenticated&&['winrm','winrms'].includes(transport))return {status:'reachable',probeStatus:`${transport}-authenticated`}
   if(transport)return {status:'port-open',probeStatus:'port-open'}
   return {status:'unreachable',probeStatus:'unreachable'}
 }
-export async function probeNode(node,{verifyWinrm=true,probePort=tcpProbe,authenticate=remote,authenticateRpc=rpcProbe}={}) {
+export async function probeNode(node,{verifyWinrm=true,probePort=tcpProbe,authenticate=remote,authenticateRpc=rpcProbe,authenticateNetsh=netshProbe}={}) {
   const host=node.fqdn || node.ip || node.hostname
-  const [winrm,winrms,wmi]=await Promise.all([probePort(host,5985),probePort(host,5986),probePort(host,135)])
+  const [winrm,winrms,wmi,smb]=await Promise.all([probePort(host,5985),probePort(host,5986),probePort(host,135),probePort(host,445)])
   const candidates=[['winrms',winrms],['winrm',winrm]].filter(([,port])=>port.status==='open')
   let transport=candidates[0]?.[0]||null
   let rpc=null
-  let winrmAuthenticated=false,winrmError=null
+  let winrmAuthenticated=false,winrmError=null,netshAuthenticated=false,netshError=null
   if(verifyWinrm){
     for(const [candidate] of candidates){
       try{await authenticate({...node,transport:candidate},'auth');transport=candidate;winrmAuthenticated=true;break}
@@ -413,10 +504,14 @@ export async function probeNode(node,{verifyWinrm=true,probePort=tcpProbe,authen
     try{rpc=await authenticateRpc(host,node.id)}catch(error){rpc={error:error.message}}
     if(typeof rpc==='string'||!transport)transport='wmi'
   }
-  const {status,probeStatus}=classifyProbe(transport,rpc,winrmAuthenticated),probedAt=now()
+  if(!winrmAuthenticated&&smb.status==='open'&&!(transport==='wmi'&&typeof rpc==='string')){
+    try{await authenticateNetsh(host,node.id);transport='netsh';netshAuthenticated=true}
+    catch(error){netshError=error.message}
+  }
+  const {status,probeStatus}=classifyProbe(transport,rpc,winrmAuthenticated,netshAuthenticated),probedAt=now()
   run('UPDATE nodes SET transport=?,status=?,probe_status=?,last_probe_at=?,last_seen_at=?,failures=?,next_retry_at=NULL WHERE id=?',transport,status,probeStatus,probedAt,transport?probedAt:node.last_seen_at,transport?0:(node.failures||0)+1,node.id)
   audit(null,'node.probe','node',node.id,null,{transport,status,probeStatus})
-  return {transport,status,probeStatus,ports:{winrm,winrms,wmi},rpc,winrmAuthenticated,winrmError,note:transport==='wmi'?'RPC authentication checked; WMI firewall and Security log access need a credentialed query.':winrmAuthenticated?'WinRM authentication confirmed.':transport?'WinRM port is open; authentication was not confirmed.':'No supported management port responded.'}
+  return {transport,status,probeStatus,ports:{winrm,winrms,wmi,smb},rpc,winrmAuthenticated,winrmError,netshAuthenticated,netshError,note:transport==='wmi'?'RPC authentication checked; WMI firewall and Security log access need a credentialed query.':netshAuthenticated?'SMB service execution authenticated; netsh is being used as the legacy fallback.':winrmAuthenticated?'WinRM authentication confirmed.':transport?'A management port responded, but authentication was not confirmed.':'No supported management port responded.'}
 }
 export async function collectFacts(node,{credentialId,suppliedFacts}={}) {
   const facts=suppliedFacts||await remote(node,'facts',{}, {credentialId})
@@ -428,19 +523,45 @@ export async function collectFacts(node,{credentialId,suppliedFacts}={}) {
   }
   return facts
 }
-export async function enrichNode(node) {
+export async function enrichNode(node,{probeNodeFn=probeNode,activate=activateWinrmViaWmi,collect=collectFacts}={}) {
   if(node.connection_mode==='agent')throw new Error('Agent nodes require agent-reported facts')
-  const probe=await probeNode(node)
-  if(probe.transport==='wmi'&&probe.probeStatus==='rpc-authenticated'){
+  const probe=await probeNodeFn(node)
+  if(probe.transport==='wmi'){
     const managed={...node,transport:'wmi'}
-    try{return (await activateWinrmViaWmi(managed)).facts}
+    if(probe.probeStatus!=='rpc-authenticated'){
+      // rpcclient is only a preliminary probe. When it is unavailable or
+      // blocked, verify the directory credential directly through WMI before
+      // attempting to change the host's WinRM configuration.
+      try {
+        const facts=await collect(managed)
+        run("UPDATE nodes SET transport='wmi',status='reachable',probe_status='wmi-authenticated',last_probe_at=?,last_seen_at=?,next_retry_at=NULL WHERE id=?",now(),now(),node.id)
+        return facts
+      } catch(error) {
+        audit(null,'node.agentless.wmi-fallback','node',node.id,null,{credentialedWmiError:error.message})
+        throw error
+      }
+    }
+    try{return (await activate(managed)).facts}
     catch(error){
       audit(null,'node.agentless.wmi-fallback','node',node.id,null,{winrmActivationError:error.message})
-      return collectFacts(managed)
+      // A credentialed WMI read is sufficient for agentless management when
+      // WinRM cannot be enabled. This also covers hosts where rpcclient is
+      // unavailable or blocked even though DCOM/WMI accepts the directory
+      // credential.
+      try {
+        const facts=await collect(managed)
+        run("UPDATE nodes SET transport='wmi',status='reachable',probe_status='wmi-authenticated',last_probe_at=?,last_seen_at=?,next_retry_at=NULL WHERE id=?",now(),now(),node.id)
+        return facts
+      } catch(fallbackError) {
+        const activationMessage=String(error.message),fallbackMessage=String(fallbackError.message)
+        fallbackError.message=activationMessage===fallbackMessage?fallbackMessage:`${activationMessage}; credentialed WMI facts failed: ${fallbackMessage}`
+        throw fallbackError
+      }
     }
   }
+  if(probe.transport==='netsh')return collect(one('SELECT * FROM nodes WHERE id=?',node.id))
   if(!['winrm','winrms'].includes(probe.transport))throw new Error('No working WinRM transport for inventory collection')
-  return collectFacts(one('SELECT * FROM nodes WHERE id=?',node.id))
+  return collect(one('SELECT * FROM nodes WHERE id=?',node.id))
 }
 export async function lookupDns(node,resolver=dns) {
   let forward=[],reverse=[]

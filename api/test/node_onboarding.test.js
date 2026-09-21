@@ -9,7 +9,7 @@ process.env.DATA_DIR=dataDir
 const {onboardPendingNodes}=await import('../src/app.js')
 const {db}=await import('../src/db.js')
 const {seal}=await import('../src/security.js')
-const {activateWinrmViaWmi,probeNode,remote}=await import('../src/connector.js')
+const {activateWinrmViaWmi,probeNode,remote,enrichNode}=await import('../src/connector.js')
 test.after(()=>{db.close();fs.rmSync(dataDir,{recursive:true,force:true})})
 
 test('AD node onboarding collects facts, enables auditing, and starts event collection once',async()=>{
@@ -135,6 +135,38 @@ test('node probing tries WMI after open WinRM ports fail authentication',async()
   assert.equal(secure.probeStatus,'winrms-authenticated')
 })
 
+test('node probing falls back to credentialed SMB netsh when WinRM and WMI are unavailable',async()=>{
+  db.prepare('INSERT INTO nodes(id,hostname,ip) VALUES(?,?,?)').run('probe-netsh','PROBE-NETSH','192.0.2.23')
+  db.prepare('INSERT INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,NULL)').run('cred','probe-netsh')
+  const node=db.prepare('SELECT * FROM nodes WHERE id=?').get('probe-netsh')
+  const result=await probeNode(node,{
+    probePort:async(_host,port)=>({status:port===445?'open':'refused'}),
+    authenticate:async()=>{throw new Error('WinRM denied access')},
+    authenticateRpc:async()=>{throw new Error('RPC unavailable')},
+    authenticateNetsh:async()=>({success:true,transport:'netsh',computerName:'PROBE-NETSH'})
+  })
+  assert.equal(result.transport,'netsh')
+  assert.equal(result.status,'reachable')
+  assert.equal(result.probeStatus,'netsh-authenticated')
+  assert.equal(result.ports.smb.status,'open')
+  assert.equal(db.prepare('SELECT transport,probe_status,status FROM nodes WHERE id=?').get(node.id).transport,'netsh')
+})
+
+test('agentless verification uses credentialed WMI when the RPC probe is inconclusive',async()=>{
+  db.prepare("INSERT INTO nodes(id,hostname,ip,connection_mode,inventory_source,transport) VALUES(?,?,?,'agentless','ad','wmi')").run('wmi-unverified','WMI-UNVERIFIED','192.0.2.22')
+  const node=db.prepare('SELECT * FROM nodes WHERE id=?').get('wmi-unverified')
+  const calls=[]
+  const facts={computer:{Name:'WMI-UNVERIFIED'},os:{Version:'10.0.26100',BuildNumber:'26100'}}
+  const result=await enrichNode(node,{
+    probeNodeFn:async()=>({transport:'wmi',probeStatus:'rpc-unverified'}),
+    activate:async()=>{calls.push('activate');throw new Error('Should not activate WinRM before credentialed WMI verification')},
+    collect:async managed=>{calls.push(managed.transport);return facts}
+  })
+  assert.deepEqual(calls,['wmi'])
+  assert.deepEqual(result,facts)
+  assert.deepEqual(db.prepare('SELECT transport,status,probe_status FROM nodes WHERE id=?').get(node.id),{transport:'wmi',status:'reachable',probe_status:'wmi-authenticated'})
+})
+
 test('authenticated WMI reads firewall inventory and events and confirms one policy write attempt',async()=>{
   db.prepare("INSERT INTO nodes(id,hostname,ip,connection_mode,inventory_source,transport) VALUES(?,?,?,'agentless','manual','wmi')").run('wmi-inventory','WMI-INVENTORY','192.0.2.14')
   db.prepare("INSERT INTO credentials(id,name,type,username,encrypted_blob) VALUES(?,?,'domain',?,?)").run('wmi-inventory-cred','WMI inventory credential','EXAMPLE\\reader',seal({password:'wmi-read-secret'}))
@@ -161,5 +193,35 @@ test('authenticated WMI reads firewall inventory and events and confirms one pol
   }finally{
     if(previous===undefined)delete process.env.WMI_PROBE_PYTHON
     else process.env.WMI_PROBE_PYTHON=previous
+  }
+})
+
+test('authenticated SMB netsh fallback reads facts, rules, audit state, and Security events',async()=>{
+  db.prepare("INSERT INTO nodes(id,hostname,ip,connection_mode,inventory_source,transport) VALUES(?,?,?,'agentless','manual','netsh')").run('netsh-inventory','NETSH-INVENTORY','192.0.2.24')
+  db.prepare("INSERT INTO credentials(id,name,type,username,encrypted_blob) VALUES(?,?,'domain',?,?)").run('netsh-inventory-cred','Netsh inventory credential','EXAMPLE\\reader',seal({password:'netsh-read-secret'}))
+  db.prepare('INSERT INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,NULL)').run('netsh-inventory-cred','netsh-inventory')
+  const stub=path.join(dataDir,'netsh-inventory-stub.cjs')
+  fs.writeFileSync(stub,`#!/usr/bin/env node
+let data='';process.stdin.on('data',part=>data+=part);process.stdin.on('end',()=>{const p=JSON.parse(data);if(p.username!=='EXAMPLE\\\\reader'||p.password!=='netsh-read-secret')process.exit(2);const rule={name:'Test',group:'WinFireSecure:test',action:'allow',direction:'in',protocol:'TCP',localPort:'3389',remotePort:'Any',remoteAddress:'Any',program:'Any',profile:'Domain'};const base={success:true,transport:'netsh',computerName:'NETSH-INVENTORY'};if(p.mode==='event_cursor')process.stdout.write('42');else {if(p.mode==='facts')base.factsResult={computer:{Name:'NETSH-INVENTORY'},os:{Version:'10.0.26100',BuildNumber:'26100'},firewall:{profiles:[]},network:[]};else if(p.mode==='all_rules')base.ruleResult={total:1,offset:p.args.offset||0,rules:[rule]};else if(p.mode==='rules')base.ruleResult=[rule];else if(p.mode==='audit_policy'||p.mode==='audit_policy_enable')base.auditResult={settingValue:3,successEnabled:true,failureEnabled:true};else if(p.mode==='events')base.eventResult=[{RecordId:43,Id:5157,Fields:{DestPort:'3389'}}];else if(p.mode==='events_recent'||p.mode==='events_probe')base.eventResult=[];else if(p.mode==='apply')base.applyResult={applied:true};process.stdout.write(JSON.stringify(base))}})
+`,{mode:0o700})
+  const previous=process.env.NETSH_PYTHON
+  process.env.NETSH_PYTHON=stub
+  try{
+    const node=db.prepare('SELECT * FROM nodes WHERE id=?').get('netsh-inventory')
+    assert.equal((await remote(node,'auth')).account,'EXAMPLE\\reader')
+    assert.equal((await remote(node,'facts')).os.Version,'10.0.26100')
+    assert.equal((await remote(node,'audit_policy')).successEnabled,true)
+    assert.equal((await remote(node,'audit_policy_enable')).failureEnabled,true)
+    assert.equal((await remote(node,'all_rules',{offset:0,limit:100})).rules[0].localPort,'3389')
+    assert.equal((await remote(node,'rules',{group:'WinFireSecure:test'}))[0].name,'Test')
+    assert.deepEqual(await remote(node,'apply',{group:'WinFireSecure:test',add:[],remove:[]}),{applied:true})
+    assert.equal(await remote(node,'event_cursor'),42)
+    assert.equal((await remote(node,'events',{after:42}))[0].Fields.DestPort,'3389')
+    assert.deepEqual(await remote(node,'events_recent'),[])
+    assert.equal(db.prepare('SELECT probe_status FROM nodes WHERE id=?').get(node.id).probe_status,'netsh-authenticated')
+    await assert.rejects(remote(node,'rights',{}),/Netsh fallback supports/)
+  }finally{
+    if(previous===undefined)delete process.env.NETSH_PYTHON
+    else process.env.NETSH_PYTHON=previous
   }
 })

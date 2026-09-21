@@ -43,6 +43,11 @@ public sealed class Worker(ILogger<Worker> logger) : BackgroundService
                 heartbeat.EnsureSuccessStatusCode();
                 var heartbeatSettings = await heartbeat.Content.ReadFromJsonAsync<HeartbeatSettings>(JsonOptions, stoppingToken);
                 if (heartbeatSettings?.PollSeconds is >= 15 and <= 300) pollSeconds = heartbeatSettings.PollSeconds;
+                if (heartbeatSettings?.Update is { Available: true } update)
+                {
+                    await AgentUpdater.StageAndRestartAsync(client, update, logger, stoppingToken);
+                    return;
+                }
                 var pending = await client.GetFromJsonAsync<JobResponse>($"api/v1/agents/{config.AgentId}/jobs", JsonOptions, stoppingToken);
                 foreach (var job in pending?.Jobs ?? [])
                     await RunJobAsync(client, config, job, stoppingToken);
@@ -103,6 +108,6 @@ public sealed class Worker(ILogger<Worker> logger) : BackgroundService
     }
 
     private sealed record JobResponse(List<AgentJob> Jobs);
-    private sealed record HeartbeatSettings(int PollSeconds);
+    private sealed record HeartbeatSettings(int PollSeconds, AgentUpdateManifest? Update);
     private sealed record AgentJob(string Id, string Type, JsonElement Payload, int Attempt, string LeaseToken);
 }

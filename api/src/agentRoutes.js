@@ -13,6 +13,7 @@ import {normalizeProfileSnapshot} from './breakGlass.js'
 import {effectiveAgentPollSeconds} from './agentPoll.js'
 import {isExcludedFirewallEvent} from './processExclusions.js'
 import {isIgnoredFirewallEvent} from './trafficIgnores.js'
+import {getAgentUpdateManifest,getAgentUpdatePackagePath} from './agentUpdate.js'
 
 export const agentRoutes=express.Router()
 const wrap=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next)
@@ -53,7 +54,30 @@ agentRoutes.post('/:id/heartbeat',requireAgent,(req,res)=>{
   run('UPDATE agents SET version=?,mode=?,last_checkin_at=? WHERE id=?',version,mode,now(),req.agent.id)
   run("UPDATE nodes SET status='reachable',last_seen_at=?,failures=0 WHERE id=?",now(),req.agent.node_id)
   if(previous==='unreachable')audit(null,'agent.online','node',req.agent.node_id,null,{agentId:req.agent.id})
-  res.json({ok:true,serverTime:now(),pollSeconds:effectiveAgentPollSeconds(req.agent.node_id)})
+  let update={available:false}
+  try {
+    update=getAgentUpdateManifest(version,`${req.protocol}://${req.get('host')}/api/v1/agents/${req.agent.id}/update/package`)
+  } catch (error) {
+    // A missing package or signer pin must never make an otherwise healthy
+    // agent appear offline. It simply disables self-update advertisement.
+    update={available:false,error:error.message}
+  }
+  res.json({ok:true,serverTime:now(),pollSeconds:effectiveAgentPollSeconds(req.agent.node_id),update})
+})
+
+agentRoutes.get('/:id/update',requireAgent,(req,res)=>{
+  try {
+    const manifest=getAgentUpdateManifest(String(req.query.version || ''),`${req.protocol}://${req.get('host')}/api/v1/agents/${req.agent.id}/update/package`)
+    res.set('Cache-Control','no-store').json(manifest)
+  } catch (error) { res.status(503).json({error:error.message}) }
+})
+
+agentRoutes.get('/:id/update/package',requireAgent,(req,res)=>{
+  try {
+    const packagePath=getAgentUpdatePackagePath()
+    if(!packagePath)return res.status(503).json({error:'Signed agent update package is not configured'})
+    res.set('Cache-Control','private, no-store').type('application/octet-stream').sendFile(packagePath)
+  } catch (error) { res.status(503).json({error:error.message}) }
 })
 
 agentRoutes.post('/:id/events',requireAgent,(req,res)=>{

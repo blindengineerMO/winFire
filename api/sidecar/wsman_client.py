@@ -179,7 +179,10 @@ def legacy_ps2(session, payload):
     """PowerShell 2 compatible operations for XP through Server 2008 R2."""
     operation = payload['operation']
     if operation == 'auth':
-        script = '[Security.Principal.WindowsIdentity]::GetCurrent().Name'
+        result = session.run_ps('[Security.Principal.WindowsIdentity]::GetCurrent().Name')
+        if result.status_code != 0:
+            raise RuntimeError(result.std_err.decode('utf-8', 'replace').strip() or 'Legacy WinRM authentication failed')
+        return result.std_out.decode('utf-8-sig', 'replace').strip()
     elif operation == 'facts':
         script = (Path(__file__).resolve().parent / 'wmi_facts.ps1').read_text()
     elif operation == 'account_inventory':
@@ -228,6 +231,7 @@ def legacy_ps2(session, payload):
     # PowerShell 2 loader, then stream the compressed script through stdin.
     loader = "$encoded=[Console]::In.ReadToEnd();$bytes=[Convert]::FromBase64String($encoded);$buffer=New-Object IO.MemoryStream;$buffer.Write($bytes,0,$bytes.Length);$buffer.Position=0;$zip=New-Object IO.Compression.GzipStream -ArgumentList $buffer,([IO.Compression.CompressionMode]::Decompress);$reader=New-Object IO.StreamReader -ArgumentList $zip,([Text.Encoding]::UTF8);try{Invoke-Expression $reader.ReadToEnd()}finally{$reader.Dispose();$zip.Dispose();$buffer.Dispose()}"
     encoded_loader = base64.b64encode(loader.encode('utf-16le')).decode()
+    script += "\nWrite-Output 'WINFIRE_RESULT_END_7C2A'\n"
     encoded_script = base64.b64encode(gzip.compress(script.encode('utf-8')))
     protocol = session.protocol
     shell_id = protocol.open_shell()
@@ -244,6 +248,8 @@ def legacy_ps2(session, payload):
     if status != 0:
         raise RuntimeError(stderr.decode('utf-8', 'replace').strip() or f'Older Windows WinRM operation exited {status}')
     output = stdout.decode('utf-8-sig', 'replace').strip()
+    if 'WINFIRE_RESULT_END_7C2A' in output:
+        output = output.split('WINFIRE_RESULT_END_7C2A', 1)[0].strip()
     if operation == 'auth':
         return output
     if operation in {'events', 'events_recent', 'events_probe', 'event_cursor'}:
@@ -463,17 +469,18 @@ def main():
         script = SHARED_POWERSHELL.replace('__WINFIRE_SHARED_FUNCTIONS__',functions).replace('__WINFIRE_CALL__',calls[operation])
     else:
         script = POWERSHELL.replace('__OPERATION__', operation).replace('# __WINFIRE_LSA_RIGHTS__', (Path(__file__).resolve().parent / 'lsa_rights.ps1').read_text() if operation.startswith('rights') else '').replace('# __WINFIRE_ACCOUNT_INVENTORY__', (Path(__file__).resolve().parent / 'account_inventory.ps1').read_text() if operation == 'account_inventory' else '').replace('# __WINFIRE_FIREWALL_USER__', (Path(__file__).resolve().parent / 'firewall_user.ps1').read_text() if operation in {'rules','apply'} else '')
+    # Send the script over the WS-Man stdin stream in bounded envelopes. The
+    # normal run_ps path puts the full script in the command line and fails on
+    # the long LSA/firewall helpers; a base64 stdin loader is ignored by some
+    # hosts. PowerShell's `-Command -` reliably consumes the streamed script.
     script = script.replace('[Console]::In.ReadToEnd()', f"'{args}'")
-    loader = "$encoded=[Console]::In.ReadToEnd();$buffer=[IO.MemoryStream]::new([Convert]::FromBase64String($encoded));$zip=[IO.Compression.GzipStream]::new($buffer,[IO.Compression.CompressionMode]::Decompress);$reader=[IO.StreamReader]::new($zip,[Text.Encoding]::UTF8);try{Invoke-Expression $reader.ReadToEnd()}finally{$reader.Dispose();$zip.Dispose();$buffer.Dispose()}"
-    encoded_loader = base64.b64encode(loader.encode('utf-16le')).decode()
-    encoded_script = base64.b64encode(gzip.compress(script.encode('utf-8')))
+    script += "\nWrite-Output 'WINFIRE_RESULT_END_7C2A'\n"
     protocol = session.protocol
     shell_id = protocol.open_shell()
     try:
-        command_id = protocol.run_command(shell_id, 'powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded_loader])
+        command_id = protocol.run_command(shell_id, 'powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', '-'])
         try:
-            # Keep WS-Man input envelopes small. Even compressed scripts may
-            # exceed a host's per-envelope input limit when sent at once.
+            encoded_script = script.encode('utf-8')
             for offset in range(0, len(encoded_script), 4096):
                 chunk = encoded_script[offset:offset + 4096]
                 protocol.send_command_input(shell_id, command_id, chunk, end=offset + 4096 >= len(encoded_script))
@@ -485,6 +492,8 @@ def main():
     if status != 0:
         raise RuntimeError(stderr.decode('utf-8', 'replace').strip() or f'WinRM exited {status}')
     output = stdout.decode('utf-8-sig').strip()
+    if 'WINFIRE_RESULT_END_7C2A' in output:
+        output = output.split('WINFIRE_RESULT_END_7C2A', 1)[0].strip()
     if operation == 'rights' and (not output or output == 'null'):
         raise RuntimeError('LSA logon-rights query returned no data; baseline was not collected')
     print(output or 'null')

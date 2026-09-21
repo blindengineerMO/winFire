@@ -6,7 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import {createServer} from 'node:net'
 import supertest from 'supertest'
-import {compilePolicy,rulesConflict,validateAddressExpression,validatePortExpression,validateProgramPath} from '@winfire/shared'
+import {compilePolicy,rulesConflict,validateAddressExpression,validatePortExpression,validateProgramPath,activePolicyRules,scheduleIsActive,scheduleStateKey} from '@winfire/shared'
 import {normalizeWindowsEvent} from '../src/eventNormalizer.js'
 import {parseSeceditRights} from '../src/logonRights.js'
 
@@ -36,7 +36,7 @@ test('policy compiler validates the graph and emits tagged rules',()=>{
   assert.equal(scoped[0].profile,'Domain')
   assert.throws(()=>compilePolicy({nodes:graph.nodes,edges:[{id:'e1',source:'a',target:'b'},{id:'e2',source:'b',target:'a'}]},'policy-1'),/cycle/)
   assert.throws(()=>compilePolicy({nodes:[{id:'gate',type:'mfaGate',data:{localPort:'3389'}}],edges:[]},'policy-1'),/MFA Gate/)
-  assert.throws(()=>compilePolicy({nodes:[{id:'timed',type:'schedule',data:{}}],edges:[]},'policy-1'),/Schedule nodes/)
+  assert.throws(()=>compilePolicy({nodes:[{id:'timed',type:'schedule',data:{}}],edges:[]},'policy-1'),/Invalid schedule node/)
   assert.throws(()=>compilePolicy({nodes:[{id:'unknown',type:'custom',data:{}}],edges:[]},'policy-1'),/Unsupported policy node type/)
   assert.throws(()=>compilePolicy({nodes:[graph.nodes[0],graph.nodes[0]],edges:[]},'policy-1'),/duplicate node IDs/)
   const outbound=compilePolicy({nodes:[{id:'ports',type:'portGroup',data:{ports:'443'}},{id:'outbound',type:'allow',data:{name:'HTTPS egress',direction:'out'}}],edges:[{id:'group',source:'ports',target:'outbound'}]},'policy-egress')
@@ -44,6 +44,21 @@ test('policy compiler validates the graph and emits tagged rules',()=>{
   assert.equal(outbound[0].remotePort,'443')
   assert.equal(rulesConflict({...outbound[0],action:'allow',remotePort:'443'},{...outbound[0],action:'block',remotePort:'3389'}),false)
   assert.equal(rulesConflict({...outbound[0],action:'allow',remotePort:'443'},{...outbound[0],action:'block',remotePort:'443'}),true)
+})
+
+test('schedule nodes compile into bounded windows and active rules change at transitions',()=>{
+  const graph={nodes:[
+    {id:'window',type:'schedule',data:{name:'Business hours',days:'1,2,3,4,5',startTime:'09:00',endTime:'17:00',timezone:'UTC'}},
+    {id:'rule',type:'allow',data:{name:'RDP business hours',localPort:'3389',protocol:'TCP'}}
+  ],edges:[{id:'schedule-rule',source:'window',target:'rule'}]}
+  const rules=compilePolicy(graph,'policy-schedule')
+  assert.deepEqual(rules[0].schedule,{days:[1,2,3,4,5],start:'09:00',end:'17:00',timezone:'UTC'})
+  assert.equal(scheduleIsActive(rules[0].schedule,new Date('2026-09-21T12:00:00Z')),true)
+  assert.equal(scheduleIsActive(rules[0].schedule,new Date('2026-09-21T18:00:00Z')),false)
+  assert.equal(activePolicyRules(rules,new Date('2026-09-21T12:00:00Z')).length,1)
+  assert.equal(activePolicyRules(rules,new Date('2026-09-21T18:00:00Z')).length,0)
+  assert.notEqual(scheduleStateKey(rules,new Date('2026-09-21T12:00:00Z')),scheduleStateKey(rules,new Date('2026-09-21T18:00:00Z')))
+  assert.throws(()=>compilePolicy({nodes:[{id:'bad-window',type:'schedule',data:{days:'8',startTime:'09:00',endTime:'17:00'}}],edges:[]},'bad-schedule'),/Schedule days/)
 })
 
 test('OpenAPI lists registered control-plane and agent routes with their auth schemes',async()=>{

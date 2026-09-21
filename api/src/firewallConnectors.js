@@ -37,6 +37,8 @@ export class WinRmConnector extends RemoteFirewallConnector {
 
 export class WmiConnector extends RemoteFirewallConnector {}
 
+export class NetshConnector extends RemoteFirewallConnector {}
+
 export class AgentConnector extends IFirewallConnector {
   get queuedReadback(){return true}
   agent(purpose='node'){
@@ -77,6 +79,7 @@ export class AgentConnector extends IFirewallConnector {
 export function firewallConnectorFor(node){
   if(node.connection_mode==='agent')return new AgentConnector(node)
   if(node.transport==='wmi')return new WmiConnector(node)
+  if(node.transport==='netsh')return new NetshConnector(node)
   if(!node.transport||['winrm','winrms'].includes(node.transport))return new WinRmConnector(node)
   throw new Error(`No firewall connector for ${node.hostname||node.id}`)
 }

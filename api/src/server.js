@@ -3,7 +3,7 @@ import path from 'node:path'
 import {fileURLToPath} from 'node:url'
 import express from 'express'
 import https from 'node:https'
-import {app,runVerification,runDriftCheck,pullLogs,pullRecentLogs,processDueTraining,processDueBreakGlass,processDuePolicySync,processDueAdAccountHolds,syncDirectory,onboardPendingNodes} from './app.js'
+import {app,runVerification,runDriftCheck,pullLogs,pullRecentLogs,processDueTraining,processDueBreakGlass,processDuePolicySync,processDuePolicySchedules,processDueAdAccountHolds,syncDirectory,onboardPendingNodes} from './app.js'
 import {processSecurityAutomations} from './securityAutomations.js'
 import {bootstrap,ensureBootstrapAdmin} from './security.js'
 import {all,one,run,now,audit} from './db.js'
@@ -30,7 +30,7 @@ const tlsSettings=['TLS_CERT','TLS_KEY','AGENT_CA_CERT','AGENT_CA_KEY'].map(name
 if(tlsSettings.some(Boolean)&&!tlsSettings.every(Boolean))throw new Error('TLS_CERT, TLS_KEY, AGENT_CA_CERT and AGENT_CA_KEY must be configured together')
 const tls=agentTlsOptions()
 const server=tls?https.createServer(tls,app):app
-server.listen(Number(process.env.PORT||3000),process.env.HOST||'0.0.0.0',()=>console.log(`WinFire ready on ${tls?'https':'http'}://localhost:${process.env.PORT||3000}`))
+const listener=server.listen(Number(process.env.PORT||3000),process.env.HOST||'0.0.0.0',()=>console.log(`WinFire ready on ${tls?'https':'http'}://localhost:${process.env.PORT||3000}`))
 let trainingRunning=false
 async function sweepTraining(){
   if(trainingRunning)return
@@ -56,6 +56,9 @@ breakGlassTimer.unref()
 setTimeout(()=>processDuePolicySync().catch(error=>console.error('Policy sync sweep failed:',error)),1500).unref()
 const policySyncTimer=setInterval(()=>processDuePolicySync().catch(error=>console.error('Policy sync sweep failed:',error)),60_000)
 policySyncTimer.unref()
+setTimeout(()=>processDuePolicySchedules().catch(error=>console.error('Policy schedule sweep failed:',error)),2000).unref()
+const policyScheduleTimer=setInterval(()=>processDuePolicySchedules().catch(error=>console.error('Policy schedule sweep failed:',error)),60_000)
+policyScheduleTimer.unref()
 setTimeout(()=>sweepLoopbackBaseline().catch(error=>console.error('Loopback baseline sweep failed:',error)),3000).unref()
 const loopbackTimer=setInterval(()=>sweepLoopbackBaseline().catch(error=>console.error('Loopback baseline sweep failed:',error)),60_000)
 loopbackTimer.unref()
@@ -154,7 +157,7 @@ async function pollNodeLogs(){
   if(logPollRunning)return
   logPollRunning=true
   try{
-    const nodes=all("SELECT id,hostname FROM nodes WHERE transport IN ('winrm','winrms','wmi') AND (next_retry_at IS NULL OR next_retry_at<=?) ORDER BY hostname",now())
+    const nodes=all("SELECT id,hostname FROM nodes WHERE transport IN ('winrm','winrms','wmi','netsh') AND (next_retry_at IS NULL OR next_retry_at<=?) ORDER BY hostname",now())
     await pollFleet(nodes,async node=>{
       await pullRecentLogs(node.id,null,true)
       await pullLogs(node.id,null,5,true)
@@ -182,4 +185,5 @@ const jobs=setInterval(async()=>{
   finally {jobsRunning=false}
 },Number(process.env.SWEEP_INTERVAL_MINUTES||60)*60*1000)
 jobs.unref()
-process.on('SIGTERM',()=>server.close())
+process.on('SIGTERM',()=>listener.close())
+process.on('SIGINT',()=>listener.close())

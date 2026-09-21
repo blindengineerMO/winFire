@@ -9,7 +9,7 @@ import crypto from 'node:crypto'
 import {isIP} from 'node:net'
 import PDFDocument from 'pdfkit'
 import {z} from 'zod'
-import {compilePolicy, graphSchema, findRuleConflicts,validateAddressExpression,validatePortExpression,validateProgramPath} from '@winfire/shared'
+import {compilePolicy, graphSchema, findRuleConflicts,validateAddressExpression,validatePortExpression,validateProgramPath,activePolicyRules,scheduleStateKey} from '@winfire/shared'
 import {db, all, one, run, id, now, audit, json, parse} from './db.js'
 import {auth, requireRole, publicUser, issueAccess, issueRefresh, rotateRefresh, hashToken, seal, openSealed} from './security.js'
 import {probeNode, collectFacts, enrichNode, lookupDns, remote, diffRules, tcpProbe,testNodeCredential} from './connector.js'
@@ -44,15 +44,21 @@ import {previewSecurityAutomation} from './securityAutomations.js'
 import {collectAccountInventory,accountName} from './localAccounts.js'
 import {normalizeProcessExclusions,refreshProcessExclusions,isExcludedFirewallEvent,visibleFirewallEventSql} from './processExclusions.js'
 import {normalizeTrafficIgnore,trafficIgnoreFingerprint,trafficIgnoreFromEvent,refreshTrafficIgnores,publicTrafficIgnore,isIgnoredFirewallEvent,trafficIgnoreMatchSql} from './trafficIgnores.js'
+import {normalizeRpcFilter,publicRpcFilter} from './rpcFilters.js'
+import {internetRoutes} from './internet.js'
 
 export const app=express()
 app.disable('x-powered-by')
 if(process.env.TRUST_PROXY_CIDRS)app.set('trust proxy',process.env.TRUST_PROXY_CIDRS.split(',').map(item=>item.trim()).filter(Boolean))
 app.use(helmet({contentSecurityPolicy:false}))
-app.use(cors({origin:(origin,cb)=>{const allowed=(process.env.CORS_ORIGIN||'').split(',').filter(Boolean);cb(null,!origin||allowed.includes(origin))}}))
+app.use(cors({origin:(origin,cb)=>{
+  const allowed=[...(process.env.CORS_ORIGIN||'').split(','),...(process.env.EXTENSION_ORIGINS||'').split(',')].map(value=>value.trim()).filter(Boolean)
+  cb(null,!origin||allowed.includes(origin))
+}}))
 app.use(express.json({limit:'2mb'}))
 const api=express.Router()
 app.use('/api/v1',api)
+api.use('/internet',internetRoutes)
 const wrap=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next)
 const body=(schema,req)=>schema.parse(req.body)
 const reqId=req=>String(req.params.id)
@@ -161,6 +167,27 @@ export async function processDuePolicySync(){
     catch(error){run('UPDATE policy_sync_schedules SET status=?,result_json=?,finished_at=? WHERE id=?','failed',json({error:error.message}),now(),schedule.id)}
   }
 }
+export async function processDuePolicySchedules(actorId=null,date=new Date()){
+  if(policySyncRunning)return
+  policySyncRunning=true
+  try{
+  const policies=all('SELECT p.*,v.rules_compiled_json FROM policies p JOIN policy_versions v ON v.id=p.current_version_id WHERE p.current_version_id IS NOT NULL')
+  for(const policy of policies){
+    const compiled=parse(policy.rules_compiled_json)||[]
+    if(!compiled.some(rule=>rule.schedule))continue
+    const targets=assignedNodes(policy.id)
+    for(const node of targets){
+      const stateKey=scheduleStateKey(compiled,date)
+      const previous=one('SELECT state_key FROM policy_schedule_state WHERE policy_id=? AND node_id=?',policy.id,node.id)
+      if(previous?.state_key===stateKey)continue
+      try{
+        const results=await applyPolicy(policy,actorId,[node],{scheduleTransition:true,scheduleAt:date})
+        if(results.every(result=>['success','queued'].includes(result.status)))run('INSERT INTO policy_schedule_state(policy_id,node_id,state_key,last_applied_at) VALUES(?,?,?,?) ON CONFLICT(policy_id,node_id) DO UPDATE SET state_key=excluded.state_key,last_applied_at=excluded.last_applied_at',policy.id,node.id,stateKey,now())
+      }catch(error){audit(actorId,'policy.schedule.failed','node',node.id,null,{policyId:policy.id,error:error.message})}
+    }
+  }
+  }finally{policySyncRunning=false}
+}
 function assignmentConflicts(policyId,rules,nodes) {
   const conflicts=[]
   if(!rules.length)return conflicts
@@ -175,7 +202,7 @@ async function applyPolicy(policy,actorId=null,targetNodes=null,context={}) {
   if(one('SELECT id FROM policy_assignments WHERE policy_id=? AND removal_job_id IS NOT NULL',policy.id))throw Object.assign(new Error('Wait for pending agent firewall cleanup before applying this policy'),{status:409})
   const version=one('SELECT * FROM policy_versions WHERE id=? AND policy_id=?',policy.current_version_id,policy.id)
   if (!version) throw Object.assign(new Error('Policy has no version'),{status:400})
-  const rules=parse(version.rules_compiled_json)||[], results=[]
+  const compiledRules=parse(version.rules_compiled_json)||[], rules=activePolicyRules(compiledRules,context.scheduleAt||new Date()), results=[]
   assertManagementAccess(rules)
   const targets=targetNodes||assignedNodes(policy.id)
   for(const node of targets)for(const rule of rules)if(rule.localUserSid){
@@ -231,7 +258,7 @@ api.get('/agent-package/enroll.ps1',wrap(async(req,res)=>{
   catch(error){return res.status(503).json({error:error.message})}
   res.set('Cache-Control','private, no-store').type('text/plain').send(script)
 }))
-api.get('/openapi.json',(_req,res)=>res.json(buildOpenApi(api,agentRoutes)))
+api.get('/openapi.json',(_req,res)=>res.json(buildOpenApi(api,agentRoutes,{internet:internetRoutes})))
 const loginLimit=rateLimit({windowMs:15*60*1000,limit:Number(process.env.AUTH_RATE_LIMIT||20),standardHeaders:'draft-8',legacyHeaders:false})
 const publicMfaLimit=rateLimit({windowMs:15*60*1000,limit:10,standardHeaders:'draft-8',legacyHeaders:false})
 api.post('/auth/login',loginLimit,wrap(async(req,res)=>{
@@ -1172,7 +1199,15 @@ api.post('/nodes/:id/probe',requireRole('editor'),wrap(async(req,res)=>{const no
 api.post('/nodes/:id/activate-agentless',requireRole('admin'),wrap(async(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
   if(!node.ad_guid||node.ad_missing||!node.ad_enabled||node.connection_mode!=='agentless')return res.status(409).json({error:'This action requires an enabled AD-discovered agentless computer'})
-  const facts=await enrichNode(node)
+  let facts
+  try{facts=await enrichNode(node)}catch(error){
+    // A failed remote verification is an upstream management failure. Keep the
+    // response actionable instead of collapsing it into the generic 500 page;
+    // the connector message does not contain credentials and is safe to show
+    // to the administrator who initiated the check.
+    const detail=String(error?.message||'The remote host did not complete verification').slice(0,500)
+    throw Object.assign(new Error(`Agentless verification failed: ${detail}`),{status:502,cause:error})
+  }
   audit(req.user.id,'node.agentless.verify','node',node.id,null,{transport:one('SELECT transport FROM nodes WHERE id=?',node.id)?.transport,computerName:facts?.computer?.Name})
   res.json({managed:true,transport:one('SELECT transport FROM nodes WHERE id=?',node.id)?.transport,computerName:facts?.computer?.Name})
 }))
@@ -1549,7 +1584,7 @@ export async function runDriftCheck(data={},actorId=null,canCheckPolicy=()=>true
   for(const policy of policies){
     const version=one('SELECT * FROM policy_versions WHERE id=?',policy.current_version_id)
     if(!version)continue
-    const desired=parse(version.rules_compiled_json)||[]
+    const desired=activePolicyRules(parse(version.rules_compiled_json)||[])
     for(const node of assignedNodes(policy.id).filter(item=>!data.nodeId||item.id===data.nodeId)){
       const connector=firewallConnectorFor(node)
       if(connector.queuedReadback){
@@ -2324,7 +2359,7 @@ export async function onboardPendingNodes(limit=5,{resolveDns=lookupDns,enrich=e
     const node=getNode(item.id)
     try{
       if(!node.ip)await resolveDns(node)
-      if(!one('SELECT 1 FROM node_facts WHERE node_id=?',node.id)||!['winrm','winrms','wmi'].includes(node.transport)||node.status!=='reachable')await enrich(getNode(node.id))
+      if(!one('SELECT 1 FROM node_facts WHERE node_id=?',node.id)||!['winrm','winrms','wmi','netsh'].includes(node.transport)||node.status!=='reachable')await enrich(getNode(node.id))
       const managed=getNode(node.id)
       const logonOnly=/^(?:5\.[12]\.|windows (?:xp|server 2003))/i.test(String(managed.os_version||''))
       let policy=logonOnly?{supported:false,reason:'WFP 515x audit events are unavailable on XP/Server 2003'}:await invoke(managed,'audit_policy')
@@ -2503,7 +2538,7 @@ async function collectTrainingTelemetry(node){
     const agent=one('SELECT last_checkin_at FROM agents WHERE id=? AND revoked_at IS NULL',node.agent_id)
     if(!agent?.last_checkin_at||Date.parse(agent.last_checkin_at)<Date.now()-5*60_000)throw new Error('Agent is not online to confirm training telemetry')
   }else{
-    if(!['winrm','winrms','wmi'].includes(node.transport))throw new Error('No working event collection transport; probe the node before training can finish')
+    if(!['winrm','winrms','wmi','netsh'].includes(node.transport))throw new Error('No working event collection transport; probe the node before training can finish')
     const auditPolicy=await remote(node,'audit_policy')
     if(auditPolicy?.successEnabled!==true)throw new Error('Filtering Platform Connection success auditing is disabled; enable it before automatic training can finish')
     const collection=await pullLogs(node.id)
@@ -2578,13 +2613,53 @@ export async function processDueBreakGlass(limit=25){
   return results
 }
 
-api.get('/rpc-filters',(_req,res)=>res.json(all('SELECT * FROM rpc_filter_rules ORDER BY label')))
-api.post('/rpc-filters',requireRole('admin'),(req,res)=>{
-  const data=body(z.object({nodeId:z.string(),interfaceUuid:z.uuid(),opnum:z.number().int().min(0).optional(),source:z.string().min(1),action:z.enum(['allow','block']),audit:z.boolean().default(true),label:z.string().default('')}),req),ruleId=id()
-  run('INSERT INTO rpc_filter_rules(id,node_id,interface_uuid,opnum,source,action,audit,label) VALUES(?,?,?,?,?,?,?,?)',ruleId,data.nodeId,data.interfaceUuid,data.opnum??null,data.source,data.action,Number(data.audit),data.label)
-  audit(req.user.id,'rpc-filter.create','rpc-filter',ruleId,null,data);res.status(201).json(one('SELECT * FROM rpc_filter_rules WHERE id=?',ruleId))
+api.get('/rpc-filters',requireRole('auditor'),(req,res)=>{
+  const nodeId=String(req.query.nodeId||'').trim()
+  const rows=all(`SELECT r.*,n.hostname node_hostname,n.transport node_transport,n.status node_status FROM rpc_filter_rules r LEFT JOIN nodes n ON n.id=r.node_id ${nodeId?'WHERE r.node_id=?':''} ORDER BY COALESCE(n.hostname,''),r.label,r.id`,...(nodeId?[nodeId]:[]))
+  res.json(rows.map(row=>({...publicRpcFilter(row),nodeHostname:row.node_hostname||null,nodeTransport:row.node_transport||null,nodeStatus:row.node_status||null})))
 })
-api.post('/rpc-filters/:id/apply-inventory',requireRole('admin'),(req,res)=>res.status(501).json({error:'RPC filter deployment requires a validated Windows test target and is not enabled by this build'}))
+api.post('/rpc-filters',requireRole('admin'),(req,res)=>{
+  const data=body(z.object({nodeId:z.string(),interfaceUuid:z.string(),opnum:z.number().int().min(0).max(65535).nullable().optional(),source:z.string().trim().max(255).default('Any'),action:z.enum(['allow','block','continue']),audit:z.boolean().default(true),label:z.string().trim().max(160).default('')}),req)
+  const node=getNode(data.nodeId);if(!node)return notFound(res,'Node')
+  const normalized=normalizeRpcFilter(data,{idValue:id()})
+  const duplicate=one('SELECT id FROM rpc_filter_rules WHERE node_id=? AND interface_uuid=? AND opnum IS ? AND COALESCE(source,\'Any\')=? AND action=?',data.nodeId,normalized.interfaceUuid,normalized.opnum,normalized.source||'Any',normalized.action)
+  if(duplicate)return res.status(409).json({error:'An equivalent RPC filter already exists'})
+  run('INSERT INTO rpc_filter_rules(id,node_id,interface_uuid,opnum,source,action,audit,label) VALUES(?,?,?,?,?,?,?,?)',normalized.id,data.nodeId,normalized.interfaceUuid,normalized.opnum,normalized.source,normalized.action,Number(normalized.audit),normalized.label)
+  audit(req.user.id,'rpc-filter.create','rpc-filter',normalized.id,null,{...normalized,nodeId:data.nodeId})
+  res.status(201).json(publicRpcFilter(one('SELECT * FROM rpc_filter_rules WHERE id=?',normalized.id)))
+})
+api.post('/rpc-filters/:id/apply-inventory',requireRole('admin'),wrap(async(req,res)=>{
+  const filter=one('SELECT * FROM rpc_filter_rules WHERE id=?',reqId(req));if(!filter)return notFound(res,'RPC filter')
+  const node=getNode(filter.node_id);if(!node)return notFound(res,'Node')
+  if(!['winrm','winrms','netsh'].includes(node.transport)||node.status!=='reachable')return res.status(409).json({error:'RPC filter deployment requires a reachable authenticated WinRM or SMB/netsh node'})
+  const rows=all('SELECT * FROM rpc_filter_rules WHERE node_id=? ORDER BY rowid,id',node.id)
+  const rules=rows.map(row=>normalizeRpcFilter({id:row.id,interfaceUuid:row.interface_uuid,opnum:row.opnum,source:row.source,action:row.action,audit:!!row.audit,label:row.label},{idValue:row.id}))
+  const result=await remote(node,'rpc_filter_apply',{rules})
+  const applied=new Set(result?.applied||[])
+  if(applied.size!==rules.length)throw Object.assign(new Error('RPC filter deployment did not confirm every filter key'),{status:502})
+  run(`UPDATE rpc_filter_rules SET applied_at=? WHERE node_id=? AND id IN (${rows.map(()=>'?').join(',')})`,now(),node.id,...rows.map(row=>row.id))
+  audit(req.user.id,'rpc-filter.apply','node',node.id,null,{filterIds:rows.map(row=>row.id),count:rows.length,transport:node.transport})
+  res.json({nodeId:node.id,applied:rows.map(row=>row.id),transport:node.transport,inventory:result?.output||null})
+}))
+api.get('/rpc-filters/:id/inventory',requireRole('auditor'),wrap(async(req,res)=>{
+  const filter=one('SELECT * FROM rpc_filter_rules WHERE id=?',reqId(req));if(!filter)return notFound(res,'RPC filter')
+  const node=getNode(filter.node_id);if(!node)return notFound(res,'Node')
+  if(!['winrm','winrms','netsh'].includes(node.transport)||node.status!=='reachable')return res.status(409).json({error:'Native RPC filter inventory requires a reachable authenticated WinRM or SMB/netsh node'})
+  const result=await remote(node,'rpc_filters',{})
+  res.json({nodeId:node.id,transport:node.transport,raw:result?.raw||''})
+}))
+api.delete('/rpc-filters/:id',requireRole('admin'),wrap(async(req,res)=>{
+  const filter=one('SELECT * FROM rpc_filter_rules WHERE id=?',reqId(req));if(!filter)return notFound(res,'RPC filter')
+  const node=getNode(filter.node_id)
+  if(filter.applied_at){
+    if(!node||!['winrm','winrms','netsh'].includes(node.transport)||node.status!=='reachable')return res.status(409).json({error:'Reconnect the authenticated node before removing its applied RPC filter'})
+    const result=await remote(node,'rpc_filter_remove',{filterKeys:[filter.id]})
+    if(!result?.removed?.includes(filter.id))throw Object.assign(new Error('RPC filter removal was not confirmed'),{status:502})
+  }
+  run('DELETE FROM rpc_filter_rules WHERE id=?',filter.id)
+  audit(req.user.id,'rpc-filter.delete','rpc-filter',filter.id,publicRpcFilter(filter),null)
+  res.status(204).end()
+}))
 api.post('/logon-rights/revoke',requireRole('admin'),(req,res)=>res.status(501).json({error:'LSA rights mutation requires a validated Windows test target and is not enabled by this build'}))
 api.post('/logon-rights/jit-grant',requireRole('admin'),(req,res)=>res.status(501).json({error:'JIT logon-rights mutation requires a validated Windows test target and is not enabled by this build'}))
 
