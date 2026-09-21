@@ -29,6 +29,6 @@ export function normalizeWindowsEvent(event) {
     dstIp:(reverseInbound?fields.SourceAddress:fields.DestAddress)||null,dstPort:intOrNull(reverseInbound?fields.SourcePort:fields.DestPort),direction,
     program:fields.Application||fields.ProcessName||null,processId:intOrNull(fields.ProcessID),accountSid:fields.TargetUserSid||fields.SubjectUserSid||null,
     filterOrigin:fields.FilterOrigin||null,filterRuntimeId:fields.FilterRTID||null,
-    logonType:fields.LogonType||null
+    logonType:fields.LogonType||null,logonStatus:fields.Status||null,logonSubStatus:fields.SubStatus||null
   }
 }

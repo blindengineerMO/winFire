@@ -12,6 +12,7 @@ import {emitNotification} from './notifications.js'
 import {normalizeProfileSnapshot} from './breakGlass.js'
 import {effectiveAgentPollSeconds} from './agentPoll.js'
 import {isExcludedFirewallEvent} from './processExclusions.js'
+import {isIgnoredFirewallEvent} from './trafficIgnores.js'
 
 export const agentRoutes=express.Router()
 const wrap=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next)
@@ -64,8 +65,8 @@ agentRoutes.post('/:id/events',requireAgent,(req,res)=>{
     for(const raw of events){
       const item=normalizeWindowsEvent(raw)
       if(ignoreLoopback&&isLoopbackEvent(item))continue
-      if(isExcludedFirewallEvent(item)){excluded++;continue}
-      const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,program,process_id,account_sid,event_time,event_type,logon_type,filter_origin,filter_runtime_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),req.agent.node_id,item.recordId,item.eventId,item.action,item.protocol,item.srcIp,item.srcPort,item.dstIp,item.dstPort,item.direction,item.program,item.processId,item.accountSid,item.eventTime,item.eventType,item.logonType,item.filterOrigin,item.filterRuntimeId)
+      if(isExcludedFirewallEvent(item)||isIgnoredFirewallEvent(item)){excluded++;continue}
+      const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,program,process_id,account_sid,event_time,event_type,logon_type,filter_origin,filter_runtime_id,logon_status,logon_sub_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),req.agent.node_id,item.recordId,item.eventId,item.action,item.protocol,item.srcIp,item.srcPort,item.dstIp,item.dstPort,item.direction,item.program,item.processId,item.accountSid,item.eventTime,item.eventType,item.logonType,item.filterOrigin,item.filterRuntimeId,item.logonStatus,item.logonSubStatus)
       inserted+=result.changes
       if(!result.changes&&item.filterOrigin)run('UPDATE log_events SET filter_origin=COALESCE(filter_origin,?),filter_runtime_id=COALESCE(filter_runtime_id,?) WHERE node_id=? AND record_id=? AND filter_origin IS NULL',item.filterOrigin,item.filterRuntimeId,req.agent.node_id,item.recordId)
       if(!result.changes&&item.eventType==='firewall'&&item.direction==='in')run('UPDATE log_events SET src_ip=?,src_port=?,dst_ip=?,dst_port=? WHERE node_id=? AND record_id=? AND pattern_id IS NULL AND (src_ip IS NOT ? OR src_port IS NOT ? OR dst_ip IS NOT ? OR dst_port IS NOT ?)',item.srcIp,item.srcPort,item.dstIp,item.dstPort,req.agent.node_id,item.recordId,item.srcIp,item.srcPort,item.dstIp,item.dstPort)

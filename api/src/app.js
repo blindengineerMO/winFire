@@ -29,7 +29,7 @@ import {observabilitySettings} from './maintenance.js'
 import {resourceRecord,canReadResource,canWriteResource} from './access.js'
 import {emitNotification,notificationSummary,preferenceKeys} from './notifications.js'
 import {buildOpenApi} from './openapi.js'
-import {parseSeceditRights,suggestedRightForLogonType,denyRightForAllow} from './logonRights.js'
+import {parseSeceditRights,suggestedRightForLogonType,denyRightForAllow,segmentRightsForPort,hasDirectRight} from './logonRights.js'
 import {normalizeProfileSnapshot,publicBreakGlass} from './breakGlass.js'
 import {normalizeSourceIp,sourceMatches,revokePortalGrant} from './mfaPortal.js'
 import {entraConfigured,startEntraAuthentication,completeEntraAuthentication} from './entraPortal.js'
@@ -43,6 +43,7 @@ import {validateExportDestination,exportSelectedEvents} from './eventExport.js'
 import {previewSecurityAutomation} from './securityAutomations.js'
 import {collectAccountInventory,accountName} from './localAccounts.js'
 import {normalizeProcessExclusions,refreshProcessExclusions,isExcludedFirewallEvent,visibleFirewallEventSql} from './processExclusions.js'
+import {normalizeTrafficIgnore,trafficIgnoreFingerprint,trafficIgnoreFromEvent,refreshTrafficIgnores,publicTrafficIgnore,isIgnoredFirewallEvent} from './trafficIgnores.js'
 
 export const app=express()
 app.disable('x-powered-by')
@@ -213,6 +214,12 @@ api.get('/agent-package/WinFire.Agent.exe',(req,res)=>{
   const packagePath=path.resolve(process.env.AGENT_PACKAGE_PATH)
   if(!fs.existsSync(packagePath)||!fs.statSync(packagePath).isFile())return notFound(res,'Agent package')
   res.set('Cache-Control','private, no-store').type('application/octet-stream').sendFile(packagePath)
+})
+api.get('/agent-package/WinFire.Agent.msi',(req,res)=>{
+  if(!req.secure||!agentPkiReady()||!process.env.AGENT_MSI_PATH)return res.status(503).json({error:'Signed agent MSI requires HTTPS, configured agent PKI, and AGENT_MSI_PATH'})
+  const packagePath=path.resolve(process.env.AGENT_MSI_PATH)
+  if(!fs.existsSync(packagePath)||!fs.statSync(packagePath).isFile())return notFound(res,'Agent MSI')
+  res.set('Cache-Control','private, no-store').type('application/x-msi').attachment('WinFire.Agent.msi').sendFile(packagePath)
 })
 api.get('/agent-package/enroll.ps1',wrap(async(req,res)=>{
   if(!req.secure||!agentPkiReady()||!process.env.AGENT_PACKAGE_PATH)return res.status(503).json({error:'Agent bootstrap requires HTTPS, PKI, and a configured package'})
@@ -750,6 +757,26 @@ api.put('/settings/process-exclusions',requireRole('admin'),(req,res)=>{
   })()
   refreshProcessExclusions(db)
   res.json({names})
+})
+api.get('/settings/traffic-ignores',requireRole('admin'),(_req,res)=>res.json(all('SELECT * FROM traffic_ignore_rules ORDER BY created_at DESC,id DESC').map(publicTrafficIgnore)))
+api.post('/settings/traffic-ignores',requireRole('admin'),(req,res)=>{
+  const data=body(z.object({label:z.string().trim().min(1).max(120),eventId:z.number().int(),action:z.string().nullable().optional(),protocol:z.string().nullable().optional(),srcIp:z.string().nullable().optional(),dstIp:z.string().nullable().optional(),dstPort:z.number().int().nullable().optional(),direction:z.string().nullable().optional(),program:z.string().nullable().optional(),accountSid:z.string().nullable().optional()}),req)
+  let pattern
+  try{pattern=normalizeTrafficIgnore(data)}catch(error){return res.status(400).json({error:error.message})}
+  const ruleId=id(),fingerprint=trafficIgnoreFingerprint(pattern)
+  if(one('SELECT id FROM traffic_ignore_rules WHERE fingerprint=?',fingerprint))return res.status(409).json({error:'An identical traffic ignore rule already exists'})
+  run('INSERT INTO traffic_ignore_rules(id,label,event_id,action,protocol,src_ip,dst_ip,dst_port,direction,program,account_sid,fingerprint,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',ruleId,data.label,pattern.eventId,pattern.action,pattern.protocol,pattern.srcIp,pattern.dstIp,pattern.dstPort,pattern.direction,pattern.program,pattern.accountSid,fingerprint,req.user.id,now())
+  refreshTrafficIgnores(db)
+  const created=one('SELECT * FROM traffic_ignore_rules WHERE id=?',ruleId)
+  audit(req.user.id,'traffic-ignore.create','settings',ruleId,null,publicTrafficIgnore(created))
+  res.status(201).json(publicTrafficIgnore(created))
+})
+api.delete('/settings/traffic-ignores/:id',requireRole('admin'),(req,res)=>{
+  const before=one('SELECT * FROM traffic_ignore_rules WHERE id=?',reqId(req));if(!before)return notFound(res,'Traffic ignore rule')
+  run('DELETE FROM traffic_ignore_rules WHERE id=?',before.id)
+  refreshTrafficIgnores(db)
+  audit(req.user.id,'traffic-ignore.delete','settings',before.id,publicTrafficIgnore(before),null)
+  res.json({ok:true})
 })
 api.get('/settings/logs-display',(_req,res)=>res.json({hideLoopbackEvents:observabilitySettings().hideLoopbackEvents}))
 api.patch('/settings/observability',requireRole('admin'),(req,res)=>{
@@ -1727,7 +1754,45 @@ api.get('/identity/learning-preview',(req,res)=>{
   res.json({items,proposals,days:query.days,truncated:observations.length>500})
 })
 
-api.get('/segments',(_req,res)=>res.json(all('SELECT * FROM identity_segments ORDER BY created_at DESC')))
+const segmentBaselines=segmentId=>all('SELECT segment_id,node_id,account_sid,allow_right,deny_right,enforced_at,enforced_by FROM segment_lsa_baselines WHERE segment_id=? ORDER BY node_id',segmentId)
+function segmentNodes(segment,nodeId=null){
+  const nodes=segment.node_id?[getNode(segment.node_id)]:all('SELECT n.* FROM nodes n JOIN node_group_members m ON m.node_id=n.id WHERE m.group_id=? ORDER BY n.hostname',segment.node_group_id)
+  const filtered=nodes.filter(Boolean).filter(node=>!nodeId||node.id===nodeId)
+  if(nodeId&&!filtered.length)throw Object.assign(new Error('The selected node is not covered by this segment'),{status:400})
+  if(!filtered.length)throw Object.assign(new Error('The segment has no target nodes'),{status:409})
+  return filtered
+}
+function assertLsaSegment(segment){
+  if(!segment.account_sid)throw Object.assign(new Error('Configure an account SID before enforcing an LSA baseline'),{status:409})
+  const rights=segmentRightsForPort(segment.port)
+  if(!rights)throw Object.assign(new Error('LSA gating is supported for RDP TCP 3389 and SSH TCP 22'),{status:409})
+  const critical=new Set(['S-1-1-0','S-1-5-9','S-1-5-11','S-1-5-18','S-1-5-19','S-1-5-20','S-1-5-32-544','S-1-5-32-548','S-1-5-32-580'])
+  if(critical.has(segment.account_sid)||/-(?:500|512|518|519)$/.test(segment.account_sid))throw Object.assign(new Error('This account is protected from LSA gate enforcement'),{status:409})
+  return rights
+}
+function managementCredentialSids(nodeId){
+  const names=all(`SELECT DISTINCT lower(c.username) username FROM credentials c JOIN credential_assignments a ON a.credential_id=c.id
+    WHERE a.node_id=? OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?)`,nodeId,nodeId).map(row=>row.username)
+  const sids=[]
+  for(const raw of names){
+    const short=raw.includes('\\')?raw.split('\\').pop():raw.split('@')[0]
+    const ad=one('SELECT sid FROM directory_users WHERE missing=0 AND (lower(upn)=? OR lower(sam_account_name)=?)',raw,short)
+    const local=one('SELECT sid FROM local_accounts WHERE node_id=? AND missing=0 AND (lower(qualified_name)=? OR lower(username)=?)',nodeId,raw,short)
+    if(ad?.sid)sids.push(ad.sid)
+    if(local?.sid)sids.push(local.sid)
+  }
+  return [...new Set(sids)]
+}
+function validateLsaNode(node,segment,rights){
+  if(node.connection_mode!=='agentless'||!['winrm','winrms'].includes(node.transport))throw Object.assign(new Error(`${node.hostname} requires working agentless WinRM for LSA enforcement`),{status:409})
+  if(rights.logonType==='Network'&&!managementCredentialSids(node.id).some(sid=>sid.toLowerCase()!==segment.account_sid.toLowerCase()))throw Object.assign(new Error(`${node.hostname} needs a resolved WinRM credential with a different SID before SSH network-logon gating can be enforced`),{status:409})
+}
+async function changeLsaRight(node,accountSid,right,present){
+  const result=await remote(node,'rights_change',{accountSid,right,present})
+  if(result?.accountSid!==accountSid||result?.right!==right||result?.present!==present)throw Object.assign(new Error(`LSA readback did not confirm ${right}`),{status:502})
+  return result
+}
+api.get('/segments',(_req,res)=>res.json(all('SELECT * FROM identity_segments ORDER BY created_at DESC').map(segment=>({...segment,lsaBaselines:segmentBaselines(segment.id)}))))
 api.post('/segments',requireRole('admin'),(req,res)=>{
   const data=body(z.object({name:z.string().min(1),nodeId:z.string().optional(),nodeGroupId:z.string().optional(),policyId:z.string().nullable().optional(),port:z.number().int().min(1).max(65535),accountSid:z.string().max(184).optional(),sourceIp:z.string().max(255).optional(),extraPorts:z.array(z.number().int().min(1).max(65535)).max(100).default([]),sourceProcess:z.string().max(1024).optional(),fallbackToLoggedOnUser:z.boolean().default(false),failOpen:z.boolean().default(false),ttlMinutes:z.number().int().min(2).max(10080).default(240),mode:z.enum(['agentless','agent']).default('agentless'),mfaProvider:z.enum(['totp','entra']).default('totp'),allowedUpns:z.array(z.email()).max(100).default([]),portalEnabled:z.boolean().default(true),autoPromptEnabled:z.boolean().default(false)}),req)
   if(Number(!!data.nodeId)+Number(!!data.nodeGroupId)!==1)return res.status(400).json({error:'Choose one node or node group'})
@@ -1746,17 +1811,64 @@ api.patch('/segments/:id',requireRole('admin'),(req,res)=>{
   if(data.policyId&&!getPolicy(data.policyId))return notFound(res,'Policy')
   const next={allowedUpns:data.allowedUpns?data.allowedUpns.map(value=>value.toLowerCase()):parse(before.allowed_upns)||[],mfaProvider:data.mfaProvider||before.mfa_provider,portalEnabled:data.portalEnabled===undefined?!!before.portal_enabled:data.portalEnabled,autoPromptEnabled:data.autoPromptEnabled===undefined?!!before.auto_prompt_enabled:data.autoPromptEnabled,ttlMinutes:data.ttlMinutes||before.ttl_minutes,sourceIp:data.sourceIp===undefined?before.source_ip:data.sourceIp||null,policyId:data.policyId===undefined?before.policy_id:data.policyId,accountSid:data.accountSid===undefined?before.account_sid:data.accountSid||null,extraPorts:data.extraPorts===undefined?parse(before.extra_ports)||[]:[...new Set(data.extraPorts)].filter(port=>port!==before.port),sourceProcess:data.sourceProcess===undefined?before.source_process:data.sourceProcess||null,fallbackToLoggedOnUser:data.fallbackToLoggedOnUser===undefined?!!before.fallback_to_logged_on_user:data.fallbackToLoggedOnUser,failOpen:data.failOpen===undefined?!!before.fail_open:data.failOpen}
   if(next.accountSid&&!/^S-1-\d+-\d+(?:-\d+)+$/.test(next.accountSid))return res.status(400).json({error:'A valid account SID is required'})
+  if(next.accountSid!==before.account_sid&&one('SELECT 1 FROM segment_lsa_baselines WHERE segment_id=?',before.id))return res.status(409).json({error:'Restore this segment’s LSA baselines before changing its account SID'})
   run('UPDATE identity_segments SET allowed_upns=?,mfa_provider=?,portal_enabled=?,auto_prompt_enabled=?,ttl_minutes=?,source_ip=?,policy_id=?,account_sid=?,extra_ports=?,source_process=?,fallback_to_logged_on_user=?,fail_open=? WHERE id=?',json(next.allowedUpns),next.mfaProvider,Number(next.portalEnabled),Number(next.autoPromptEnabled),next.ttlMinutes,next.sourceIp,next.policyId,next.accountSid,json(next.extraPorts),next.sourceProcess,Number(next.fallbackToLoggedOnUser),Number(next.failOpen),before.id)
   audit(req.user.id,'segment.update','segment',before.id,{allowedUpns:parse(before.allowed_upns),mfaProvider:before.mfa_provider,portalEnabled:!!before.portal_enabled,autoPromptEnabled:!!before.auto_prompt_enabled,ttlMinutes:before.ttl_minutes,sourceIp:before.source_ip,policyId:before.policy_id,accountSid:before.account_sid,extraPorts:parse(before.extra_ports)||[],sourceProcess:before.source_process,fallbackToLoggedOnUser:!!before.fallback_to_logged_on_user,failOpen:!!before.fail_open},next)
   res.json(one('SELECT * FROM identity_segments WHERE id=?',before.id))
 })
+api.get('/segments/:id/lsa-baselines',requireRole('admin'),(req,res)=>{
+  const segment=one('SELECT * FROM identity_segments WHERE id=?',reqId(req));if(!segment)return notFound(res,'Segment')
+  res.json(segmentBaselines(segment.id))
+})
+api.post('/segments/:id/lsa-baselines',requireRole('admin'),wrap(async(req,res)=>{
+  const segment=one('SELECT * FROM identity_segments WHERE id=?',reqId(req));if(!segment)return notFound(res,'Segment')
+  const data=body(z.object({enabled:z.boolean(),nodeId:z.string().uuid().optional(),reason:z.string().trim().min(10).max(500),confirmation:z.literal('ENFORCE LSA GATE')}),req)
+  const rights=assertLsaSegment(segment),targets=segmentNodes(segment,data.nodeId)
+  const results=[]
+  for(const node of targets){
+    validateLsaNode(node,segment,rights)
+    const existing=one('SELECT * FROM segment_lsa_baselines WHERE segment_id=? AND node_id=?',segment.id,node.id)
+    if(data.enabled&&existing){results.push({...existing,unchanged:true});continue}
+    if(!data.enabled&&!existing){results.push({nodeId:node.id,enabled:false,unchanged:true});continue}
+    if(one("SELECT 1 FROM jit_grants WHERE segment_id=? AND node_id=? AND revoked_at IS NULL AND expires_at>?",segment.id,node.id,now()))throw Object.assign(new Error(`Close active MFA grants on ${node.hostname} before changing its LSA baseline`),{status:409})
+    const applyRunId=id();run('INSERT INTO policy_apply_runs(id,node_id,status) VALUES(?,?,?)',applyRunId,node.id,'running')
+    try{
+      if(data.enabled){
+        const raw=await remote(node,'rights'),lines=Array.isArray(raw)?raw:[raw].filter(Boolean)
+        const allowWasPresent=hasDirectRight(lines,segment.account_sid,rights.allowRight),denyWasPresent=hasDirectRight(lines,segment.account_sid,rights.denyRight)
+        let denyChanged=false
+        try{
+          await changeLsaRight(node,segment.account_sid,rights.denyRight,true);denyChanged=!denyWasPresent
+          await changeLsaRight(node,segment.account_sid,rights.allowRight,false)
+        }catch(error){
+          if(denyChanged)await changeLsaRight(node,segment.account_sid,rights.denyRight,denyWasPresent).catch(()=>{})
+          await changeLsaRight(node,segment.account_sid,rights.allowRight,allowWasPresent).catch(()=>{})
+          throw error
+        }
+        run('INSERT INTO segment_lsa_baselines(segment_id,node_id,account_sid,allow_right,deny_right,allow_was_present,deny_was_present,enforced_at,enforced_by) VALUES(?,?,?,?,?,?,?,?,?)',segment.id,node.id,segment.account_sid,rights.allowRight,rights.denyRight,Number(allowWasPresent),Number(denyWasPresent),now(),req.user.id)
+        results.push({nodeId:node.id,enabled:true,allowRight:rights.allowRight,denyRight:rights.denyRight})
+      }else{
+        await changeLsaRight(node,existing.account_sid,existing.allow_right,!!existing.allow_was_present)
+        await changeLsaRight(node,existing.account_sid,existing.deny_right,!!existing.deny_was_present)
+        run('DELETE FROM segment_lsa_baselines WHERE segment_id=? AND node_id=?',segment.id,node.id)
+        results.push({nodeId:node.id,enabled:false})
+      }
+      run('UPDATE policy_apply_runs SET status=?,diff_json=?,finished_at=? WHERE id=?','success',json({operation:data.enabled?'lsa_baseline_enforce':'lsa_baseline_restore',segmentId:segment.id,accountSid:segment.account_sid,...rights}),now(),applyRunId)
+      audit(req.user.id,data.enabled?'segment.lsa.enforce':'segment.lsa.restore','segment',segment.id,null,{nodeId:node.id,accountSid:segment.account_sid,...rights,reason:data.reason,runId:applyRunId})
+    }catch(error){
+      run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?','failed',error.message,now(),applyRunId)
+      audit(req.user.id,'segment.lsa.failed','segment',segment.id,null,{nodeId:node.id,enabled:data.enabled,error:error.message,reason:data.reason,runId:applyRunId})
+      throw error
+    }
+  }
+  res.status(201).json({results,baselines:segmentBaselines(segment.id)})
+}))
 const portalAccessLimit=rateLimit({windowMs:15*60*1000,limit:10,standardHeaders:'draft-8',legacyHeaders:false})
 function portalTarget(req,segment,requestedNodeId){
   if(!segment)throw Object.assign(new Error('Segment not found'),{status:404})
   if(!segment.portal_enabled||segment.mode!=='agentless')throw Object.assign(new Error('The access portal is disabled for this segment'),{status:409})
   if(!(parse(segment.allowed_upns)||[]).includes(req.user.email.toLowerCase()))throw Object.assign(new Error('Your account is not assigned to this segment'),{status:403})
   if(segment.fail_open)throw Object.assign(new Error('Portal access requires a fail-closed segment'),{status:409})
-  if(segment.account_sid)throw Object.assign(new Error('Account SID gating requires an enforced LSA baseline and is not available for portal grants yet'),{status:409})
   if(segment.source_process)throw Object.assign(new Error('Agentless portal access cannot enforce a source process'),{status:409})
   if(segment.fallback_to_logged_on_user)throw Object.assign(new Error('Agentless portal access cannot safely resolve a fallback logged-on user'),{status:409})
   const nodeId=segment.node_id||requestedNodeId
@@ -1765,6 +1877,7 @@ function portalTarget(req,segment,requestedNodeId){
   if(!node)throw Object.assign(new Error('Node not found'),{status:404})
   if(node.connection_mode!=='agentless'||!['winrm','winrms'].includes(node.transport))throw Object.assign(new Error('Agentless portal access requires a working WinRM node'),{status:409})
   if(node.firewall_state==='learning')throw Object.assign(new Error('The target is still learning; enforce its firewall policy before enabling portal access'),{status:409})
+  if(segment.account_sid&&!one('SELECT 1 FROM segment_lsa_baselines WHERE segment_id=? AND node_id=? AND account_sid=?',segment.id,node.id,segment.account_sid))throw Object.assign(new Error('Enforce the segment LSA deny baseline on this node before granting access'),{status:409})
   if(segment.policy_id){
     const policy=getPolicy(segment.policy_id)
     if(!policy||!assignedNodes(policy.id).some(target=>target.id===node.id))throw Object.assign(new Error('The linked MFA policy is not assigned to this node'),{status:409})
@@ -1799,12 +1912,15 @@ async function grantPortalAccess(req,segment,node,sourceIp,provider,promptId=nul
       if(reserved.changes!==1)throw Object.assign(new Error('MFA browser prompt was already used'),{status:409})
     }
     const ports=[segment.port,...(parse(segment.extra_ports)||[])]
-    const preflight=await remote(node,'jit_preflight',{port:segment.port,ports})
+    const baseline=segment.account_sid?one('SELECT * FROM segment_lsa_baselines WHERE segment_id=? AND node_id=?',segment.id,node.id):null
+    const lsaScope=baseline?{accountSid:baseline.account_sid,allowRight:baseline.allow_right,denyRight:baseline.deny_right}:{}
+    const preflight=await remote(node,'jit_preflight',{port:segment.port,ports,...lsaScope})
     if(!preflight?.safe){
       const names=[...(preflight?.conflictingAllows||[]),...(preflight?.conflictingBlocks||[])].map(item=>item.name).slice(0,3).join(', ')
-      throw Object.assign(new Error(`Firewall gate is not ready for TCP ${segment.port}; check inbound profile defaults${names?` and overlapping rules: ${names}`:' and overlapping rules'}`),{status:409})
+      const lsa=preflight?.lsaReady===false?' and restore its enforced LSA deny baseline':''
+      throw Object.assign(new Error(`Firewall gate is not ready for TCP ${segment.port}; check inbound profile defaults${names?` and overlapping rules: ${names}`:' and overlapping rules'}${lsa}`),{status:409})
     }
-    const args={grantId,sourceIp,port:segment.port,ports,expiresAt}
+    const args={grantId,sourceIp,port:segment.port,ports,expiresAt,...lsaScope}
     applyRunId=id()
     run('INSERT INTO policy_apply_runs(id,node_id,status) VALUES(?,?,?)',applyRunId,node.id,'running')
     try{const started=await remote(node,'jit_start',args);if(started?.active!==true)throw new Error('The node did not confirm the temporary firewall rule');ruleStarted=true}
@@ -1818,7 +1934,7 @@ async function grantPortalAccess(req,segment,node,sourceIp,provider,promptId=nul
       run('INSERT INTO jit_grants(id,segment_id,node_id,account_sid,src_ip,dst_port,ports_json,rule_path,grant_type,ttl_seconds,granted_at,expires_at,mfa_challenge_id,prompt_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',grantId,segment.id,node.id,segment.account_sid||null,sourceIp,segment.port,json(ports),`WinFireSecure:JIT:${grantId}`,'portal_firewall',segment.ttl_minutes*60,now(),expiresAt,challengeId,promptId)
       if(promptId)run("UPDATE mfa_prompt_events SET status='consumed',consumed_at=? WHERE id=?",now(),promptId)
       if(!resolveMfaChallenge(challengeId,'approved',{actorId:req.user.id}))throw Object.assign(new Error('MFA challenge expired before access could open'),{status:409})
-      run('UPDATE policy_apply_runs SET status=?,diff_json=?,finished_at=? WHERE id=?','success',json({operation:'mfa_jit_start',grantId,sourceIp,ports,expiresAt}),now(),applyRunId)
+      run('UPDATE policy_apply_runs SET status=?,diff_json=?,finished_at=? WHERE id=?','success',json({operation:'mfa_jit_start',grantId,sourceIp,ports,expiresAt,lsaTemporary:!!baseline}),now(),applyRunId)
       audit(req.user.id,'mfa.portal.granted','jit-grant',grantId,null,{segmentId:segment.id,nodeId:node.id,sourceIp,ports,expiresAt,provider,promptId})
     })()
     grantRecorded=true
@@ -1827,7 +1943,7 @@ async function grantPortalAccess(req,segment,node,sourceIp,provider,promptId=nul
     let cleanupFailed=false
     if(ruleStarted){
       try{
-        await remote(node,'jit_end',{grantId})
+        await remote(node,'jit_end',{grantId,...lsaScope})
         if(grantRecorded)run('UPDATE jit_grants SET revoked_at=? WHERE id=?',now(),grantId)
       }catch(cleanupError){
         cleanupFailed=true
@@ -2066,6 +2182,20 @@ api.post('/event-export/send',requireRole('admin'),wrap(async(req,res)=>{
     throw Object.assign(new Error(error.message),{status:502})
   }
 }))
+api.post('/logs/:id/ignore-traffic',requireRole('admin'),(req,res)=>{
+  const event=one(`SELECT e.id,e.event_id,e.account_sid,COALESCE(e.action,p.action) action,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,COALESCE(e.dst_ip,p.dst_ip) dst_ip,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.direction,p.direction) direction,COALESCE(e.program,p.program) program FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE ${visibleFirewallEventSql()} AND e.id=?`,reqId(req))
+  if(!event)return notFound(res,'Event')
+  let pattern
+  try{pattern=trafficIgnoreFromEvent(event)}catch(error){return res.status(400).json({error:error.message})}
+  const fingerprint=trafficIgnoreFingerprint(pattern),existing=one('SELECT * FROM traffic_ignore_rules WHERE fingerprint=?',fingerprint)
+  if(existing)return res.json({...publicTrafficIgnore(existing),existing:true})
+  const ruleId=id(),label=`${event.action||'traffic'} ${event.protocol||'network'} ${event.direction||'flow'}${event.dst_port?` ${event.dst_port}`:''}`
+  run('INSERT INTO traffic_ignore_rules(id,label,event_id,action,protocol,src_ip,dst_ip,dst_port,direction,program,account_sid,fingerprint,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',ruleId,label,pattern.eventId,pattern.action,pattern.protocol,pattern.srcIp,pattern.dstIp,pattern.dstPort,pattern.direction,pattern.program,pattern.accountSid,fingerprint,req.user.id,now())
+  refreshTrafficIgnores(db)
+  const created=one('SELECT * FROM traffic_ignore_rules WHERE id=?',ruleId)
+  audit(req.user.id,'traffic-ignore.create-from-event','settings',ruleId,null,{...publicTrafficIgnore(created),eventId:event.id})
+  res.status(201).json(publicTrafficIgnore(created))
+})
 api.post('/logs/:id/rule',requireRole('admin'),(req,res)=>{
   const event=one(`SELECT e.*,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,COALESCE(e.dst_ip,p.dst_ip) dst_ip,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.direction,p.direction) direction,COALESCE(e.program,p.program) program FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE ${visibleFirewallEventSql()} AND e.id=?`,reqId(req));if(!event)return notFound(res,'Event')
   const node=getNode(event.node_id);if(!node)return notFound(res,'Node')
@@ -2096,9 +2226,9 @@ api.post('/logs/:id/rule',requireRole('admin'),(req,res)=>{
   res.status(201).json({policyId:policy.id,versionId,versionNo,ruleCount:rules.length,pendingSync:true})
 })
 api.post('/logs/ingest',requireRole('editor'),(req,res)=>{
-  const data=body(z.object({nodeId:z.string(),events:z.array(z.object({recordId:z.number().optional(),eventId:z.number().int(),action:z.string().optional(),protocol:z.string().optional(),srcIp:z.string().optional(),dstIp:z.string().optional(),dstPort:z.number().optional(),direction:z.string().optional(),program:z.string().optional(),accountSid:z.string().optional(),challengeId:z.string().optional()})).max(1000)}),req)
+  const data=body(z.object({nodeId:z.string(),events:z.array(z.object({recordId:z.number().optional(),eventId:z.number().int(),action:z.string().optional(),protocol:z.string().optional(),srcIp:z.string().optional(),dstIp:z.string().optional(),dstPort:z.number().optional(),direction:z.string().optional(),program:z.string().optional(),accountSid:z.string().optional(),challengeId:z.string().optional(),logonType:z.string().optional(),logonStatus:z.string().optional(),logonSubStatus:z.string().optional()})).max(1000)}),req)
   const ignoreLoopback=observabilitySettings().ignoreLoopbackIngest
-  let inserted=0;db.transaction(()=>{for(const event of data.events){if(ignoreLoopback&&isLoopbackEvent(event)||isExcludedFirewallEvent(event))continue;const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,dst_ip,dst_port,direction,program,account_sid,challenge_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),data.nodeId,event.recordId??null,event.eventId,event.action||null,event.protocol||null,event.srcIp||null,event.dstIp||null,event.dstPort||null,event.direction||null,event.program||null,event.accountSid||null,event.challengeId||null);inserted+=result.changes}})()
+  let inserted=0;db.transaction(()=>{for(const event of data.events){if(ignoreLoopback&&isLoopbackEvent(event)||isExcludedFirewallEvent(event)||isIgnoredFirewallEvent(event))continue;const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,dst_ip,dst_port,direction,program,account_sid,challenge_id,logon_type,logon_status,logon_sub_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),data.nodeId,event.recordId??null,event.eventId,event.action||null,event.protocol||null,event.srcIp||null,event.dstIp||null,event.dstPort||null,event.direction||null,event.program||null,event.accountSid||null,event.challengeId||null,event.logonType||null,event.logonStatus||null,event.logonSubStatus||null);inserted+=result.changes}})()
   res.status(201).json({inserted})
 })
 
@@ -2107,8 +2237,8 @@ function insertCollectedEvents(nodeId,events,ignoreLoopback){
   db.transaction(()=>{for(const event of events){
     const item=normalizeWindowsEvent(event)
     if(ignoreLoopback&&isLoopbackEvent(item))continue
-    if(isExcludedFirewallEvent(item))continue
-    const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,program,process_id,account_sid,event_time,event_type,logon_type,filter_origin,filter_runtime_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),nodeId,item.recordId,item.eventId,item.action,item.protocol,item.srcIp,item.srcPort,item.dstIp,item.dstPort,item.direction,item.program,item.processId,item.accountSid,item.eventTime,item.eventType,item.logonType,item.filterOrigin,item.filterRuntimeId)
+    if(isExcludedFirewallEvent(item)||isIgnoredFirewallEvent(item))continue
+    const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,program,process_id,account_sid,event_time,event_type,logon_type,filter_origin,filter_runtime_id,logon_status,logon_sub_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),nodeId,item.recordId,item.eventId,item.action,item.protocol,item.srcIp,item.srcPort,item.dstIp,item.dstPort,item.direction,item.program,item.processId,item.accountSid,item.eventTime,item.eventType,item.logonType,item.filterOrigin,item.filterRuntimeId,item.logonStatus,item.logonSubStatus)
     inserted+=result.changes
     if(!result.changes&&item.filterOrigin)run('UPDATE log_events SET filter_origin=COALESCE(filter_origin,?),filter_runtime_id=COALESCE(filter_runtime_id,?) WHERE node_id=? AND record_id=? AND filter_origin IS NULL',item.filterOrigin,item.filterRuntimeId,nodeId,item.recordId)
     if(!result.changes&&item.eventType==='firewall'&&item.direction==='in')run('UPDATE log_events SET src_ip=?,src_port=?,dst_ip=?,dst_port=? WHERE node_id=? AND record_id=? AND pattern_id IS NULL AND (src_ip IS NOT ? OR src_port IS NOT ? OR dst_ip IS NOT ? OR dst_port IS NOT ?)',item.srcIp,item.srcPort,item.dstIp,item.dstPort,nodeId,item.recordId,item.srcIp,item.srcPort,item.dstIp,item.dstPort)

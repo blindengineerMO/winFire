@@ -1,0 +1,23 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="WinFire Agent" Manufacturer="WinFire Secure" Version="0.1.0" UpgradeCode="D63E326A-8E9E-4D84-8C46-A95169F3EF9D" Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer WinFire Agent is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Property Id="SERVERURL" Secure="yes" />
+    <Property Id="ENROLLMENTTOKEN" Secure="yes" Hidden="yes" />
+    <Launch Condition="Installed OR (SERVERURL AND ENROLLMENTTOKEN)" Message="Set SERVERURL and ENROLLMENTTOKEN to install and enroll WinFire Agent." />
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="WinFire">
+        <Component Id="AgentService" Guid="B8528AA2-1124-4919-A794-5D3527929E91" Bitness="always64">
+          <File Id="AgentExecutable" Source="$(var.AgentPublishDir)/WinFire.Agent.exe" KeyPath="yes" />
+          <ServiceInstall Id="AgentServiceInstall" Name="WinFireAgent" DisplayName="WinFire Agent" Description="WinFire Secure policy and event agent" Type="ownProcess" Start="auto" ErrorControl="normal" Account="LocalSystem" />
+          <ServiceControl Id="AgentServiceControl" Name="WinFireAgent" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+          <RegistryValue Root="HKLM" Key="SOFTWARE\WinFire" Name="BootstrapServer" Type="string" Value="[SERVERURL]" />
+          <RegistryValue Root="HKLM" Key="SOFTWARE\WinFire" Name="BootstrapToken" Type="string" Value="[ENROLLMENTTOKEN]" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+    <Feature Id="AgentFeature" Title="WinFire Agent" Level="1">
+      <ComponentRef Id="AgentService" />
+    </Feature>
+  </Package>
+</Wix>

@@ -456,6 +456,8 @@ def main():
     if operation in calls:
         source = (Path(__file__).resolve().parent / ('agent_deploy.ps1' if operation == 'agent_deploy' else 'security_process_owner.ps1')) if operation in {'agent_deploy','security_process_owner','security_session_logoff'} else shared_root / ('jitAccess.ps1' if operation.startswith('jit_') else 'mfaPrompt.ps1' if operation.startswith('prompt_') else 'breakGlass.ps1')
         functions = source.read_text()
+        if operation.startswith('jit_'):
+            functions = (Path(__file__).resolve().parent / 'lsa_rights.ps1').read_text() + '\n' + functions
         if operation == 'security_session_logoff':
             functions = (shared_root / 'mfaPrompt.ps1').read_text() + '\n' + functions
         script = SHARED_POWERSHELL.replace('__WINFIRE_SHARED_FUNCTIONS__',functions).replace('__WINFIRE_CALL__',calls[operation])

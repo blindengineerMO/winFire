@@ -4,7 +4,8 @@ import {all,one,run,id,now,audit,parse,json} from './db.js'
 import {remote,tcpProbe} from './connector.js'
 import {sourceMatches} from './mfaPortal.js'
 import {mfaPromptSettings} from './mfaPromptSettings.js'
-import {visibleFirewallEventSql} from './processExclusions.js'
+import {matchesProcess,visibleFirewallEventSql} from './processExclusions.js'
+import {emitNotification} from './notifications.js'
 
 function addresses(node){
   const values=new Set([node.ip,node.fqdn,node.hostname])
@@ -21,6 +22,15 @@ export function remoteIpFromBlockedEvent(event,targetAddresses){
   if(localSource===localDestination)return null
   const sourcePort=event.src_port==null?null:Number(event.src_port)
   return localSource?{sourceIp:destination,targetIp:source,sourcePort}:{sourceIp:source,targetIp:destination,sourcePort}
+}
+function lsaDeniedPair(event,segment,targetAddresses){
+  if(Number(event.event_id)!==4625||!['0xc000015b','c000015b'].includes(String(event.logon_status||event.logon_sub_status||'').toLowerCase()))return null
+  if(!segment.account_sid||String(event.account_sid).toLowerCase()!==String(segment.account_sid).toLowerCase())return null
+  if(Number(segment.port)===3389&&String(event.logon_type)!=='10'||Number(segment.port)===22&&String(event.logon_type)!=='3')return null
+  const source=String(event.src_ip||'').replace(/^::ffff:/,''),sourcePort=Number(event.src_port)
+  if(!isIP(source)||!Number.isInteger(sourcePort)||sourcePort<1||sourcePort>65535)return null
+  const target=[event.dst_ip,...targetAddresses].map(value=>String(value||'').replace(/^::ffff:/,'')).find(value=>isIP(value)&&value!==source)
+  return target?{sourceIp:source,targetIp:target,sourcePort,lsaDenied:true}:null
 }
 const adAddressCache=new Map()
 async function sourceNodeForIp(ip,targetId){
@@ -88,17 +98,19 @@ function promptUrl(promptId){
 }
 export async function processBlockedMfaEvent(event,segment,target){
   const promptId=id(),expiresAt=new Date(Date.now()+5*60_000).toISOString()
-  const local=addresses(target),pair=remoteIpFromBlockedEvent(event,local)
+  const local=addresses(target),pair=remoteIpFromBlockedEvent(event,local)||lsaDeniedPair(event,segment,local)
   const sourceMatch=pair?await sourceNodeForIp(pair.sourceIp,target.id):null
   const sourceNode=sourceMatch?.node||null
   const insert=(status,error=null)=>{
     run('INSERT OR IGNORE INTO mfa_prompt_events(id,segment_id,target_node_id,source_node_id,log_event_id,source_ip,status,error,expires_at) VALUES(?,?,?,?,?,?,?,?,?)',promptId,segment.id,target.id,sourceNode?.id||null,event.id,pair?.sourceIp||null,status,error,expiresAt)
     return {id:promptId,status,error}
   }
-  if(!pair)return insert('skipped','Blocked event does not identify exactly one target-local address')
+  if(!pair)return insert('skipped','Denied event does not identify one source and target address')
   if(!Number.isInteger(pair.sourcePort)||pair.sourcePort<1||pair.sourcePort>65535)return insert('skipped','Blocked event is missing a valid source port')
   if(!parse(segment.allowed_upns)?.length)return insert('skipped','No operators are assigned to this MFA segment')
-  if(segment.fail_open||segment.account_sid||segment.source_process||segment.fallback_to_logged_on_user)return insert('skipped','This segment uses an identity scope or fail mode that the agentless portal cannot enforce')
+  if(segment.fail_open||segment.fallback_to_logged_on_user)return insert('skipped','This segment uses a logged-on-user scope or fail-open mode that the agentless portal cannot enforce')
+  if(segment.source_process&&!matchesProcess(event.program,segment.source_process))return insert('skipped','The captured firewall process does not match this segment source-process restriction')
+  if(segment.account_sid&&!one('SELECT 1 FROM segment_lsa_baselines WHERE segment_id=? AND node_id=? AND account_sid=?',segment.id,target.id,segment.account_sid))return insert('skipped','The account SID segment does not have an enforced LSA deny baseline on this target')
   let inScope=false
   try{inScope=sourceMatches(pair.sourceIp,segment.source_ip)}catch(error){return insert('skipped',`Invalid segment source scope: ${error.message}`)}
   if(!inScope)return insert('skipped','Source IP is outside the segment scope')
@@ -119,6 +131,7 @@ export async function processBlockedMfaEvent(event,segment,target){
   let url
   try{url=promptUrl(promptId)}catch(error){return insert('skipped',error.message)}
   insert('pending')
+  emitNotification({eventKey:`mfa-access:${promptId}`,category:'mfa_access_request',title:`MFA access requested for ${target.hostname}`,body:`A connection from ${pair.sourceIp} to TCP ${segment.port} was denied${pair.lsaDenied?' by the Windows logon-right gate':''}. Complete MFA within five minutes to open temporary access.`,entityType:'mfa-prompt',entityId:promptId,recipientEmails:parse(segment.allowed_upns)||[]})
   const applyRunId=id()
   run('INSERT INTO policy_apply_runs(id,node_id,status) VALUES(?,?,?)',applyRunId,sourceNode.id,'running')
   audit(null,'mfa.prompt.launch.start','node',sourceNode.id,null,{promptId,runId:applyRunId,targetNodeId:target.id})
@@ -157,20 +170,25 @@ export async function sweepMfaPrompts(limit=25){
   let processed=0
   try{
     const threshold=new Date(Date.now()-3*60_000).toISOString()
-    const rows=all(`SELECT e.id,e.node_id,e.event_id,e.action,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,e.src_port,COALESCE(e.dst_ip,p.dst_ip) dst_ip,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.direction,p.direction) direction,e.event_time,e.received_at,
+    const rows=all(`SELECT e.id,e.node_id,e.event_id,e.action,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,e.src_port,COALESCE(e.dst_ip,p.dst_ip) dst_ip,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.direction,p.direction) direction,e.event_time,e.received_at,e.account_sid event_account_sid,e.logon_type,e.logon_status,e.logon_sub_status,
         s.id segment_id,s.port,s.source_ip,s.allowed_upns,s.portal_enabled,s.auto_prompt_enabled,s.mode,s.ttl_minutes,s.policy_id,
-        s.account_sid,s.source_process,s.fallback_to_logged_on_user,s.fail_open
+        s.account_sid segment_account_sid,s.source_process,s.fallback_to_logged_on_user,s.fail_open,
+        COALESCE(e.program,p.program) program
       FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id
       JOIN nodes n ON n.id=e.node_id
       JOIN identity_segments s ON (s.node_id=e.node_id OR s.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=e.node_id))
-      WHERE ${visibleFirewallEventSql()} AND e.event_id=5157 AND e.action='block' AND datetime(e.received_at)>=datetime(?) AND datetime(COALESCE(e.event_time,e.received_at))>=datetime(?) AND s.portal_enabled=1 AND s.auto_prompt_enabled=1 AND s.mode='agentless'
+      WHERE ${visibleFirewallEventSql()} AND datetime(e.received_at)>=datetime(?) AND datetime(COALESCE(e.event_time,e.received_at))>=datetime(?) AND s.portal_enabled=1 AND s.auto_prompt_enabled=1 AND s.mode='agentless'
         AND n.connection_mode='agentless' AND n.transport IN ('winrm','winrms') AND n.firewall_state<>'learning'
-        AND COALESCE(e.dst_port,p.dst_port)=s.port AND NOT EXISTS(SELECT 1 FROM mfa_prompt_events m WHERE m.log_event_id=e.id AND m.segment_id=s.id)
+        AND ((e.event_id=5157 AND e.action='block' AND COALESCE(e.dst_port,p.dst_port)=s.port)
+          OR (e.event_id=4625 AND lower(COALESCE(e.logon_status,e.logon_sub_status,'')) IN ('0xc000015b','c000015b') AND e.account_sid=s.account_sid
+            AND ((e.logon_type='10' AND s.port=3389) OR (e.logon_type='3' AND s.port=22))
+            AND EXISTS(SELECT 1 FROM segment_lsa_baselines b WHERE b.segment_id=s.id AND b.node_id=e.node_id AND b.account_sid=e.account_sid)))
+        AND NOT EXISTS(SELECT 1 FROM mfa_prompt_events m WHERE m.log_event_id=e.id AND m.segment_id=s.id)
       ORDER BY e.received_at DESC,e.id DESC LIMIT ?`,threshold,threshold,limit)
     for(const row of rows){
       const target=one('SELECT * FROM nodes WHERE id=?',row.node_id)
       if(!target)continue
-      await processBlockedMfaEvent(row,{id:row.segment_id,port:row.port,source_ip:row.source_ip,allowed_upns:row.allowed_upns,policy_id:row.policy_id,account_sid:row.account_sid,source_process:row.source_process,fallback_to_logged_on_user:row.fallback_to_logged_on_user,fail_open:row.fail_open},target)
+      await processBlockedMfaEvent({...row,account_sid:row.event_account_sid},{id:row.segment_id,port:row.port,source_ip:row.source_ip,allowed_upns:row.allowed_upns,policy_id:row.policy_id,account_sid:row.segment_account_sid,source_process:row.source_process,fallback_to_logged_on_user:row.fallback_to_logged_on_user,fail_open:row.fail_open},target)
       processed++
     }
     return {processed}

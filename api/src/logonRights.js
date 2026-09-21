@@ -11,6 +11,23 @@ export function denyRightForAllow(right){
   return right?.replace(/^Se(?!Deny)/,'SeDeny')||null
 }
 
+export function segmentRightsForPort(port){
+  if(Number(port)===3389)return {allowRight:'SeRemoteInteractiveLogonRight',denyRight:'SeDenyRemoteInteractiveLogonRight',logonType:'RemoteInteractive'}
+  if(Number(port)===22)return {allowRight:'SeNetworkLogonRight',denyRight:'SeDenyNetworkLogonRight',logonType:'Network'}
+  return null
+}
+
+export function hasDirectRight(lines,accountSid,right){
+  for(const line of lines||[]){
+    const match=logonRight.exec(String(line))
+    if(!match)continue
+    const parsedRight=`Se${match[1]||''}${match[2]}LogonRight`
+    if(parsedRight.toLowerCase()!==String(right).toLowerCase())continue
+    return match[3].split(',').some(value=>value.trim().replace(/^\*/,'').toLowerCase()===String(accountSid).toLowerCase())
+  }
+  return false
+}
+
 export function parseSeceditRights(lines){
   const rights=[],seen=new Set()
   for(const line of lines){

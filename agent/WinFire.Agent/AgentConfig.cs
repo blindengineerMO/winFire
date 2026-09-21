@@ -10,6 +10,8 @@ public sealed record AgentConfig(string ServerUrl, string AgentId, string NodeId
     private static readonly string ConfigPath = Path.Combine(DirectoryPath, "agent.json");
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
+    public static bool Exists => File.Exists(ConfigPath);
+
     public static AgentConfig Load() => JsonSerializer.Deserialize<AgentConfig>(File.ReadAllText(ConfigPath), JsonOptions)
         ?? throw new InvalidDataException("Agent configuration is empty");
 

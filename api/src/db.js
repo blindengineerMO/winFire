@@ -4,6 +4,7 @@ import {fileURLToPath} from 'node:url'
 import Database from 'better-sqlite3'
 import knexFactory from 'knex'
 import {isExcludedProcess,refreshProcessExclusions} from './processExclusions.js'
+import {isIgnoredFirewallEvent,refreshTrafficIgnores} from './trafficIgnores.js'
 
 const dataDir = path.resolve(process.env.DATA_DIR || 'data')
 fs.mkdirSync(dataDir, {recursive:true, mode:0o700})
@@ -21,6 +22,8 @@ db.pragma('journal_mode = WAL')
 db.pragma('foreign_keys = ON')
 refreshProcessExclusions(db)
 db.function('winfire_excluded_process',value=>Number(isExcludedProcess(value)))
+refreshTrafficIgnores(db)
+db.function('winfire_ignored_traffic',(eventId,action,protocol,srcIp,dstIp,dstPort,direction,program,accountSid)=>Number(isIgnoredFirewallEvent({eventId,action,protocol,srcIp,dstIp,dstPort,direction,program,accountSid})))
 
 export const one = (sql, ...args) => db.prepare(sql).get(...args)
 export const all = (sql, ...args) => db.prepare(sql).all(...args)

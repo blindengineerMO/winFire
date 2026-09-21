@@ -10,6 +10,7 @@
   "scripts": {
     "build": "npm run build -w web",
     "build:agent": "dotnet publish agent/WinFire.Agent/WinFire.Agent.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o agent/dist/win-x64",
+    "build:agent-msi": "npm run build:agent && dotnet build agent/WinFire.Agent.Setup/WinFire.Agent.Setup.wixproj -c Release",
     "start": "npm run build && node api/src/server.js",
     "dev:api": "node --watch api/src/server.js",
     "dev:web": "npm run dev -w web",

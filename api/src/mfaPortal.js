@@ -38,7 +38,9 @@ export async function revokePortalGrant(grant,actorId=null,action='mfa.portal.re
   run('INSERT INTO policy_apply_runs(id,node_id,status) VALUES(?,?,?)',runId,node.id,'running')
   audit(actorId,'mfa.grant.revoke.start','jit-grant',grant.id,null,{nodeId:node.id,runId})
   try{
-    const result=await remote(node,'jit_end',{grantId:grant.id})
+    const baseline=grant.segment_id?one('SELECT * FROM segment_lsa_baselines WHERE segment_id=? AND node_id=?',grant.segment_id,node.id):null
+    const lsaScope=baseline?{accountSid:baseline.account_sid,allowRight:baseline.allow_right,denyRight:baseline.deny_right}:{}
+    const result=await remote(node,'jit_end',{grantId:grant.id,...lsaScope})
     if(result?.revoked!==true)throw new Error('The node did not confirm JIT firewall rule removal')
     db.transaction(()=>{
       run('UPDATE jit_grants SET revoked_at=? WHERE id=?',now(),grant.id)

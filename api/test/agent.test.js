@@ -56,9 +56,11 @@ function request(method,url,body,token,client) {
 test.after(async()=>{await new Promise(resolve=>server.close(resolve));db.close();fs.rmSync(dir,{recursive:true,force:true})})
 
 test('HTTPS bootstrap pins the package hash and signer before installation',async()=>{
-  const packagePath=file('bootstrap-package.exe'),previousPackage=process.env.AGENT_PACKAGE_PATH,previousBase=process.env.PUBLIC_BASE_URL,previousSigner=process.env.AGENT_SIGNER_THUMBPRINT
+  const packagePath=file('bootstrap-package.exe'),msiPath=file('WinFire.Agent.msi'),previousPackage=process.env.AGENT_PACKAGE_PATH,previousMsi=process.env.AGENT_MSI_PATH,previousBase=process.env.PUBLIC_BASE_URL,previousSigner=process.env.AGENT_SIGNER_THUMBPRINT
   fs.writeFileSync(packagePath,'bootstrap-fixture')
+  fs.writeFileSync(msiPath,'msi-fixture')
   process.env.AGENT_PACKAGE_PATH=packagePath
+  process.env.AGENT_MSI_PATH=msiPath
   process.env.PUBLIC_BASE_URL=`https://127.0.0.1:${port}`
   process.env.AGENT_SIGNER_THUMBPRINT='AB:'.repeat(19)+'AB'
   try{
@@ -72,10 +74,12 @@ test('HTTPS bootstrap pins the package hash and signer before installation',asyn
     assert.ok(response.body.includes(`$expectedSigner='${'AB'.repeat(20)}'`))
     assert.ok(response.body.includes("Read-Host 'Short-lived WinFire enrollment token'"))
     assert.equal((await request('GET','/agent-package/WinFire.Agent.exe')).status,200)
+    assert.equal((await request('GET','/agent-package/WinFire.Agent.msi')).status,200)
     process.env.AGENT_SIGNER_THUMBPRINT='invalid'
     assert.equal((await request('GET','/agent-package/enroll.ps1')).status,503)
   }finally{
     if(previousPackage===undefined)delete process.env.AGENT_PACKAGE_PATH;else process.env.AGENT_PACKAGE_PATH=previousPackage
+    if(previousMsi===undefined)delete process.env.AGENT_MSI_PATH;else process.env.AGENT_MSI_PATH=previousMsi
     if(previousBase===undefined)delete process.env.PUBLIC_BASE_URL;else process.env.PUBLIC_BASE_URL=previousBase
     if(previousSigner===undefined)delete process.env.AGENT_SIGNER_THUMBPRINT;else process.env.AGENT_SIGNER_THUMBPRINT=previousSigner
   }

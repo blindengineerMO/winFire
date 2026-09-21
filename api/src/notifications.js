@@ -1,7 +1,7 @@
 import {db,all,one,run,id,now,parse,json} from './db.js'
 import {deliverAlert} from './mailer.js'
 
-export const categories=['policy_drift','verifier_failure','mfa_challenge_failure','agent_offline','node_unreachable','security_policy']
+export const categories=['policy_drift','verifier_failure','mfa_access_request','mfa_challenge_failure','agent_offline','node_unreachable','security_policy']
 export const channels=['in_app','email','webhook']
 export const preferenceKeys=categories.flatMap(category=>channels.map(channel=>`${category}.${channel}`))
 
@@ -10,10 +10,11 @@ function enabled(preferences,category,channel){
   return value===undefined?channel==='in_app':value===true
 }
 
-export function emitNotification({eventKey,category,title,body,entityType=null,entityId=null}){
+export function emitNotification({eventKey,category,title,body,entityType=null,entityId=null,recipientEmails=null}){
   if(!categories.includes(category))throw new Error('Unknown notification category')
   if(!eventKey||!title||!body)throw new Error('Notification event key, title and body are required')
-  const recipients=all('SELECT u.id,u.email,u.email_verified,p.notification_prefs FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id WHERE u.suspended=0')
+  const allowed=recipientEmails?new Set(recipientEmails.map(value=>String(value).toLowerCase())):null
+  const recipients=all('SELECT u.id,u.email,u.email_verified,p.notification_prefs FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id WHERE u.suspended=0').filter(user=>!allowed||allowed.has(user.email.toLowerCase()))
   db.transaction(()=>{
     for(const user of recipients){
       const preferences=parse(user.notification_prefs)||{}

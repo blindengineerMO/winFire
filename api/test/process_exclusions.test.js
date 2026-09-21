@@ -13,10 +13,17 @@ const {app}=await import('../src/app.js')
 const {bootstrap}=await import('../src/security.js')
 const {db}=await import('../src/db.js')
 const {compactDueEvents}=await import('../src/maintenance.js')
-const {isExcludedFirewallEvent}=await import('../src/processExclusions.js')
+const {isExcludedFirewallEvent,matchesProcess}=await import('../src/processExclusions.js')
 await bootstrap()
 const request=supertest(app)
 test.after(()=>{db.close();fs.rmSync(dir,{recursive:true,force:true})})
+
+test('source-process matching accepts device-path evidence and exact executable names',()=>{
+  assert.equal(matchesProcess('\\Device\\HarddiskVolume3\\Program Files\\Client\\client.exe','C:\\Program Files\\Client\\client.exe'),true)
+  assert.equal(matchesProcess('C:\\Program Files\\Client\\client.exe','client.exe'),true)
+  assert.equal(matchesProcess('C:\\Program Files\\Client\\client-helper.exe','client.exe'),false)
+  assert.equal(matchesProcess('C:\\Program Files\\Client\\client.exe','C:\\Other\\client.exe'),false)
+})
 
 test('global process names exclude new WFP events and hide prior compacted events',async()=>{
   const login=await request.post('/api/v1/auth/login').send({email:'owner@process-exclusions.test',password:'process-exclusions-test-password'}).expect(200)

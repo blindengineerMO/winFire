@@ -1,6 +1,7 @@
 <script setup>
 import {onMounted,ref} from 'vue'
 import {api} from '../lib/api.js'
+import TrafficIgnores from './TrafficIgnores.vue'
 
 const names=ref('')
 const busy=ref(false)
@@ -38,6 +39,7 @@ async function save(){
     <p v-if="error" class="error-msg">{{error}}</p>
     <p v-if="message" class="success-msg">{{message}}</p>
   </div>
+  <TrafficIgnores />
 </template>
 
 <style scoped>

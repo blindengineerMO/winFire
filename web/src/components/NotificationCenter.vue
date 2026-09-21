@@ -5,7 +5,7 @@ import {api,session} from '../lib/api.js'
 
 const router=useRouter(),open=ref(false),items=ref([]),unread=ref(0),error=ref('')
 let timer
-const destinations={policy_drift:'/reports',verifier_failure:'/reports',mfa_challenge_failure:'/identity',agent_offline:'/inventory',node_unreachable:'/inventory'}
+const destinations={policy_drift:'/reports',verifier_failure:'/reports',mfa_access_request:'/identity',mfa_challenge_failure:'/identity',agent_offline:'/inventory',node_unreachable:'/inventory'}
 async function load(){if(!session.token)return;try{const result=await api('/notifications');items.value=result.items;unread.value=result.unread;error.value=''}catch(cause){error.value=cause.message}}
 async function show(){open.value=!open.value;if(open.value)await load()}
 async function read(item){try{if(!item.read_at){await api(`/notifications/${item.id}/read`,{method:'PATCH',body:{}});item.read_at=new Date().toISOString();unread.value=Math.max(0,unread.value-1)}open.value=false;router.push(destinations[item.category]||'/')}catch(cause){error.value=cause.message}}

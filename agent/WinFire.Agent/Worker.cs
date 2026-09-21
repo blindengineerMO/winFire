@@ -1,6 +1,7 @@
 using System.Net.Http.Json;
 using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
+using Microsoft.Win32;
 
 namespace WinFire.Agent;
 
@@ -17,6 +18,11 @@ public sealed class Worker(ILogger<Worker> logger) : BackgroundService
         {
             try
             {
+                if (!AgentConfig.Exists)
+                {
+                    await EnrollFromInstallerAsync();
+                    logger.LogInformation("Agent enrolled from the MSI bootstrap values");
+                }
                 var config = AgentConfig.Load();
                 using var cert = AgentConfig.LoadCertificate(config.CertificateThumbprint);
                 using var handler = new HttpClientHandler { ClientCertificateOptions = ClientCertificateOption.Manual };
@@ -45,6 +51,19 @@ public sealed class Worker(ILogger<Worker> logger) : BackgroundService
             catch (Exception error) { logger.LogError(error, "Agent cycle failed"); }
             await Task.Delay(TimeSpan.FromSeconds(pollSeconds), stoppingToken);
         }
+    }
+
+    private static async Task EnrollFromInstallerAsync()
+    {
+        using var key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\WinFire", writable: true)
+            ?? throw new InvalidOperationException("Agent is not enrolled and MSI bootstrap values are missing");
+        var serverUrl = key.GetValue("BootstrapServer") as string;
+        var token = key.GetValue("BootstrapToken") as string;
+        if (string.IsNullOrWhiteSpace(serverUrl) || string.IsNullOrWhiteSpace(token))
+            throw new InvalidOperationException("Agent is not enrolled and MSI bootstrap values are incomplete");
+        await Enrollment.EnrollAsync(serverUrl, token);
+        key.DeleteValue("BootstrapToken", throwOnMissingValue: false);
+        key.DeleteValue("BootstrapServer", throwOnMissingValue: false);
     }
 
     private async Task RunJobAsync(HttpClient client, AgentConfig config, AgentJob job, CancellationToken cancellationToken)

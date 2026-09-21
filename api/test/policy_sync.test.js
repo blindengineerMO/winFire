@@ -169,7 +169,7 @@ test('identity segment scope fields can be revised and are audited',async()=>{
   db.prepare("UPDATE nodes SET transport='winrm',firewall_state='enforcing' WHERE id=?").run(node.id)
   const created=(await auth(request.post('/api/v1/segments')).send({name:'Scoped SSH',nodeId:node.id,port:22,extraPorts:[22,3389,3389],accountSid:'S-1-5-21-1-2-3-1001',allowedUpns:['owner@sync.test']}).expect(201)).body
   assert.deepEqual(JSON.parse(created.extra_ports),[3389])
-  assert.match((await auth(request.post(`/api/v1/segments/${created.id}/access`)).send({code:'123456'}).expect(409)).body.error,/Account SID gating/)
+  assert.match((await auth(request.post(`/api/v1/segments/${created.id}/access`)).send({code:'123456'}).expect(409)).body.error,/LSA deny baseline/)
   const revised=(await auth(request.patch(`/api/v1/segments/${created.id}`)).send({accountSid:'S-1-5-21-1-2-3-1002',extraPorts:[22,5985,5985],sourceProcess:'C:\\Tools\\client.exe',fallbackToLoggedOnUser:true,failOpen:true,ttlMinutes:30}).expect(200)).body
   assert.equal(revised.account_sid,'S-1-5-21-1-2-3-1002')
   assert.deepEqual(JSON.parse(revised.extra_ports),[5985])
@@ -179,6 +179,44 @@ test('identity segment scope fields can be revised and are audited',async()=>{
   assert.equal(revised.ttl_minutes,30)
   assert.equal(db.prepare("SELECT COUNT(*) n FROM audit_log WHERE action='segment.update' AND entity_id=?").get(created.id).n,1)
   await auth(request.patch(`/api/v1/segments/${created.id}`)).send({accountSid:'invalid'}).expect(400)
+})
+
+test('segment LSA baseline is confirmed, persisted, and restores its prior assignments',async()=>{
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@sync.test',password:'sync-test-password-123'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
+  const node=(await auth(request.post('/api/v1/nodes')).send({hostname:'lsa-gate-target',connectionMode:'agentless'}).expect(201)).body
+  db.prepare("UPDATE nodes SET transport='winrm',firewall_state='enforcing' WHERE id=?").run(node.id)
+  const sid='S-1-5-21-1-2-3-1777',segment=(await auth(request.post('/api/v1/segments')).send({name:'LSA gated RDP',nodeId:node.id,port:3389,accountSid:sid,allowedUpns:['owner@sync.test']}).expect(201)).body
+  const ownerId=db.prepare('SELECT id FROM users WHERE email=?').get('owner@sync.test').id,credentialId=crypto.randomUUID()
+  db.prepare("INSERT INTO credentials(id,name,type,username,encrypted_blob,owner_user_id,visibility,priority) VALUES(?,?,'domain',?,?,?,'private',100)").run(credentialId,'LSA test','TEST\\operator',seal({password:'test-only'}),ownerId)
+  db.prepare('INSERT INTO credential_assignments(credential_id,node_id) VALUES(?,?)').run(credentialId,node.id)
+  const state=path.join(dir,'lsa-gate-state.json'),mock=path.join(dir,'mock-lsa-gate-winrm')
+  fs.writeFileSync(state,JSON.stringify({allow:true,deny:false}))
+  fs.writeFileSync(mock,`#!/usr/bin/env python3
+import json,sys
+p=${JSON.stringify(state)}
+r=json.load(sys.stdin);s=json.load(open(p));op=r['operation'];a=r.get('args') or {}
+if op=='rights':
+ rows=[]
+ if s['allow']: rows.append('SeRemoteInteractiveLogonRight = *${sid}')
+ if s['deny']: rows.append('SeDenyRemoteInteractiveLogonRight = *${sid}')
+ print(json.dumps(rows))
+elif op=='rights_change':
+ key='deny' if a['right'].startswith('SeDeny') else 'allow';before=s[key];s[key]=bool(a['present']);json.dump(s,open(p,'w'));print(json.dumps({'accountSid':a['accountSid'],'right':a['right'],'before':before,'present':s[key],'changed':before!=s[key]}))
+else: sys.exit(2)
+`,{mode:0o755})
+  const previous=process.env.WINRM_PYTHON;process.env.WINRM_PYTHON=mock
+  try{
+    const confirmation={reason:'Protect this RDP account with an OS logon gate',confirmation:'ENFORCE LSA GATE'}
+    const enabled=(await auth(request.post(`/api/v1/segments/${segment.id}/lsa-baselines`)).send({enabled:true,...confirmation}).expect(201)).body
+    assert.equal(enabled.baselines.length,1)
+    assert.deepEqual(JSON.parse(fs.readFileSync(state)),{allow:false,deny:true})
+    assert.match((await auth(request.patch(`/api/v1/segments/${segment.id}`)).send({accountSid:'S-1-5-21-1-2-3-1888'}).expect(409)).body.error,/Restore/)
+    const restored=(await auth(request.post(`/api/v1/segments/${segment.id}/lsa-baselines`)).send({enabled:false,...confirmation}).expect(201)).body
+    assert.equal(restored.baselines.length,0)
+    assert.deepEqual(JSON.parse(fs.readFileSync(state)),{allow:true,deny:false})
+    assert.equal(db.prepare("SELECT COUNT(*) count FROM audit_log WHERE entity_id=? AND action IN ('segment.lsa.enforce','segment.lsa.restore')").get(segment.id).count,2)
+  }finally{if(previous===undefined)delete process.env.WINRM_PYTHON;else process.env.WINRM_PYTHON=previous}
 })
 
 test('agentless logon learning preview separates service and interactive observations',async()=>{
@@ -251,7 +289,16 @@ test('blocked inbound WFP traffic prompts only from an identifiable managed work
   assert.equal((await sweepMfaPrompts()).processed,1)
   const scopedPrompt=db.prepare('SELECT status,error FROM mfa_prompt_events WHERE log_event_id=?').get(scopedEventId)
   assert.equal(scopedPrompt.status,'skipped')
-  assert.match(scopedPrompt.error,/identity scope/)
+  assert.match(scopedPrompt.error,/LSA deny baseline/)
+  const sourceId=crypto.randomUUID(),lsaEventId=crypto.randomUUID(),sid='S-1-5-21-1-2-3-1001'
+  db.prepare("INSERT INTO nodes(id,hostname,ip,transport,connection_mode,status) VALUES(?,?,?,'winrm','agentless','reachable')").run(sourceId,'lsa-denied-client','192.0.2.12')
+  db.prepare('INSERT INTO segment_lsa_baselines(segment_id,node_id,account_sid,allow_right,deny_right,allow_was_present,deny_was_present,enforced_at) VALUES(?,?,?,?,?,?,?,?)').run(segment.id,target.id,sid,'SeRemoteInteractiveLogonRight','SeDenyRemoteInteractiveLogonRight',0,0,new Date().toISOString())
+  db.prepare("INSERT INTO log_events(id,node_id,record_id,event_id,action,src_ip,src_port,account_sid,event_type,logon_type,logon_status,event_time) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").run(lsaEventId,target.id,1001,4625,'failure','192.0.2.12',52002,sid,'logon','10','0xC000015B',new Date().toISOString())
+  const previousBase=process.env.PUBLIC_BASE_URL;process.env.PUBLIC_BASE_URL='https://winfire.example.test'
+  try{assert.equal((await sweepMfaPrompts()).processed,1)}finally{if(previousBase===undefined)delete process.env.PUBLIC_BASE_URL;else process.env.PUBLIC_BASE_URL=previousBase}
+  const lsaPrompt=db.prepare('SELECT status,error FROM mfa_prompt_events WHERE log_event_id=?').get(lsaEventId)
+  assert.equal(lsaPrompt.status,'failed')
+  assert.equal(db.prepare("SELECT COUNT(*) count FROM notifications WHERE category='mfa_access_request' AND entity_id IN (SELECT id FROM mfa_prompt_events WHERE log_event_id=?)").get(lsaEventId).count,1)
   db.prepare('UPDATE identity_segments SET account_sid=NULL WHERE id=?').run(segment.id)
   const promptId=crypto.randomUUID()
   db.prepare('INSERT INTO mfa_prompt_events(id,segment_id,target_node_id,log_event_id,source_ip,status,expires_at) VALUES(?,?,?,?,?,?,?)').run(promptId,segment.id,target.id,crypto.randomUUID(),'127.0.0.1','opened',new Date(Date.now()+120_000).toISOString())

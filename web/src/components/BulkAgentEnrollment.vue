@@ -6,7 +6,9 @@ const props=defineProps({nodes:{type:Array,required:true},agents:{type:Array,req
 const selected=ref([]),issued=ref(null),busy=ref(false),error=ref('')
 const enrolledIds=computed(()=>new Set(props.agents.map(agent=>agent.node_id)))
 const eligible=computed(()=>props.nodes.filter(node=>!enrolledIds.value.has(node.id)))
-const bootstrapCommand=computed(()=>location.protocol==='https:'?`irm ${location.origin}/api/v1/agent-package/enroll.ps1 | iex`:null)
+const origin=location.origin
+const bootstrapCommand=computed(()=>location.protocol==='https:'?`irm ${origin}/api/v1/agent-package/enroll.ps1 | iex`:null)
+const msiUrl=computed(()=>location.protocol==='https:'?`${origin}/api/v1/agent-package/WinFire.Agent.msi`:null)
 function toggle(nodeId){selected.value=selected.value.includes(nodeId)?selected.value.filter(id=>id!==nodeId):[...selected.value,nodeId]}
 function selectFirstPage(){selected.value=eligible.value.slice(0,50).map(node=>node.id)}
 async function generate(){
@@ -32,6 +34,7 @@ function downloadTokens(){
     <p>Select up to 50 nodes. Tokens are shown once and expire after 15 minutes. Install the signed agent executable on each matching node and enter its token when prompted.</p>
     <p v-if="bootstrapCommand">On each selected Windows node, run this in elevated PowerShell. The bootstrap checks the package hash and Authenticode signature before installation.</p>
     <code v-if="bootstrapCommand" class="bootstrap-command">{{bootstrapCommand}}</code>
+    <p v-if="msiUrl"><a :href="msiUrl" download="WinFire.Agent.msi">Download signed MSI</a>. After generating tokens, use the per-node silent install command shown below.</p>
     <div v-if="eligible.length" class="bulk-controls">
       <button type="button" class="button small secondary" @click="selectFirstPage">Select first {{Math.min(eligible.length,50)}}</button>
       <button type="button" class="button small primary" :disabled="busy||!selected.length||selected.length>50" @click="generate">{{busy?'Generating…':`Generate ${selected.length} tokens`}}</button>
@@ -44,7 +47,7 @@ function downloadTokens(){
     <div v-if="issued" class="bulk-results" aria-live="polite">
       <p><strong>{{issued.tokens.length}} tokens generated.</strong> Expires {{new Date(issued.expiresAt).toLocaleString()}}. Save these now; WinFire stores only their hashes.</p>
       <button type="button" class="button small secondary" @click="downloadTokens">Download token JSON</button>
-      <div v-for="item in issued.tokens" :key="item.nodeId" class="bulk-token"><strong>{{item.hostname}}</strong><code>{{item.token}}</code></div>
+      <div v-for="item in issued.tokens" :key="item.nodeId" class="bulk-token"><strong>{{item.hostname}}</strong><code>{{item.token}}</code><code v-if="msiUrl">msiexec /i WinFire.Agent.msi SERVERURL=&quot;{{origin}}&quot; ENROLLMENTTOKEN=&quot;{{item.token}}&quot; /qn</code></div>
     </div>
   </details>
 </template>
@@ -59,7 +62,7 @@ summary{cursor:pointer;font-weight:700}
 .bulk-node-list small{color:var(--muted)}
 .bulk-results{margin-top:1rem}
 .bootstrap-command{display:block;overflow-wrap:anywhere;margin:.5rem 0 1rem;padding:.7rem;border:1px solid var(--border);font-size:.8rem}
-.bulk-token{display:grid;grid-template-columns:minmax(8rem,1fr) minmax(0,2fr);gap:.5rem;padding:.45rem 0;border-bottom:1px solid var(--border)}
+.bulk-token{display:grid;grid-template-columns:minmax(8rem,1fr) minmax(0,2fr);gap:.5rem;padding:.45rem 0;border-bottom:1px solid var(--border)}.bulk-token code:last-child{grid-column:1/-1}
 .bulk-token code{overflow-wrap:anywhere;font-size:.75rem}
 @media(max-width:620px){.bulk-token{grid-template-columns:1fr}}
 </style>
