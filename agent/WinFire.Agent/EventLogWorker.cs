@@ -74,6 +74,7 @@ public sealed class EventLogWorker(ILogger<EventLogWorker> logger) : BackgroundS
         var query = new EventLogQuery("Security", PathType.LogName, $"*[System[{EventIds} and EventRecordID > {cursor}]]");
         using var reader = new EventLogReader(query);
         var events = new List<SecurityEvent>(500);
+        var driveMappings = WindowsProgramPath.GetMappings();
         while (events.Count < 500)
         {
             using var record = reader.ReadEvent();
@@ -87,6 +88,10 @@ public sealed class EventLogWorker(ILogger<EventLogWorker> logger) : BackgroundS
                 var name = (string?)data.Attribute("Name");
                 if (!string.IsNullOrEmpty(name)) fields[name] = data.Value;
             }
+            if (fields.TryGetValue("Application", out var application))
+                fields["Application"] = WindowsProgramPath.Normalize(application, driveMappings);
+            if (fields.TryGetValue("ProcessName", out var processName))
+                fields["ProcessName"] = WindowsProgramPath.Normalize(processName, driveMappings);
             events.Add(new SecurityEvent(recordId, record.Id,
                 (record.TimeCreated ?? DateTime.UtcNow).ToUniversalTime().ToString("o"), fields));
         }

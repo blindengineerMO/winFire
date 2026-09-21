@@ -12,7 +12,8 @@ import {z} from 'zod'
 import {compilePolicy, graphSchema, findRuleConflicts,validateAddressExpression,validatePortExpression,validateProgramPath} from '@winfire/shared'
 import {db, all, one, run, id, now, audit, json, parse} from './db.js'
 import {auth, requireRole, publicUser, issueAccess, issueRefresh, rotateRefresh, hashToken, seal, openSealed} from './security.js'
-import {probeNode, collectFacts, enrichNode, lookupDns, remote, applyRules, diffRules, tcpProbe,testNodeCredential} from './connector.js'
+import {probeNode, collectFacts, enrichNode, lookupDns, remote, diffRules, tcpProbe,testNodeCredential} from './connector.js'
+import {firewallConnectorFor,applyManagedRules} from './firewallConnectors.js'
 import {classifyVerification,findMatchingDenyEvent,hasManagedRule} from './verifier.js'
 import {makeTotpSecret,verifyTotp,matchingTotpCounter} from './totp.js'
 import {agentRoutes} from './agentRoutes.js'
@@ -169,7 +170,7 @@ async function applyPolicy(policy,actorId=null,targetNodes=null,context={}) {
   assertManagementAccess(rules)
   const targets=targetNodes||assignedNodes(policy.id)
   for(const node of targets)for(const rule of rules)if(rule.localUserSid){
-    if(node.connection_mode!=='agentless'||!['winrm','winrms'].includes(node.transport))throw Object.assign(new Error('Local account firewall rules require an agentless WinRM source node'),{status:409})
+    if(!firewallConnectorFor(node).supportsLocalUserSid)throw Object.assign(new Error('Local account firewall rules require a modern agentless WinRM source node'),{status:409})
     if(!one('SELECT id FROM local_accounts WHERE node_id=? AND sid=? AND missing=0',node.id,rule.localUserSid))throw Object.assign(new Error(`Local account ${rule.localUserSid} is not present on ${node.hostname}`),{status:409})
   }
   const conflicts=assignmentConflicts(policy.id,rules,targets)
@@ -178,17 +179,14 @@ async function applyPolicy(policy,actorId=null,targetNodes=null,context={}) {
     const runId=id()
     run('INSERT INTO policy_apply_runs(id,policy_id,version_id,node_id,status) VALUES(?,?,?,?,?)',runId,policy.id,version.id,node.id,'running')
     try {
-      if(node.connection_mode==='agent') {
-        const agent=one('SELECT * FROM agents WHERE id=? AND revoked_at IS NULL',node.agent_id)
-        if(!agent)throw new Error('No active enrolled agent for node')
-        const jobId=id()
-        run('INSERT INTO agent_jobs(id,agent_id,type,payload_json) VALUES(?,?,?,?)',jobId,agent.id,'policy.apply',json({applyRunId:runId,policyId:policy.id,versionId:version.id,group:`WinFireSecure:${policy.id}`,rules,...context}))
+      const applied=await firewallConnectorFor(node).applyPolicy({policyId:policy.id,versionId:version.id,rules,runId,context})
+      if(applied.status==='queued'){
         run("UPDATE policy_apply_runs SET status='queued' WHERE id=?",runId)
-        audit(actorId,'policy.apply.queued','node',node.id,null,{policyId:policy.id,versionId:version.id,jobId})
-        results.push({nodeId:node.id,status:'queued',jobId})
+        audit(actorId,'policy.apply.queued','node',node.id,null,{policyId:policy.id,versionId:version.id,jobId:applied.jobId})
+        results.push({nodeId:node.id,status:'queued',jobId:applied.jobId})
         continue
       }
-      const diff=await applyRules(node,policy.id,rules)
+      const diff=applied.diff
       run('UPDATE policy_apply_runs SET status=?,diff_json=?,finished_at=? WHERE id=?','success',json(diff),now(),runId)
       audit(actorId,'policy.apply','node',node.id,null,{policyId:policy.id,versionId:version.id,diff})
       results.push({nodeId:node.id,status:'success',diff})
@@ -1286,24 +1284,24 @@ api.delete('/node-groups/:id/members/:nodeId',requireRole('editor'),wrap(async(r
   if(policies.some(policy=>!canWriteResource(req.user,'policy',policy)))return res.status(403).json({error:'Write access to each assigned policy is required to remove this member'})
   if(policies.some(policy=>one('SELECT id FROM policy_assignments WHERE policy_id=? AND removal_job_id IS NOT NULL',policy.id)))return res.status(409).json({error:'Wait for pending agent firewall cleanup before changing this group'})
   const cleanup=policies.filter(policy=>!one(`SELECT a.id FROM policy_assignments a WHERE a.policy_id=? AND (a.node_id=? OR a.node_group_id IN (SELECT m.group_id FROM node_group_members m WHERE m.node_id=? AND m.group_id<>?))`,policy.id,node.id,node.id,group.id))
-  if(cleanup.length&&node.connection_mode==='agent')return res.status(409).json({error:'Removing an agent node from a policy group needs coordinated agent cleanup and is not available yet'})
+  if(cleanup.length&&firewallConnectorFor(node).queuedReadback)return res.status(409).json({error:'Removing an agent node from a policy group needs coordinated agent cleanup and is not available yet'})
   const snapshots=[]
   try {
     for(const policy of cleanup){
-      const observed=await remote(node,'rules',{group:`WinFireSecure:${policy.id}`})
-      snapshots.push({policy,rules:Array.isArray(observed)?observed:observed?[observed]:[]})
+      const rules=await firewallConnectorFor(node).readRules(`WinFireSecure:${policy.id}`)
+      snapshots.push({policy,rules})
     }
   } catch(error){return res.status(502).json({error:`Could not read managed rules before membership removal: ${error.message}`})}
   const completed=[]
   for(const snapshot of snapshots){
     const runId=id()
     run('INSERT INTO policy_apply_runs(id,policy_id,version_id,node_id,status) VALUES(?,?,?,?,?)',runId,snapshot.policy.id,snapshot.policy.current_version_id,node.id,'running')
-    try {completed.push({...snapshot,runId,diff:await applyRules(node,snapshot.policy.id,[])})}
+    try {completed.push({...snapshot,runId,diff:await applyManagedRules(node,snapshot.policy.id,[])})}
     catch(error){
       run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?','failed',error.message,now(),runId)
       const rollbackErrors=[]
       for(const prior of completed.reverse()){
-        try {await applyRules(node,prior.policy.id,prior.rules)}
+        try {await applyManagedRules(node,prior.policy.id,prior.rules)}
         catch(rollbackError){rollbackErrors.push({policyId:prior.policy.id,error:rollbackError.message})}
         run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?','failed',rollbackErrors.find(item=>item.policyId===prior.policy.id)?.error||'Membership removal aborted; original rules restored',now(),prior.runId)
       }
@@ -1376,31 +1374,16 @@ api.delete('/policies/:id/assignments/:assignmentId',requireRole('editor'),wrap(
   if(assignment.removal_job_id)return res.status(202).json({queued:true,jobId:assignment.removal_job_id})
   const targets=assignment.node_id?[getNode(assignment.node_id)].filter(Boolean):all('SELECT n.* FROM nodes n JOIN node_group_members m ON m.node_id=n.id WHERE m.group_id=?',assignment.node_group_id)
   const cleanup=targets.filter(node=>!one(`SELECT id FROM policy_assignments WHERE policy_id=? AND id<>? AND (node_id=? OR node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?))`,policy.id,assignment.id,node.id,node.id))
-  if(cleanup.some(node=>node.connection_mode==='agent')){
+  if(cleanup.some(node=>firewallConnectorFor(node).queuedReadback)){
     if(!assignment.node_id||cleanup.length!==1)return res.status(409).json({error:'Group removal with agent nodes needs coordinated cleanup and is not available yet'})
-    const node=cleanup[0],agent=one('SELECT * FROM agents WHERE id=? AND revoked_at IS NULL',node.agent_id)
-    if(!agent)return res.status(409).json({error:'No active enrolled agent can remove these firewall rules'})
-    const pendingApply=all("SELECT * FROM agent_jobs WHERE agent_id=? AND type='policy.apply' AND status IN ('queued','leased') AND json_extract(payload_json,'$.policyId')=?",agent.id,policy.id)
-    if(pendingApply.some(job=>job.status==='leased'))return res.status(409).json({error:'Wait for the current agent policy apply job before removing this assignment'})
-    const runId=id(),jobId=id()
-    db.transaction(()=>{
-      for(const job of pendingApply){
-        run("UPDATE agent_jobs SET status='failed',error='Superseded by policy unassignment',finished_at=? WHERE id=?",now(),job.id)
-        const oldRunId=parse(job.payload_json)?.applyRunId
-        if(oldRunId)run("UPDATE policy_apply_runs SET status='failed',error='Superseded by policy unassignment',finished_at=? WHERE id=?",now(),oldRunId)
-      }
-      run('INSERT INTO policy_apply_runs(id,policy_id,version_id,node_id,status) VALUES(?,?,?,?,?)',runId,policy.id,policy.current_version_id,node.id,'queued')
-      run('INSERT INTO agent_jobs(id,agent_id,type,payload_json) VALUES(?,?,?,?)',jobId,agent.id,'policy.apply',json({applyRunId:runId,policyId:policy.id,versionId:policy.current_version_id,group:`WinFireSecure:${policy.id}`,rules:[],removalAssignmentId:assignment.id}))
-      run('UPDATE policy_assignments SET removal_job_id=? WHERE id=?',jobId,assignment.id)
-      audit(req.user.id,'policy.unassign.queued','policy',policy.id,assignment,{assignmentId:assignment.id,nodeId:node.id,jobId})
-    })()
-    return res.status(202).json({queued:true,jobId,nodeId:node.id})
+    const queued=firewallConnectorFor(cleanup[0]).queuePolicyRemoval({policy,assignment,actorId:req.user.id})
+    return res.status(202).json({queued:true,...queued})
   }
   const snapshots=[]
   try {
     for(const node of cleanup){
-      const observed=await remote(node,'rules',{group:`WinFireSecure:${policy.id}`})
-      snapshots.push({node,rules:Array.isArray(observed)?observed:observed?[observed]:[]})
+      const rules=await firewallConnectorFor(node).readRules(`WinFireSecure:${policy.id}`)
+      snapshots.push({node,rules})
     }
   } catch(error){return res.status(502).json({error:`Could not read managed rules before removal: ${error.message}`})}
   const completed=[]
@@ -1408,13 +1391,13 @@ api.delete('/policies/:id/assignments/:assignmentId',requireRole('editor'),wrap(
     const runId=id()
     run('INSERT INTO policy_apply_runs(id,policy_id,version_id,node_id,status) VALUES(?,?,?,?,?)',runId,policy.id,policy.current_version_id,snapshot.node.id,'running')
     try {
-      const diff=await applyRules(snapshot.node,policy.id,[])
+      const diff=await applyManagedRules(snapshot.node,policy.id,[])
       completed.push({...snapshot,runId,diff})
     } catch(error){
       run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?','failed',error.message,now(),runId)
       const rollbackErrors=[]
       for(const prior of completed.reverse()){
-        try {await applyRules(prior.node,policy.id,prior.rules)}
+        try {await applyManagedRules(prior.node,policy.id,prior.rules)}
         catch(rollbackError){rollbackErrors.push({nodeId:prior.node.id,error:rollbackError.message})}
         run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?','failed',rollbackErrors.find(item=>item.nodeId===prior.node.id)?.error||'Removal aborted; original rules restored',now(),prior.runId)
       }
@@ -1464,19 +1447,17 @@ export async function runDriftCheck(data={},actorId=null,canCheckPolicy=()=>true
     if(!version)continue
     const desired=parse(version.rules_compiled_json)||[]
     for(const node of assignedNodes(policy.id).filter(item=>!data.nodeId||item.id===data.nodeId)){
-      if(node.connection_mode==='agent'){
+      const connector=firewallConnectorFor(node)
+      if(connector.queuedReadback){
         const pending=one(`SELECT d.* FROM policy_drift_checks d JOIN agent_jobs j ON json_extract(j.payload_json,'$.driftCheckId')=d.id WHERE d.node_id=? AND d.policy_id=? AND d.version_id=? AND d.status='pending' AND j.status IN ('queued','leased') ORDER BY datetime(d.checked_at) DESC LIMIT 1`,node.id,policy.id,version.id)
         if(pending){checks.push({id:pending.id,policyId:policy.id,versionId:version.id,nodeId:node.id,status:'pending',diff:null,error:null,checkedAt:pending.checked_at,reused:true});continue}
       }
-      let status='unknown',diff=null,error=null,agent=null
+      let status='unknown',diff=null,error=null
       try {
-        if(node.connection_mode==='agent'){
-          agent=one('SELECT * FROM agents WHERE id=? AND revoked_at IS NULL',node.agent_id)
-          if(!agent)throw new Error('No active enrolled agent for firewall readback')
-          status='pending'
-        } else {
-          const observed=await remote(node,'rules',{group:`WinFireSecure:${policy.id}`})
-          diff=diffRules(desired,Array.isArray(observed)?observed:observed?[observed]:[])
+        const observed=await connector.readRules(`WinFireSecure:${policy.id}`)
+        if(connector.queuedReadback)status='pending'
+        else{
+          diff=diffRules(desired,observed)
           status=diff.add.length||diff.remove.length?'drift':'in-sync'
         }
       } catch(cause){error=cause.message}
@@ -1484,7 +1465,7 @@ export async function runDriftCheck(data={},actorId=null,canCheckPolicy=()=>true
       const previous=one('SELECT status FROM policy_drift_checks WHERE policy_id=? AND node_id=? AND version_id=? ORDER BY checked_at DESC,rowid DESC LIMIT 1',policy.id,node.id,version.id)?.status
       db.transaction(()=>{
         run('INSERT INTO policy_drift_checks(id,policy_id,version_id,node_id,status,diff_json,error,checked_at) VALUES(?,?,?,?,?,?,?,?)',check.id,check.policyId,check.versionId,check.nodeId,check.status,json(check.diff),check.error,check.checkedAt)
-        if(status==='pending')run('INSERT INTO agent_jobs(id,agent_id,type,payload_json) VALUES(?,?,?,?)',id(),agent.id,'policy.read',json({driftCheckId:check.id,policyId:policy.id,versionId:version.id,group:`WinFireSecure:${policy.id}`}))
+        if(status==='pending')connector.queueReadback({driftCheckId:check.id,policyId:policy.id,versionId:version.id})
       })()
       if(status==='drift'&&previous!=='drift')emitNotification({eventKey:`drift:${check.id}`,category:'policy_drift',title:'Policy drift detected',body:`${policy.name} differs from the firewall rules on ${node.hostname}.`,entityType:'node',entityId:node.id})
       checks.push(check)
@@ -1506,15 +1487,15 @@ api.get('/drift/checks',(req,res)=>{
   res.json(all(`SELECT * FROM policy_drift_checks ${filters.length?'WHERE '+filters.join(' AND '):''} ORDER BY datetime(checked_at) DESC LIMIT 500`,...args).filter(row=>visible.has(row.policy_id)).map(row=>({...row,diff:parse(row.diff_json)})))
 })
 
-async function verifyOne(node,policy,rule,runId,actualRules,vantageNode=null) {
+async function verifyOne(node,policy,rule,runId,actualRules,targetConnector,vantageNode=null,vantageConnector=null) {
   const singleTcpPort=rule.direction==='in' && rule.protocol==='TCP' && /^\d{1,5}$/.test(String(rule.localPort))
   const port=singleTcpPort?Number(rule.localPort):null
   const supported=port!==null && port>=1 && port<=65535
   const started=Date.now()
   let baselineRecordId=null,eventError=null
-  if(rule.action==='block'&&supported&&node.connection_mode==='agentless'){
+  if(rule.action==='block'&&supported&&targetConnector.readsSecurityEvents){
     try{
-      baselineRecordId=Number(await remote(node,'event_cursor'))
+      baselineRecordId=Number(await targetConnector.eventCursor())
       if(!Number.isSafeInteger(baselineRecordId)||baselineRecordId<0)throw new Error('Invalid Security log cursor')
     }catch(error){baselineRecordId=null;eventError=`Security log cursor unavailable: ${error.message}`}
   }
@@ -1524,7 +1505,7 @@ async function verifyOne(node,policy,rule,runId,actualRules,vantageNode=null) {
     if(vantageNode?.id===node.id)probeError='The verifier peer is the target node; choose another peer for a network-path check'
     else if(vantageNode){
       try{
-        probe=await remote(vantageNode,'tcp_probe',{host:node.ip||node.fqdn||node.hostname,port,timeoutMs:1500})
+        probe=await vantageConnector.probeTcp({host:node.ip||node.fqdn||node.hostname,port,timeoutMs:1500})
         if(!['open','refused','timeout','unreachable'].includes(probe?.status))throw new Error('Verifier peer returned invalid probe evidence')
       }catch(error){probe=null;probeError=`Verifier peer unavailable: ${error.message}`}
     }else probe=await tcpProbe(node.ip||node.fqdn||node.hostname,port,1500)
@@ -1533,13 +1514,13 @@ async function verifyOne(node,policy,rule,runId,actualRules,vantageNode=null) {
   const managedRulePresent=actualRules===null?null:hasManagedRule(rule,actualRules)
   let firewallEvent=null
   if(rule.action==='block'&&supported&&['refused','timeout'].includes(probe?.status)&&probe?.sourceIp&&probe?.sourcePort){
-    if(node.connection_mode==='agentless'&&baselineRecordId!==null){
+    if(targetConnector.readsSecurityEvents&&baselineRecordId!==null){
       try{
-        const collected=await remote(node,'events_probe')
+        const collected=await targetConnector.probeEvents()
         insertCollectedEvents(node.id,Array.isArray(collected)?collected:collected?[collected]:[],false)
       }catch(error){eventError=error.message}
     }
-    if(node.connection_mode!=='agentless'||baselineRecordId!==null){
+    if(!targetConnector.readsSecurityEvents||baselineRecordId!==null){
       const candidates=all(`SELECT e.record_id,e.event_id,e.event_time,e.action,e.filter_origin,e.filter_runtime_id,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.direction,p.direction) direction,COALESCE(e.src_ip,p.src_ip) src_ip,e.src_port,COALESCE(e.dst_port,p.dst_port) dst_port
         FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE e.node_id=? AND e.event_id=5157 AND e.src_port=? AND COALESCE(e.dst_port,p.dst_port)=? AND (? IS NULL OR e.record_id>?) AND (? IS NOT NULL OR datetime(e.event_time)>=datetime(?)) ORDER BY e.record_id DESC LIMIT 100`,node.id,probe.sourcePort,port,baselineRecordId,baselineRecordId,baselineRecordId,new Date(Date.parse(probeStartedAt)-2000).toISOString())
       firewallEvent=findMatchingDenyEvent(candidates,probe,port,probeStartedAt,probeFinishedAt,baselineRecordId)
@@ -1557,8 +1538,9 @@ async function verifyOne(node,policy,rule,runId,actualRules,vantageNode=null) {
 }
 export async function runVerification(data={},actorId=null,canCheckPolicy=()=>true) {
   const vantageNode=data.vantageNodeId?getNode(data.vantageNodeId):null
+  const vantageConnector=vantageNode?firewallConnectorFor(vantageNode):null
   if(data.vantageNodeId&&!vantageNode)throw Object.assign(new Error('Verifier peer not found'),{status:404})
-  if(vantageNode&&!['winrm','winrms'].includes(vantageNode.transport))throw Object.assign(new Error('Verifier peer requires a working WinRM connection'),{status:409})
+  if(vantageConnector&&!vantageConnector.supportsTcpProbe)throw Object.assign(new Error('Verifier peer requires a working WinRM connection'),{status:409})
   const runId=id()
   run('INSERT INTO verifier_runs(id,status,requested_by) VALUES(?,?,?)',runId,'running',actorId)
   const policies=(data.policyId?[getPolicy(data.policyId)].filter(Boolean):all('SELECT * FROM policies WHERE current_version_id IS NOT NULL')).filter(canCheckPolicy)
@@ -1567,12 +1549,13 @@ export async function runVerification(data={},actorId=null,canCheckPolicy=()=>tr
     const version=one('SELECT * FROM policy_versions WHERE id=?',policy.current_version_id)
     const rules=parse(version.rules_compiled_json)||[]
     for(const node of assignedNodes(policy.id).filter(n=>!data.nodeId||n.id===data.nodeId)){
+      const targetConnector=firewallConnectorFor(node)
       let actualRules=null
       if(rules.some(rule=>rule.action==='block')) {
-        try {const response=await remote(node,'rules',{group:`WinFireSecure:${policy.id}`});actualRules=Array.isArray(response)?response:response?[response]:[]}
+        try {actualRules=await targetConnector.readRules(`WinFireSecure:${policy.id}`)}
         catch {actualRules=null}
       }
-      for(const rule of rules){const result=await verifyOne(node,policy,rule,runId,actualRules,vantageNode);if(result)results.push(result)}
+      for(const rule of rules){const result=await verifyOne(node,policy,rule,runId,actualRules,targetConnector,vantageNode,vantageConnector);if(result)results.push(result)}
     }
   }
   run('UPDATE verifier_runs SET status=?,finished_at=? WHERE id=?','complete',now(),runId)
@@ -2198,19 +2181,47 @@ function learningPreview(session) {
   const assigned=all(`SELECT DISTINCT v.rules_compiled_json FROM policy_versions v JOIN policies p ON p.current_version_id=v.id JOIN policy_assignments a ON a.policy_id=p.id WHERE p.id<>? AND (a.node_id=? OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?))`,policy.id,session.node_id,session.node_id)
   for(const row of assigned)for(const rule of parse(row.rules_compiled_json)||[])if(rule.action==='allow')known.add(ruleLearningKey(rule))
   const endAt=new Date(Math.min(Date.now(),Date.parse(session.ends_at))).toISOString()
-  const observations=all(`SELECT DISTINCT COALESCE(e.direction,p.direction) direction,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,COALESCE(e.dst_ip,p.dst_ip) dst_ip,${processAware?'COALESCE(e.program,p.program)':'NULL'} program FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE e.node_id=? AND datetime(COALESCE(e.event_time,e.received_at)) BETWEEN datetime(?) AND datetime(?) AND e.action='allow' AND COALESCE(e.dst_port,p.dst_port) BETWEEN 1 AND 65535 AND COALESCE(e.protocol,p.protocol) IN ('TCP','UDP') AND COALESCE(e.direction,p.direction) IN ('in','out') ORDER BY direction,protocol,dst_port,src_ip,dst_ip`,session.node_id,session.started_at,endAt)
-  const additions=[],seen=new Set()
+  const observations=all(`SELECT COALESCE(e.direction,p.direction) direction,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,COALESCE(e.dst_ip,p.dst_ip) dst_ip,${processAware?'COALESCE(e.program,p.program)':'NULL'} program,e.src_port src_port,COUNT(*) event_count,MIN(COALESCE(e.event_time,e.received_at)) first_seen_at,MAX(COALESCE(e.event_time,e.received_at)) last_seen_at FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE e.node_id=? AND e.action='allow' AND datetime(COALESCE(e.event_time,e.received_at)) BETWEEN datetime(?) AND datetime(?) AND COALESCE(e.dst_port,p.dst_port) BETWEEN 1 AND 65535 AND COALESCE(e.protocol,p.protocol) IN ('TCP','UDP') AND COALESCE(e.direction,p.direction) IN ('in','out') GROUP BY 1,3,2,4,5,6,7 ORDER BY 1,3,2,4,5,7 LIMIT 10001`,session.node_id,session.started_at,endAt)
+  if(observations.length>10000)throw Object.assign(new Error('Learning preview exceeds 10,000 observed 5-tuples; narrow the session'),{status:409})
+  const existingLearned=new Map((base.nodes||[]).filter(node=>node.id?.startsWith('learned-')&&node.type==='allow').map(node=>[learningRuleKey(node.data.direction,node.data.protocol,node.data.direction==='in'?node.data.localPort:node.data.remotePort,node.data.remoteAddress,node.data.program||'Any'),node.id]))
+  const existingKeyByNode=new Map([...existingLearned].map(([key,nodeId])=>[nodeId,key]))
+  const broadKeys=new Set([...existingLearned.keys()].filter(key=>key.endsWith('|any')))
+  for(const event of observations){
+    const remoteAddress=event.direction==='in'?event.src_ip:event.dst_ip
+    if(isIP(remoteAddress||'')&&(!processAware||!validateProgramPath(event.program)))broadKeys.add(learningRuleKey(event.direction,event.protocol,event.dst_port,remoteAddress))
+  }
+  const retainedBaseNodes=(base.nodes||[]).filter(node=>{
+    const key=existingKeyByNode.get(node.id)
+    return !key||key.endsWith('|any')||!broadKeys.has(key.slice(0,key.lastIndexOf('|'))+'|any')
+  })
+  const additions=[],seen=new Set(),evidenceByKey=new Map()
   for(const event of observations){
     const remoteAddress=event.direction==='in'?event.src_ip:event.dst_ip
     if(!isIP(remoteAddress||''))continue
-    const program=processAware&&validateProgramPath(event.program)?event.program:'Any'
-    const key=learningRuleKey(event.direction,event.protocol,event.dst_port,remoteAddress,program)
     const broadKey=learningRuleKey(event.direction,event.protocol,event.dst_port,remoteAddress)
-    if(known.has(key)||known.has(broadKey)||seen.has(key)||seen.has(broadKey))continue
-    seen.add(key);additions.push({...event,remoteAddress,program,key})
-    if(additions.length>500)throw Object.assign(new Error('Learning preview exceeds 500 distinct new flows; narrow the session'),{status:409})
+    const program=processAware&&validateProgramPath(event.program)&&!broadKeys.has(broadKey)?event.program:'Any'
+    const key=learningRuleKey(event.direction,event.protocol,event.dst_port,remoteAddress,program)
+    if(!existingLearned.has(key)&&(known.has(key)||known.has(broadKey)))continue
+    let evidence=evidenceByKey.get(key)
+    if(!evidence){
+      if(!existingLearned.has(key)&&!seen.has(key)){
+        seen.add(key);additions.push({...event,remoteAddress,program,key})
+        if(additions.length>500)throw Object.assign(new Error('Learning preview exceeds 500 distinct new flows; narrow the session'),{status:409})
+      }
+      evidence={eventCount:0,sourcePortCount:0,firstSeenAt:event.first_seen_at,lastSeenAt:event.last_seen_at,sample:null,samples:[],sourcePorts:new Set(),unresolvedProgram:false}
+      evidenceByKey.set(key,evidence)
+    }
+    const sample={sourceIp:event.src_ip,sourcePort:event.src_port,destinationIp:event.dst_ip,destinationPort:event.dst_port,protocol:event.protocol,program:event.program||null,eventCount:event.event_count}
+    evidence.eventCount+=event.event_count
+    if(processAware&&event.program&&!validateProgramPath(event.program))evidence.unresolvedProgram=true
+    if(event.src_port!==null)evidence.sourcePorts.add(event.src_port)
+    if(!evidence.sample){const {eventCount,...flow}=sample;evidence.sample=flow}
+    if(evidence.samples.length<5)evidence.samples.push(sample)
+    if(event.first_seen_at<evidence.firstSeenAt)evidence.firstSeenAt=event.first_seen_at
+    if(event.last_seen_at>evidence.lastSeenAt)evidence.lastSeenAt=event.last_seen_at
   }
-  const nodes=[...base.nodes,...additions.map((event,index)=>({id:`learned-${crypto.createHash('sha256').update(event.key).digest('hex').slice(0,16)}`,type:'allow',position:{x:80+((base.nodes.length+index)%4)*180,y:80+Math.floor((base.nodes.length+index)/4)*100},data:{name:`Learned ${event.protocol} ${event.dst_port} ${event.direction}`,localPort:event.direction==='in'?String(event.dst_port):'Any',remotePort:event.direction==='out'?String(event.dst_port):'Any',protocol:event.protocol,remoteAddress:event.remoteAddress,direction:event.direction,program:event.program}}))]
+  const ruleEvidence=key=>{const {sourcePorts,...evidence}=evidenceByKey.get(key);return {...evidence,sourcePortCount:sourcePorts.size}}
+  const nodes=[...retainedBaseNodes.map(node=>{const key=existingKeyByNode.get(node.id);return key&&evidenceByKey.has(key)?{...node,data:{...node.data,evidence:ruleEvidence(key)}}:node}),...additions.map((event,index)=>({id:`learned-${crypto.createHash('sha256').update(event.key).digest('hex').slice(0,16)}`,type:'allow',position:{x:80+((retainedBaseNodes.length+index)%4)*180,y:80+Math.floor((retainedBaseNodes.length+index)/4)*100},data:{name:`Learned ${event.protocol} ${event.dst_port} ${event.direction}`,localPort:event.direction==='in'?String(event.dst_port):'Any',remotePort:event.direction==='out'?String(event.dst_port):'Any',protocol:event.protocol,remoteAddress:event.remoteAddress,direction:event.direction,program:event.program,evidence:ruleEvidence(event.key)}}))]
   const graph={nodes,edges:base.edges||[]},rules=compilePolicy(graph,policy.id)
   assertManagementAccess(rules)
   return {policyId:policy.id,nodeId:session.node_id,sessionId:session.id,status:session.status,graph,rules,newFlowCount:additions.length,observedFlowCount:observations.length,asOf:now(),endsAt:session.ends_at,progressiveEnabled:!!session.progressive_enabled,nextProgressiveAt:session.next_progressive_at,lastProgressiveAt:session.last_progressive_at}
@@ -2290,12 +2301,13 @@ async function applyProgressiveLearning(session,node){
   const preview=learningPreview(session),policy=getPolicy(session.generated_policy_id)
   const conflicts=assignmentConflicts(policy.id,preview.rules,[node])
   if(conflicts.length)throw Object.assign(new Error('Learned rules conflict with another assigned policy'),{status:409,conflicts})
-  const current=one('SELECT graph_json FROM policy_versions WHERE id=?',policy.current_version_id)
+  const current=one('SELECT graph_json,rules_compiled_json FROM policy_versions WHERE id=?',policy.current_version_id)
   const changed=current?.graph_json!==json(preview.graph)
+  const rulesChanged=current?.rules_compiled_json!==json(preview.rules)
   if(changed)saveLearningVersion(session,preview,null,'Progressive learning snapshot')
   if(preview.rules.length&&!one('SELECT id FROM policy_assignments WHERE policy_id=? AND node_id=?',policy.id,node.id))run('INSERT INTO policy_assignments(id,policy_id,node_id) VALUES(?,?,?)',id(),policy.id,node.id)
   let result={status:'unchanged'}
-  if(preview.rules.length&&(changed||session.last_error)){
+  if(preview.rules.length&&(rulesChanged||session.last_error)){
     result=(await applyPolicy(getPolicy(policy.id),null,[node],{progressiveSessionId:session.id}))[0]
     if(result.status==='failed')throw new Error(result.error)
   }
