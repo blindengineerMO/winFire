@@ -39,8 +39,7 @@ function normalizedEvent(event){
 export function isIgnoredFirewallEvent(event){
   const candidate=normalizedEvent(event)
   if(!candidate)return false
-  const fingerprint=trafficIgnoreFingerprint(candidate)
-  return rules.some(rule=>rule.fingerprint===fingerprint)
+  return rules.some(rule=>fields.every(field=>rule[field]===null||rule[field]===candidate[field]))
 }
 
 export function refreshTrafficIgnores(db){
@@ -53,8 +52,12 @@ export function publicTrafficIgnore(rule){
 }
 
 export function ignoredTrafficSql(eventAlias='e',patternAlias='p'){
+  return `${trafficIgnoreMatchSql(eventAlias,patternAlias)}=0`
+}
+
+export function trafficIgnoreMatchSql(eventAlias='e',patternAlias='p'){
   const value=field=>patternAlias?`COALESCE(${eventAlias}.${field},${patternAlias}.${field})`:`${eventAlias}.${field}`
-  return `winfire_ignored_traffic(${eventAlias}.event_id,${value('action')},${value('protocol')},${value('src_ip')},${value('dst_ip')},${value('dst_port')},${value('direction')},${value('program')},${eventAlias}.account_sid)=0`
+  return `winfire_ignored_traffic(${eventAlias}.event_id,${value('action')},${value('protocol')},${value('src_ip')},${value('dst_ip')},${value('dst_port')},${value('direction')},${value('program')},${eventAlias}.account_sid)`
 }
 
 export {firewallIds}

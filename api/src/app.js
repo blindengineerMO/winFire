@@ -43,7 +43,7 @@ import {validateExportDestination,exportSelectedEvents} from './eventExport.js'
 import {previewSecurityAutomation} from './securityAutomations.js'
 import {collectAccountInventory,accountName} from './localAccounts.js'
 import {normalizeProcessExclusions,refreshProcessExclusions,isExcludedFirewallEvent,visibleFirewallEventSql} from './processExclusions.js'
-import {normalizeTrafficIgnore,trafficIgnoreFingerprint,trafficIgnoreFromEvent,refreshTrafficIgnores,publicTrafficIgnore,isIgnoredFirewallEvent} from './trafficIgnores.js'
+import {normalizeTrafficIgnore,trafficIgnoreFingerprint,trafficIgnoreFromEvent,refreshTrafficIgnores,publicTrafficIgnore,isIgnoredFirewallEvent,trafficIgnoreMatchSql} from './trafficIgnores.js'
 
 export const app=express()
 app.disable('x-powered-by')
@@ -760,16 +760,26 @@ api.put('/settings/process-exclusions',requireRole('admin'),(req,res)=>{
 })
 api.get('/settings/traffic-ignores',requireRole('admin'),(_req,res)=>res.json(all('SELECT * FROM traffic_ignore_rules ORDER BY created_at DESC,id DESC').map(publicTrafficIgnore)))
 api.post('/settings/traffic-ignores',requireRole('admin'),(req,res)=>{
-  const data=body(z.object({label:z.string().trim().min(1).max(120),eventId:z.number().int(),action:z.string().nullable().optional(),protocol:z.string().nullable().optional(),srcIp:z.string().nullable().optional(),dstIp:z.string().nullable().optional(),dstPort:z.number().int().nullable().optional(),direction:z.string().nullable().optional(),program:z.string().nullable().optional(),accountSid:z.string().nullable().optional()}),req)
-  let pattern
-  try{pattern=normalizeTrafficIgnore(data)}catch(error){return res.status(400).json({error:error.message})}
-  const ruleId=id(),fingerprint=trafficIgnoreFingerprint(pattern)
-  if(one('SELECT id FROM traffic_ignore_rules WHERE fingerprint=?',fingerprint))return res.status(409).json({error:'An identical traffic ignore rule already exists'})
-  run('INSERT INTO traffic_ignore_rules(id,label,event_id,action,protocol,src_ip,dst_ip,dst_port,direction,program,account_sid,fingerprint,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',ruleId,data.label,pattern.eventId,pattern.action,pattern.protocol,pattern.srcIp,pattern.dstIp,pattern.dstPort,pattern.direction,pattern.program,pattern.accountSid,fingerprint,req.user.id,now())
+  const data=body(z.object({label:z.string().trim().min(1).max(120),eventId:z.number().int(),action:z.string().nullable().optional(),protocol:z.string().nullable().optional(),srcIp:z.string().nullable().optional(),dstIp:z.string().nullable().optional(),dstPort:z.number().int().nullable().optional(),direction:z.string().nullable().optional(),program:z.string().nullable().optional(),accountSid:z.string().nullable().optional(),accountSids:z.array(z.string().trim().min(1).max(184)).max(200).optional()}),req)
+  const accountSids=[...new Set([...(data.accountSids||[]),...(data.accountSid?[data.accountSid]:[])])]
+  const candidates=accountSids.length?accountSids:[null]
+  const patterns=[]
+  try{for(const accountSid of candidates)patterns.push(normalizeTrafficIgnore({...data,accountSid}))}catch(error){return res.status(400).json({error:error.message})}
+  const uniquePatterns=[...new Map(patterns.map(pattern=>[trafficIgnoreFingerprint(pattern),pattern])).values()]
+  const existing=new Set(all(`SELECT fingerprint FROM traffic_ignore_rules WHERE fingerprint IN (${uniquePatterns.map(()=>'?').join(',')})`,...uniquePatterns.map(trafficIgnoreFingerprint)).map(row=>row.fingerprint))
+  const pending=uniquePatterns.filter(pattern=>!existing.has(trafficIgnoreFingerprint(pattern)))
+  if(!pending.length)return res.status(409).json({error:'All requested traffic ignore rules already exist'})
+  const createdIds=[]
+  db.transaction(()=>{
+    for(const pattern of pending){
+      const ruleId=id();createdIds.push(ruleId)
+      run('INSERT INTO traffic_ignore_rules(id,label,event_id,action,protocol,src_ip,dst_ip,dst_port,direction,program,account_sid,fingerprint,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',ruleId,data.label,pattern.eventId,pattern.action,pattern.protocol,pattern.srcIp,pattern.dstIp,pattern.dstPort,pattern.direction,pattern.program,pattern.accountSid,trafficIgnoreFingerprint(pattern),req.user.id,now())
+      audit(req.user.id,'traffic-ignore.create','settings',ruleId,null,{...publicTrafficIgnore(one('SELECT * FROM traffic_ignore_rules WHERE id=?',ruleId)),accountGroup:accountSids.length>1})
+    }
+  })()
   refreshTrafficIgnores(db)
-  const created=one('SELECT * FROM traffic_ignore_rules WHERE id=?',ruleId)
-  audit(req.user.id,'traffic-ignore.create','settings',ruleId,null,publicTrafficIgnore(created))
-  res.status(201).json(publicTrafficIgnore(created))
+  const created=createdIds.map(ruleId=>publicTrafficIgnore(one('SELECT * FROM traffic_ignore_rules WHERE id=?',ruleId)))
+  res.status(201).json({rules:created,created:created.length,skipped:uniquePatterns.length-pending.length})
 })
 api.delete('/settings/traffic-ignores/:id',requireRole('admin'),(req,res)=>{
   const before=one('SELECT * FROM traffic_ignore_rules WHERE id=?',reqId(req));if(!before)return notFound(res,'Traffic ignore rule')
@@ -777,6 +787,23 @@ api.delete('/settings/traffic-ignores/:id',requireRole('admin'),(req,res)=>{
   refreshTrafficIgnores(db)
   audit(req.user.id,'traffic-ignore.delete','settings',before.id,publicTrafficIgnore(before),null)
   res.json({ok:true})
+})
+api.post('/settings/traffic-ignores/cleanup',requireRole('admin'),(req,res)=>{
+  const data=body(z.object({confirmed:z.literal(true)}),req)
+  if(!data.confirmed)return res.status(400).json({error:'Cleanup confirmation is required'})
+  const loopback=observabilitySettings().ignoreLoopbackIngest
+  const firewall=`(e.event_id IN (5150,5151,5156,5157) OR COALESCE(e.event_type,p.event_type)='firewall')`
+  const process=`(${firewall} AND winfire_excluded_process(COALESCE(e.program,p.program)))`
+  const traffic=`(${trafficIgnoreMatchSql()}=1)`
+  const local=loopback?`((COALESCE(e.src_ip,p.src_ip,'') LIKE '127.%' OR COALESCE(e.src_ip,p.src_ip,'') IN ('::1','0:0:0:0:0:0:0:1')) AND (COALESCE(e.dst_ip,p.dst_ip,'') LIKE '127.%' OR COALESCE(e.dst_ip,p.dst_ip,'') IN ('::1','0:0:0:0:0:0:0:1')))`:'0'
+  const before=one('SELECT COUNT(*) count FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE '+`(${process} OR ${traffic} OR ${local})`).count
+  const deleted=db.transaction(()=>{
+    const result=run(`DELETE FROM log_events WHERE id IN (SELECT e.id FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE (${process} OR ${traffic} OR ${local}))`)
+    run('DELETE FROM event_patterns WHERE NOT EXISTS (SELECT 1 FROM log_events e WHERE e.pattern_id=event_patterns.id)')
+    return result.changes
+  })()
+  audit(req.user.id,'traffic-ignore.cleanup','settings','global',{matching:Number(before)},{deleted,loopbackIncluded:loopback})
+  res.json({deleted,loopbackIncluded:loopback})
 })
 api.get('/settings/logs-display',(_req,res)=>res.json({hideLoopbackEvents:observabilitySettings().hideLoopbackEvents}))
 api.patch('/settings/observability',requireRole('admin'),(req,res)=>{

@@ -49,3 +49,19 @@ test('traffic ignore rule validation and duplicate protection are enforced',asyn
   await auth(request.post('/api/v1/settings/traffic-ignores')).send(body).expect(201)
   await auth(request.post('/api/v1/settings/traffic-ignores')).send(body).expect(409)
 })
+
+test('account groups use wildcard traffic fields and cleanup removes retained matches',async()=>{
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@traffic-ignores.test',password:'traffic-ignores-test-password'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
+  const node=(await auth(request.post('/api/v1/nodes')).send({hostname:'account-ignore-node'}).expect(201)).body
+  const base={eventId:5156,action:'allow',protocol:'TCP',srcIp:'192.0.2.50',dstIp:'198.51.100.50',dstPort:443,direction:'out',program:'C:\\Apps\\client.exe'}
+  await auth(request.post('/api/v1/logs/ingest')).send({nodeId:node.id,events:[{recordId:10,...base,accountSid:'S-1-5-21-100'},{recordId:11,...base,accountSid:'S-1-5-21-200'},{recordId:12,...base,accountSid:'S-1-5-21-300'}]}).expect(201)
+  const created=await auth(request.post('/api/v1/settings/traffic-ignores')).send({label:'Service accounts',eventId:5156,accountSids:['S-1-5-21-100','S-1-5-21-200']}).expect(201)
+  assert.equal(created.body.created,2)
+  const future=await auth(request.post('/api/v1/logs/ingest')).send({nodeId:node.id,events:[{recordId:13,...base,accountSid:'S-1-5-21-100'},{recordId:14,...base,accountSid:'S-1-5-21-300'}]}).expect(201)
+  assert.equal(future.body.inserted,1)
+  const cleanup=await auth(request.post('/api/v1/settings/traffic-ignores/cleanup')).send({confirmed:true}).expect(200)
+  assert.equal(cleanup.body.deleted,2)
+  assert.equal(db.prepare('SELECT COUNT(*) count FROM log_events WHERE node_id=?').get(node.id).count,2)
+  await auth(request.post('/api/v1/settings/traffic-ignores/cleanup')).send({confirmed:false}).expect(400)
+})
