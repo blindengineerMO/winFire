@@ -3,6 +3,7 @@ import path from 'node:path'
 import {fileURLToPath} from 'node:url'
 import Database from 'better-sqlite3'
 import knexFactory from 'knex'
+import {isExcludedProcess,refreshProcessExclusions} from './processExclusions.js'
 
 const dataDir = path.resolve(process.env.DATA_DIR || 'data')
 fs.mkdirSync(dataDir, {recursive:true, mode:0o700})
@@ -18,6 +19,8 @@ await migrationClient.destroy()
 export const db = new Database(path.join(dataDir, 'winfire.db'))
 db.pragma('journal_mode = WAL')
 db.pragma('foreign_keys = ON')
+refreshProcessExclusions(db)
+db.function('winfire_excluded_process',value=>Number(isExcludedProcess(value)))
 
 export const one = (sql, ...args) => db.prepare(sql).get(...args)
 export const all = (sql, ...args) => db.prepare(sql).all(...args)

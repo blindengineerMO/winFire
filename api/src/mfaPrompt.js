@@ -4,6 +4,7 @@ import {all,one,run,id,now,audit,parse,json} from './db.js'
 import {remote,tcpProbe} from './connector.js'
 import {sourceMatches} from './mfaPortal.js'
 import {mfaPromptSettings} from './mfaPromptSettings.js'
+import {visibleFirewallEventSql} from './processExclusions.js'
 
 function addresses(node){
   const values=new Set([node.ip,node.fqdn,node.hostname])
@@ -162,7 +163,7 @@ export async function sweepMfaPrompts(limit=25){
       FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id
       JOIN nodes n ON n.id=e.node_id
       JOIN identity_segments s ON (s.node_id=e.node_id OR s.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=e.node_id))
-      WHERE e.event_id=5157 AND e.action='block' AND datetime(e.received_at)>=datetime(?) AND datetime(COALESCE(e.event_time,e.received_at))>=datetime(?) AND s.portal_enabled=1 AND s.auto_prompt_enabled=1 AND s.mode='agentless'
+      WHERE ${visibleFirewallEventSql()} AND e.event_id=5157 AND e.action='block' AND datetime(e.received_at)>=datetime(?) AND datetime(COALESCE(e.event_time,e.received_at))>=datetime(?) AND s.portal_enabled=1 AND s.auto_prompt_enabled=1 AND s.mode='agentless'
         AND n.connection_mode='agentless' AND n.transport IN ('winrm','winrms') AND n.firewall_state<>'learning'
         AND COALESCE(e.dst_port,p.dst_port)=s.port AND NOT EXISTS(SELECT 1 FROM mfa_prompt_events m WHERE m.log_event_id=e.id AND m.segment_id=s.id)
       ORDER BY e.received_at DESC,e.id DESC LIMIT ?`,threshold,threshold,limit)

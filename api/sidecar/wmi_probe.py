@@ -38,13 +38,17 @@ def firewall_script(mode, version, args, marker):
                 "Write-Output ('ERROR|'+[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($_.Exception.Message)))\n"
                 "Write-Output 'DONE|" + marker + "'\n}\n")
     if mode in ("events", "events_recent", "events_probe", "event_cursor"):
-        if not str(version).startswith(("6.", "10.")):
-            raise RuntimeError("WMI Security event collection requires Windows Vista or newer")
+        if not str(version).startswith(("5.1.", "5.2.", "6.", "10.")):
+            raise RuntimeError("Unsupported Windows version for WMI Security events")
         after = int(args.get("after") or 0)
         if after < 0 or after > 9223372036854775807:
             raise ValueError("Invalid event cursor")
-        source = (Path(__file__).resolve().parent / "wmi_events.ps1").read_text()
-        script = f"$mode='{mode}';$after=[long]{after}\n{source}"
+        if str(version).startswith(("5.1.", "5.2.")):
+            source = (Path(__file__).resolve().parent / "xp_events.ps1").read_text()
+            script = source + f"\nGet-WinFireXpEvents '{mode}' {after}\n"
+        else:
+            source = (Path(__file__).resolve().parent / "wmi_events.ps1").read_text()
+            script = f"$mode='{mode}';$after=[long]{after}\n{source}"
         return ("try {\n" + script + "\nWrite-Output 'DONE|" + marker + "'\n} catch {\n"
                 "Write-Output ('ERROR|'+[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($_.Exception.Message)))\n"
                 "Write-Output 'DONE|" + marker + "'\n}\n")
@@ -119,7 +123,7 @@ def parse_event_output(lines, mode):
 
 
 def run_staged_operation(services, host, account, password, domain, mode, version, args):
-    from wsman_client import parse_legacy_facts, parse_legacy_firewall
+    from wsman_client import parse_legacy_facts, parse_legacy_firewall, parse_legacy_events
 
     marker = uuid.uuid4().hex
     script = firewall_script(mode, version, args, marker)
@@ -163,7 +167,7 @@ def run_staged_operation(services, host, account, password, domain, mode, versio
                             raise RuntimeError("WMI firewall apply returned no success confirmation")
                         return {"applied": True}
                     if mode in ("events", "events_recent", "events_probe", "event_cursor"):
-                        return parse_event_output(lines[:-1], mode)
+                        return parse_legacy_events("\n".join(lines[:-1]), mode) if str(version).startswith(("5.1.", "5.2.")) else parse_event_output(lines[:-1], mode)
                     if mode == "facts":
                         facts = parse_legacy_facts("\n".join(lines[:-1]))
                         if not facts["computer"]["Name"] or not facts["os"]["Version"]:

@@ -6,6 +6,7 @@ import path from 'node:path'
 import https from 'node:https'
 import crypto from 'node:crypto'
 import {execFileSync} from 'node:child_process'
+import supertest from 'supertest'
 
 const dir=fs.mkdtempSync(path.join(os.tmpdir(),'winfire-agent-test-'))
 const file=name=>path.join(dir,name)
@@ -46,13 +47,70 @@ function request(method,url,body,token,client) {
     const req=https.request({host:'127.0.0.1',port,path:`/api/v1${url}`,method,ca,
       ...(client?{cert:client.cert,key:client.key}:{}),
       headers:{...(token?{Authorization:`Bearer ${token}`}:{}) ,...(data?{'Content-Type':'application/json','Content-Length':Buffer.byteLength(data)}:{})}
-    },res=>{let output='';res.on('data',chunk=>output+=chunk);res.on('end',()=>resolve({status:res.statusCode,body:JSON.parse(output||'null')}))})
+    },res=>{let output='';res.on('data',chunk=>output+=chunk);res.on('end',()=>{let body;try{body=JSON.parse(output||'null')}catch{body=output}resolve({status:res.statusCode,body})})})
     req.once('error',reject)
     req.end(data)
   })
 }
 
 test.after(async()=>{await new Promise(resolve=>server.close(resolve));db.close();fs.rmSync(dir,{recursive:true,force:true})})
+
+test('HTTPS bootstrap pins the package hash and signer before installation',async()=>{
+  const packagePath=file('bootstrap-package.exe'),previousPackage=process.env.AGENT_PACKAGE_PATH,previousBase=process.env.PUBLIC_BASE_URL,previousSigner=process.env.AGENT_SIGNER_THUMBPRINT
+  fs.writeFileSync(packagePath,'bootstrap-fixture')
+  process.env.AGENT_PACKAGE_PATH=packagePath
+  process.env.PUBLIC_BASE_URL=`https://127.0.0.1:${port}`
+  process.env.AGENT_SIGNER_THUMBPRINT='AB:'.repeat(19)+'AB'
+  try{
+    await supertest(app).get('/api/v1/agent-package/enroll.ps1').expect(503)
+    const response=await request('GET','/agent-package/enroll.ps1')
+    assert.equal(response.status,200)
+    assert.equal(typeof response.body,'string')
+    assert.ok(response.body.includes(crypto.createHash('sha256').update('bootstrap-fixture').digest('hex')))
+    assert.ok(response.body.includes(`https://127.0.0.1:${port}/api/v1/agent-package/WinFire.Agent.exe`))
+    assert.ok(response.body.includes('Get-AuthenticodeSignature'))
+    assert.ok(response.body.includes(`$expectedSigner='${'AB'.repeat(20)}'`))
+    assert.ok(response.body.includes("Read-Host 'Short-lived WinFire enrollment token'"))
+    assert.equal((await request('GET','/agent-package/WinFire.Agent.exe')).status,200)
+    process.env.AGENT_SIGNER_THUMBPRINT='invalid'
+    assert.equal((await request('GET','/agent-package/enroll.ps1')).status,503)
+  }finally{
+    if(previousPackage===undefined)delete process.env.AGENT_PACKAGE_PATH;else process.env.AGENT_PACKAGE_PATH=previousPackage
+    if(previousBase===undefined)delete process.env.PUBLIC_BASE_URL;else process.env.PUBLIC_BASE_URL=previousBase
+    if(previousSigner===undefined)delete process.env.AGENT_SIGNER_THUMBPRINT;else process.env.AGENT_SIGNER_THUMBPRINT=previousSigner
+  }
+})
+
+test('bulk enrollment validates every node and issues one-time hashed tokens atomically',async()=>{
+  const login=await request('POST','/auth/login',{email:'owner@agent.test',password:'agent-test-password-123'})
+  const bearer=login.body.accessToken
+  const first=await request('POST','/nodes',{hostname:'bulk-agent-one'},bearer)
+  const second=await request('POST','/nodes',{hostname:'bulk-agent-two'},bearer)
+  assert.equal(first.status,201)
+  assert.equal(second.status,201)
+  const ids=[first.body.id,second.body.id]
+  await supertest(app).post('/api/v1/agents/enrollment-tokens/bulk').set('Authorization',`Bearer ${bearer}`).send({nodeIds:ids}).expect(426)
+  await supertest(app).post('/api/v1/agents/enrollment-tokens').set('Authorization',`Bearer ${bearer}`).send({nodeId:ids[0]}).expect(426)
+  assert.equal((await request('POST','/agents/enrollment-tokens/bulk',{nodeIds:ids})).status,401)
+  assert.equal((await request('POST','/agents/enrollment-tokens/bulk',{nodeIds:[ids[0],ids[0]]},bearer)).status,400)
+  assert.equal((await request('POST','/agents/enrollment-tokens/bulk',{nodeIds:[ids[0],'missing-node']},bearer)).status,404)
+  assert.equal(one('SELECT COUNT(*) n FROM enrollment_tokens WHERE node_id IN (?,?)',...ids).n,0)
+  const bulk=await request('POST','/agents/enrollment-tokens/bulk',{nodeIds:ids},bearer)
+  assert.equal(bulk.status,201)
+  assert.deepEqual(bulk.body.tokens.map(item=>item.nodeId),ids)
+  assert.equal(new Set(bulk.body.tokens.map(item=>item.token)).size,2)
+  for(const item of bulk.body.tokens){
+    assert.equal(item.expiresAt,bulk.body.expiresAt)
+    const stored=one('SELECT token_hash FROM enrollment_tokens WHERE node_id=?',item.nodeId)
+    assert.ok(stored)
+    assert.notEqual(stored.token_hash,item.token)
+  }
+  const enrolled=await request('POST','/agents/enroll',{token:bulk.body.tokens[0].token,csr:fs.readFileSync(file('agent.csr'),'utf8')})
+  assert.equal(enrolled.status,201)
+  assert.equal((await request('POST','/agents/enroll',{token:bulk.body.tokens[0].token,csr:fs.readFileSync(file('agent.csr'),'utf8')})).status,401)
+  assert.equal((await request('POST','/agents/enrollment-tokens/bulk',{nodeIds:ids},bearer)).status,409)
+  assert.equal(one('SELECT COUNT(*) n FROM enrollment_tokens WHERE node_id=?',ids[1]).n,1)
+})
 
 test('mTLS enrollment, job polling, completion and revocation',async()=>{
   const login=await request('POST','/auth/login',{email:'owner@agent.test',password:'agent-test-password-123'})
@@ -68,7 +126,28 @@ test('mTLS enrollment, job polling, completion and revocation',async()=>{
   assert.equal((await request('POST','/agents/enroll',{token:enrollment.body.token,csr:fs.readFileSync(file('agent.csr'),'utf8')})).status,401)
   const client={cert:enrolled.body.certificate,key:fs.readFileSync(file('agent.key'))}
   assert.equal((await request('POST',`/agents/${enrolled.body.agentId}/heartbeat`,{version:'test-1'})).status,401)
-  assert.equal((await request('POST',`/agents/${enrolled.body.agentId}/heartbeat`,{version:'test-1'},null,client)).status,200)
+  assert.equal((await request('POST',`/agents/${enrolled.body.agentId}/heartbeat`,{version:'',mode:'pull'},null,client)).status,400)
+  assert.equal((await request('POST',`/agents/${enrolled.body.agentId}/heartbeat`,{version:'test-1',mode:'push'},null,client)).status,400)
+  assert.equal((await request('POST',`/agents/${enrolled.body.agentId}/heartbeat`,{version:'test-1'},null,client)).body.pollSeconds,30)
+  assert.deepEqual(one('SELECT version,mode FROM agents WHERE id=?',enrolled.body.agentId),{version:'test-1',mode:'pull'})
+  const group=await request('POST','/node-groups',{name:'Slow polling agents'},token)
+  assert.equal(group.status,201)
+  assert.equal((await request('POST',`/node-groups/${group.body.id}/members`,{nodeId:node.body.id},token)).status,200)
+  assert.equal((await request('PUT','/settings/agent-poll',{targetType:'group',targetId:group.body.id,pollSeconds:90})).status,401)
+  assert.equal((await request('PUT','/settings/agent-poll',{targetType:'group',targetId:group.body.id,pollSeconds:90},token)).status,200)
+  assert.equal((await request('POST',`/agents/${enrolled.body.agentId}/heartbeat`,{version:'test-1'},null,client)).body.pollSeconds,90)
+  assert.equal((await request('PUT','/settings/agent-poll',{targetType:'node',targetId:node.body.id,pollSeconds:45},token)).status,200)
+  assert.equal((await request('POST',`/agents/${enrolled.body.agentId}/heartbeat`,{version:'test-1'},null,client)).body.pollSeconds,45)
+  assert.equal((await request('PUT','/settings/agent-poll',{targetType:'node',targetId:node.body.id,pollSeconds:null},token)).status,200)
+  assert.equal((await request('POST',`/agents/${enrolled.body.agentId}/heartbeat`,{version:'test-1'},null,client)).body.pollSeconds,90)
+  const fasterGroup=await request('POST','/node-groups',{name:'Faster polling agents'},token)
+  assert.equal(fasterGroup.status,201)
+  assert.equal((await request('POST',`/node-groups/${fasterGroup.body.id}/members`,{nodeId:node.body.id},token)).status,200)
+  assert.equal((await request('PUT','/settings/agent-poll',{targetType:'group',targetId:fasterGroup.body.id,pollSeconds:60},token)).status,200)
+  assert.equal((await request('POST',`/agents/${enrolled.body.agentId}/heartbeat`,{version:'test-1'},null,client)).body.pollSeconds,60)
+  assert.equal((await request('PUT','/settings/agent-poll',{targetType:'node',targetId:node.body.id,pollSeconds:10},token)).status,400)
+  assert.equal((await request('PUT','/settings/agent-poll',{targetType:'node',targetId:'missing',pollSeconds:30},token)).status,404)
+  assert.equal((await request('PUT','/settings/agent-poll',{targetType:'group',targetId:fasterGroup.body.id,pollSeconds:null},token)).status,200)
   const event={recordId:42,id:5157,timeCreated:new Date().toISOString(),fields:{SourceAddress:'192.0.2.20',SourcePort:'3389',DestAddress:'192.0.2.10',DestPort:'52000',Protocol:'6',Direction:'%%14592',Application:'test.exe'}}
   assert.equal((await request('POST',`/agents/${enrolled.body.agentId}/events`,{events:[event]})).status,401)
   const firstEvents=await request('POST',`/agents/${enrolled.body.agentId}/events`,{events:[event]},null,client)
@@ -76,6 +155,8 @@ test('mTLS enrollment, job polling, completion and revocation',async()=>{
   assert.equal(firstEvents.body.inserted,1)
   assert.equal((await request('POST',`/agents/${enrolled.body.agentId}/events`,{events:[event]},null,client)).body.inserted,0)
   assert.deepEqual(one('SELECT event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,program FROM log_events WHERE node_id=? AND record_id=42',node.body.id),{event_id:5157,action:'block',protocol:'TCP',src_ip:'192.0.2.10',src_port:52000,dst_ip:'192.0.2.20',dst_port:3389,direction:'in',program:'test.exe'})
+  run('UPDATE agents SET last_checkin_at=? WHERE id=?',new Date(Date.now()-150_000).toISOString(),enrolled.body.agentId)
+  assert.equal(sweepAgentHealth(),0)
   run('UPDATE agents SET last_checkin_at=? WHERE id=?',new Date(Date.now()-300_000).toISOString(),enrolled.body.agentId)
   assert.equal(sweepAgentHealth(),1)
   assert.equal(one('SELECT status FROM nodes WHERE id=?',node.body.id).status,'unreachable')
@@ -221,7 +302,7 @@ test('agent training waits for personal and global apply acknowledgements',async
   }
 })
 
-test('remote agent installation records a verified apply run and a failed attempt',async()=>{
+test('remote agent installation verifies service, package hash, and failure outcomes',async()=>{
   const login=await request('POST','/auth/login',{email:'owner@agent.test',password:'agent-test-password-123'})
   const token=login.body.accessToken
   const credential=await request('POST','/credentials',{name:'Install test',type:'local',username:'test-admin',password:'test-only-password'},token)
@@ -232,22 +313,23 @@ test('remote agent installation records a verified apply run and a failed attemp
     run("UPDATE nodes SET transport='winrm' WHERE id=?",created.body.id)
     return created.body.id
   }
-  const first=await createNode('install-success'),second=await createNode('install-failure')
+  const first=await createNode('install-success'),second=await createNode('install-failure'),third=await createNode('install-hash-mismatch')
   const packagePath=file('WinFire.Agent.exe'),stub=file('install-stub')
   fs.writeFileSync(packagePath,'signed-package-fixture')
   fs.writeFileSync(stub,`#!/usr/bin/env node
 let body='';process.stdin.on('data',part=>body+=part);process.stdin.on('end',()=>{
   const input=JSON.parse(body)
   if(input.operation!=='agent_deploy')process.exit(2)
+  if(input.args.signerThumbprint!==process.env.WINFIRE_TEST_SIGNER)process.exit(3)
   if(process.env.WINFIRE_TEST_DEPLOY_FAIL==='1')process.exit(1)
   const crypto=require('crypto'),path=require('path'),Database=require(require.resolve('better-sqlite3',{paths:[process.cwd()]}))
   const db=new Database(path.join(process.env.DATA_DIR,'winfire.db')),agentId=crypto.randomUUID()
   db.prepare("INSERT INTO agents(id,node_id,cert_thumbprint,cert_expires_at,version,mode,last_checkin_at) VALUES(?,?,?,?,?,?,?)").run(agentId,process.env.WINFIRE_TEST_DEPLOY_NODE,'test-thumbprint',new Date(Date.now()+86400000).toISOString(),'test','pull',new Date().toISOString())
-  db.close();process.stdout.write(JSON.stringify({installed:true,status:'Running'}))
+  db.close();process.stdout.write(JSON.stringify({installed:true,status:'Running',sha256:process.env.WINFIRE_TEST_DEPLOY_HASH_MISMATCH==='1'?'0'.repeat(64):input.args.sha256}))
 })
 `,{mode:0o700})
-  const previous={python:process.env.WINRM_PYTHON,packagePath:process.env.AGENT_PACKAGE_PATH,base:process.env.PUBLIC_BASE_URL}
-  process.env.WINRM_PYTHON=stub;process.env.AGENT_PACKAGE_PATH=packagePath;process.env.PUBLIC_BASE_URL='https://localhost'
+  const previous={python:process.env.WINRM_PYTHON,packagePath:process.env.AGENT_PACKAGE_PATH,base:process.env.PUBLIC_BASE_URL,signer:process.env.AGENT_SIGNER_THUMBPRINT}
+  process.env.WINRM_PYTHON=stub;process.env.AGENT_PACKAGE_PATH=packagePath;process.env.PUBLIC_BASE_URL='https://localhost';process.env.AGENT_SIGNER_THUMBPRINT='CD'.repeat(20);process.env.WINFIRE_TEST_SIGNER='CD'.repeat(20)
   try{
     process.env.WINFIRE_TEST_DEPLOY_NODE=first
     const installed=await request('POST',`/nodes/${first}/deploy-agent`,{},token)
@@ -258,8 +340,14 @@ let body='';process.stdin.on('data',part=>body+=part);process.stdin.on('end',()=
     const failed=await request('POST',`/nodes/${second}/deploy-agent`,{},token)
     assert.equal(failed.status,502)
     assert.equal(one('SELECT status FROM policy_apply_runs WHERE node_id=? ORDER BY rowid DESC LIMIT 1',second).status,'failed')
+    delete process.env.WINFIRE_TEST_DEPLOY_FAIL
+    process.env.WINFIRE_TEST_DEPLOY_NODE=third;process.env.WINFIRE_TEST_DEPLOY_HASH_MISMATCH='1'
+    const mismatched=await request('POST',`/nodes/${third}/deploy-agent`,{},token)
+    assert.equal(mismatched.status,502)
+    assert.match(mismatched.body.error,/package hash/)
+    assert.equal(one('SELECT status FROM policy_apply_runs WHERE node_id=? ORDER BY rowid DESC LIMIT 1',third).status,'unknown')
   }finally{
-    for(const [key,value] of [['WINRM_PYTHON',previous.python],['AGENT_PACKAGE_PATH',previous.packagePath],['PUBLIC_BASE_URL',previous.base]])if(value===undefined)delete process.env[key];else process.env[key]=value
-    delete process.env.WINFIRE_TEST_DEPLOY_NODE;delete process.env.WINFIRE_TEST_DEPLOY_FAIL
+    for(const [key,value] of [['WINRM_PYTHON',previous.python],['AGENT_PACKAGE_PATH',previous.packagePath],['PUBLIC_BASE_URL',previous.base],['AGENT_SIGNER_THUMBPRINT',previous.signer]])if(value===undefined)delete process.env[key];else process.env[key]=value
+    delete process.env.WINFIRE_TEST_DEPLOY_NODE;delete process.env.WINFIRE_TEST_DEPLOY_FAIL;delete process.env.WINFIRE_TEST_DEPLOY_HASH_MISMATCH;delete process.env.WINFIRE_TEST_SIGNER
   }
 })

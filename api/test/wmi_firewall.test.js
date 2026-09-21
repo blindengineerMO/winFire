@@ -82,9 +82,7 @@ assert audit['settingValue']==3 and audit['successEnabled'] and audit['failureEn
 assert wmi_probe.run_staged_operation(Services(),'192.0.2.1','reader','secret','EXAMPLE','audit_policy_enable','10.0.20348',{})==audit
 assert len(smb.deleted)==16
 assert 'Get-WinFireXpRules' in wmi_probe.firewall_script('all_rules','5.1.2600',{},'a'*32)
-try:wmi_probe.firewall_script('events','5.1.2600',{},'a'*32)
-except RuntimeError:pass
-else:raise AssertionError('XP accepted WFP event collection')
+assert "Get-WinFireXpEvents 'events' 0" in wmi_probe.firewall_script('events','5.1.2600',{},'a'*32)
 try:wmi_probe.firewall_script('rules','5.1.2600',{'group':'WinFireSecure:test'},'a'*32)
 except RuntimeError:pass
 else:raise AssertionError('XP accepted managed firewall readback')

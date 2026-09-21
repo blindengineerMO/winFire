@@ -10,6 +10,8 @@ import {isLoopbackEvent} from './eventPattern.js'
 import {diffRules} from './connector.js'
 import {emitNotification} from './notifications.js'
 import {normalizeProfileSnapshot} from './breakGlass.js'
+import {effectiveAgentPollSeconds} from './agentPoll.js'
+import {isExcludedFirewallEvent} from './processExclusions.js'
 
 export const agentRoutes=express.Router()
 const wrap=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next)
@@ -45,23 +47,24 @@ agentRoutes.post('/enroll',enrollLimit,wrap(async(req,res)=>{
 }))
 
 agentRoutes.post('/:id/heartbeat',requireAgent,(req,res)=>{
-  const {version,mode}=z.object({version:z.string().max(100),mode:z.enum(['pull','push']).default('pull')}).parse(req.body)
+  const {version,mode}=z.object({version:z.string().trim().min(1).max(100),mode:z.literal('pull').default('pull')}).parse(req.body)
   const previous=one('SELECT status FROM nodes WHERE id=?',req.agent.node_id)?.status
   run('UPDATE agents SET version=?,mode=?,last_checkin_at=? WHERE id=?',version,mode,now(),req.agent.id)
   run("UPDATE nodes SET status='reachable',last_seen_at=?,failures=0 WHERE id=?",now(),req.agent.node_id)
   if(previous==='unreachable')audit(null,'agent.online','node',req.agent.node_id,null,{agentId:req.agent.id})
-  res.json({ok:true,serverTime:now()})
+  res.json({ok:true,serverTime:now(),pollSeconds:effectiveAgentPollSeconds(req.agent.node_id)})
 })
 
 agentRoutes.post('/:id/events',requireAgent,(req,res)=>{
   const event=z.object({recordId:z.number().int().positive(),id:z.number().int().positive(),timeCreated:z.string().datetime({offset:true}),fields:z.record(z.string(),z.string()).default({})})
   const {events}=z.object({events:z.array(event).min(1).max(500)}).parse(req.body)
   const ignoreLoopback=one("SELECT value FROM app_settings WHERE key='ignore_loopback_ingest'")?.value==='true'
-  let inserted=0
+  let inserted=0,excluded=0
   db.transaction(()=>{
     for(const raw of events){
       const item=normalizeWindowsEvent(raw)
       if(ignoreLoopback&&isLoopbackEvent(item))continue
+      if(isExcludedFirewallEvent(item)){excluded++;continue}
       const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,program,process_id,account_sid,event_time,event_type,logon_type,filter_origin,filter_runtime_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),req.agent.node_id,item.recordId,item.eventId,item.action,item.protocol,item.srcIp,item.srcPort,item.dstIp,item.dstPort,item.direction,item.program,item.processId,item.accountSid,item.eventTime,item.eventType,item.logonType,item.filterOrigin,item.filterRuntimeId)
       inserted+=result.changes
       if(!result.changes&&item.filterOrigin)run('UPDATE log_events SET filter_origin=COALESCE(filter_origin,?),filter_runtime_id=COALESCE(filter_runtime_id,?) WHERE node_id=? AND record_id=? AND filter_origin IS NULL',item.filterOrigin,item.filterRuntimeId,req.agent.node_id,item.recordId)
@@ -69,9 +72,9 @@ agentRoutes.post('/:id/events',requireAgent,(req,res)=>{
     }
     run('UPDATE agents SET last_checkin_at=? WHERE id=?',now(),req.agent.id)
     run("UPDATE nodes SET status='reachable',last_seen_at=?,failures=0 WHERE id=?",now(),req.agent.node_id)
-    audit(null,'agent.events.ingest','node',req.agent.node_id,null,{agentId:req.agent.id,received:events.length,inserted,lastRecordId:events.at(-1).recordId})
+    audit(null,'agent.events.ingest','node',req.agent.node_id,null,{agentId:req.agent.id,received:events.length,inserted,excluded,lastRecordId:events.at(-1).recordId})
   })()
-  res.status(201).json({received:events.length,inserted,lastRecordId:events.at(-1).recordId})
+  res.status(201).json({received:events.length,inserted,excluded,lastRecordId:events.at(-1).recordId})
 })
 
 agentRoutes.get('/:id/jobs',requireAgent,(req,res)=>{

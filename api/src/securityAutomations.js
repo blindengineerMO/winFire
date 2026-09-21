@@ -3,6 +3,7 @@ import {emitNotification} from './notifications.js'
 import {writeDirectoryUserStatus} from './directory.js'
 import {openSealed} from './security.js'
 import {remote} from './connector.js'
+import {visibleFirewallEventSql} from './processExclusions.js'
 
 const cutoff=minutes=>new Date(Date.now()-minutes*60_000).toISOString()
 const safeDestination=value=>String(value||'').trim().toLowerCase()
@@ -11,8 +12,8 @@ export function previewSecurityAutomation(policy,{limit=100,offset=0,upperBound=
   if(policy.trigger_type==='destination'){
     if(!destination)return {count:0,items:[]}
     const items=all(`SELECT e.id,e.node_id,e.event_id,e.direction,e.process_id,e.account_sid,e.dst_ip,e.event_time,e.received_at,n.hostname,n.transport
-      FROM log_events e JOIN nodes n ON n.id=e.node_id
-      WHERE e.received_at>=? AND e.received_at>=? AND e.received_at<=? AND
+      FROM log_events e JOIN nodes n ON n.id=e.node_id LEFT JOIN event_patterns p ON p.id=e.pattern_id
+      WHERE ${visibleFirewallEventSql()} AND e.received_at>=? AND e.received_at>=? AND e.received_at<=? AND
       (lower(COALESCE(e.dst_ip,''))=? OR EXISTS(SELECT 1 FROM nodes target
         WHERE (lower(target.hostname)=? OR lower(target.fqdn)=?) AND
         lower(COALESCE(e.dst_ip,'')) IN (lower(COALESCE(target.ip,'')),lower(COALESCE(target.fqdn,'')))))

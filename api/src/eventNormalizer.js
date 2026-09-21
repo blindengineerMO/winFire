@@ -1,5 +1,8 @@
 const firewallAllow=new Set([5156])
 const firewallBlock=new Set([5150,5151,5157])
+const legacyLogonSuccess=new Set([528,540])
+const legacyLogonFailure=new Set([529,530,531,532,533,534,535,536,537,539])
+const legacyLogoff=new Set([538,551])
 
 function intOrNull(value) {
   if(value===undefined||value===null||String(value).trim()==='')return null
@@ -9,8 +12,8 @@ function intOrNull(value) {
 
 export function normalizeWindowsEvent(event) {
   const id=Number(event.Id??event.id),fields=event.Fields??event.fields??{}
-  const eventType=firewallAllow.has(id)||firewallBlock.has(id)?'firewall':[4624,4625,4634,4647].includes(id)?'logon':id===5712?'rpc':'other'
-  const action=firewallAllow.has(id)?'allow':firewallBlock.has(id)?'block':id===4624?'success':id===4625?'failure':[4634,4647].includes(id)?'logoff':null
+  const eventType=firewallAllow.has(id)||firewallBlock.has(id)?'firewall':[4624,4625,4634,4647].includes(id)||legacyLogonSuccess.has(id)||legacyLogonFailure.has(id)||legacyLogoff.has(id)?'logon':id===5712?'rpc':'other'
+  const action=firewallAllow.has(id)?'allow':firewallBlock.has(id)?'block':id===4624||legacyLogonSuccess.has(id)?'success':id===4625||legacyLogonFailure.has(id)?'failure':[4634,4647].includes(id)||legacyLogoff.has(id)?'logoff':null
   const rawProtocol=String(fields.Protocol||'')
   const protocol=rawProtocol==='6'?'TCP':rawProtocol==='17'?'UDP':rawProtocol||null
   const rawDirection=String(fields.Direction||'')

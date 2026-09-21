@@ -69,6 +69,24 @@ test('WMI host completes onboarding with host facts, audit readback, and event p
   assert.deepEqual(await onboardPendingNodes(5,handlers),[])
 })
 
+test('XP onboarding collects legacy logons without attempting WFP auditing or firewall training',async()=>{
+  db.prepare("INSERT INTO nodes(id,hostname,ip,connection_mode,inventory_source,transport,os_version,firewall_state) VALUES(?,?,?,'agentless','manual','winrm',?,'learning')").run('xp-onboard','XP-ONBOARD','192.0.2.21','5.1.2600')
+  db.prepare('INSERT INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,NULL)').run('cred','xp-onboard')
+  db.prepare('INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?)').run('xp-onboard','{}',new Date().toISOString())
+  db.prepare("UPDATE nodes SET status='reachable' WHERE id='xp-onboard'").run()
+  const calls=[]
+  const handlers={
+    invoke:async()=>{throw new Error('XP must not receive WFP audit commands')},
+    pullRecent:async()=>{calls.push('recent');return {inserted:1}},
+    pullHistory:async()=>{calls.push('history');return {inserted:2,caughtUp:true}}
+  }
+  assert.deepEqual(await onboardPendingNodes(5,handlers),[{nodeId:'xp-onboard',status:'complete'}])
+  assert.deepEqual(calls,['recent','history'])
+  assert.equal(db.prepare("SELECT firewall_state FROM nodes WHERE id='xp-onboard'").get().firewall_state,'unmanaged')
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM audit_log WHERE entity_id='xp-onboard' AND action='node.onboarding.logon-only'").get().n,1)
+  assert.deepEqual(await onboardPendingNodes(5,handlers),[])
+})
+
 test('manual WMI host authenticates and checks identity before audited WinRM activation',async()=>{
   db.prepare("INSERT INTO nodes(id,hostname,ip,connection_mode,inventory_source,transport) VALUES(?,?,?,'agentless','manual','wmi')").run('manual-wmi','MANUAL-WMI','192.0.2.12')
   db.prepare("INSERT INTO credentials(id,name,type,username,encrypted_blob,priority) VALUES(?,?,'domain',?,?,?)").run('wmi-bad','Wrong WMI credential','EXAMPLE\\bad',seal({password:'wrong-secret'}),10)

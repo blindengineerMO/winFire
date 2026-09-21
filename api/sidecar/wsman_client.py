@@ -203,6 +203,12 @@ def legacy_ps2(session, payload):
         limit = min(200, max(1, int(args.get('limit') or 100)))
         source = (Path(__file__).resolve().parent / 'xp_firewall.ps1').read_text()
         script = source + f'\nGet-WinFireXpRules {offset} {limit}\n'
+    elif operation in {'events', 'events_recent', 'events_probe', 'event_cursor'} and windows_dialect(payload.get('osVersion')) == 'xp':
+        after = int((payload.get('args') or {}).get('after') or 0)
+        if after < 0 or after > 9223372036854775807:
+            raise ValueError('Invalid event cursor')
+        source = (Path(__file__).resolve().parent / 'xp_events.ps1').read_text()
+        script = source + f"\nGet-WinFireXpEvents '{operation}' {after}\n"
     elif operation in {'all_rules', 'rules', 'apply'} and windows_dialect(payload.get('osVersion')) == 'advfirewall':
         args = payload.get('args') or {}
         group = str(args.get('group') or '')
@@ -240,6 +246,8 @@ def legacy_ps2(session, payload):
     output = stdout.decode('utf-8-sig', 'replace').strip()
     if operation == 'auth':
         return output
+    if operation in {'events', 'events_recent', 'events_probe', 'event_cursor'}:
+        return parse_legacy_events(output, operation)
     if operation in {'all_rules', 'rules'}:
         return parse_legacy_firewall(output, operation)
     if operation == 'apply':
@@ -272,6 +280,35 @@ def legacy_ps2(session, payload):
             raise RuntimeError('Account inventory returned no host record')
         return inventory
     return parse_legacy_facts(output)
+
+
+def parse_legacy_events(output, operation):
+    if operation == 'event_cursor':
+        if not re.fullmatch(r'CURSOR\|\d+', output):
+            raise RuntimeError('Legacy Security event cursor returned an invalid response')
+        return int(output.split('|', 1)[1])
+    events = []
+    allowed = {528, 540, 529, 530, 531, 532, 533, 534, 535, 536, 537, 539, 538, 551}
+    for line in output.splitlines():
+        parts = line.split('|')
+        if len(parts) != 5 or parts[0] != 'XPEVENT' or not parts[1].isdigit() or not parts[2].isdigit():
+            raise RuntimeError('Legacy Security event returned an invalid frame')
+        record_id, event_id = int(parts[1]), int(parts[2])
+        if record_id < 0 or event_id not in allowed:
+            raise RuntimeError('Legacy Security event returned an unexpected ID')
+        try:
+            from datetime import datetime
+            datetime.fromisoformat(parts[3].replace('Z', '+00:00'))
+            sid = base64.b64decode(parts[4], validate=True).decode('utf-8')
+        except (ValueError, UnicodeError) as error:
+            raise RuntimeError('Legacy Security event returned invalid data') from error
+        if sid and not re.fullmatch(r'S-1-\d+(?:-\d+)+', sid):
+            raise RuntimeError('Legacy Security event returned an invalid SID')
+        events.append({'RecordId': record_id, 'Id': event_id, 'TimeCreated': parts[3],
+                       'Fields': {'TargetUserSid': sid} if sid else {}})
+    if len(events) > 500 or any(events[index]['RecordId'] >= events[index + 1]['RecordId'] for index in range(len(events) - 1)):
+        raise RuntimeError('Legacy Security event page is not ordered or exceeds 500 records')
+    return events
 
 
 def parse_legacy_facts(output):
@@ -401,7 +438,7 @@ def main():
         operation_timeout_sec=80 if slow else 20,
     )
     os_version = str(payload.get('osVersion') or '')
-    if not os_version and operation in {'facts', 'rights', 'rights_change', 'account_inventory', 'all_rules', 'rules', 'apply'}:
+    if not os_version and operation in {'facts', 'rights', 'rights_change', 'account_inventory', 'all_rules', 'rules', 'apply', 'events', 'events_recent', 'events_probe', 'event_cursor'}:
         detected = session.run_ps('(Get-WmiObject Win32_OperatingSystem).Caption')
         if detected.status_code == 0:
             os_version = detected.std_out.decode('utf-8-sig', 'replace').strip()

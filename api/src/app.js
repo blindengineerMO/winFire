@@ -18,6 +18,8 @@ import {classifyVerification,findMatchingDenyEvent,hasManagedRule} from './verif
 import {makeTotpSecret,verifyTotp,matchingTotpCounter} from './totp.js'
 import {agentRoutes} from './agentRoutes.js'
 import {agentPkiReady} from './agentPki.js'
+import {agentBootstrapScript,normalizeSignerThumbprint} from './agentBootstrap.js'
+import {agentPollSettings} from './agentPoll.js'
 import {normalizeWindowsEvent} from './eventNormalizer.js'
 import {isLoopbackEvent} from './eventPattern.js'
 import {deliverInvite,deliverVerification,inviteLink} from './mailer.js'
@@ -40,6 +42,7 @@ import {beginAdAuthenticatorEnrollment,confirmAdAuthenticatorEnrollment} from '.
 import {validateExportDestination,exportSelectedEvents} from './eventExport.js'
 import {previewSecurityAutomation} from './securityAutomations.js'
 import {collectAccountInventory,accountName} from './localAccounts.js'
+import {normalizeProcessExclusions,refreshProcessExclusions,isExcludedFirewallEvent,visibleFirewallEventSql} from './processExclusions.js'
 
 export const app=express()
 app.disable('x-powered-by')
@@ -86,6 +89,11 @@ function directoryActionCredential(settings){
   return {username:credential.username,password:openSealed(credential.encrypted_blob).password}
 }
 function startTraining(node,days,mode,actorId=null) {
+  if(/^(?:5\.[12]\.|windows (?:xp|server 2003))/i.test(String(node.os_version||''))){
+    run("UPDATE nodes SET firewall_state='unmanaged' WHERE id=?",node.id)
+    audit(actorId,'learning.unsupported','node',node.id,null,{osVersion:node.os_version,reason:'XP/Server 2003 firewall enforcement is unavailable'})
+    return null
+  }
   if(one("SELECT id FROM learning_sessions WHERE node_id=? AND status IN ('active','review','applying','apply-failed')",node.id))throw Object.assign(new Error('Finish the current learning session before starting another'),{status:409})
   const sessionId=id(),endsAt=new Date(Date.now()+days*864e5).toISOString(),policy=ensurePersonalPolicy(node,actorId)
   const progressive=progressiveSettings(),progressiveEnabled=mode==='auto'&&progressive.enabled&&days>progressive.startDays
@@ -206,6 +214,16 @@ api.get('/agent-package/WinFire.Agent.exe',(req,res)=>{
   if(!fs.existsSync(packagePath)||!fs.statSync(packagePath).isFile())return notFound(res,'Agent package')
   res.set('Cache-Control','private, no-store').type('application/octet-stream').sendFile(packagePath)
 })
+api.get('/agent-package/enroll.ps1',wrap(async(req,res)=>{
+  if(!req.secure||!agentPkiReady()||!process.env.AGENT_PACKAGE_PATH)return res.status(503).json({error:'Agent bootstrap requires HTTPS, PKI, and a configured package'})
+  if(!process.env.PUBLIC_BASE_URL)return res.status(503).json({error:'Set an HTTPS PUBLIC_BASE_URL for agent bootstrap'})
+  const packagePath=path.resolve(process.env.AGENT_PACKAGE_PATH)
+  if(!fs.existsSync(packagePath)||!fs.statSync(packagePath).isFile())return notFound(res,'Agent package')
+  let script
+  try{script=await agentBootstrapScript(packagePath,process.env.PUBLIC_BASE_URL,process.env.AGENT_SIGNER_THUMBPRINT)}
+  catch(error){return res.status(503).json({error:error.message})}
+  res.set('Cache-Control','private, no-store').type('text/plain').send(script)
+}))
 api.get('/openapi.json',(_req,res)=>res.json(buildOpenApi(api,agentRoutes)))
 const loginLimit=rateLimit({windowMs:15*60*1000,limit:Number(process.env.AUTH_RATE_LIMIT||20),standardHeaders:'draft-8',legacyHeaders:false})
 const publicMfaLimit=rateLimit({windowMs:15*60*1000,limit:10,standardHeaders:'draft-8',legacyHeaders:false})
@@ -691,6 +709,20 @@ api.get('/audit/search',requireRole('auditor'),(req,res)=>{
 })
 const publicTrainingSettings=()=>({newHostTrainingDays:trainingDays(),progressiveLearning:progressiveSettings()})
 api.get('/settings/training',(_req,res)=>res.json(publicTrainingSettings()))
+api.get('/settings/agent-poll',requireRole('admin'),(_req,res)=>res.json(agentPollSettings()))
+api.put('/settings/agent-poll',requireRole('admin'),(req,res)=>{
+  const data=body(z.object({targetType:z.enum(['node','group']),targetId:z.string().min(1),pollSeconds:z.number().int().min(15).max(300).nullable()}),req)
+  const target=data.targetType==='node'?one('SELECT id FROM nodes WHERE id=?',data.targetId):one('SELECT id FROM node_groups WHERE id=?',data.targetId)
+  if(!target)return notFound(res,data.targetType==='node'?'Node':'Node group')
+  const before=one('SELECT poll_seconds FROM agent_poll_settings WHERE target_type=? AND target_id=?',data.targetType,data.targetId)?.poll_seconds??null
+  db.transaction(()=>{
+    if(data.pollSeconds===null)run('DELETE FROM agent_poll_settings WHERE target_type=? AND target_id=?',data.targetType,data.targetId)
+    else run(`INSERT INTO agent_poll_settings(target_type,target_id,poll_seconds,updated_at) VALUES(?,?,?,?)
+      ON CONFLICT(target_type,target_id) DO UPDATE SET poll_seconds=excluded.poll_seconds,updated_at=excluded.updated_at`,data.targetType,data.targetId,data.pollSeconds,now())
+    audit(req.user.id,'agent.poll.configure',data.targetType,data.targetId,{pollSeconds:before},{pollSeconds:data.pollSeconds})
+  })()
+  res.json(agentPollSettings())
+})
 api.patch('/settings/training',requireRole('admin'),(req,res)=>{
   const data=body(z.object({newHostTrainingDays:z.number().int().min(1).max(365),progressiveLearning:z.object({enabled:z.boolean(),startDays:z.number().int().min(1).max(364),intervalHours:z.number().int().min(1).max(168)}).optional()}),req)
   const before=publicTrainingSettings()
@@ -705,6 +737,20 @@ api.patch('/settings/training',requireRole('admin'),(req,res)=>{
   res.json(publicTrainingSettings())
 })
 api.get('/settings/observability',requireRole('admin'),(_req,res)=>res.json(observabilitySettings()))
+api.get('/settings/process-exclusions',requireRole('admin'),(_req,res)=>res.json({names:all('SELECT name FROM process_exclusions ORDER BY name').map(row=>row.name)}))
+api.put('/settings/process-exclusions',requireRole('admin'),(req,res)=>{
+  const {names:rawNames}=body(z.object({names:z.array(z.string()).max(200)}),req)
+  let names
+  try{names=normalizeProcessExclusions(rawNames)}catch(error){return res.status(400).json({error:error.message})}
+  const before=all('SELECT name FROM process_exclusions ORDER BY name').map(row=>row.name)
+  db.transaction(()=>{
+    run('DELETE FROM process_exclusions')
+    for(const name of names)run('INSERT INTO process_exclusions(name,added_at) VALUES(?,?)',name,now())
+    audit(req.user.id,'process-exclusions.update','settings','global',{names:before},{names})
+  })()
+  refreshProcessExclusions(db)
+  res.json({names})
+})
 api.get('/settings/logs-display',(_req,res)=>res.json({hideLoopbackEvents:observabilitySettings().hideLoopbackEvents}))
 api.patch('/settings/observability',requireRole('admin'),(req,res)=>{
   const data=body(z.object({logRetentionDays:z.number().int().min(1).max(3650),dnsRefreshHours:z.number().int().min(1).max(720),eventCompactHours:z.number().int().min(1).max(720).optional(),hideLoopbackEvents:z.boolean().optional(),ignoreLoopbackIngest:z.boolean().optional()}),req)
@@ -844,7 +890,7 @@ api.get('/directory/accounts',requireRole('auditor'),(req,res)=>{
 })
 api.get('/directory/local-accounts/:id',requireRole('auditor'),(req,res)=>{
   const account=one('SELECT l.*,n.hostname FROM local_accounts l JOIN nodes n ON n.id=l.node_id WHERE l.id=?',reqId(req));if(!account)return notFound(res,'Local account')
-  const logonEvents=all('SELECT e.id,e.node_id,n.hostname,e.event_id,e.action,e.src_ip,e.event_time,e.logon_type FROM log_events e LEFT JOIN nodes n ON n.id=e.node_id WHERE e.account_sid=? AND e.node_id=? AND e.event_id IN (4624,4625,4634,4647) ORDER BY e.event_time DESC,e.record_id DESC LIMIT 100',account.sid,account.node_id)
+  const logonEvents=all('SELECT e.id,e.node_id,n.hostname,e.event_id,e.action,e.src_ip,e.event_time,e.logon_type FROM log_events e LEFT JOIN nodes n ON n.id=e.node_id WHERE e.account_sid=? AND e.node_id=? AND e.event_id IN (4624,4625,4634,4647,528,540,529,530,531,532,533,534,535,536,537,539,538,551) ORDER BY e.event_time DESC,e.record_id DESC LIMIT 100',account.sid,account.node_id)
   res.json({...account,source:'local',sam_account_name:account.qualified_name,display_name:account.full_name||account.username,logonEvents,mfaEvents:[]})
 })
 api.post('/nodes/:id/local-accounts/refresh',requireRole('admin'),wrap(async(req,res)=>{
@@ -893,7 +939,7 @@ api.get('/directory/users',requireRole('auditor'),(req,res)=>{
 api.get('/directory/users/:id',requireRole('auditor'),(req,res)=>{
   const user=one('SELECT * FROM directory_users WHERE id=?',reqId(req));if(!user)return notFound(res,'Directory user')
   const mfa=all('SELECT id,segment_id,node_id,status,challenged_at,resolved_at FROM mfa_challenges WHERE lower(user_upn) IN (?,?) ORDER BY challenged_at DESC LIMIT 100',String(user.upn||'').toLowerCase(),String(user.email||'').toLowerCase())
-  const logons=all('SELECT e.id,e.node_id,n.hostname,e.event_id,e.action,e.src_ip,e.event_time,e.logon_type FROM log_events e LEFT JOIN nodes n ON n.id=e.node_id WHERE e.account_sid=? AND e.event_id IN (4624,4625,4634,4647) ORDER BY e.event_time DESC,e.record_id DESC LIMIT 100',user.sid)
+  const logons=all('SELECT e.id,e.node_id,n.hostname,e.event_id,e.action,e.src_ip,e.event_time,e.logon_type FROM log_events e LEFT JOIN nodes n ON n.id=e.node_id WHERE e.account_sid=? AND e.event_id IN (4624,4625,4634,4647,528,540,529,530,531,532,533,534,535,536,537,539,538,551) ORDER BY e.event_time DESC,e.record_id DESC LIMIT 100',user.sid)
   const {member_of_json,...publicUser}=user
   res.json({...publicUser,memberOf:parse(member_of_json)||[],mfaEnrolled:!!one('SELECT 1 FROM users WHERE ad_guid=? AND totp_secret IS NOT NULL',user.id),operatorImported:!!one("SELECT 1 FROM users WHERE ad_guid=? AND auth_source='ad'",user.id),mfaEvents:mfa,logonEvents:logons})
 })
@@ -1058,6 +1104,7 @@ api.delete('/nodes/:id',requireRole('admin'),(req,res)=>{
   db.transaction(()=>{
     run('DELETE FROM credential_assignments WHERE node_id=?',node.id)
     run('DELETE FROM enrollment_tokens WHERE node_id=?',node.id)
+    run("DELETE FROM agent_poll_settings WHERE target_type='node' AND target_id=?",node.id)
     run('DELETE FROM node_group_members WHERE node_id=?',node.id)
     run('DELETE FROM learning_sessions WHERE node_id=?',node.id)
     run('DELETE FROM agent_jobs WHERE agent_id IN (SELECT id FROM agents WHERE node_id=?)',node.id)
@@ -1082,6 +1129,9 @@ api.post('/nodes/:id/deploy-agent',requireRole('admin'),wrap(async(req,res)=>{
   const base=process.env.PUBLIC_BASE_URL
   if(!base||!base.startsWith('https://'))return res.status(503).json({error:'Set an HTTPS PUBLIC_BASE_URL for agent deployment'})
   if(!process.env.AGENT_PACKAGE_PATH)return res.status(503).json({error:'Set AGENT_PACKAGE_PATH to a signed Windows agent executable'})
+  let signerThumbprint
+  try{signerThumbprint=normalizeSignerThumbprint(process.env.AGENT_SIGNER_THUMBPRINT)}
+  catch(error){return res.status(503).json({error:error.message})}
   const packagePath=path.resolve(process.env.AGENT_PACKAGE_PATH)
   if(!fs.existsSync(packagePath)||!fs.statSync(packagePath).isFile())return res.status(503).json({error:'The signed agent executable was not found'})
   const digest=crypto.createHash('sha256')
@@ -1092,9 +1142,9 @@ api.post('/nodes/:id/deploy-agent',requireRole('admin'),wrap(async(req,res)=>{
   run('INSERT INTO policy_apply_runs(id,node_id,status) VALUES(?,?,?)',applyRunId,node.id,'running')
   audit(req.user.id,'agent.remote-deploy.start','node',node.id,null,{runId:applyRunId,packageSha256,expiresAt})
   try{
-    const result=await remote(node,'agent_deploy',{serverUrl:base.replace(/\/$/,''),packageUrl:new URL('/api/v1/agent-package/WinFire.Agent.exe',base).toString(),sha256:digest.digest('hex'),token})
+    const result=await remote(node,'agent_deploy',{serverUrl:base.replace(/\/$/,''),packageUrl:new URL('/api/v1/agent-package/WinFire.Agent.exe',base).toString(),sha256:digest.digest('hex'),signerThumbprint,token})
     const agent=one('SELECT id FROM agents WHERE node_id=?',node.id)
-    if(!result?.installed||!agent)throw new Error('The agent service or certificate enrollment was not confirmed')
+    if(!result?.installed||!agent||String(result.status).toLowerCase()!=='running'||String(result.sha256).toLowerCase()!==packageSha256)throw new Error('The agent service, package hash, or certificate enrollment was not confirmed')
     db.transaction(()=>{
       run('UPDATE policy_apply_runs SET status=?,diff_json=?,finished_at=? WHERE id=?','success',json({operation:'agent_deploy',agentId:agent.id,serviceStatus:result.status,packageSha256}),now(),applyRunId)
       audit(req.user.id,'agent.remote-deploy.success','node',node.id,null,{runId:applyRunId,agentId:agent.id,serviceStatus:result.status})
@@ -1522,7 +1572,7 @@ async function verifyOne(node,policy,rule,runId,actualRules,targetConnector,vant
     }
     if(!targetConnector.readsSecurityEvents||baselineRecordId!==null){
       const candidates=all(`SELECT e.record_id,e.event_id,e.event_time,e.action,e.filter_origin,e.filter_runtime_id,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.direction,p.direction) direction,COALESCE(e.src_ip,p.src_ip) src_ip,e.src_port,COALESCE(e.dst_port,p.dst_port) dst_port
-        FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE e.node_id=? AND e.event_id=5157 AND e.src_port=? AND COALESCE(e.dst_port,p.dst_port)=? AND (? IS NULL OR e.record_id>?) AND (? IS NOT NULL OR datetime(e.event_time)>=datetime(?)) ORDER BY e.record_id DESC LIMIT 100`,node.id,probe.sourcePort,port,baselineRecordId,baselineRecordId,baselineRecordId,new Date(Date.parse(probeStartedAt)-2000).toISOString())
+        FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE ${visibleFirewallEventSql()} AND e.node_id=? AND e.event_id=5157 AND e.src_port=? AND COALESCE(e.dst_port,p.dst_port)=? AND (? IS NULL OR e.record_id>?) AND (? IS NOT NULL OR datetime(e.event_time)>=datetime(?)) ORDER BY e.record_id DESC LIMIT 100`,node.id,probe.sourcePort,port,baselineRecordId,baselineRecordId,baselineRecordId,new Date(Date.parse(probeStartedAt)-2000).toISOString())
       firewallEvent=findMatchingDenyEvent(candidates,probe,port,probeStartedAt,probeFinishedAt,baselineRecordId)
     }
   }
@@ -1627,7 +1677,7 @@ api.get('/reports/dashboard',(_req,res)=>{
   const checks=one('SELECT COUNT(passed) n,COALESCE(SUM(passed),0) passed,COUNT(*)-COUNT(passed) inconclusive FROM verifier_results')
   const agentCutoff=new Date(Date.now()-120_000).toISOString()
   const agents=one('SELECT COUNT(*) total,COALESCE(SUM(CASE WHEN revoked_at IS NULL AND last_checkin_at>=? THEN 1 ELSE 0 END),0) online FROM agents',agentCutoff)
-  const denied=all("SELECT COALESCE(e.dst_port,p.dst_port) dst_port,COUNT(*) count FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE e.action='block' GROUP BY COALESCE(e.dst_port,p.dst_port) ORDER BY count DESC LIMIT 6")
+  const denied=all(`SELECT COALESCE(e.dst_port,p.dst_port) dst_port,COUNT(*) count FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE e.action='block' AND ${visibleFirewallEventSql()} GROUP BY COALESCE(e.dst_port,p.dst_port) ORDER BY count DESC LIMIT 6`)
   const verifierTrend=all("SELECT date(run_at) day,COUNT(passed) decisive,SUM(CASE WHEN passed=1 THEN 1 ELSE 0 END) passed FROM verifier_results WHERE datetime(run_at)>=datetime('now','-14 days') GROUP BY date(run_at) ORDER BY day").map(row=>({day:row.day,decisive:row.decisive,passRate:row.decisive?Math.round(row.passed/row.decisive*100):null}))
   const mfaTrend=all("SELECT date(resolved_at) day,SUM(CASE WHEN status='approved' THEN 1 ELSE 0 END) approved,SUM(CASE WHEN status='denied' THEN 1 ELSE 0 END) denied FROM mfa_challenges WHERE datetime(resolved_at)>=datetime('now','-14 days') GROUP BY date(resolved_at) ORDER BY day")
   const coverage=report('coverage')
@@ -1641,11 +1691,11 @@ api.get('/identity/learning-preview',(req,res)=>{
   const since=new Date(Date.now()-query.days*864e5).toISOString()
   const observations=all(`SELECT e.node_id,n.hostname,e.account_sid,COALESCE(e.logon_type,'') logon_type,
       COALESCE(e.src_ip,p.src_ip,'') source_ip,
-      SUM(CASE WHEN e.event_id=4624 THEN 1 ELSE 0 END) successes,
-      SUM(CASE WHEN e.event_id=4625 THEN 1 ELSE 0 END) failures,
+      SUM(CASE WHEN e.event_id IN (4624,528,540) THEN 1 ELSE 0 END) successes,
+      SUM(CASE WHEN e.event_id IN (4625,529,530,531,532,533,534,535,536,537,539) THEN 1 ELSE 0 END) failures,
       MAX(COALESCE(e.event_time,e.received_at)) last_seen_at
     FROM log_events e JOIN nodes n ON n.id=e.node_id LEFT JOIN event_patterns p ON p.id=e.pattern_id
-    WHERE e.event_id IN (4624,4625) AND e.account_sid IS NOT NULL
+    WHERE e.event_id IN (4624,4625,528,540,529,530,531,532,533,534,535,536,537,539) AND e.account_sid IS NOT NULL
       AND datetime(COALESCE(e.event_time,e.received_at))>=datetime(?)
       AND (? IS NULL OR e.node_id=?)
     GROUP BY e.node_id,e.account_sid,COALESCE(e.logon_type,''),COALESCE(e.src_ip,p.src_ip,'')
@@ -1960,7 +2010,7 @@ api.get('/logs/search',(req,res)=>{
     sortBy:z.enum(['time','node','eventId','action','direction','srcIp','dstIp','port','program','account']).default('time'),sortDir:z.enum(['asc','desc']).default('desc'),hideLoopback:z.enum(['true','false']).optional(),account:z.string().max(200).default('')
   }).parse(req.query)
   if(query.from&&query.to&&new Date(query.from)>new Date(query.to))return res.status(400).json({error:'From must be earlier than To'})
-  const filters=[],args=[]
+  const filters=[visibleFirewallEventSql()],args=[]
   for(const [key,column] of [['nodeId','e.node_id'],['action','e.action'],['direction','COALESCE(e.direction,p.direction)'],['challengeId','e.challenge_id'],['eventId','e.event_id'],['port','COALESCE(e.dst_port,p.dst_port)']])if(query[key]!==undefined){filters.push(`${column}=?`);args.push(query[key])}
   for(const [key,column] of [['program','COALESCE(e.program,p.program)'],['protocol','COALESCE(e.protocol,p.protocol)'],['srcIp','COALESCE(e.src_ip,p.src_ip)'],['dstIp','COALESCE(e.dst_ip,p.dst_ip)']])if(query[key]){filters.push(`${column} LIKE ? ESCAPE '\\'`);args.push(`%${query[key].replace(/[\\%_]/g,'\\$&')}%`)}
   if(query.account.trim()){const term=`%${query.account.trim().replace(/[\\%_]/g,'\\$&')}%`;filters.push("(e.account_sid LIKE ? ESCAPE '\\' OR COALESCE(ad.sam_account_name,ad.upn,'') LIKE ? ESCAPE '\\' OR COALESCE(la.qualified_name,'') LIKE ? ESCAPE '\\' OR COALESCE(sr.qualified_name,'') LIKE ? ESCAPE '\\')");args.push(term,term,term,term)}
@@ -2004,7 +2054,7 @@ api.post('/event-export/send',requireRole('admin'),wrap(async(req,res)=>{
   const data=body(z.object({destinationId:z.string().uuid(),eventIds:z.array(z.string().uuid()).min(1).max(500)}),req)
   const eventIds=[...new Set(data.eventIds)],destination=one('SELECT * FROM event_export_destinations WHERE id=?',data.destinationId)
   if(!destination)return notFound(res,'Export destination')
-  const events=all(`SELECT e.*,n.hostname,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,COALESCE(e.dst_ip,p.dst_ip) dst_ip,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.direction,p.direction) direction,COALESCE(e.program,p.program) program FROM log_events e LEFT JOIN nodes n ON n.id=e.node_id LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE e.id IN (${eventIds.map(()=>'?').join(',')})`,...eventIds)
+  const events=all(`SELECT e.*,n.hostname,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,COALESCE(e.dst_ip,p.dst_ip) dst_ip,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.direction,p.direction) direction,COALESCE(e.program,p.program) program FROM log_events e LEFT JOIN nodes n ON n.id=e.node_id LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE ${visibleFirewallEventSql()} AND e.id IN (${eventIds.map(()=>'?').join(',')})`,...eventIds)
   if(events.length!==eventIds.length)return res.status(404).json({error:'One or more selected events no longer exist'})
   audit(req.user.id,'event-export.send.attempt','event-export',destination.id,null,{eventIds,count:events.length})
   try{
@@ -2017,7 +2067,7 @@ api.post('/event-export/send',requireRole('admin'),wrap(async(req,res)=>{
   }
 }))
 api.post('/logs/:id/rule',requireRole('admin'),(req,res)=>{
-  const event=one('SELECT e.*,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,COALESCE(e.dst_ip,p.dst_ip) dst_ip,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.direction,p.direction) direction,COALESCE(e.program,p.program) program FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE e.id=?',reqId(req));if(!event)return notFound(res,'Event')
+  const event=one(`SELECT e.*,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,COALESCE(e.dst_ip,p.dst_ip) dst_ip,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.direction,p.direction) direction,COALESCE(e.program,p.program) program FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE ${visibleFirewallEventSql()} AND e.id=?`,reqId(req));if(!event)return notFound(res,'Event')
   const node=getNode(event.node_id);if(!node)return notFound(res,'Node')
   const data=body(z.object({action:z.enum(['allow','block']),policyId:z.string().optional()}),req)
   if(!['in','out'].includes(event.direction)||!['TCP','UDP'].includes(event.protocol)||!Number.isInteger(event.dst_port)||event.dst_port<1||event.dst_port>65535)return res.status(400).json({error:'This event lacks a direction, TCP/UDP protocol, or valid destination port'})
@@ -2048,7 +2098,7 @@ api.post('/logs/:id/rule',requireRole('admin'),(req,res)=>{
 api.post('/logs/ingest',requireRole('editor'),(req,res)=>{
   const data=body(z.object({nodeId:z.string(),events:z.array(z.object({recordId:z.number().optional(),eventId:z.number().int(),action:z.string().optional(),protocol:z.string().optional(),srcIp:z.string().optional(),dstIp:z.string().optional(),dstPort:z.number().optional(),direction:z.string().optional(),program:z.string().optional(),accountSid:z.string().optional(),challengeId:z.string().optional()})).max(1000)}),req)
   const ignoreLoopback=observabilitySettings().ignoreLoopbackIngest
-  let inserted=0;db.transaction(()=>{for(const event of data.events){if(ignoreLoopback&&isLoopbackEvent(event))continue;const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,dst_ip,dst_port,direction,program,account_sid,challenge_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),data.nodeId,event.recordId??null,event.eventId,event.action||null,event.protocol||null,event.srcIp||null,event.dstIp||null,event.dstPort||null,event.direction||null,event.program||null,event.accountSid||null,event.challengeId||null);inserted+=result.changes}})()
+  let inserted=0;db.transaction(()=>{for(const event of data.events){if(ignoreLoopback&&isLoopbackEvent(event)||isExcludedFirewallEvent(event))continue;const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,dst_ip,dst_port,direction,program,account_sid,challenge_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),data.nodeId,event.recordId??null,event.eventId,event.action||null,event.protocol||null,event.srcIp||null,event.dstIp||null,event.dstPort||null,event.direction||null,event.program||null,event.accountSid||null,event.challengeId||null);inserted+=result.changes}})()
   res.status(201).json({inserted})
 })
 
@@ -2057,6 +2107,7 @@ function insertCollectedEvents(nodeId,events,ignoreLoopback){
   db.transaction(()=>{for(const event of events){
     const item=normalizeWindowsEvent(event)
     if(ignoreLoopback&&isLoopbackEvent(item))continue
+    if(isExcludedFirewallEvent(item))continue
     const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,program,process_id,account_sid,event_time,event_type,logon_type,filter_origin,filter_runtime_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),nodeId,item.recordId,item.eventId,item.action,item.protocol,item.srcIp,item.srcPort,item.dstIp,item.dstPort,item.direction,item.program,item.processId,item.accountSid,item.eventTime,item.eventType,item.logonType,item.filterOrigin,item.filterRuntimeId)
     inserted+=result.changes
     if(!result.changes&&item.filterOrigin)run('UPDATE log_events SET filter_origin=COALESCE(filter_origin,?),filter_runtime_id=COALESCE(filter_runtime_id,?) WHERE node_id=? AND record_id=? AND filter_origin IS NULL',item.filterOrigin,item.filterRuntimeId,nodeId,item.recordId)
@@ -2118,8 +2169,9 @@ export async function onboardPendingNodes(limit=5,{resolveDns=lookupDns,enrich=e
       if(!node.ip)await resolveDns(node)
       if(!one('SELECT 1 FROM node_facts WHERE node_id=?',node.id)||!['winrm','winrms','wmi'].includes(node.transport)||node.status!=='reachable')await enrich(getNode(node.id))
       const managed=getNode(node.id)
-      let policy=await invoke(managed,'audit_policy')
-      if(!policy?.successEnabled||!policy?.failureEnabled){
+      const logonOnly=/^(?:5\.[12]\.|windows (?:xp|server 2003))/i.test(String(managed.os_version||''))
+      let policy=logonOnly?{supported:false,reason:'WFP 515x audit events are unavailable on XP/Server 2003'}:await invoke(managed,'audit_policy')
+      if(!logonOnly&&(!policy?.successEnabled||!policy?.failureEnabled)){
         const before=policy,applyRunId=id()
         run('INSERT INTO policy_apply_runs(id,node_id,status) VALUES(?,?,?)',applyRunId,node.id,'running')
         try{
@@ -2135,7 +2187,12 @@ export async function onboardPendingNodes(limit=5,{resolveDns=lookupDns,enrich=e
       }
       const recent=await pullRecent(node.id,null,true)
       const history=await pullHistory(node.id,null,2,true)
-      audit(null,'node.onboarding.complete','node',node.id,null,{transport:managed.transport,auditPolicy:policy,eventsInserted:recent.inserted+history.inserted,historyCaughtUp:history.caughtUp})
+      if(logonOnly)db.transaction(()=>{
+        run("UPDATE learning_sessions SET status='unsupported',last_error='XP/Server 2003 firewall enforcement is unavailable' WHERE node_id=? AND mode='auto' AND status='active'",node.id)
+        run("UPDATE nodes SET firewall_state='unmanaged' WHERE id=?",node.id)
+        audit(null,'node.onboarding.logon-only','node',node.id,null,{transport:managed.transport,osVersion:managed.os_version})
+      })()
+      audit(null,'node.onboarding.complete','node',node.id,null,{transport:managed.transport,auditPolicy:policy,eventsInserted:recent.inserted+history.inserted,historyCaughtUp:history.caughtUp,logonOnly})
       results.push({nodeId:node.id,status:'complete'})
     }catch(error){
       run('UPDATE nodes SET next_retry_at=? WHERE id=?',new Date(Date.now()+15*60_000).toISOString(),node.id)
@@ -2155,6 +2212,7 @@ api.get('/learning-sessions',(req,res)=>res.json(all('SELECT * FROM learning_ses
 api.post('/learning-sessions',requireRole('editor'),(req,res)=>{
   const {nodeId,durationHours}=body(z.object({nodeId:z.string(),durationHours:z.number().min(1).max(720).default(24)}),req),node=getNode(nodeId)
   if(!node)return notFound(res,'Node')
+  if(/^(?:5\.[12]\.|windows (?:xp|server 2003))/i.test(String(node.os_version||'')))return res.status(409).json({error:'XP/Server 2003 can collect legacy logons but cannot train or enforce modern firewall policies'})
   const active=one("SELECT * FROM learning_sessions WHERE node_id=? AND status='active'",nodeId)
   if(active?.mode==='manual')return res.status(409).json({error:'Node already learning'})
   if(!active&&one("SELECT id FROM learning_sessions WHERE node_id=? AND status IN ('review','applying','apply-failed')",nodeId))return res.status(409).json({error:'Finish the current learning session before starting another'})
@@ -2181,7 +2239,7 @@ function learningPreview(session) {
   const assigned=all(`SELECT DISTINCT v.rules_compiled_json FROM policy_versions v JOIN policies p ON p.current_version_id=v.id JOIN policy_assignments a ON a.policy_id=p.id WHERE p.id<>? AND (a.node_id=? OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?))`,policy.id,session.node_id,session.node_id)
   for(const row of assigned)for(const rule of parse(row.rules_compiled_json)||[])if(rule.action==='allow')known.add(ruleLearningKey(rule))
   const endAt=new Date(Math.min(Date.now(),Date.parse(session.ends_at))).toISOString()
-  const observations=all(`SELECT COALESCE(e.direction,p.direction) direction,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,COALESCE(e.dst_ip,p.dst_ip) dst_ip,${processAware?'COALESCE(e.program,p.program)':'NULL'} program,e.src_port src_port,COUNT(*) event_count,MIN(COALESCE(e.event_time,e.received_at)) first_seen_at,MAX(COALESCE(e.event_time,e.received_at)) last_seen_at FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE e.node_id=? AND e.action='allow' AND datetime(COALESCE(e.event_time,e.received_at)) BETWEEN datetime(?) AND datetime(?) AND COALESCE(e.dst_port,p.dst_port) BETWEEN 1 AND 65535 AND COALESCE(e.protocol,p.protocol) IN ('TCP','UDP') AND COALESCE(e.direction,p.direction) IN ('in','out') GROUP BY 1,3,2,4,5,6,7 ORDER BY 1,3,2,4,5,7 LIMIT 10001`,session.node_id,session.started_at,endAt)
+  const observations=all(`SELECT COALESCE(e.direction,p.direction) direction,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,COALESCE(e.dst_ip,p.dst_ip) dst_ip,${processAware?'COALESCE(e.program,p.program)':'NULL'} program,e.src_port src_port,COUNT(*) event_count,MIN(COALESCE(e.event_time,e.received_at)) first_seen_at,MAX(COALESCE(e.event_time,e.received_at)) last_seen_at FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE ${visibleFirewallEventSql()} AND e.node_id=? AND e.action='allow' AND datetime(COALESCE(e.event_time,e.received_at)) BETWEEN datetime(?) AND datetime(?) AND COALESCE(e.dst_port,p.dst_port) BETWEEN 1 AND 65535 AND COALESCE(e.protocol,p.protocol) IN ('TCP','UDP') AND COALESCE(e.direction,p.direction) IN ('in','out') GROUP BY 1,3,2,4,5,6,7 ORDER BY 1,3,2,4,5,7 LIMIT 10001`,session.node_id,session.started_at,endAt)
   if(observations.length>10000)throw Object.assign(new Error('Learning preview exceeds 10,000 observed 5-tuples; narrow the session'),{status:409})
   const existingLearned=new Map((base.nodes||[]).filter(node=>node.id?.startsWith('learned-')&&node.type==='allow').map(node=>[learningRuleKey(node.data.direction,node.data.protocol,node.data.direction==='in'?node.data.localPort:node.data.remotePort,node.data.remoteAddress,node.data.program||'Any'),node.id]))
   const existingKeyByNode=new Map([...existingLearned].map(([key,nodeId])=>[nodeId,key]))
@@ -2390,13 +2448,32 @@ api.post('/agents/:id/revoke',requireRole('admin'),(req,res)=>{
   })()
   res.json({revoked:true})
 })
+function issueAgentEnrollmentToken(nodeId,actorId,expiresAt){
+  const token=crypto.randomBytes(32).toString('base64url')
+  run('INSERT INTO enrollment_tokens(id,node_id,token_hash,expires_at) VALUES(?,?,?,?)',id(),nodeId,hashToken(token),expiresAt)
+  audit(actorId,'agent.token.create','node',nodeId,null,{expires:expiresAt})
+  return {nodeId,token,expiresAt}
+}
+api.post('/agents/enrollment-tokens/bulk',requireRole('admin'),(req,res)=>{
+  if(!req.secure)return res.status(426).json({error:'Agent enrollment tokens require HTTPS'})
+  if(!agentPkiReady())return res.status(503).json({error:'Configure HTTPS and agent PKI before generating enrollment tokens'})
+  const {nodeIds}=body(z.object({nodeIds:z.array(z.string()).min(1).max(50).refine(ids=>new Set(ids).size===ids.length,'Choose each node only once')}),req)
+  const nodes=all(`SELECT id,hostname FROM nodes WHERE id IN (${nodeIds.map(()=>'?').join(',')})`,...nodeIds)
+  if(nodes.length!==nodeIds.length)return res.status(404).json({error:'One or more nodes were not found'})
+  const enrolled=all(`SELECT node_id FROM agents WHERE node_id IN (${nodeIds.map(()=>'?').join(',')})`,...nodeIds)
+  if(enrolled.length)return res.status(409).json({error:'One or more nodes already have an agent; use certificate renewal'})
+  const byId=new Map(nodes.map(node=>[node.id,node]))
+  const expiresAt=new Date(Date.now()+15*60*1000).toISOString()
+  const tokens=db.transaction(()=>nodeIds.map(nodeId=>({hostname:byId.get(nodeId).hostname,...issueAgentEnrollmentToken(nodeId,req.user.id,expiresAt)})))()
+  res.status(201).json({tokens,expiresAt})
+})
 api.post('/agents/enrollment-tokens',requireRole('admin'),(req,res)=>{
+  if(!req.secure)return res.status(426).json({error:'Agent enrollment tokens require HTTPS'})
   if(!agentPkiReady())return res.status(503).json({error:'Configure HTTPS and agent PKI before generating enrollment tokens'})
   const {nodeId}=body(z.object({nodeId:z.string()}),req);if(!getNode(nodeId))return notFound(res,'Node')
   if(one('SELECT id FROM agents WHERE node_id=?',nodeId))return res.status(409).json({error:'This node already has an agent; use certificate renewal'})
-  const token=crypto.randomBytes(32).toString('base64url'),tokenId=id(),expires=new Date(Date.now()+15*60*1000).toISOString()
-  run('INSERT INTO enrollment_tokens(id,node_id,token_hash,expires_at) VALUES(?,?,?,?)',tokenId,nodeId,hashToken(token),expires)
-  audit(req.user.id,'agent.token.create','node',nodeId,null,{expires});res.status(201).json({token,expiresAt:expires})
+  const issued=issueAgentEnrollmentToken(nodeId,req.user.id,new Date(Date.now()+15*60*1000).toISOString())
+  res.status(201).json({token:issued.token,expiresAt:issued.expiresAt})
 })
 api.get('/agents/:id',(req,res)=>{const agent=one('SELECT * FROM agents WHERE id=?',reqId(req));return agent?res.json(agent):notFound(res,'Agent')})
 

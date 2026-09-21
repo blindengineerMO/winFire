@@ -7,10 +7,12 @@ namespace WinFire.Agent;
 public sealed class Worker(ILogger<Worker> logger) : BackgroundService
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    private static readonly string AgentVersion = typeof(Worker).Assembly.GetName().Version?.ToString(3) ?? "unknown";
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("The WinFire agent runs as a Windows Service");
+        var pollSeconds = 30;
         while (!stoppingToken.IsCancellationRequested)
         {
             try
@@ -31,15 +33,17 @@ public sealed class Worker(ILogger<Worker> logger) : BackgroundService
                     continue;
                 }
                 using var heartbeat = await client.PostAsJsonAsync($"api/v1/agents/{config.AgentId}/heartbeat",
-                    new { version = "0.1.0", mode = "pull" }, JsonOptions, stoppingToken);
+                    new { version = AgentVersion, mode = "pull" }, JsonOptions, stoppingToken);
                 heartbeat.EnsureSuccessStatusCode();
+                var heartbeatSettings = await heartbeat.Content.ReadFromJsonAsync<HeartbeatSettings>(JsonOptions, stoppingToken);
+                if (heartbeatSettings?.PollSeconds is >= 15 and <= 300) pollSeconds = heartbeatSettings.PollSeconds;
                 var pending = await client.GetFromJsonAsync<JobResponse>($"api/v1/agents/{config.AgentId}/jobs", JsonOptions, stoppingToken);
                 foreach (var job in pending?.Jobs ?? [])
                     await RunJobAsync(client, config, job, stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
             catch (Exception error) { logger.LogError(error, "Agent cycle failed"); }
-            await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
+            await Task.Delay(TimeSpan.FromSeconds(pollSeconds), stoppingToken);
         }
     }
 
@@ -80,5 +84,6 @@ public sealed class Worker(ILogger<Worker> logger) : BackgroundService
     }
 
     private sealed record JobResponse(List<AgentJob> Jobs);
+    private sealed record HeartbeatSettings(int PollSeconds);
     private sealed record AgentJob(string Id, string Type, JsonElement Payload, int Attempt, string LeaseToken);
 }

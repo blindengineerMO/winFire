@@ -5,15 +5,22 @@ function Install-WinFireAgentRemote($argsData) {
   $target=Join-Path $targetDirectory 'WinFire.Agent.exe'
   $temporary=Join-Path $env:TEMP ('WinFire-Agent-'+[guid]::NewGuid().ToString('N')+'.exe')
   $serviceCreated=$false
+  $copied=$false
   try {
     $client=New-Object System.Net.WebClient
     try { $client.DownloadFile([string]$argsData.packageUrl,$temporary) } finally { $client.Dispose() }
-    $actual=(Get-FileHash -Path $temporary -Algorithm SHA256).Hash
-    if($actual -ine [string]$argsData.sha256) { throw 'Downloaded agent SHA-256 does not match the server package' }
+    $actualHash=(Get-FileHash -Path $temporary -Algorithm SHA256).Hash
+    if($actualHash -ine [string]$argsData.sha256) { throw 'Downloaded agent SHA-256 does not match the server package' }
     $signature=Get-AuthenticodeSignature -FilePath $temporary
     if($signature.Status -ne 'Valid') { throw "Agent Authenticode signature is $($signature.Status)" }
+    if([string]$argsData.signerThumbprint) {
+      $expected=([string]$argsData.signerThumbprint -replace '[^0-9A-Fa-f]','').ToUpperInvariant()
+      $actualSigner=([string]$signature.SignerCertificate.Thumbprint -replace '[^0-9A-Fa-f]','').ToUpperInvariant()
+      if($expected -notmatch '^[0-9A-F]{40}$' -or $actualSigner -ne $expected) { throw 'Agent signer certificate does not match the configured publisher' }
+    }
     New-Item -ItemType Directory -Force -Path $targetDirectory | Out-Null
     Copy-Item -Path $temporary -Destination $target -Force
+    $copied=$true
     [string]$argsData.token | & $target enroll ([string]$argsData.serverUrl) | Out-Null
     if($LASTEXITCODE -ne 0) { throw "Agent enrollment exited with code $LASTEXITCODE" }
     New-Service -Name WinFireAgent -DisplayName 'WinFire Agent' -BinaryPathName ('"'+$target+'"') -StartupType Automatic | Out-Null
@@ -21,9 +28,10 @@ function Install-WinFireAgentRemote($argsData) {
     Start-Service -Name WinFireAgent -ErrorAction Stop
     $service=Get-Service -Name WinFireAgent -ErrorAction Stop
     if($service.Status -ne 'Running') { throw 'WinFire Agent service did not start' }
-    [pscustomobject]@{installed=$true;service='WinFireAgent';status=[string]$service.Status;sha256=$actual}
+    [pscustomobject]@{installed=$true;service='WinFireAgent';status=[string]$service.Status;sha256=$actualHash}
   } catch {
     if($serviceCreated) { try { Stop-Service -Name WinFireAgent -Force -ErrorAction SilentlyContinue; sc.exe delete WinFireAgent | Out-Null } catch {} }
+    if($copied) { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue }
     throw
   } finally {
     Remove-Item -Path $temporary -Force -ErrorAction SilentlyContinue
