@@ -41,9 +41,24 @@ test('Internet extension enrollment is one-time and event ingestion is redacted,
   assert.equal(events.body.items[0].node_hostname,'BROWSER-01')
   assert.equal(events.body.items[0].tab_session_hash,undefined)
   const summary=await request.get('/api/v1/internet/summary').set(headers).expect(200)
-  assert.deepEqual(summary.body,{events:1,domains:1,devices:1,blocked:0,unmappedUsers:0})
+  assert.deepEqual(summary.body,{events:1,domains:1,devices:1,blocked:0,unmappedUsers:1})
   await request.post('/api/v1/internet/events/cleanup').set(headers).send({confirmed:true,before:'2026-09-22T00:00:00.000Z'}).expect(200)
   assert.equal((await request.get('/api/v1/internet/summary').set(headers)).body.events,0)
+})
+
+test('administrator browser enrollment binds Internet events to a selected operator',async()=>{
+  const headers=await auth(),nodeId=id(),owner=db.prepare('SELECT id,email FROM users WHERE email=?').get('internet-owner@example.test')
+  run("INSERT INTO nodes(id,hostname,connection_mode,status) VALUES(?,?, 'agentless','reachable')",nodeId,'BROWSER-BOUND')
+  const enrollment=await request.post('/api/v1/internet/enrollment').set(headers).send({nodeId,userId:owner.id,collectionLevel:'host'}).expect(201)
+  assert.equal(enrollment.body.userEmail,owner.email)
+  const enrolled=await request.post('/api/v1/internet/enroll').send({token:enrollment.body.token,browser:'edge',extensionVersion:'1.0.0',installId:'install-bound-123456789012',capabilities:{}}).expect(201)
+  const devices=await request.get('/api/v1/internet/devices').set(headers).expect(200)
+  const device=devices.body.find(item=>item.id===enrolled.body.deviceId)
+  assert.equal(device.userEmail,owner.email)
+  await request.post('/api/v1/internet/events:batch').set('Authorization',`Bearer ${enrolled.body.deviceToken}`).send({events:[{id:'33333333-3333-4333-8333-333333333333',url:'https://bound.example.test/',observedAt:'2026-09-21T13:00:00.000Z'}]}).expect(201)
+  const events=await request.get('/api/v1/internet/events').set(headers).query({userId:owner.id}).expect(200)
+  assert.equal(events.body.total,1)
+  assert.equal(events.body.items[0].user_email,owner.email)
 })
 
 test('Internet ingestion rejects credentials, unsafe schemes, and oversized batches',async()=>{

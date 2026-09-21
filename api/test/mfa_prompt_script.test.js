@@ -23,7 +23,7 @@ function Register-ScheduledTask {param($TaskName,$Action,$Principal,$Settings,$E
 function Start-ScheduledTask {param($TaskName,$ErrorAction) $script:opened=$true}
 function Get-ScheduledTaskInfo {param($TaskName,$ErrorAction) [pscustomobject]@{LastRunTime=(Get-Date)}}
 function Unregister-ScheduledTask {param($TaskName,$Confirm,$ErrorAction) $script:registered=$false}
-$data=[pscustomobject]@{promptId='${promptId}';url='https://portal.example.test/identity?prompt=${promptId}';sourceIp='192.0.2.10';sourcePort=54000;targetIp='192.0.2.20';port=3389}
+$data=[pscustomobject]@{promptId='${promptId}';url='https://portal.example.test/mfa/${promptId}';sourceIp='192.0.2.10';sourcePort=54000;targetIp='192.0.2.20';port=3389}
 $success=Open-WinFireMfaPortal $data
 $script:events=$false;$noEvidence=Open-WinFireMfaPortal $data
 $script:events=$true;$script:sameUser=$true;$ambiguous=Open-WinFireMfaPortal $data

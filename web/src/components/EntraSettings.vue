@@ -2,17 +2,19 @@
 import {onMounted,ref} from 'vue'
 import {api} from '../lib/api.js'
 
-const settings=ref({enabled:false,tenantId:'',clientId:'',clientSecretConfigured:false,redirectUris:[],ready:false,source:'environment'})
-const secret=ref(''),busy=ref(false),error=ref(''),message=ref('')
+const settings=ref({enabled:false,tenantId:'',clientId:'',clientAuthMethod:'secret',clientSecretConfigured:false,clientCertificateConfigured:false,redirectUris:[],ready:false,source:'environment'})
+const secret=ref(''),certificate=ref(''),privateKey=ref(''),busy=ref(false),error=ref(''),message=ref('')
 
 async function load(){busy.value=true;error.value='';try{settings.value=await api('/settings/entra')}catch(cause){error.value=cause.message}finally{busy.value=false}}
 async function save(){
   busy.value=true;error.value='';message.value=''
   try{
-    const body={tenantId:settings.value.tenantId.trim(),clientId:settings.value.clientId.trim(),enabled:settings.value.enabled}
+    const body={tenantId:settings.value.tenantId.trim(),clientId:settings.value.clientId.trim(),clientAuthMethod:settings.value.clientAuthMethod,enabled:settings.value.enabled}
     if(secret.value)body.clientSecret=secret.value
+    if(certificate.value)body.clientCertificate=certificate.value
+    if(privateKey.value)body.clientPrivateKey=privateKey.value
     settings.value=await api('/settings/entra',{method:'PATCH',body})
-    secret.value=''
+    secret.value='';certificate.value='';privateKey.value=''
     message.value='Microsoft Entra settings saved. Sign-in is ready when the app registration, redirect URIs, and MFA policy are configured.'
   }catch(cause){error.value=cause.message}
   finally{busy.value=false}
@@ -29,12 +31,17 @@ onMounted(load)
     <form class="form-grid" @submit.prevent="save">
       <label>Directory (tenant) ID<input v-model.trim="settings.tenantId" required autocomplete="off" placeholder="00000000-0000-0000-0000-000000000000"></label>
       <label>Application (client) ID<input v-model.trim="settings.clientId" required autocomplete="off" placeholder="00000000-0000-0000-0000-000000000000"></label>
-      <label>Client secret <small>{{settings.clientSecretConfigured?'Stored securely; leave blank to keep it':'Required to enable sign-in'}}</small><input v-model="secret" type="password" autocomplete="new-password" :required="settings.enabled&&!settings.clientSecretConfigured" placeholder="Enter a new secret to rotate"></label>
+      <label>Client authentication<select v-model="settings.clientAuthMethod"><option value="secret">Client secret</option><option value="certificate">Certificate (private_key_jwt)</option></select></label>
+      <label v-if="settings.clientAuthMethod==='secret'">Client secret <small>{{settings.clientSecretConfigured?'Stored securely; leave blank to keep it':'Required to enable sign-in'}}</small><input v-model="secret" type="password" autocomplete="new-password" :required="settings.enabled&&!settings.clientSecretConfigured" placeholder="Enter a new secret to rotate"></label>
+      <template v-else>
+        <label>Client certificate <small>{{settings.clientCertificateConfigured?'Stored securely; leave blank to keep it':'PEM certificate registered on the Entra app'}}</small><textarea v-model="certificate" rows="4" spellcheck="false" autocomplete="off" placeholder="-----BEGIN CERTIFICATE-----" :required="settings.enabled&&!settings.clientCertificateConfigured"></textarea></label>
+        <label>Private key <small>{{settings.clientCertificateConfigured?'Stored securely; leave blank to keep it':'Unencrypted RSA PEM key; never returned by the API'}}</small><textarea v-model="privateKey" rows="4" spellcheck="false" autocomplete="off" placeholder="-----BEGIN PRIVATE KEY-----" :required="settings.enabled&&!settings.clientCertificateConfigured"></textarea></label>
+      </template>
       <label class="entra-toggle"><input v-model="settings.enabled" type="checkbox"> Enable Microsoft sign-in</label>
       <div class="form-actions"><button class="button primary" :disabled="busy">{{busy?'Saving…':'Save integration'}}</button></div>
     </form>
     <div class="entra-callbacks"><h3>Register these Web redirect URIs</h3><code v-for="uri in settings.redirectUris" :key="uri">{{uri}}</code><p v-if="!settings.redirectUris.length" class="muted">Set an HTTPS PUBLIC_BASE_URL on the server to show the redirect URIs.</p></div>
-    <p class="muted">In the app registration, request the <code>amr</code> optional ID-token claim and require MFA with Conditional Access. WinFire uses OpenID Connect with PKCE. The secret stays on the server and is never returned to this page. A live tenant sign-in is still required to verify the integration.</p>
+    <p class="muted">In the app registration, request the <code>amr</code> optional ID-token claim and require MFA with Conditional Access. WinFire uses OpenID Connect with PKCE. Secrets, certificates, and private keys stay encrypted on the server and are never returned to this page. Certificate mode uses RSA <code>private_key_jwt</code> for Entra token and Graph requests. A live tenant sign-in and Graph permission check are still required to verify the integration.</p>
   </section>
 </template>
 

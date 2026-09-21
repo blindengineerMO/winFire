@@ -6,7 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import {createServer} from 'node:net'
 import supertest from 'supertest'
-import {compilePolicy,rulesConflict,validateAddressExpression,validatePortExpression,validateProgramPath,activePolicyRules,scheduleIsActive,scheduleStateKey} from '@winfire/shared'
+import {compilePolicy,extractMfaGates,rulesConflict,validateAddressExpression,validatePortExpression,validateProgramPath,activePolicyRules,scheduleIsActive,scheduleStateKey} from '@winfire/shared'
 import {normalizeWindowsEvent} from '../src/eventNormalizer.js'
 import {parseSeceditRights} from '../src/logonRights.js'
 
@@ -35,7 +35,10 @@ test('policy compiler validates the graph and emits tagged rules',()=>{
   assert.equal(scoped[0].remoteAddress,'192.0.2.0/24')
   assert.equal(scoped[0].profile,'Domain')
   assert.throws(()=>compilePolicy({nodes:graph.nodes,edges:[{id:'e1',source:'a',target:'b'},{id:'e2',source:'b',target:'a'}]},'policy-1'),/cycle/)
-  assert.throws(()=>compilePolicy({nodes:[{id:'gate',type:'mfaGate',data:{localPort:'3389'}}],edges:[]},'policy-1'),/MFA Gate/)
+  const gateGraph={nodes:[{id:'gate',type:'mfaGate',data:{name:'RDP Gate',localPort:'3389',program:'Any',sourceAssetScope:'node-a',destinationAssetScope:'group-b',sourceProcess:'Any',extraPorts:'22,5985',fallbackToLoggedOnUser:true,failMode:'closed',sessionTtlMinutes:480,reactiveTtlMinutes:240,entraGroupId:'entra-group'}}],edges:[]}
+  assert.deepEqual(compilePolicy(gateGraph,'policy-1'),[])
+  assert.deepEqual(extractMfaGates(gateGraph)[0],{id:'gate',name:'RDP Gate',targetPort:'3389',program:'Any',sourceAssetScope:'node-a',destinationAssetScope:'group-b',sourceProcess:'Any',extraPorts:'22,5985',fallbackToLoggedOnUser:true,failMode:'closed',sessionTtlMinutes:480,reactiveTtlMinutes:240,entraGroupId:'entra-group'})
+  assert.throws(()=>compilePolicy({nodes:[{id:'bad-gate',type:'mfaGate',data:{localPort:'Any'}}],edges:[]},'policy-1'),/MFA Gate target port/)
   assert.throws(()=>compilePolicy({nodes:[{id:'timed',type:'schedule',data:{}}],edges:[]},'policy-1'),/Invalid schedule node/)
   assert.throws(()=>compilePolicy({nodes:[{id:'unknown',type:'custom',data:{}}],edges:[]},'policy-1'),/Unsupported policy node type/)
   assert.throws(()=>compilePolicy({nodes:[graph.nodes[0],graph.nodes[0]],edges:[]},'policy-1'),/duplicate node IDs/)
@@ -73,6 +76,58 @@ test('OpenAPI lists registered control-plane and agent routes with their auth sc
   assert.ok(spec.paths['/node-groups/{id}/members/{nodeId}'].delete.responses[200])
   assert.equal(spec.paths['/auth/login'].post.security,undefined)
   assert.equal(spec.paths['/auth/login'].post.requestBody.content['application/json'].schema.$ref,'#/components/schemas/LoginRequest')
+  assert.equal(spec.paths['/agents/{id}/events'].post.requestBody.required,true)
+  assert.equal(spec.paths['/agents/{id}/events'].post.requestBody.content['application/json'].schema.$ref,'#/components/schemas/AgentEventBatchRequest')
+  assert.equal(spec.paths['/nodes/{id}/wef/configure'].post.requestBody.content['application/json'].schema.$ref,'#/components/schemas/WefConfigureRequest')
+  assert.equal(spec.paths['/segments/{id}/entra-group/sync'].post.responses[200].content['application/json'].schema.$ref,'#/components/schemas/EntraGroupSyncResponse')
+  assert.equal(spec.paths['/segments/{id}/entra-group/members'].get.responses[200].content['application/json'].schema.$ref,'#/components/schemas/EntraGroupMembersResponse')
+  assert.equal(spec.paths['/auth/ad/login'].post.requestBody.content['application/json'].schema.$ref,'#/components/schemas/AdLoginRequest')
+  assert.equal(spec.paths['/auth/ad/login'].post.security,undefined)
+  assert.equal(spec.paths['/auth/ad-totp/enroll'].post.security,undefined)
+  assert.deepEqual(spec.paths['/wef/wsman'].post.security,[{wefHmac:[]}])
+  assert.equal(spec.paths['/settings/training'].get.security,undefined)
+  assert.equal(spec.paths['/settings/logs-display'].get.security,undefined)
+  assert.equal(spec.paths['/mfa/prompts/{id}/totp'].post.requestBody.content['application/json'].schema.$ref,'#/components/schemas/MfaPromptTotpRequest')
+  assert.equal(spec.paths['/mfa/entra/complete'].post.requestBody.content['application/json'].schema.$ref,'#/components/schemas/MfaEntraCompleteRequest')
+  assert.equal(spec.paths['/auth/totp/setup'].post.requestBody.required,false)
+  assert.equal(spec.paths['/internet/enrollment'].post.requestBody.content['application/json'].schema.$ref,'#/components/schemas/InternetEnrollmentRequest')
+  assert.equal(spec.paths['/internet/enroll'].post.requestBody.content['application/json'].schema.$ref,'#/components/schemas/InternetDeviceEnrollRequest')
+  assert.deepEqual(spec.paths['/internet/events:batch'].post.security,[{internetDeviceBearer:[]}])
+  assert.equal(spec.paths['/internet/policies'].post.requestBody.content['application/json'].schema.$ref,'#/components/schemas/InternetPolicyStageRequest')
+  assert.equal(spec.paths['/internet/events/cleanup'].post.requestBody.content['application/json'].schema.$ref,'#/components/schemas/InternetCleanupRequest')
+  assert.equal(spec.paths['/settings/entra'].patch.requestBody.content['application/json'].schema.$ref,'#/components/schemas/EntraSettingsRequest')
+  assert.equal(spec.paths['/settings/entra'].get.responses[200].content['application/json'].schema.$ref,'#/components/schemas/EntraSettingsResponse')
+})
+
+test('OpenAPI authorization audit protects every non-public route',async()=>{
+  const spec=(await request.get('/api/v1/openapi.json').expect(200)).body
+  const publicRoutes=new Set([
+    'GET /health','GET /openapi.json','POST /auth/login','POST /auth/refresh','POST /auth/ad/login',
+    'POST /auth/ad-totp/enroll','POST /auth/ad-totp/confirm','POST /invites/accept','POST /auth/verify-email',
+    'GET /avatars/{id}','GET /portal-branding','GET /portal-branding/image','GET /settings/training',
+    'GET /settings/logs-display','GET /mfa/prompts/{id}','POST /mfa/prompts/{id}/totp',
+    'POST /mfa/prompts/{id}/entra/start','POST /mfa/entra/complete','POST /mfa/entra/cancel','POST /agents/enroll',
+    'POST /internet/enroll'
+  ])
+  const deviceRoutes=new Set(['POST /internet/events:batch','GET /internet/config'])
+  for(const [path,item] of Object.entries(spec.paths))for(const method of Object.keys(item)){
+    if(!['get','post','put','patch','delete'].includes(method))continue
+    const key=`${method.toUpperCase()} ${path}`,security=item[method].security
+    if(publicRoutes.has(key))assert.ok(security===undefined||Array.isArray(security)&&security.length===0,`${key} must remain public`)
+    else if(deviceRoutes.has(key))assert.deepEqual(security,[{internetDeviceBearer:[]}],`${key} must use device credentials`)
+    else assert.ok(Array.isArray(security)&&security.length,`${key} is missing an authorization scheme`)
+  }
+})
+
+test('web responses publish a restrictive content security policy',async()=>{
+  const response=await request.get('/api/v1/openapi.json').expect(200)
+  const policy=response.headers['content-security-policy']||''
+  assert.match(policy,/default-src 'self'/)
+  assert.match(policy,/object-src 'none'/)
+  assert.match(policy,/frame-ancestors 'none'/)
+  assert.match(policy,/script-src 'self'/)
+  assert.match(policy,/style-src[^;]*https:\/\/fonts\.googleapis\.com/)
+  assert.match(policy,/font-src[^;]*https:\/\/fonts\.gstatic\.com/)
 })
 
 test('policy fields reject invalid ports, addresses and program paths before apply',()=>{
@@ -176,7 +231,12 @@ test('node edits clear stale facts and deletion protects managed or assigned hos
   const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
   const created=await auth(request.post('/api/v1/nodes')).send({hostname:'editable-node',ip:'192.0.2.10'}).expect(201)
   const nodeId=created.body.id
+  db.prepare("UPDATE nodes SET transport='winrm',status='reachable',probe_status='winrm-authenticated',last_probe_at=? WHERE id=?").run(new Date().toISOString(),nodeId)
   db.prepare('INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?)').run(nodeId,'{}',new Date().toISOString())
+  const listed=await auth(request.get('/api/v1/nodes')).expect(200)
+  assert.deepEqual(listed.body.find(node=>node.id===nodeId).managementVerification,{status:'reachable',label:'Verified',reason:'WinRM credentials authenticated and host facts collected',transport:'winrm',checkedAt:listed.body.find(node=>node.id===nodeId).last_probe_at})
+  const detail=await auth(request.get(`/api/v1/nodes/${nodeId}`)).expect(200)
+  assert.equal(detail.body.managementVerification.label,'Verified')
   await auth(request.patch(`/api/v1/nodes/${nodeId}`)).send({hostname:'renamed-node',ip:'192.0.2.11'}).expect(200)
   assert.equal(db.prepare('SELECT hostname,ip,status,transport FROM nodes WHERE id=?').get(nodeId).hostname,'renamed-node')
   assert.equal(db.prepare('SELECT node_id FROM node_facts WHERE node_id=?').get(nodeId),undefined)

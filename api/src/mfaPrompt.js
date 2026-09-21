@@ -34,7 +34,7 @@ function lsaDeniedPair(event,segment,targetAddresses){
 }
 const adAddressCache=new Map()
 async function sourceNodeForIp(ip,targetId){
-  const candidates=all("SELECT * FROM nodes WHERE id<>? AND connection_mode='agentless' AND COALESCE(ad_enabled,1)=1 AND COALESCE(ad_missing,0)=0",targetId)
+  const candidates=all("SELECT * FROM nodes WHERE id<>? AND connection_mode IN ('agentless','agent') AND COALESCE(ad_enabled,1)=1 AND COALESCE(ad_missing,0)=0",targetId)
   const known=candidates.filter(node=>addresses(node).has(ip))
   if(known.length>1)return {ambiguous:true}
   if(known.length===1)return {node:known[0]}
@@ -63,6 +63,14 @@ async function sourceTransport(node){
   if(plain.status==='open')return {...node,transport:'winrm'}
   throw new Error('Source workstation WinRM is unreachable')
 }
+function queueAgentPrompt(sourceNode,payload){
+  const agent=one('SELECT id,last_checkin_at FROM agents WHERE id=? AND node_id=? AND revoked_at IS NULL',sourceNode.agent_id,sourceNode.id)
+  if(!agent)throw new Error('Source agent is not enrolled')
+  if(!agent.last_checkin_at||Date.parse(agent.last_checkin_at)<Date.now()-5*60_000)throw new Error('Source agent is offline')
+  const jobId=id()
+  run('INSERT INTO agent_jobs(id,agent_id,type,payload_json) VALUES(?,?,?,?)',jobId,agent.id,'mfa.prompt',json(payload))
+  return jobId
+}
 async function failOpenForUncontrolledSource(promptId,segment,target,pair,reason){
   const settings=mfaPromptSettings()
   if(settings.failureMode!=='open'||segment.fail_open||segment.account_sid||segment.source_process||segment.fallback_to_logged_on_user)return null
@@ -90,7 +98,7 @@ async function failOpenForUncontrolledSource(promptId,segment,target,pair,reason
     return null
   }
 }
-function promptUrl(promptId){
+export function promptUrl(promptId){
   const base=new URL(process.env.PUBLIC_BASE_URL||'')
   if(base.protocol!=='https:'||base.username||base.password||base.search||base.hash)throw new Error('Automatic MFA browser prompts require an HTTPS PUBLIC_BASE_URL')
   const url=new URL(`/mfa/${promptId}`,base)
@@ -107,8 +115,8 @@ export async function processBlockedMfaEvent(event,segment,target){
   }
   if(!pair)return insert('skipped','Denied event does not identify one source and target address')
   if(!Number.isInteger(pair.sourcePort)||pair.sourcePort<1||pair.sourcePort>65535)return insert('skipped','Blocked event is missing a valid source port')
-  if(!parse(segment.allowed_upns)?.length)return insert('skipped','No operators are assigned to this MFA segment')
-  if(segment.fail_open||segment.fallback_to_logged_on_user)return insert('skipped','This segment uses a logged-on-user scope or fail-open mode that the agentless portal cannot enforce')
+  if(!parse(segment.allowed_upns)?.length&&!segment.entra_group_id)return insert('skipped','No operators or directory group are assigned to this MFA segment')
+  if(segment.fail_open)return insert('skipped','This segment uses fail-open mode and does not require an MFA prompt')
   if(segment.source_process&&!matchesProcess(event.program,segment.source_process))return insert('skipped','The captured firewall process does not match this segment source-process restriction')
   if(segment.account_sid&&!one('SELECT 1 FROM segment_lsa_baselines WHERE segment_id=? AND node_id=? AND account_sid=?',segment.id,target.id,segment.account_sid))return insert('skipped','The account SID segment does not have an enforced LSA deny baseline on this target')
   let inScope=false
@@ -135,6 +143,18 @@ export async function processBlockedMfaEvent(event,segment,target){
   const applyRunId=id()
   run('INSERT INTO policy_apply_runs(id,node_id,status) VALUES(?,?,?)',applyRunId,sourceNode.id,'running')
   audit(null,'mfa.prompt.launch.start','node',sourceNode.id,null,{promptId,runId:applyRunId,targetNodeId:target.id})
+  if(sourceNode.connection_mode==='agent'){
+    try{
+      const jobId=queueAgentPrompt(sourceNode,{promptId,url,sourceIp:pair.sourceIp,sourcePort:pair.sourcePort,targetIp:pair.targetIp,port:segment.port,applyRunId})
+      audit(null,'mfa.prompt.queued','node',sourceNode.id,null,{promptId,runId:applyRunId,jobId,targetNodeId:target.id})
+      return {id:promptId,status:'queued',jobId,runId:applyRunId}
+    }catch(error){
+      run('UPDATE mfa_prompt_events SET status=?,error=? WHERE id=?','failed',error.message,promptId)
+      run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?','failed',error.message,now(),applyRunId)
+      audit(null,'mfa.prompt.queue.failed','node',sourceNode.id,null,{promptId,runId:applyRunId,error:error.message})
+      return {id:promptId,status:'failed',error:error.message}
+    }
+  }
   let attempted=false
   try{
     const reachable=await sourceTransport(sourceNode)
@@ -171,7 +191,7 @@ export async function sweepMfaPrompts(limit=25){
   try{
     const threshold=new Date(Date.now()-3*60_000).toISOString()
     const rows=all(`SELECT e.id,e.node_id,e.event_id,e.action,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,e.src_port,COALESCE(e.dst_ip,p.dst_ip) dst_ip,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.direction,p.direction) direction,e.event_time,e.received_at,e.account_sid event_account_sid,e.logon_type,e.logon_status,e.logon_sub_status,
-        s.id segment_id,s.port,s.source_ip,s.allowed_upns,s.portal_enabled,s.auto_prompt_enabled,s.mode,s.ttl_minutes,s.policy_id,
+        s.id segment_id,s.port,s.source_ip,s.allowed_upns,s.entra_group_id,s.portal_enabled,s.auto_prompt_enabled,s.mode,s.ttl_minutes,s.policy_id,
         s.account_sid segment_account_sid,s.source_process,s.fallback_to_logged_on_user,s.fail_open,
         COALESCE(e.program,p.program) program
       FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id
@@ -188,7 +208,7 @@ export async function sweepMfaPrompts(limit=25){
     for(const row of rows){
       const target=one('SELECT * FROM nodes WHERE id=?',row.node_id)
       if(!target)continue
-      await processBlockedMfaEvent({...row,account_sid:row.event_account_sid},{id:row.segment_id,port:row.port,source_ip:row.source_ip,allowed_upns:row.allowed_upns,policy_id:row.policy_id,account_sid:row.segment_account_sid,source_process:row.source_process,fallback_to_logged_on_user:row.fallback_to_logged_on_user,fail_open:row.fail_open},target)
+      await processBlockedMfaEvent({...row,account_sid:row.event_account_sid},{id:row.segment_id,port:row.port,source_ip:row.source_ip,allowed_upns:row.allowed_upns,entra_group_id:row.entra_group_id,policy_id:row.policy_id,account_sid:row.segment_account_sid,source_process:row.source_process,fallback_to_logged_on_user:row.fallback_to_logged_on_user,fail_open:row.fail_open},target)
       processed++
     }
     return {processed}

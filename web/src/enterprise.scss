@@ -141,6 +141,38 @@
 :root[data-theme=enterprise] .enterprise-brand-mark{width:42px;height:42px;flex:none}
 :root[data-theme=enterprise] .enterprise-brand-mark img{display:block;width:100%;height:100%;object-fit:contain}
 
+/* Keep the light enterprise palette readable at normal and compact table sizes. */
+:root[data-theme=enterprise] .environment{color:#70491f}
+:root[data-theme=enterprise] .page-heading p,:root[data-theme=enterprise] .hint,:root[data-theme=enterprise] .muted{color:#4f6075}
+:root[data-theme=enterprise] th{color:#4b5d73}
+:root[data-theme=enterprise] .status.reachable,:root[data-theme=enterprise] .status.enforcing,:root[data-theme=enterprise] .status.pass,:root[data-theme=enterprise] .status.allow,:root[data-theme=enterprise] .status.success{color:#236348}
+:root[data-theme=enterprise] .status.fail,:root[data-theme=enterprise] .status.failed,:root[data-theme=enterprise] .status.unreachable,:root[data-theme=enterprise] .status.block{color:#963442}
+:root[data-theme=enterprise] .enterprise-flow-tile .enterprise-green,:root[data-theme=enterprise] .enterprise-donut-legend strong{color:#2b7657}
+:root[data-theme=enterprise] .metric strong{color:#2d7658}
+:root[data-theme=enterprise] .policy-item small,:root[data-theme=enterprise] .segment-row small,:root[data-theme=enterprise] .enterprise-data-card small{color:#586a7e}
+:root[data-theme=enterprise] .tab-bar button{color:#52647a}
+:root[data-theme=enterprise] .tab-bar button.active{color:#236348}
+:root[data-theme=enterprise] .enterprise-side{color:#eef2f8}
+:root[data-theme=enterprise] .metric-top{color:#4f6075}
+:root[data-theme=enterprise] .metric small{color:#4f6075}
+:root[data-theme=enterprise] .form-grid label,:root[data-theme=enterprise] .security-settings label,:root[data-theme=enterprise] .appearance-controls label,:root[data-theme=enterprise] .internet-filters label,:root[data-theme=enterprise] .internet-policy-footer label{color:#4f6075}
+:root[data-theme=enterprise] .log-filters label{color:#4f6075}
+:root[data-theme=enterprise] .event-export-bar small{color:#4f6075}
+:root[data-theme=enterprise] .internet-pagination{color:#4f6075}
+:root[data-theme=enterprise] .empty-chart{color:#4f6075}
+:root[data-theme=enterprise] .portal-company-name{color:#4f6075}
+:root[data-theme=enterprise] .tab-bar button.active{color:#fff}
+:root[data-theme=enterprise] .admin-nav button.active,:root[data-theme=enterprise] .admin-nav button:hover{color:#226149}
+:root[data-theme=enterprise] .filter-hint{color:#4f6075;opacity:1}
+:root[data-theme=enterprise] .asset-context-menu .asset-context-title{color:#4f6075!important;opacity:1!important}
+:root[data-theme=enterprise] .learning-sid{color:#4f6075}
+:root[data-theme=enterprise] label,:root[data-theme=enterprise] small,:root[data-theme=enterprise] code{color:#4f6075!important}
+:root[data-theme=enterprise] .enterprise-brand small{color:#eef2f8!important}
+:root[data-theme=enterprise] .portal-brand-preview span{color:#4f6075!important}
+:root[data-theme=enterprise] .notification-preferences-head span{color:#4f6075!important}
+:root[data-theme=enterprise] .cleanup-bar span{color:#4f6075!important}
+.sr-only{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;white-space:nowrap!important;border:0!important}
+
 @media(max-width:1250px){:root[data-theme=enterprise] .enterprise-flow{gap:14px}:root[data-theme=enterprise] .enterprise-distribution{grid-template-columns:1fr 1fr}:root[data-theme=enterprise] .enterprise-data-summary{grid-column:1/-1;min-height:0}}
 @media(max-width:900px){:root[data-theme=enterprise] .enterprise-flow{grid-template-columns:1fr 1fr;align-items:stretch}:root[data-theme=enterprise] .enterprise-flow-assets,:root[data-theme=enterprise] .enterprise-flow-progress{grid-template-columns:repeat(3,1fr)}:root[data-theme=enterprise] .enterprise-flow-assets,:root[data-theme=enterprise] .enterprise-flow-progress{grid-column:1/-1}:root[data-theme=enterprise] .enterprise-overview{min-height:0}:root[data-theme=enterprise] .enterprise-distribution{grid-template-columns:1fr}:root[data-theme=enterprise] .enterprise-data-summary{grid-column:auto}}
 @media(max-width:700px){:root[data-theme=enterprise] .shell{display:block}:root[data-theme=enterprise] .enterprise-side{position:fixed;z-index:30;top:0;left:0;width:220px;transform:translateX(-230px);transition:transform .2s}:root[data-theme=enterprise] .enterprise-side.side-open{transform:none}:root[data-theme=enterprise] .page-wrap{padding:0 12px}:root[data-theme=enterprise] .top{height:63px}:root[data-theme=enterprise] .top .breadcrumb strong{font-size:.95rem}:root[data-theme=enterprise] .panel-title{flex-wrap:wrap}:root[data-theme=enterprise] .enterprise-flow{grid-template-columns:1fr}:root[data-theme=enterprise] .enterprise-flow-outcomes{grid-column:auto}:root[data-theme=enterprise] .enterprise-flow-breakdown{grid-column:auto}:root[data-theme=enterprise] .login-screen{grid-template-columns:1fr;display:grid;padding:15px}:root[data-theme=enterprise] .login-art{min-height:230px;padding:27px}:root[data-theme=enterprise] .login-art h1{font-size:2.2rem}:root[data-theme=enterprise] .login-symbol{display:none}}

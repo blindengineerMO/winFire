@@ -79,7 +79,9 @@ export async function ensureBootstrapAdmin() {
     const conflict=one('SELECT id FROM users WHERE email=? AND id<>?',email,user.id)
     if(conflict)throw new Error('BOOTSTRAP_ADMIN_EMAIL is already used by another account')
     const passwordMatches=await argon2.verify(user.password_hash,password)
-    const changed=!passwordMatches||user.email!==email||user.role!=='admin'||!!user.suspended||!!user.totp_secret||!user.email_verified
+    // Reconcile lockout state too: a demo admin should remain recoverable after
+    // repeated bad attempts and a process restart, without waiting for the TTL.
+    const changed=!passwordMatches||user.email!==email||user.role!=='admin'||!!user.suspended||!!user.totp_secret||!user.email_verified||user.failed_attempts>0||!!user.locked_until
     if(changed){
       const passwordHash=passwordMatches?user.password_hash:await argon2.hash(password)
       db.transaction(()=>{

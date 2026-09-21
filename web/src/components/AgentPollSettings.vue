@@ -3,15 +3,15 @@ import {onMounted,ref,watch} from 'vue'
 import {api} from '../lib/api.js'
 
 const props=defineProps({nodes:{type:Array,required:true},groups:{type:Array,required:true}})
-const settings=ref({defaultPollSeconds:30,overrides:[]})
-const targetType=ref('node'),targetId=ref(''),pollSeconds=ref(30),busy=ref(false),error=ref(''),message=ref('')
+const settings=ref({defaultPollSeconds:30,defaultChannelMode:'pull',overrides:[]})
+const targetType=ref('node'),targetId=ref(''),pollSeconds=ref(30),channelMode=ref('pull'),busy=ref(false),error=ref(''),message=ref('')
 watch(targetType,()=>{targetId.value=''})
 async function load(){try{settings.value=await api('/settings/agent-poll');error.value=''}catch(cause){error.value=cause.message}}
 async function save(value){
   busy.value=true;error.value='';message.value=''
   try{
-    settings.value=await api('/settings/agent-poll',{method:'PUT',body:{targetType:value?.targetType||targetType.value,targetId:value?.targetId||targetId.value,pollSeconds:value?null:Number(pollSeconds.value)}})
-    message.value=value?'Polling override removed':'Polling interval saved. The agent will receive it at its next heartbeat.'
+    settings.value=await api('/settings/agent-poll',{method:'PUT',body:{targetType:value?.targetType||targetType.value,targetId:value?.targetId||targetId.value,pollSeconds:value?null:Number(pollSeconds.value),channelMode:value?'pull':channelMode.value}})
+    message.value=value?'Agent channel override removed':'Agent channel settings saved. The agent will receive them at its next heartbeat.'
   }catch(cause){error.value=cause.message}
   finally{busy.value=false}
 }
@@ -21,15 +21,16 @@ onMounted(load)
 <template>
   <div class="agent-poll-settings">
     <h3>Agent polling</h3>
-    <p>The default job polling interval is {{settings.defaultPollSeconds}} seconds. A node setting takes priority over group settings; when groups differ, the shortest interval wins. Event shipment continues independently.</p>
+    <p>The default job channel is {{settings.defaultChannelMode}} with a {{settings.defaultPollSeconds}} second pull interval. A node setting takes priority over group settings; when groups differ, push wins so jobs can be delivered immediately. Push uses the existing mutually authenticated single-port connection.</p>
     <form class="poll-form" @submit.prevent="save()">
       <label>Target type<select v-model="targetType"><option value="node">Node</option><option value="group">Node group</option></select></label>
       <label>Target<select v-model="targetId" required><option value="">Select a {{targetType==='node'?'node':'group'}}</option><option v-for="item in targetType==='node'?props.nodes:props.groups" :key="item.id" :value="item.id">{{targetType==='node'?item.hostname:item.name}}</option></select></label>
       <label>Poll every (seconds)<input v-model.number="pollSeconds" type="number" min="15" max="300" required></label>
-      <button type="submit" class="button small secondary" :disabled="busy||!targetId">Save interval</button>
+      <label>Job channel<select v-model="channelMode"><option value="pull">Pull (scheduled)</option><option value="push">Push (live stream)</option></select></label>
+      <button type="submit" class="button small secondary" :disabled="busy||!targetId">Save channel</button>
     </form>
     <p v-if="error" class="error-msg" role="alert">{{error}}</p><p v-if="message" class="success-msg" role="status">{{message}}</p>
-    <div v-for="item in settings.overrides" :key="`${item.targetType}:${item.targetId}`" class="poll-row"><span>{{item.targetName}} <small>{{item.targetType}} · {{item.pollSeconds}} seconds</small></span><button type="button" class="button small secondary" :disabled="busy" :aria-label="`Remove polling override for ${item.targetName}`" @click="save(item)">Use inherited interval</button></div>
+    <div v-for="item in settings.overrides" :key="`${item.targetType}:${item.targetId}`" class="poll-row"><span>{{item.targetName}} <small>{{item.targetType}} · {{item.channelMode}} · {{item.pollSeconds}} seconds</small></span><button type="button" class="button small secondary" :disabled="busy" :aria-label="`Remove agent channel override for ${item.targetName}`" @click="save(item)">Use inherited channel</button></div>
   </div>
 </template>
 

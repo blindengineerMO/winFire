@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import {execFileSync} from 'node:child_process'
 import supertest from 'supertest'
 
 const dataDir=fs.mkdtempSync(path.join(os.tmpdir(),'winfire-entra-settings-'))
@@ -53,6 +54,19 @@ test('admin can replace environment Entra config with encrypted write-only setti
   assert.equal(entraConfigured(),false)
   assert.equal(openSealed(db.prepare("SELECT client_secret_sealed FROM entra_integrations WHERE id='default'").get().client_secret_sealed).secret,'rotated-secret-value')
   await assert.rejects(Promise.resolve().then(()=>entraRedirectUri()),error=>error.status===503)
+  const certificateDir=fs.mkdtempSync(path.join(os.tmpdir(),'winfire-entra-cert-'))
+  try{
+    execFileSync('openssl',['req','-x509','-newkey','rsa:2048','-nodes','-subj','/CN=WinFire test','-days','3650','-keyout',path.join(certificateDir,'client.key'),'-out',path.join(certificateDir,'client.crt')],{stdio:'ignore'})
+    const clientCertificate=fs.readFileSync(path.join(certificateDir,'client.crt'),'utf8'),clientPrivateKey=fs.readFileSync(path.join(certificateDir,'client.key'),'utf8')
+    const certificateSaved=await auth(request.patch('/api/v1/settings/entra')).send({tenantId,clientId,clientAuthMethod:'certificate',clientCertificate,clientPrivateKey,enabled:true}).expect(200)
+    assert.equal(certificateSaved.body.clientAuthMethod,'certificate')
+    assert.equal(certificateSaved.body.clientCertificateConfigured,true)
+    assert.equal(certificateSaved.body.ready,true)
+    assert.equal(JSON.stringify(certificateSaved.body).includes('PRIVATE KEY'),false)
+    const certificateRow=db.prepare("SELECT client_certificate_sealed,client_private_key_sealed FROM entra_integrations WHERE id='default'").get()
+    assert.match(openSealed(certificateRow.client_certificate_sealed).value,/BEGIN CERTIFICATE/)
+    assert.match(openSealed(certificateRow.client_private_key_sealed).value,/BEGIN PRIVATE KEY/)
+  }finally{fs.rmSync(certificateDir,{recursive:true,force:true})}
   const audit=db.prepare("SELECT before_json,after_json FROM audit_log WHERE action='entra.settings.update'").all()
   assert.equal(JSON.stringify(audit).includes('secret-value'),false)
 })

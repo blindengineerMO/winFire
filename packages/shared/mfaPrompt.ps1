@@ -33,7 +33,8 @@ public static class WinFireTerminalSessions {
 function Open-WinFireMfaPortal($data) {
   $promptId=[guid]::Parse([string]$data.promptId)
   $url=[uri]([string]$data.url)
-  if($url.Scheme -ne 'https' -or $url.UserInfo -or $url.Fragment -or $url.AbsolutePath -ne '/identity' -or $url.Query -ne ('?prompt='+$promptId.ToString('D'))) {throw 'Invalid MFA portal URL'}
+  $modernPath='/mfa/'+$promptId.ToString('D')
+  if($url.Scheme -ne 'https' -or $url.UserInfo -or $url.Fragment -or $url.AbsolutePath -ne $modernPath -or $url.Query) {throw 'Invalid MFA portal URL'}
   $targetIp=[ipaddress]::Parse([string]$data.targetIp).ToString()
   $sourceIp=[ipaddress]::Parse([string]$data.sourceIp).ToString()
   $port=[int]$data.port

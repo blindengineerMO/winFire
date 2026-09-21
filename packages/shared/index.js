@@ -1,5 +1,10 @@
 import { z } from 'zod'
 import {validateAddressExpression,validatePortExpression,validateProgramPath} from './validation.js'
+// The production browser bundle runs under a strict CSP without `unsafe-eval`.
+// Zod's default fast path probes `new Function` once; use its runtime parser in
+// browsers so the probe does not generate a CSP violation. Node keeps the
+// optimized default for API validation.
+if(typeof window!=='undefined')z.config({jitless:true})
 export {validateAddressExpression,validatePortExpression,validateProgramPath} from './validation.js'
 export {findRuleConflicts,rulesConflict} from './conflicts.js'
 export const firewallRule = z.object({
@@ -73,6 +78,34 @@ export function normalizeSchedule(data={}){
   try{new Intl.DateTimeFormat('en-US',{timeZone:timezone}).format()}catch{throw new Error(`Invalid schedule timezone: ${timezone}`)}
   return {days:scheduleDays(data.days??data.dayOfWeek),start:scheduleTime(data.start??data.startTime,'start'),end:scheduleTime(data.end??data.endTime,'end'),timezone}
 }
+// MFA Gate nodes are policy metadata. They are validated and persisted with
+// the graph while the Windows agent/broker remains responsible for runtime
+// enforcement.
+export function normalizeMfaGate(data={}){
+  const targetPort=String(data.targetPort??data.localPort??'3389').trim()
+  if(!validatePortExpression(targetPort)||targetPort==='Any')throw new Error('MFA Gate target port must be a concrete port expression')
+  const extraPorts=String(data.extraPorts??'').trim()
+  if(extraPorts&&!validatePortExpression(extraPorts))throw new Error('MFA Gate extra ports must be valid port expressions')
+  const program=String(data.program??'Any').trim()||'Any'
+  if(program!=='Any'&&!validateProgramPath(program))throw new Error('MFA Gate program must be an absolute Windows program path')
+  const sourceProcess=String(data.sourceProcess??'Any').trim()||'Any'
+  if(sourceProcess!=='Any'&&!validateProgramPath(sourceProcess))throw new Error('MFA Gate source process must be an absolute Windows program path')
+  const sessionTtlMinutes=Number(data.sessionTtlMinutes??data.ttlMinutes??480)
+  if(!Number.isInteger(sessionTtlMinutes)||sessionTtlMinutes<1||sessionTtlMinutes>10080)throw new Error('MFA Gate session TTL must be between 1 and 10080 minutes')
+  const reactiveTtlMinutes=Number(data.reactiveTtlMinutes??data.reactiveRuleTtlMinutes??240)
+  if(!Number.isInteger(reactiveTtlMinutes)||reactiveTtlMinutes<1||reactiveTtlMinutes>10080)throw new Error('MFA Gate reactive-rule TTL must be between 1 and 10080 minutes')
+  const sourceAssetScope=String(data.sourceAssetScope??'Any').trim()||'Any'
+  const destinationAssetScope=String(data.destinationAssetScope??'Any').trim()||'Any'
+  if(sourceAssetScope.length>512||destinationAssetScope.length>512)throw new Error('MFA Gate asset scopes are limited to 512 characters')
+  const entraGroupId=String(data.entraGroupId??data.entraGroup??'').trim()
+  if(entraGroupId.length>256)throw new Error('MFA Gate Entra group is limited to 256 characters')
+  const failMode=data.failMode==='open'?'open':'closed'
+  return {targetPort,program,sourceAssetScope,destinationAssetScope,sourceProcess,extraPorts,fallbackToLoggedOnUser:Boolean(data.fallbackToLoggedOnUser),failMode,sessionTtlMinutes,reactiveTtlMinutes,entraGroupId}
+}
+export function extractMfaGates(graph){
+  const doc=graphSchema.parse(graph)
+  return doc.nodes.filter(node=>node.type==='mfaGate').map(node=>({id:node.id,name:node.data.name||node.id,...normalizeMfaGate(node.data)}))
+}
 export function scheduleIsActive(schedule,date=new Date()){
   if(!schedule)return true
   const normalized=normalizeSchedule(schedule)
@@ -121,7 +154,7 @@ export function compilePolicy(graph, policyId) {
       try { normalizeSchedule(node.data) } catch(error) { throw new Error(`Invalid schedule node ${node.data.name||node.id}: ${error.message}`) }
       continue
     }
-    if (node.type === 'mfaGate') throw new Error('MFA Gate nodes require an enrolled agent or configured Entra integration')
+    if (node.type === 'mfaGate') { normalizeMfaGate(node.data); continue }
     if (!['allow', 'deny', 'program'].includes(node.type)) continue
     if(node.type==='program'&&!validateProgramPath(node.data.program))throw new Error(`Program rule requires an absolute Windows program path: ${node.data.name||node.id}`)
     const ancestorIds = new Set()

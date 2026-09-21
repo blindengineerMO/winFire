@@ -1,11 +1,12 @@
 import * as oidc from 'openid-client'
-import {createHash} from 'node:crypto'
-import {effectiveEntraSettings} from './entraSettings.js'
+import {createHash,createPrivateKey,webcrypto} from 'node:crypto'
+import {effectiveEntraSettings,entraCertificateDetails} from './entraSettings.js'
 
 let cached=null,cachedUntil=0,cachedKey=null
 export function entraConfigured(){
   const settings=effectiveEntraSettings()
-  try{const base=new URL(settings.publicBaseUrl);return !!(settings.enabled&&settings.tenantId&&settings.clientId&&settings.clientSecret&&(base.protocol==='https:'||base.hostname==='localhost'))}catch{return false}
+  const credential=settings.clientAuthMethod==='certificate'?!!(settings.clientCertificate&&settings.clientPrivateKey):!!settings.clientSecret
+  try{const base=new URL(settings.publicBaseUrl);return !!(settings.enabled&&settings.tenantId&&settings.clientId&&credential&&(base.protocol==='https:'||base.hostname==='localhost'))}catch{return false}
 }
 export function entraRedirectUri(path='/identity'){
   if(!entraConfigured())throw Object.assign(new Error('Configure and enable the Entra integration and PUBLIC_BASE_URL'),{status:503})
@@ -18,9 +19,21 @@ export async function entraConfig(){
   entraRedirectUri()
   const settings=effectiveEntraSettings(),tenant=settings.tenantId
   if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(tenant))throw Object.assign(new Error('ENTRA_TENANT_ID must be a tenant GUID'),{status:503})
-  const key=createHash('sha256').update(JSON.stringify([tenant,settings.clientId,settings.clientSecret])).digest('hex')
+  const certificate=settings.clientAuthMethod==='certificate'?entraCertificateDetails():null
+  if(settings.clientAuthMethod==='certificate'&&!certificate)throw Object.assign(new Error('Configure a valid Entra client certificate and private key'),{status:503})
+  const key=createHash('sha256').update(JSON.stringify([tenant,settings.clientId,settings.clientAuthMethod,settings.clientSecret,certificate?.thumbprint])).digest('hex')
   if(cached&&cachedKey===key&&Date.now()<cachedUntil)return cached
-  cached=await oidc.discovery(new URL(`https://login.microsoftonline.com/${tenant}/v2.0`),settings.clientId,settings.clientSecret)
+  let metadata=settings.clientAuthMethod==='secret'?settings.clientSecret:undefined
+  let authentication
+  if(certificate){
+    const thumbprint=Buffer.from(certificate.thumbprint.replaceAll(':',''),'hex').toString('base64url')
+    const keyObject=createPrivateKey(certificate.privateKey)
+    const key=await webcrypto.subtle.importKey('pkcs8',keyObject.export({format:'der',type:'pkcs8'}),{name:'RSA-PSS',hash:'SHA-256'},false,['sign'])
+    authentication=oidc.PrivateKeyJwt(key,{[oidc.modifyAssertion](header){
+      header['x5t#S256']=thumbprint
+    }})
+  }
+  cached=await oidc.discovery(new URL(`https://login.microsoftonline.com/${tenant}/v2.0`),settings.clientId,metadata,authentication)
   cachedKey=key
   cachedUntil=Date.now()+5*60_000
   return cached

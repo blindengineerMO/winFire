@@ -17,10 +17,27 @@ const {db}=await import('../src/db.js')
 const {ensureLoopbackBaseline,loopbackRules}=await import('../src/loopbackBaseline.js')
 const {sourceMatches}=await import('../src/mfaPortal.js')
 const {diffRules,remote}=await import('../src/connector.js')
-const {remoteIpFromBlockedEvent,sweepMfaPrompts,processBlockedMfaEvent}=await import('../src/mfaPrompt.js')
+const {remoteIpFromBlockedEvent,sweepMfaPrompts,processBlockedMfaEvent,promptUrl}=await import('../src/mfaPrompt.js')
+const {segmentAllowsOperator}=await import('../src/segmentAccess.js')
 await bootstrap()
 const request=supertest(app)
 test.after(()=>{db.close();fs.rmSync(dir,{recursive:true,force:true})})
+
+test('automatic MFA browser prompts use the public MFA route',()=>{
+  const previous=process.env.PUBLIC_BASE_URL
+  process.env.PUBLIC_BASE_URL='https://portal.example.test/control'
+  const promptId=crypto.randomUUID()
+  try{assert.equal(promptUrl(promptId),`https://portal.example.test/mfa/${promptId}`)}finally{if(previous===undefined)delete process.env.PUBLIC_BASE_URL;else process.env.PUBLIC_BASE_URL=previous}
+})
+
+test('identity segments can resolve operators from synced directory group membership',()=>{
+  const userId=crypto.randomUUID()
+  db.prepare('INSERT INTO directory_users(id,dn,upn,email,member_of_json,enabled,missing,seen_at) VALUES(?,?,?,?,?,?,?,?)').run(userId,'CN=Casey,DC=example,DC=com','casey@example.test','casey@example.test','["CN=SecOps,DC=example,DC=com"]',1,0,new Date().toISOString())
+  const segment={allowed_upns:'[]',entra_group_id:'cn=secops,dc=example,dc=com'}
+  assert.equal(segmentAllowsOperator(segment,'casey@example.test'),true)
+  assert.equal(segmentAllowsOperator(segment,'other@example.test'),false)
+  assert.equal(segmentAllowsOperator({...segment,allowed_upns:'["other@example.test"]'},'other@example.test'),true)
+})
 
 test('duplicate rules and like ports compile into one firewall entry',()=>{
   const graph={nodes:[
@@ -192,16 +209,18 @@ test('identity segment scope fields can be revised and are audited',async()=>{
   const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
   const node=(await auth(request.post('/api/v1/nodes')).send({hostname:'scope-test',connectionMode:'agentless'}).expect(201)).body
   db.prepare("UPDATE nodes SET transport='winrm',firewall_state='enforcing' WHERE id=?").run(node.id)
-  const created=(await auth(request.post('/api/v1/segments')).send({name:'Scoped SSH',nodeId:node.id,port:22,extraPorts:[22,3389,3389],accountSid:'S-1-5-21-1-2-3-1001',allowedUpns:['owner@sync.test']}).expect(201)).body
+  const created=(await auth(request.post('/api/v1/segments')).send({name:'Scoped SSH',nodeId:node.id,port:22,extraPorts:[22,3389,3389],accountSid:'S-1-5-21-1-2-3-1001',allowedUpns:['owner@sync.test'],entraGroupId:'CN=SecOps,DC=example,DC=com'}).expect(201)).body
   assert.deepEqual(JSON.parse(created.extra_ports),[3389])
+  assert.equal(created.entra_group_id,'CN=SecOps,DC=example,DC=com')
   assert.match((await auth(request.post(`/api/v1/segments/${created.id}/access`)).send({code:'123456'}).expect(409)).body.error,/LSA deny baseline/)
-  const revised=(await auth(request.patch(`/api/v1/segments/${created.id}`)).send({accountSid:'S-1-5-21-1-2-3-1002',extraPorts:[22,5985,5985],sourceProcess:'C:\\Tools\\client.exe',fallbackToLoggedOnUser:true,failOpen:true,ttlMinutes:30}).expect(200)).body
+  const revised=(await auth(request.patch(`/api/v1/segments/${created.id}`)).send({accountSid:'S-1-5-21-1-2-3-1002',entraGroupId:'CN=Privileged,DC=example,DC=com',extraPorts:[22,5985,5985],sourceProcess:'C:\\Tools\\client.exe',fallbackToLoggedOnUser:true,failOpen:true,ttlMinutes:30}).expect(200)).body
   assert.equal(revised.account_sid,'S-1-5-21-1-2-3-1002')
   assert.deepEqual(JSON.parse(revised.extra_ports),[5985])
   assert.equal(revised.source_process,'C:\\Tools\\client.exe')
   assert.equal(revised.fallback_to_logged_on_user,1)
   assert.equal(revised.fail_open,1)
   assert.equal(revised.ttl_minutes,30)
+  assert.equal(revised.entra_group_id,'CN=Privileged,DC=example,DC=com')
   assert.equal(db.prepare("SELECT COUNT(*) n FROM audit_log WHERE action='segment.update' AND entity_id=?").get(created.id).n,1)
   await auth(request.patch(`/api/v1/segments/${created.id}`)).send({accountSid:'invalid'}).expect(400)
 })
@@ -295,6 +314,20 @@ test('policy versions reject rules that would block WinRM management',async()=>{
   assert.match(response.body.error,/WinRM/)
 })
 
+test('MFA Gate graph fields are validated, persisted, and held from deployment until the broker exists',async()=>{
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@sync.test',password:'sync-test-password-123'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
+  const policy=(await auth(request.post('/api/v1/policies')).send({name:'Graph MFA Gate'}).expect(201)).body
+  const graph={nodes:[{id:'gate',type:'mfaGate',data:{name:'RDP MFA',localPort:'3389',program:'Any',sourceAssetScope:'node-source',destinationAssetScope:'node-target',sourceProcess:'Any',extraPorts:'22,5985',fallbackToLoggedOnUser:true,failMode:'closed',sessionTtlMinutes:480,reactiveTtlMinutes:240,entraGroupId:'entra-group-id'}}],edges:[]}
+  const created=(await auth(request.post(`/api/v1/policies/${policy.id}/versions`)).send({graph}).expect(201)).body
+  assert.equal(created.rules.length,0)
+  assert.equal(created.mfaGates[0].targetPort,'3389')
+  assert.equal(created.mfaGates[0].entraGroupId,'entra-group-id')
+  const versions=(await auth(request.get(`/api/v1/policies/${policy.id}/versions`)).expect(200)).body
+  assert.equal(versions[0].mfaGates[0].fallbackToLoggedOnUser,true)
+  await auth(request.post(`/api/v1/policies/${policy.id}/apply`)).send({}).expect(409)
+})
+
 test('blocked inbound WFP traffic prompts only from an identifiable managed workstation',async()=>{
   const local=new Set(['192.0.2.20'])
   assert.deepEqual(remoteIpFromBlockedEvent({event_id:5157,action:'block',direction:'in',protocol:'TCP',src_ip:'192.0.2.10',src_port:52000,dst_ip:'192.0.2.20'},local),{sourceIp:'192.0.2.10',targetIp:'192.0.2.20',sourcePort:52000})
@@ -333,6 +366,64 @@ test('blocked inbound WFP traffic prompts only from an identifiable managed work
   db.prepare("UPDATE mfa_prompt_events SET status='consumed' WHERE id=?").run(promptId)
   const reused=await auth(request.post(`/api/v1/segments/${segment.id}/access`)).send({promptId,code:'123456'}).expect(409)
   assert.match(reused.body.error,/prompt is invalid or expired/)
+})
+
+test('blocked inbound traffic queues a source-scoped MFA prompt for an enrolled agent',async()=>{
+  const targetId=crypto.randomUUID(),sourceId=crypto.randomUUID(),agentId=crypto.randomUUID(),segmentId=crypto.randomUUID(),eventId=crypto.randomUUID()
+  db.prepare("INSERT INTO nodes(id,hostname,ip,transport,connection_mode,status,firewall_state) VALUES(?,?,?,'winrm','agentless','reachable','enforcing')").run(targetId,'agent-prompt-target','192.0.2.250')
+  db.prepare("INSERT INTO nodes(id,hostname,ip,transport,connection_mode,status,firewall_state,agent_id) VALUES(?,?,?,'winrm','agent','reachable','enforcing',?)").run(sourceId,'agent-prompt-source','192.0.2.251',agentId)
+  db.prepare('INSERT INTO agents(id,node_id,last_checkin_at) VALUES(?,?,?)').run(agentId,sourceId,new Date().toISOString())
+  db.prepare("INSERT INTO identity_segments(id,name,node_id,port,allowed_upns,auto_prompt_enabled,portal_enabled,mode) VALUES(?,?,?,?,?,?,?,?)").run(segmentId,'Agent prompt segment',targetId,3389,'["owner@sync.test"]',1,1,'agentless')
+  db.prepare("INSERT INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,event_time) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").run(eventId,targetId,1200,5157,'block','TCP','192.0.2.251',52100,'192.0.2.250',3389,'in',new Date().toISOString())
+  const previousBase=process.env.PUBLIC_BASE_URL;process.env.PUBLIC_BASE_URL='https://portal.example.test'
+  try{
+    const target=db.prepare('SELECT * FROM nodes WHERE id=?').get(targetId)
+    const segment=db.prepare('SELECT * FROM identity_segments WHERE id=?').get(segmentId)
+    const result=await processBlockedMfaEvent({id:eventId,event_id:5157,action:'block',direction:'in',protocol:'TCP',src_ip:'192.0.2.251',src_port:52100,dst_ip:'192.0.2.250',dst_port:3389,program:null},segment,target)
+    assert.equal(result.status,'queued')
+    const job=db.prepare('SELECT type,payload_json,status FROM agent_jobs WHERE id=?').get(result.jobId)
+    assert.equal(job.type,'mfa.prompt')
+    assert.equal(job.status,'queued')
+    const payload=JSON.parse(job.payload_json)
+    assert.equal(payload.promptId,result.id)
+    assert.equal(payload.sourceIp,'192.0.2.251')
+    assert.equal(payload.targetIp,'192.0.2.250')
+    assert.equal(payload.port,3389)
+    assert.equal(db.prepare('SELECT status FROM policy_apply_runs WHERE id=?').get(result.runId).status,'running')
+    assert.equal(db.prepare('SELECT status,source_node_id FROM mfa_prompt_events WHERE id=?').get(result.id).status,'pending')
+    assert.equal(db.prepare('SELECT source_node_id FROM mfa_prompt_events WHERE id=?').get(result.id).source_node_id,sourceId)
+  }finally{
+    if(previousBase===undefined)delete process.env.PUBLIC_BASE_URL;else process.env.PUBLIC_BASE_URL=previousBase
+  }
+})
+
+test('logged-on-user fallback uses the source workstation interactive-session prompt',async()=>{
+  const targetId=crypto.randomUUID(),sourceId=crypto.randomUUID(),segmentId=crypto.randomUUID(),credentialId=crypto.randomUUID(),eventId=crypto.randomUUID()
+  db.prepare("INSERT INTO nodes(id,hostname,ip,transport,connection_mode,status,firewall_state) VALUES(?,?,?,'winrm','agentless','reachable','enforcing')").run(targetId,'fallback-session-target','192.0.2.240')
+  db.prepare("INSERT INTO nodes(id,hostname,ip,transport,connection_mode,status,firewall_state) VALUES(?,?,?,'winrm','agentless','reachable','enforcing')").run(sourceId,'fallback-session-source','192.0.2.241')
+  db.prepare("INSERT INTO identity_segments(id,name,node_id,port,allowed_upns,source_ip,fallback_to_logged_on_user,auto_prompt_enabled,portal_enabled,mode) VALUES(?,?,?,?,?,?,?,?,?,?)").run(segmentId,'Logged-on user fallback',targetId,3389,'["owner@sync.test"]',null,1,1,1,'agentless')
+  const owner=db.prepare('SELECT id FROM users WHERE email=?').get('owner@sync.test')
+  db.prepare("INSERT INTO credentials(id,name,type,username,encrypted_blob,owner_user_id,visibility,priority) VALUES(?,?,'domain',?,?,?,'private',100)").run(credentialId,'Fallback session credential','TEST\\operator',seal({password:'test-only'}),owner.id)
+  db.prepare('INSERT INTO credential_assignments(credential_id,node_id) VALUES(?,?)').run(credentialId,sourceId)
+  const mock=path.join(dir,'mock-mfa-session-winrm')
+  fs.writeFileSync(mock,`#!/usr/bin/env python3
+import sys,json
+request=json.load(sys.stdin)
+print(json.dumps({'prompt_browser':{'opened':True,'user':'TEST\\\\operator','sessionId':7,'processId':123,'sourceEventRecordId':55},'auth':'TEST\\\\operator'}.get(request['operation'])))
+`,{mode:0o755})
+  const previousPython=process.env.WINRM_PYTHON,previousBase=process.env.PUBLIC_BASE_URL
+  process.env.WINRM_PYTHON=mock;process.env.PUBLIC_BASE_URL='https://portal.example.test'
+  try{
+    const target=db.prepare('SELECT * FROM nodes WHERE id=?').get(targetId)
+    const result=await processBlockedMfaEvent({id:eventId,event_id:5157,action:'block',direction:'in',protocol:'TCP',src_ip:'192.0.2.241',src_port:52040,dst_ip:'192.0.2.240',dst_port:3389,program:null},db.prepare('SELECT * FROM identity_segments WHERE id=?').get(segmentId),target)
+    assert.equal(result.status,'opened')
+    const prompt=db.prepare('SELECT status,opened_user,opened_session_id FROM mfa_prompt_events WHERE id=?').get(result.id)
+    assert.deepEqual(prompt,{status:'opened',opened_user:'TEST\\operator',opened_session_id:7})
+  }finally{
+    if(previousPython===undefined)delete process.env.WINRM_PYTHON;else process.env.WINRM_PYTHON=previousPython
+    if(previousBase===undefined)delete process.env.PUBLIC_BASE_URL;else process.env.PUBLIC_BASE_URL=previousBase
+    try{fs.unlinkSync(mock)}catch{}
+  }
 })
 
 test('administrator approved fail open uses a short audited grant only for an uncontrolled source',async()=>{

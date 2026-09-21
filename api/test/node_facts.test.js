@@ -8,6 +8,7 @@ const connector=readFileSync(new URL('../src/connector.js',import.meta.url),'utf
 const sidecarScript=sidecar.match(/POWERSHELL = r'''([\s\S]*?)'''/)?.[1].replace('__WINFIRE_SHARED_FUNCTIONS__','')
 const factBlock=connector.slice(connector.indexOf("      'facts' {"),connector.indexOf("      'all_rules' {"))
 const ruleBlock=connector.slice(connector.indexOf("      'all_rules' {"),connector.indexOf("      'rules' {"))
+const wefBlock=connector.slice(connector.indexOf('    function Set-WinFireWefSource'),connector.indexOf('    ${breakGlassFunctions}'))
 const hasPwsh=spawnSync('pwsh',['-NoProfile','-Command','$PSVersionTable.PSVersion.Major'],{encoding:'utf8'}).status===0
 
 const mocks=String.raw`
@@ -59,4 +60,21 @@ test('Linux and Windows WinRM rule inventory scripts return paged normalized rul
     assert.equal(result.rules[0].localPort,'3389')
     assert.equal(result.rules[0].enabled,true)
   }
+})
+
+test('WinRM WEF source configuration enables audit and confirms registry readback',{skip:!hasPwsh},()=>{
+  const script=String.raw`$ErrorActionPreference='Stop'
+$global:props=@{}
+function Get-CimInstance { param($ClassName) [pscustomobject]@{Version='10.0.26100'} }
+function New-Item { param($Path,[switch]$Force) }
+function Get-ItemProperty { param($Path,$Name) if($Name){[pscustomobject]@{SubscriptionManager=$global:props[$Name]}} }
+function Set-ItemProperty { param($Path,$Name,$PropertyType,$Value,[switch]$Force) $global:props[$Name]=$Value }
+function auditpol { $global:LASTEXITCODE=0 }
+function Get-WinFireAuditPolicy { [pscustomobject]@{successEnabled=$true;failureEnabled=$true} }
+${wefBlock}
+Set-WinFireWefSource ([pscustomobject]@{subscriptionUrl='https://control.test/api/v1/wef/wsman?token=test&node=node';refreshSeconds=900}) | ConvertTo-Json -Compress -Depth 6`
+  const result=execute(script)
+  assert.equal(result.configured,true)
+  assert.equal(result.refreshSeconds,900)
+  assert.equal(result.auditPolicy.successEnabled,true)
 })

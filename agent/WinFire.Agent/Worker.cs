@@ -1,5 +1,6 @@
 using System.Net.Http.Json;
 using System.Security.Cryptography.X509Certificates;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Win32;
 
@@ -48,6 +49,12 @@ public sealed class Worker(ILogger<Worker> logger) : BackgroundService
                     await AgentUpdater.StageAndRestartAsync(client, update, logger, stoppingToken);
                     return;
                 }
+                if (heartbeatSettings?.ChannelMode == "push")
+                {
+                    await RunPushAsync(client, config, heartbeatSettings.PushUrl ?? $"api/v1/agents/{config.AgentId}/stream", stoppingToken);
+                    await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
+                    continue;
+                }
                 var pending = await client.GetFromJsonAsync<JobResponse>($"api/v1/agents/{config.AgentId}/jobs", JsonOptions, stoppingToken);
                 foreach (var job in pending?.Jobs ?? [])
                     await RunJobAsync(client, config, job, stoppingToken);
@@ -55,6 +62,30 @@ public sealed class Worker(ILogger<Worker> logger) : BackgroundService
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
             catch (Exception error) { logger.LogError(error, "Agent cycle failed"); }
             await Task.Delay(TimeSpan.FromSeconds(pollSeconds), stoppingToken);
+        }
+    }
+
+    private async Task RunPushAsync(HttpClient client, AgentConfig config, string streamUrl, CancellationToken cancellationToken)
+    {
+        using var response = await client.GetAsync(streamUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        response.EnsureSuccessStatusCode();
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var reader = new StreamReader(stream);
+        var data = new StringBuilder();
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var line = await reader.ReadLineAsync(cancellationToken);
+            if (line is null) break;
+            if (line.StartsWith("data: ", StringComparison.Ordinal)) data.Append(line[6..]);
+            if (line.Length != 0 || data.Length == 0) continue;
+            using var document = JsonDocument.Parse(data.ToString());
+            if (document.RootElement.TryGetProperty("id", out _))
+            {
+                var job = document.RootElement.Deserialize<AgentJob>(JsonOptions)
+                    ?? throw new InvalidDataException("Push job payload is empty");
+                await RunJobAsync(client, config, job, cancellationToken);
+            }
+            data.Clear();
         }
     }
 
@@ -94,6 +125,12 @@ public sealed class Worker(ILogger<Worker> logger) : BackgroundService
                 response = await client.PostAsJsonAsync($"api/v1/agents/{config.AgentId}/jobs/{job.Id}/result",
                     new { leaseToken = job.LeaseToken, success = true, result }, JsonOptions, cancellationToken);
             }
+            else if (job.Type == "mfa.prompt")
+            {
+                var result = await MfaBroker.OpenAsync(job.Payload, cancellationToken);
+                response = await client.PostAsJsonAsync($"api/v1/agents/{config.AgentId}/jobs/{job.Id}/result",
+                    new { leaseToken = job.LeaseToken, success = true, result }, JsonOptions, cancellationToken);
+            }
             else throw new InvalidOperationException($"Unsupported job type: {job.Type}");
             using (response) response.EnsureSuccessStatusCode();
             logger.LogInformation("Completed agent job {JobId}", job.Id);
@@ -108,6 +145,6 @@ public sealed class Worker(ILogger<Worker> logger) : BackgroundService
     }
 
     private sealed record JobResponse(List<AgentJob> Jobs);
-    private sealed record HeartbeatSettings(int PollSeconds, AgentUpdateManifest? Update);
+    private sealed record HeartbeatSettings(int PollSeconds, string? ChannelMode, string? PushUrl, AgentUpdateManifest? Update);
     private sealed record AgentJob(string Id, string Type, JsonElement Payload, int Attempt, string LeaseToken);
 }

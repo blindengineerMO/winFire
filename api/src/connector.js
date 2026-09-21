@@ -162,6 +162,26 @@ try {
       $setting=[WinFireAuditPolicyQuery]::Read('0CCE9226-69AE-11D9-BED3-505054503030')
       [pscustomobject]@{subcategoryGuid='0CCE9226-69AE-11D9-BED3-505054503030';settingValue=$setting;successEnabled=[bool]($setting -band 1);failureEnabled=[bool]($setting -band 2)}
     }
+    function Set-WinFireWefSource($argsData) {
+      $uri=[uri][string]$argsData.subscriptionUrl
+      if($uri.Scheme -ne 'https' -or $uri.UserInfo){throw 'WEF Subscription Manager must be an HTTPS URL without embedded credentials'}
+      if($uri.AbsoluteUri.Length -gt 2048){throw 'WEF Subscription Manager URL is too long'}
+      $osVersion=[string](Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).Version
+      if($osVersion -match '^(5\\.1|5\\.2)\\.') {throw 'This Windows version does not support the WinFire source-initiated WEF configuration'}
+      $refresh=[Math]::Min(86400,[Math]::Max(60,[int]$argsData.refreshSeconds))
+      $key='HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\EventLog\\EventForwarding'
+      New-Item -Path $key -Force | Out-Null
+      $before=@((Get-ItemProperty -Path $key -Name SubscriptionManager -ErrorAction SilentlyContinue).SubscriptionManager)
+      $value="Server=$($uri.AbsoluteUri),Refresh=$refresh"
+      Set-ItemProperty -Path $key -Name SubscriptionManager -PropertyType MultiString -Value @($value) -Force
+      auditpol /set '/subcategory:{0CCE9226-69AE-11D9-BED3-505054503030}' /success:enable /failure:enable | Out-Null
+      if($LASTEXITCODE -ne 0){throw "Filtering Platform Connection audit policy update failed with exit code $LASTEXITCODE"}
+      $readback=@((Get-ItemProperty -Path $key -Name SubscriptionManager -ErrorAction Stop).SubscriptionManager)
+      if($readback -notcontains $value){throw 'WEF Subscription Manager registry readback did not confirm the configured URL'}
+      $audit=Get-WinFireAuditPolicy
+      if(-not ($audit.successEnabled -and $audit.failureEnabled)){throw 'Filtering Platform Connection audit readback did not confirm success and failure auditing'}
+      [pscustomobject]@{configured=$true;subscriptionManager=$value;previousSubscriptionManager=$before;refreshSeconds=$refresh;auditPolicy=$audit}
+    }
     ${breakGlassFunctions}
     ${jitAccessFunctions}
     __WINFIRE_AGENT_DEPLOY__
@@ -213,6 +233,7 @@ try {
       'rpc_filters' { Invoke-WinFireRpcFilter $operation $argsData }
       'rpc_filter_apply' { Invoke-WinFireRpcFilter $operation $argsData }
       'rpc_filter_remove' { Invoke-WinFireRpcFilter $operation $argsData }
+      'wef_configure' { Set-WinFireWefSource $argsData }
       'tcp_probe' {
         $addresses=@([System.Net.Dns]::GetHostAddresses([string]$argsData.host));$address=@($addresses | Where-Object AddressFamily -EQ InterNetwork | Select-Object -First 1)[0];if(-not $address){$address=$addresses[0]}
         $route=[System.Net.Sockets.Socket]::new($address.AddressFamily,[System.Net.Sockets.SocketType]::Dgram,[System.Net.Sockets.ProtocolType]::Udp)
@@ -456,7 +477,7 @@ export async function remote(node,operation,args={},options={}) {
   let lastError
   for (const credential of nodeCredential(node.id,options.credentialId)) {
     const input={host,transport:node.transport||'winrm',osVersion:node.os_version||null,username:credential.username,password:credential.secret.password,operation,args}
-    const mutating=operation==='apply'||operation.startsWith('breakglass_')||operation==='jit_start'||operation==='jit_end'||operation==='prompt_browser'||operation==='rights_change'||operation==='audit_policy_enable'||operation==='agent_deploy'||operation==='security_session_logoff'||operation==='rpc_filter_apply'||operation==='rpc_filter_remove'
+    const mutating=operation==='apply'||operation.startsWith('breakglass_')||operation==='jit_start'||operation==='jit_end'||operation==='prompt_browser'||operation==='rights_change'||operation==='audit_policy_enable'||operation==='agent_deploy'||operation==='security_session_logoff'||operation==='rpc_filter_apply'||operation==='rpc_filter_remove'||operation==='wef_configure'
     const attempts=mutating?1:2
     for(let attempt=0;attempt<attempts;attempt++){
       try {

@@ -10,7 +10,7 @@ import {isLoopbackEvent} from './eventPattern.js'
 import {diffRules} from './connector.js'
 import {emitNotification} from './notifications.js'
 import {normalizeProfileSnapshot} from './breakGlass.js'
-import {effectiveAgentPollSeconds} from './agentPoll.js'
+import {effectiveAgentPollSeconds,effectiveAgentChannelMode} from './agentPoll.js'
 import {isExcludedFirewallEvent} from './processExclusions.js'
 import {isIgnoredFirewallEvent} from './trafficIgnores.js'
 import {getAgentUpdateManifest,getAgentUpdatePackagePath} from './agentUpdate.js'
@@ -31,6 +31,15 @@ function requireAgent(req,res,next) {
   next()
 }
 
+function claimPushJobs(agentId){
+  const leaseUntil=new Date(Date.now()+60_000).toISOString()
+  return db.transaction(()=>all("SELECT * FROM agent_jobs WHERE agent_id=? AND ((status='queued') OR (status='leased' AND lease_until<?)) AND attempt_count<5 ORDER BY created_at LIMIT 10",agentId,now()).map(job=>{
+    const leaseToken=crypto.randomBytes(24).toString('base64url')
+    run("UPDATE agent_jobs SET status='leased',lease_until=?,lease_token=?,attempt_count=attempt_count+1 WHERE id=? AND ((status='queued') OR (status='leased' AND lease_until<?))",leaseUntil,leaseToken,job.id,now())
+    return {id:job.id,type:job.type,payload:parse(job.payload_json),attempt:job.attempt_count+1,leaseToken}
+  }))()
+}
+
 agentRoutes.post('/enroll',enrollLimit,wrap(async(req,res)=>{
   if(!req.socket.encrypted||!agentPkiReady())return res.status(503).json({error:'Agent enrollment requires configured HTTPS and PKI'})
   const {token,csr}=z.object({token:z.string().min(32),csr:z.string().min(100).max(12000)}).parse(req.body)
@@ -49,9 +58,10 @@ agentRoutes.post('/enroll',enrollLimit,wrap(async(req,res)=>{
 }))
 
 agentRoutes.post('/:id/heartbeat',requireAgent,(req,res)=>{
-  const {version,mode}=z.object({version:z.string().trim().min(1).max(100),mode:z.literal('pull').default('pull')}).parse(req.body)
+  const {version}=z.object({version:z.string().trim().min(1).max(100),mode:z.enum(['pull','push']).default('pull')}).parse(req.body)
+  const channelMode=effectiveAgentChannelMode(req.agent.node_id)
   const previous=one('SELECT status FROM nodes WHERE id=?',req.agent.node_id)?.status
-  run('UPDATE agents SET version=?,mode=?,last_checkin_at=? WHERE id=?',version,mode,now(),req.agent.id)
+  run('UPDATE agents SET version=?,mode=?,last_checkin_at=? WHERE id=?',version,channelMode,now(),req.agent.id)
   run("UPDATE nodes SET status='reachable',last_seen_at=?,failures=0 WHERE id=?",now(),req.agent.node_id)
   if(previous==='unreachable')audit(null,'agent.online','node',req.agent.node_id,null,{agentId:req.agent.id})
   let update={available:false}
@@ -62,7 +72,25 @@ agentRoutes.post('/:id/heartbeat',requireAgent,(req,res)=>{
     // agent appear offline. It simply disables self-update advertisement.
     update={available:false,error:error.message}
   }
-  res.json({ok:true,serverTime:now(),pollSeconds:effectiveAgentPollSeconds(req.agent.node_id),update})
+  res.json({ok:true,serverTime:now(),pollSeconds:effectiveAgentPollSeconds(req.agent.node_id),channelMode,pushUrl:channelMode==='push'?`api/v1/agents/${req.agent.id}/stream`:null,update})
+})
+
+// Push mode uses a mutually authenticated, long-lived HTTP stream so the
+// control plane can deliver a queued job as soon as it is created. Keeping it
+// HTTP rather than adding a second listener preserves single-port deployment.
+agentRoutes.get('/:id/stream',requireAgent,(req,res)=>{
+  if(effectiveAgentChannelMode(req.agent.node_id)!=='push')return res.status(409).json({error:'Push channel is not enabled for this agent'})
+  res.status(200).set({'Cache-Control':'no-store','Content-Type':'text/event-stream','Connection':'keep-alive','X-Accel-Buffering':'no'});res.flushHeaders?.()
+  let closed=false
+  const send=()=>{
+    if(closed)return
+    for(const job of claimPushJobs(req.agent.id))res.write(`event: job\ndata: ${JSON.stringify(job)}\n\n`)
+    run('UPDATE agents SET last_checkin_at=? WHERE id=?',now(),req.agent.id)
+    res.write(`event: ping\ndata: ${JSON.stringify({serverTime:now()})}\n\n`)
+  }
+  const timer=setInterval(send,1000);timer.unref?.();send()
+  const close=()=>{if(closed)return;closed=true;clearInterval(timer);res.end()}
+  req.on('aborted',close);req.on('close',()=>{clearInterval(timer);closed=true})
 })
 
 agentRoutes.get('/:id/update',requireAgent,(req,res)=>{
@@ -103,6 +131,7 @@ agentRoutes.post('/:id/events',requireAgent,(req,res)=>{
 })
 
 agentRoutes.get('/:id/jobs',requireAgent,(req,res)=>{
+  if(effectiveAgentChannelMode(req.agent.node_id)==='push')return res.status(409).json({error:'Push channel is enabled for this agent; connect to the stream endpoint'})
   const leaseUntil=new Date(Date.now()+60_000).toISOString()
   const jobs=db.transaction(()=>{
     const abandoned=all("SELECT * FROM agent_jobs WHERE agent_id=? AND status='leased' AND lease_until<? AND attempt_count>=5",req.agent.id,now())
@@ -121,6 +150,11 @@ agentRoutes.get('/:id/jobs',requireAgent,(req,res)=>{
         if(learning){run("UPDATE learning_sessions SET status='apply-failed',last_error='Agent did not complete the apply job' WHERE id=?",learning.id);run("UPDATE nodes SET firewall_state='review' WHERE id=?",req.agent.node_id)}
       }
       if(payload.progressiveSessionId)run("UPDATE learning_sessions SET last_error='Agent did not complete progressive apply',next_progressive_at=?,last_attempt_at=? WHERE id=? AND status='active'",now(),now(),payload.progressiveSessionId)
+      if(job.type==='mfa.prompt'&&payload.promptId){
+        run("UPDATE mfa_prompt_events SET status='failed',error=? WHERE id=? AND status IN ('pending','queued')",'Agent did not open MFA prompt after five attempts',payload.promptId)
+        if(payload.applyRunId)run("UPDATE policy_apply_runs SET status='unknown',error=?,finished_at=? WHERE id=?",'Agent did not open MFA prompt after five attempts',now(),payload.applyRunId)
+        audit(null,'mfa.prompt.abandoned','mfa-prompt',payload.promptId,null,{promptId:payload.promptId,nodeId:req.agent.node_id,jobId:job.id,attempts:job.attempt_count})
+      }
       if(payload.breakGlassSessionId){
         if(job.type==='breakglass.start')run("UPDATE break_glass_sessions SET status='failed',last_error='Agent did not confirm activation' WHERE id=? AND status='activating'",payload.breakGlassSessionId)
         if(job.type==='breakglass.end')run("UPDATE break_glass_sessions SET status='active',last_error='Agent did not confirm firewall restoration' WHERE id=? AND status='ending'",payload.breakGlassSessionId)
@@ -151,8 +185,11 @@ agentRoutes.post('/:id/jobs/:jobId/result',requireAgent,(req,res)=>{
   let breakGlassValid=true
   if(payload.breakGlassSessionId&&job.type==='breakglass.start')breakGlassValid=data.result?.active===true&&!!normalizeProfileSnapshot(data.result?.profiles)
   if(payload.breakGlassSessionId&&job.type==='breakglass.end')breakGlassValid=data.result?.restored===true
-  const status=data.success&&breakGlassValid?'success':'failed'
-  const resultError=data.error||(!breakGlassValid?'Agent break-glass readback was invalid':null)
+  const mfaPrompt=job.type==='mfa.prompt'&&payload.promptId?one('SELECT status,expires_at FROM mfa_prompt_events WHERE id=?',payload.promptId):null
+  const mfaActive=job.type!=='mfa.prompt'||!!mfaPrompt&&['pending','queued'].includes(mfaPrompt.status)&&Number.isFinite(Date.parse(mfaPrompt.expires_at))&&Date.parse(mfaPrompt.expires_at)>Date.now()
+  const mfaOpened=job.type!=='mfa.prompt'||mfaActive&&data.result?.opened===true
+  const status=data.success&&breakGlassValid&&mfaOpened?'success':'failed'
+  const resultError=data.error||(!breakGlassValid?'Agent break-glass readback was invalid':job.type==='mfa.prompt'&&!mfaActive?'MFA prompt expired or was already resolved':!mfaOpened?'No interactive browser session was confirmed':null)
   db.transaction(()=>{
     run('UPDATE agent_jobs SET status=?,result_json=?,error=?,finished_at=?,lease_until=NULL,lease_token=NULL WHERE id=?',status,json(data.result||data.diff||null),resultError,now(),job.id)
     if(payload.applyRunId)run('UPDATE policy_apply_runs SET status=?,diff_json=?,error=?,finished_at=? WHERE id=?',status,json(data.diff||null),resultError,now(),payload.applyRunId)
@@ -224,6 +261,13 @@ agentRoutes.post('/:id/jobs/:jobId/result',requireAgent,(req,res)=>{
         audit(null,restored?(payload.finalStatus==='expired'?'break-glass.expired':'break-glass.end'):'break-glass.end.failed','node',req.agent.node_id,null,{sessionId:session.id,jobId:job.id,error:restored?null:data.error||'Invalid agent readback'})
       }
       if(payload.applyRunId&&(!session||(job.type==='breakglass.start'&&session.status!=='activating')||(job.type==='breakglass.end'&&session.status!=='ending')))run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?','unknown','Break-glass session was unavailable or changed before agent readback',now(),payload.applyRunId)
+    }
+    if(job.type==='mfa.prompt'&&payload.promptId){
+      const opened=data.success&&mfaActive&&data.result?.opened===true
+      const promptError=data.error||(!mfaActive?'MFA prompt expired or was already resolved':!opened?'No interactive browser session was confirmed':null)
+      run('UPDATE mfa_prompt_events SET status=?,opened_at=?,opened_user=?,opened_session_id=?,opened_process_id=?,source_event_record_id=?,error=? WHERE id=? AND status IN (\'pending\',\'queued\')',opened?'opened':'failed',opened?now():null,opened?data.result?.user||null:null,opened?Number(data.result?.sessionId)||null:null,opened?Number(data.result?.processId)||null:null,opened?Number(data.result?.sourceEventRecordId)||null:null,promptError,payload.promptId)
+      if(payload.applyRunId)run('UPDATE policy_apply_runs SET status=?,diff_json=?,error=?,finished_at=? WHERE id=?',opened?'success':'failed',opened?json({operation:'mfa.prompt',promptId:payload.promptId,sessionId:data.result?.sessionId,processId:data.result?.processId}):null,promptError,now(),payload.applyRunId)
+      audit(null,opened?'mfa.prompt.opened':'mfa.prompt.failed','mfa-prompt',payload.promptId,null,{promptId:payload.promptId,nodeId:req.agent.node_id,jobId:job.id,sessionId:opened?data.result?.sessionId:null,error:promptError})
     }
     audit(null,status==='success'?'agent.job.success':'agent.job.failed','agent-job',job.id,null,{agentId:req.agent.id,type:job.type,error:resultError})
   })()

@@ -52,3 +52,8 @@
 :root[data-theme=enterprise] .status.pending,:root[data-theme=enterprise] .status.unknown{background:#fff1d4;color:#875a04}
 @media(max-width:700px){.password-form{grid-template-columns:1fr}}
 @media(max-width:440px){.log-filters label{flex-basis:100%}.log-filters .button{flex:1}}
+
+/* Keep keyboard focus visible across both dashboard themes. Respect operators who
+   reduce motion at the OS level while retaining immediate state changes. */
+:where(button,a,input,select,textarea,[tabindex]):focus-visible{outline:3px solid var(--green);outline-offset:2px}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}

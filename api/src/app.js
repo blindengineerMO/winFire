@@ -9,7 +9,7 @@ import crypto from 'node:crypto'
 import {isIP} from 'node:net'
 import PDFDocument from 'pdfkit'
 import {z} from 'zod'
-import {compilePolicy, graphSchema, findRuleConflicts,validateAddressExpression,validatePortExpression,validateProgramPath,activePolicyRules,scheduleStateKey} from '@winfire/shared'
+import {compilePolicy, graphSchema, findRuleConflicts,validateAddressExpression,validatePortExpression,validateProgramPath,activePolicyRules,scheduleStateKey,extractMfaGates} from '@winfire/shared'
 import {db, all, one, run, id, now, audit, json, parse} from './db.js'
 import {auth, requireRole, publicUser, issueAccess, issueRefresh, rotateRefresh, hashToken, seal, openSealed} from './security.js'
 import {probeNode, collectFacts, enrichNode, lookupDns, remote, diffRules, tcpProbe,testNodeCredential} from './connector.js'
@@ -19,7 +19,7 @@ import {makeTotpSecret,verifyTotp,matchingTotpCounter} from './totp.js'
 import {agentRoutes} from './agentRoutes.js'
 import {agentPkiReady} from './agentPki.js'
 import {agentBootstrapScript,normalizeSignerThumbprint} from './agentBootstrap.js'
-import {agentPollSettings} from './agentPoll.js'
+import {agentPollSettings,effectiveAgentChannelMode} from './agentPoll.js'
 import {normalizeWindowsEvent} from './eventNormalizer.js'
 import {isLoopbackEvent} from './eventPattern.js'
 import {deliverInvite,deliverVerification,inviteLink} from './mailer.js'
@@ -45,12 +45,26 @@ import {collectAccountInventory,accountName} from './localAccounts.js'
 import {normalizeProcessExclusions,refreshProcessExclusions,isExcludedFirewallEvent,visibleFirewallEventSql} from './processExclusions.js'
 import {normalizeTrafficIgnore,trafficIgnoreFingerprint,trafficIgnoreFromEvent,refreshTrafficIgnores,publicTrafficIgnore,isIgnoredFirewallEvent,trafficIgnoreMatchSql} from './trafficIgnores.js'
 import {normalizeRpcFilter,publicRpcFilter} from './rpcFilters.js'
+import {segmentAllowsOperatorAsync} from './segmentAccess.js'
+import {syncEntraGroup,cachedEntraGroupMembers} from './entraGraph.js'
+import {parseWefEvents,timingSafeSecret,wefNodeToken,wefSubscriptionUrl,publicWefSettings} from './wefReceiver.js'
 import {internetRoutes} from './internet.js'
 
 export const app=express()
 app.disable('x-powered-by')
 if(process.env.TRUST_PROXY_CIDRS)app.set('trust proxy',process.env.TRUST_PROXY_CIDRS.split(',').map(item=>item.trim()).filter(Boolean))
-app.use(helmet({contentSecurityPolicy:false}))
+app.use(helmet({contentSecurityPolicy:{directives:{
+  defaultSrc:["'self'"],
+  baseUri:["'self'"],
+  objectSrc:["'none'"],
+  scriptSrc:["'self'"],
+  styleSrc:["'self'","'unsafe-inline'",'https://fonts.googleapis.com'],
+  imgSrc:["'self'",'data:','blob:'],
+  fontSrc:["'self'",'data:','https://fonts.gstatic.com'],
+  connectSrc:["'self'",'https://login.microsoftonline.com'],
+  frameAncestors:["'none'"],
+  formAction:["'self'","https://login.microsoftonline.com"]
+}}}))
 app.use(cors({origin:(origin,cb)=>{
   const allowed=[...(process.env.CORS_ORIGIN||'').split(','),...(process.env.EXTENSION_ORIGINS||'').split(',')].map(value=>value.trim()).filter(Boolean)
   cb(null,!origin||allowed.includes(origin))
@@ -65,13 +79,24 @@ const reqId=req=>String(req.params.id)
 const notFound=(res,label='Record')=>res.status(404).json({error:`${label} not found`})
 const latestTraining=nodeId=>one('SELECT id,mode,status,started_at,ends_at,generated_policy_id,last_error,progressive_enabled,progressive_start_at,progressive_interval_hours,next_progressive_at,last_progressive_at FROM learning_sessions WHERE node_id=? ORDER BY started_at DESC,rowid DESC LIMIT 1',nodeId)
 const latestVerification=nodeId=>one('SELECT status,reason,run_at FROM verifier_results WHERE node_id=? ORDER BY run_at DESC,rowid DESC LIMIT 1',nodeId)||null
+const managementVerification=node=>{
+  const probe=String(node?.probe_status||'').toLowerCase()
+  const hasFacts=!!node?.snapshot_json
+  if((probe==='winrm-authenticated'||probe==='winrms-authenticated')&&hasFacts)return {status:'reachable',label:'Verified',reason:'WinRM credentials authenticated and host facts collected',transport:node.transport,checkedAt:node.last_probe_at||node.last_seen_at||null}
+  if(probe==='wmi-authenticated')return {status:'reachable',label:'WMI authenticated',reason:'Credentialed WMI facts collected; WinRM is not active',transport:node.transport,checkedAt:node.last_probe_at||node.last_seen_at||null}
+  if(probe==='rpc-authenticated')return {status:'pending',label:'RPC authenticated',reason:'RPC sign-in passed; credentialed host verification is still required',transport:node.transport,checkedAt:node.last_probe_at||node.last_seen_at||null}
+  if(probe==='netsh-authenticated')return {status:'reachable',label:'Verified',reason:'SMB/netsh credentials authenticated and host facts collected',transport:node.transport,checkedAt:node.last_probe_at||node.last_seen_at||null}
+  if(node?.status==='unreachable')return {status:'unreachable',label:'Unreachable',reason:'The management connection is unavailable',transport:node.transport,checkedAt:node.last_probe_at||node.last_seen_at||null}
+  if(node?.status==='reachable')return {status:'pending',label:'Reachable',reason:'A management endpoint responded, but credentials have not been verified',transport:node.transport,checkedAt:node.last_probe_at||node.last_seen_at||null}
+  return {status:'unknown',label:'Unchecked',reason:'No authenticated management check has completed',transport:node?.transport||null,checkedAt:node?.last_probe_at||null}
+}
 function policyVerification(policyId){
   const latest=one('SELECT run_id FROM verifier_results WHERE policy_id=? ORDER BY run_at DESC,rowid DESC LIMIT 1',policyId)
   if(!latest)return null
   const checks=all('SELECT status FROM verifier_results WHERE policy_id=? AND run_id=?',policyId,latest.run_id)
   return checks.some(check=>check.status==='fail')?'fail':checks.some(check=>check.status==='inconclusive')?'inconclusive':checks.length?'pass':null
 }
-const publicNode=node=>node && ({...node,failures:Number(node.failures),facts:parse(node.snapshot_json),ad:parse(node.ad_snapshot_json),training:latestTraining(node.id)||null,verification:latestVerification(node.id)})
+const publicNode=node=>node && ({...node,failures:Number(node.failures),facts:parse(node.snapshot_json),ad:parse(node.ad_snapshot_json),training:latestTraining(node.id)||null,verification:latestVerification(node.id),managementVerification:managementVerification(node)})
 const canUseCredential=(user,credential)=>credential&&(user.role==='owner'||user.role==='admin'||credential.owner_user_id===user.id||credential.visibility==='team'&&credential.team_id&&credential.team_id===user.team_id||canWriteResource(user,'credential',credential))
 function getNode(idValue) {return one('SELECT * FROM nodes WHERE id=?',idValue)}
 function getPolicy(idValue) {return one('SELECT * FROM policies WHERE id=?',idValue)}
@@ -84,6 +109,13 @@ function progressiveSettings() {return {
   intervalHours:Number(one("SELECT value FROM app_settings WHERE key='progressive_learning_interval_hours'")?.value||24)
 }}
 const directorySettings=()=>one("SELECT * FROM directory_connections WHERE id='default'")
+const wefPath=()=>one("SELECT value FROM app_settings WHERE key='wef_path'")?.value||'/api/v1/wef/wsman'
+const wefEnabled=()=>one("SELECT value FROM app_settings WHERE key='wef_enabled'")?.value==='true'
+const wefSecret=()=>String(process.env.WEF_SHARED_SECRET||'').trim()
+function publicWef(req){
+  const base=process.env.PUBLIC_BASE_URL||`${req.protocol}://${req.get('host')}`
+  return publicWefSettings({enabled:wefEnabled(),secretConfigured:!!wefSecret(),baseUrl:base,path:wefPath()})
+}
 const publicDirectory=settings=>settings&&({url:settings.url||'',baseDn:settings.base_dn||'',bindCredentialId:settings.bind_credential_id||null,nodeCredentialId:settings.node_credential_id||null,actionCredentialId:settings.action_credential_id||null,enabled:!!settings.enabled,syncIntervalMinutes:settings.sync_interval_minutes,allowLdapFallback:!!settings.allow_ldap_fallback,ldapFallbackApprovedBy:settings.ldap_fallback_approved_by||null,ldapFallbackApprovedAt:settings.ldap_fallback_approved_at||null,lastTransport:settings.last_transport||null,lastSyncedAt:settings.last_synced_at,lastSyncAttemptAt:settings.last_sync_attempt_at,lastSyncStatus:settings.last_sync_status,lastSyncError:settings.last_sync_error,lastSyncCount:settings.last_sync_count})
 function directoryCredential(settings) {
   const credential=one('SELECT * FROM credentials WHERE id=?',settings.bind_credential_id)
@@ -202,6 +234,8 @@ async function applyPolicy(policy,actorId=null,targetNodes=null,context={}) {
   if(one('SELECT id FROM policy_assignments WHERE policy_id=? AND removal_job_id IS NOT NULL',policy.id))throw Object.assign(new Error('Wait for pending agent firewall cleanup before applying this policy'),{status:409})
   const version=one('SELECT * FROM policy_versions WHERE id=? AND policy_id=?',policy.current_version_id,policy.id)
   if (!version) throw Object.assign(new Error('Policy has no version'),{status:400})
+  const graph=parse(version.graph_json)||{nodes:[],edges:[]},mfaGates=extractMfaGates(graph)
+  if(mfaGates.length)throw Object.assign(new Error('This policy contains MFA Gate nodes. Runtime gate deployment requires the Windows agent challenge broker and is not available yet.'),{status:409})
   const compiledRules=parse(version.rules_compiled_json)||[], rules=activePolicyRules(compiledRules,context.scheduleAt||new Date()), results=[]
   assertManagementAccess(rules)
   const targets=targetNodes||assignedNodes(policy.id)
@@ -371,9 +405,9 @@ function livePublicPrompt(req,promptId){
   if(!segment?.portal_enabled||segment.mode!=='agentless')throw Object.assign(new Error('MFA request is unavailable or expired'),{status:404})
   return {prompt,segment}
 }
-function portalIdentity(email,segment){
+async function portalIdentity(email,segment){
   const user=one('SELECT * FROM users WHERE email=?',email.toLowerCase())
-  if(!user||user.suspended||!user.email_verified||user.locked_until&&user.locked_until>now()||!(parse(segment.allowed_upns)||[]).includes(email.toLowerCase()))throw Object.assign(new Error('This account cannot authorize the request'),{status:403})
+  if(!user||user.suspended||!user.email_verified||user.locked_until&&user.locked_until>now()||!await segmentAllowsOperatorAsync(segment,email))throw Object.assign(new Error('This account cannot authorize the request'),{status:403})
   return user
 }
 api.get('/mfa/prompts/:id',(req,res)=>{
@@ -392,7 +426,7 @@ api.post('/mfa/prompts/:id/totp',publicMfaLimit,wrap(async(req,res)=>{
   let user=null
   let totpFailure=false
   try{
-    user=portalIdentity(email,segment)
+    user=await portalIdentity(email,segment)
     if(!user.totp_secret)throw Object.assign(new Error('Enroll an authenticator at /enroll-authenticator before using this request'),{status:403})
     await authenticateDirectoryUser(directorySettings(),email,password)
     markVerifiedAdChallenge(challengeId,user,email,'ldaps-bind')
@@ -433,7 +467,7 @@ api.post('/mfa/entra/complete',publicMfaLimit,wrap(async(req,res)=>{
     const {prompt,segment}=livePublicPrompt(req,flow.prompt_id)
     const identity=await completeEntraAuthentication({code,state,...openSealed(flow.sealed_checks),redirectPath:'/mfa/callback'})
     run('UPDATE mfa_challenges SET user_upn=? WHERE id=?',identity.email,flow.challenge_id)
-    const user=portalIdentity(identity.email,segment)
+    const user=await portalIdentity(identity.email,segment)
     req.user=user
     const {node,sourceIp}=portalTarget(req,segment,prompt.target_node_id)
     res.status(201).json(await grantPortalAccess(req,segment,node,sourceIp,'entra',prompt.id,flow.challenge_id))
@@ -450,6 +484,20 @@ api.post('/mfa/entra/cancel',publicMfaLimit,(req,res)=>{
 })
 
 api.use('/agents',agentRoutes)
+const wefSoapResponse=()=>`<?xml version="1.0" encoding="UTF-8"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><w:EventsResponse xmlns:w="http://schemas.dmtf.org/wbem/wsman/1/wsman"/></s:Body></s:Envelope>`
+api.post('/wef/wsman',express.raw({type:['application/soap+xml','text/xml','application/xml'],limit:'2mb'}),wrap(async(req,res)=>{
+  if(!wefEnabled())return res.status(404).json({error:'WEF push receiver is disabled'})
+  const secret=wefSecret();if(!secret)return res.status(503).json({error:'WEF_SHARED_SECRET is not configured'})
+  const node=wefNodeForRequest(req)
+  const token=String(req.get('x-winfire-wef-token')||req.query.token||'')
+  if(!timingSafeSecret(token,wefNodeToken(secret,node.id)))return res.status(401).json({error:'WEF source authentication failed'})
+  const bodyBuffer=Buffer.isBuffer(req.body)?req.body:Buffer.from(String(req.body||''))
+  const events=parseWefEvents(bodyBuffer.toString('utf8'))
+  const inserted=insertCollectedEvents(node.id,events,observabilitySettings().ignoreLoopbackIngest)
+  run("UPDATE nodes SET status='reachable',last_seen_at=?,failures=0,next_retry_at=NULL WHERE id=?",now(),node.id)
+  audit(null,'logs.push.wef','node',node.id,null,{received:events.length,inserted,lastRecordId:events.at(-1)?.RecordId||null})
+  res.status(200).type('application/soap+xml').send(wefSoapResponse())
+}))
 api.use(auth)
 const securityAutomationSchema=z.object({name:z.string().trim().min(3).max(120),triggerType:z.enum(['destination','mfa_failures']),destination:z.string().trim().max(255).default(''),failureCount:z.number().int().min(2).max(100).default(3),windowMinutes:z.number().int().min(1).max(1440).default(15),cooldownMinutes:z.number().int().min(1).max(10080).default(60),actionType:z.enum(['alert','disable_ad','disable_ad_logoff']).default('alert'),disableMinutes:z.number().int().min(5).max(10080).default(60),enabled:z.boolean().default(false)})
 function validAutomation(data){
@@ -483,14 +531,14 @@ api.post('/security-automations/preview',requireRole('admin'),(req,res)=>{
 api.get('/security-automations/incidents',requireRole('admin'),(_req,res)=>res.json(all('SELECT i.*,p.name policy_name FROM security_automation_incidents i JOIN security_automations p ON p.id=i.policy_id ORDER BY i.created_at DESC LIMIT 100')))
 api.get('/settings/entra',requireRole('admin'),(_req,res)=>res.json(publicEntraSettings()))
 api.patch('/settings/entra',requireRole('admin'),(req,res)=>{
-  const data=body(z.object({tenantId:z.uuid(),clientId:z.uuid(),clientSecret:z.string().min(8).max(4096).optional(),enabled:z.boolean()}),req)
+  const data=body(z.object({tenantId:z.uuid(),clientId:z.uuid(),clientAuthMethod:z.enum(['secret','certificate']).optional(),clientSecret:z.string().min(8).max(4096).optional(),clientCertificate:z.string().max(30000).optional(),clientPrivateKey:z.string().max(30000).optional(),enabled:z.boolean()}),req)
   res.json(saveEntraSettings(data,req.user.id))
 })
 api.get('/settings/mfa-prompt',requireRole('admin'),(_req,res)=>res.json(mfaPromptSettings()))
 api.patch('/settings/mfa-prompt',requireRole('admin'),(req,res)=>{
-  const data=body(z.object({failureMode:z.enum(['closed','open']),failOpenMinutes:z.number().int().min(2).max(15),approval:z.string().optional()}),req)
+  const data=body(z.object({failureMode:z.enum(['closed','open']),failOpenMinutes:z.number().int().min(2).max(15),confirmed:z.boolean().optional(),approval:z.string().optional()}),req)
   const before=mfaPromptSettings()
-  if(data.failureMode==='open'&&before.failureMode!=='open'&&data.approval!=='ENABLE MFA FAIL OPEN')return res.status(400).json({error:'Type ENABLE MFA FAIL OPEN to approve temporary access without MFA when a client cannot be controlled'})
+  if(data.failureMode==='open'&&before.failureMode!=='open'&&!data.confirmed&&data.approval!=='ENABLE MFA FAIL OPEN')return res.status(400).json({error:'Administrator confirmation is required before enabling fail-open MFA fallback'})
   db.transaction(()=>{
     run("UPDATE app_settings SET value=? WHERE key='mfa_prompt_failure_mode'",data.failureMode)
     run("UPDATE app_settings SET value=? WHERE key='mfa_prompt_fail_open_minutes'",String(data.failOpenMinutes))
@@ -745,15 +793,15 @@ const publicTrainingSettings=()=>({newHostTrainingDays:trainingDays(),progressiv
 api.get('/settings/training',(_req,res)=>res.json(publicTrainingSettings()))
 api.get('/settings/agent-poll',requireRole('admin'),(_req,res)=>res.json(agentPollSettings()))
 api.put('/settings/agent-poll',requireRole('admin'),(req,res)=>{
-  const data=body(z.object({targetType:z.enum(['node','group']),targetId:z.string().min(1),pollSeconds:z.number().int().min(15).max(300).nullable()}),req)
+  const data=body(z.object({targetType:z.enum(['node','group']),targetId:z.string().min(1),pollSeconds:z.number().int().min(15).max(300).nullable(),channelMode:z.enum(['pull','push']).default('pull')}),req)
   const target=data.targetType==='node'?one('SELECT id FROM nodes WHERE id=?',data.targetId):one('SELECT id FROM node_groups WHERE id=?',data.targetId)
   if(!target)return notFound(res,data.targetType==='node'?'Node':'Node group')
-  const before=one('SELECT poll_seconds FROM agent_poll_settings WHERE target_type=? AND target_id=?',data.targetType,data.targetId)?.poll_seconds??null
+  const before=one('SELECT poll_seconds,channel_mode FROM agent_poll_settings WHERE target_type=? AND target_id=?',data.targetType,data.targetId)||null
   db.transaction(()=>{
-    if(data.pollSeconds===null)run('DELETE FROM agent_poll_settings WHERE target_type=? AND target_id=?',data.targetType,data.targetId)
-    else run(`INSERT INTO agent_poll_settings(target_type,target_id,poll_seconds,updated_at) VALUES(?,?,?,?)
-      ON CONFLICT(target_type,target_id) DO UPDATE SET poll_seconds=excluded.poll_seconds,updated_at=excluded.updated_at`,data.targetType,data.targetId,data.pollSeconds,now())
-    audit(req.user.id,'agent.poll.configure',data.targetType,data.targetId,{pollSeconds:before},{pollSeconds:data.pollSeconds})
+    if(data.pollSeconds===null&&data.channelMode==='pull')run('DELETE FROM agent_poll_settings WHERE target_type=? AND target_id=?',data.targetType,data.targetId)
+    else run(`INSERT INTO agent_poll_settings(target_type,target_id,poll_seconds,channel_mode,updated_at) VALUES(?,?,?,?,?)
+      ON CONFLICT(target_type,target_id) DO UPDATE SET poll_seconds=excluded.poll_seconds,channel_mode=excluded.channel_mode,updated_at=excluded.updated_at`,data.targetType,data.targetId,data.pollSeconds??30,data.channelMode,now())
+    audit(req.user.id,'agent.poll.configure',data.targetType,data.targetId,before,{pollSeconds:data.pollSeconds,channelMode:data.channelMode})
   })()
   res.json(agentPollSettings())
 })
@@ -771,6 +819,15 @@ api.patch('/settings/training',requireRole('admin'),(req,res)=>{
   res.json(publicTrainingSettings())
 })
 api.get('/settings/observability',requireRole('admin'),(_req,res)=>res.json(observabilitySettings()))
+api.get('/settings/wef',requireRole('admin'),(req,res)=>res.json(publicWef(req)))
+api.patch('/settings/wef',requireRole('admin'),(req,res)=>{
+  const data=body(z.object({enabled:z.boolean()}),req)
+  if(data.enabled&&!wefSecret())return res.status(503).json({error:'Set WEF_SHARED_SECRET on the control plane before enabling WEF push'})
+  const before=wefEnabled()
+  run("UPDATE app_settings SET value=? WHERE key='wef_enabled'",String(data.enabled))
+  audit(req.user.id,'wef.settings.update','app-settings','wef',{enabled:before},{enabled:data.enabled,secretConfigured:!!wefSecret()})
+  res.json(publicWef(req))
+})
 api.get('/settings/process-exclusions',requireRole('admin'),(_req,res)=>res.json({names:all('SELECT name FROM process_exclusions ORDER BY name').map(row=>row.name)}))
 api.put('/settings/process-exclusions',requireRole('admin'),(req,res)=>{
   const {names:rawNames}=body(z.object({names:z.array(z.string()).max(200)}),req)
@@ -851,7 +908,7 @@ api.patch('/settings/directory',requireRole('admin'),(req,res)=>{
   const data=body(z.object({
     url:z.string().url().refine(value=>{const parsed=new URL(value);return parsed.protocol==='ldaps:'&&!parsed.username&&!parsed.password&&parsed.pathname==='/'&&!parsed.search&&!parsed.hash},{message:'Use an ldaps:// server URL without embedded credentials or query parameters'}),
     baseDn:z.string().min(3).max(512).refine(value=>/(^|,)\s*DC=/i.test(value),{message:'Search base must include a DC component'}),
-    bindCredentialId:z.string().min(1),nodeCredentialId:z.string().nullable().optional(),enabled:z.boolean().default(false),syncIntervalMinutes:z.number().int().min(5).max(1440).default(60),allowLdapFallback:z.boolean().optional(),ldapFallbackApproval:z.string().optional()
+    bindCredentialId:z.string().min(1),nodeCredentialId:z.string().nullable().optional(),enabled:z.boolean().default(false),syncIntervalMinutes:z.number().int().min(5).max(1440).default(60),allowLdapFallback:z.boolean().optional(),ldapFallbackApproved:z.boolean().optional(),ldapFallbackApproval:z.string().optional()
   }),req)
   for(const credentialId of [data.bindCredentialId,data.nodeCredentialId].filter(Boolean)){
     const credential=one('SELECT * FROM credentials WHERE id=?',credentialId)
@@ -861,7 +918,7 @@ api.patch('/settings/directory',requireRole('admin'),(req,res)=>{
   const allowLdapFallback=data.allowLdapFallback===undefined?!!prior.allow_ldap_fallback:data.allowLdapFallback
   const scopeChanged=data.url!==prior.url||data.bindCredentialId!==prior.bind_credential_id
   const needsApproval=allowLdapFallback&&(!prior.allow_ldap_fallback||!prior.ldap_fallback_approved_at||scopeChanged)
-  if(needsApproval&&data.ldapFallbackApproval!=='ALLOW LDAP 389')return res.status(400).json({error:'Administrator approval is required: type ALLOW LDAP 389 to permit an unencrypted bind when LDAPS is unavailable'})
+  if(needsApproval&&!data.ldapFallbackApproved&&data.ldapFallbackApproval!=='ALLOW LDAP 389')return res.status(400).json({error:'Administrator confirmation is required before enabling LDAP 389 fallback'})
   const approvedAt=needsApproval?now():allowLdapFallback?prior.ldap_fallback_approved_at:null
   const approvedBy=needsApproval?req.user.id:allowLdapFallback?prior.ldap_fallback_approved_by:null
   db.transaction(()=>{
@@ -1025,8 +1082,8 @@ api.get('/directory/users/:id',requireRole('auditor'),(req,res)=>{
   res.json({...publicUser,memberOf:parse(member_of_json)||[],mfaEnrolled:!!one('SELECT 1 FROM users WHERE ad_guid=? AND totp_secret IS NOT NULL',user.id),operatorImported:!!one("SELECT 1 FROM users WHERE ad_guid=? AND auth_source='ad'",user.id),mfaEvents:mfa,logonEvents:logons})
 })
 api.post('/directory/users/:id/status',requireRole('admin'),wrap(async(req,res)=>{
-  const data=body(z.object({enabled:z.boolean(),reason:z.string().trim().min(10).max(500),confirmation:z.enum(['ENABLE AD USER','DISABLE AD USER']),durationMinutes:z.number().int().min(5).max(10080).optional()}),req)
-  if(data.confirmation!==(data.enabled?'ENABLE AD USER':'DISABLE AD USER'))return res.status(400).json({error:'Confirmation does not match the requested action'})
+  const data=body(z.object({enabled:z.boolean(),reason:z.string().trim().min(10).max(500),confirmed:z.boolean().optional(),confirmation:z.string().optional(),durationMinutes:z.number().int().min(5).max(10080).optional()}),req)
+  if(!data.confirmed&&data.confirmation!==(data.enabled?'ENABLE AD USER':'DISABLE AD USER'))return res.status(400).json({error:'Confirmation is required'})
   if(data.enabled&&data.durationMinutes)return res.status(400).json({error:'A duration applies only when disabling an account'})
   const user=one('SELECT * FROM directory_users WHERE id=?',reqId(req));if(!user)return notFound(res,'Directory user')
   if(user.missing)return res.status(409).json({error:'Sync the directory before changing a missing AD user'})
@@ -1150,7 +1207,7 @@ api.post('/nodes',requireRole('editor'),wrap(async(req,res)=>{
   })()
   const node=getNode(nodeId),dns=await lookupDns(node);res.status(201).json({...node,dns,training})
 }))
-api.get('/nodes/:id',(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json({...node,ad:parse(node.ad_snapshot_json),training:latestTraining(node.id)||null,verification:latestVerification(node.id),facts:parse(one('SELECT snapshot_json FROM node_facts WHERE node_id=?',node.id)?.snapshot_json),dns:one('SELECT * FROM dns_lookups WHERE node_id=?',node.id),groups:all('SELECT g.* FROM node_groups g JOIN node_group_members m ON m.group_id=g.id WHERE m.node_id=? ORDER BY g.name',node.id).filter(group=>canReadResource(req.user,'node_group',group)).map(group=>({id:group.id,name:group.name,canWrite:canWriteResource(req.user,'node_group',group)}))})})
+api.get('/nodes/:id',(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');const factsRow=one('SELECT snapshot_json FROM node_facts WHERE node_id=?',node.id);res.json({...node,ad:parse(node.ad_snapshot_json),training:latestTraining(node.id)||null,verification:latestVerification(node.id),managementVerification:managementVerification({...node,snapshot_json:factsRow?.snapshot_json}),facts:parse(factsRow?.snapshot_json),dns:one('SELECT * FROM dns_lookups WHERE node_id=?',node.id),groups:all('SELECT g.* FROM node_groups g JOIN node_group_members m ON m.group_id=g.id WHERE m.node_id=? ORDER BY g.name',node.id).filter(group=>canReadResource(req.user,'node_group',group)).map(group=>({id:group.id,name:group.name,canWrite:canWriteResource(req.user,'node_group',group)}))})})
 api.post('/nodes/:id/training',requireRole('editor'),(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
   const {durationDays}=body(z.object({durationDays:z.number().int().min(1).max(365)}),req)
@@ -1177,6 +1234,8 @@ api.patch('/nodes/:id',requireRole('editor'),wrap(async(req,res)=>{
 }))
 api.delete('/nodes/:id',requireRole('admin'),(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
+  const data=z.object({confirmed:z.boolean().optional(),confirmation:z.string().optional()}).parse(req.body||{})
+  if((data.confirmed!==undefined||data.confirmation!==undefined)&&!data.confirmed&&data.confirmation!==node.hostname)return res.status(400).json({error:'Confirmation is required'})
   if(node.ad_guid)return res.status(409).json({error:'This computer is managed by Active Directory and will be imported again. Remove it from the directory search scope first.'})
   if(one('SELECT id FROM agents WHERE node_id=? AND revoked_at IS NULL',node.id))return res.status(409).json({error:'Revoke the enrolled agent before removing this node'})
   if(one("SELECT id FROM break_glass_sessions WHERE node_id=? AND status IN ('activating','activation-unknown','active','ending')",node.id))return res.status(409).json({error:'End break glass before removing this node'})
@@ -1210,6 +1269,34 @@ api.post('/nodes/:id/activate-agentless',requireRole('admin'),wrap(async(req,res
   }
   audit(req.user.id,'node.agentless.verify','node',node.id,null,{transport:one('SELECT transport FROM nodes WHERE id=?',node.id)?.transport,computerName:facts?.computer?.Name})
   res.json({managed:true,transport:one('SELECT transport FROM nodes WHERE id=?',node.id)?.transport,computerName:facts?.computer?.Name})
+}))
+api.post('/nodes/:id/wef/configure',requireRole('admin'),wrap(async(req,res)=>{
+  const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
+  if(!wefEnabled())return res.status(409).json({error:'Enable WEF push in Administration before configuring a source'})
+  const secret=wefSecret();if(!secret)return res.status(503).json({error:'Set WEF_SHARED_SECRET on the control plane before configuring WEF push'})
+  if(!['winrm','winrms'].includes(node.transport)||node.connection_mode!=='agentless'||node.status!=='reachable')return res.status(409).json({error:'WEF source configuration requires a reachable authenticated WinRM node'})
+  const data=body(z.object({refreshSeconds:z.number().int().min(60).max(86400).default(900)}),req)
+  const base=process.env.PUBLIC_BASE_URL||`${req.protocol}://${req.get('host')}`
+  let subscriptionUrl
+  try {
+    const parsed=new URL(base)
+    if(parsed.protocol!=='https:')throw new Error('WEF push requires an HTTPS PUBLIC_BASE_URL')
+    subscriptionUrl=wefSubscriptionUrl(parsed.origin,secret,node.id,wefPath())
+  } catch(error) {throw Object.assign(new Error(error.message),{status:503})}
+  const applyRunId=id();run('INSERT INTO policy_apply_runs(id,node_id,status) VALUES(?,?,?)',applyRunId,node.id,'running')
+  try {
+    const result=await remote(node,'wef_configure',{subscriptionUrl,refreshSeconds:data.refreshSeconds})
+    if(result?.configured!==true)throw Object.assign(new Error('WEF source configuration was not confirmed'),{status:502})
+    const configured=new URL(subscriptionUrl);configured.searchParams.delete('token')
+    const summary={operation:'wef_configure',path:configured.pathname,refreshSeconds:result.refreshSeconds,auditPolicy:result.auditPolicy}
+    run('UPDATE policy_apply_runs SET status=?,diff_json=?,finished_at=? WHERE id=?','success',json(summary),now(),applyRunId)
+    audit(req.user.id,'wef.source.configure','node',node.id,null,{...summary,runId:applyRunId,transport:node.transport})
+    res.json({nodeId:node.id,configured:true,subscriptionManager:configured.toString(),refreshSeconds:result.refreshSeconds,auditPolicy:result.auditPolicy,runId:applyRunId})
+  } catch(error) {
+    run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?',error.status===502?'unknown':'failed',error.message,now(),applyRunId)
+    audit(req.user.id,'wef.source.configure.failed','node',node.id,null,{runId:applyRunId,error:error.message})
+    throw Object.assign(new Error(`WEF source configuration failed: ${error.message}`),{status:error.status||502})
+  }
 }))
 api.post('/nodes/:id/deploy-agent',requireRole('admin'),wrap(async(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
@@ -1302,7 +1389,8 @@ api.get('/nodes/:id/break-glass',requireRole('admin'),(req,res)=>{
 })
 api.post('/nodes/:id/break-glass',requireRole('admin'),wrap(async(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
-  const data=body(z.object({durationMinutes:z.number().int().min(5).max(240),reason:z.string().trim().min(10).max(500),confirmation:z.literal('OPEN FIREWALL')}),req)
+  const data=body(z.object({durationMinutes:z.number().int().min(5).max(240),reason:z.string().trim().min(10).max(500),confirmed:z.boolean().optional(),confirmation:z.string().optional()}),req)
+  if((data.confirmed!==undefined||data.confirmation!==undefined)&&!data.confirmed&&data.confirmation!=='OPEN FIREWALL')return res.status(400).json({error:'Confirmation is required'})
   if(node.connection_mode!=='agent'&&!['winrm','winrms'].includes(node.transport))return res.status(409).json({error:'Break glass requires WinRM or an enrolled agent'})
   if(one("SELECT id FROM break_glass_sessions WHERE node_id=? AND status IN ('activating','activation-unknown','active','ending')",node.id))return res.status(409).json({error:'Break glass is already active or pending for this node'})
   const sessionId=id(),startedAt=now(),expiresAt=new Date(Date.now()+data.durationMinutes*60_000).toISOString()
@@ -1358,7 +1446,8 @@ api.get('/nodes/:id/audit-policy',wrap(async(req,res)=>{const node=getNode(reqId
 api.post('/nodes/:id/audit-policy/enable',requireRole('admin'),wrap(async(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
   if(node.connection_mode==='agent')return res.status(409).json({error:'Audit policy changes require a WinRM node'})
-  body(z.object({confirmation:z.literal('ENABLE WFP AUDITING')}),req)
+  const data=body(z.object({confirmed:z.boolean().optional(),confirmation:z.string().optional()}),req)
+  if(!data.confirmed&&data.confirmation!=='ENABLE WFP AUDITING')return res.status(400).json({error:'Confirmation is required'})
   const runId=id()
   run('INSERT INTO policy_apply_runs(id,node_id,status) VALUES(?,?,?)',runId,node.id,'running')
   let before=null,attempted=false
@@ -1478,7 +1567,7 @@ api.delete('/policies/sync/:scheduleId',requireRole('admin'),(req,res)=>{
 })
 api.post('/policies',requireRole('editor'),(req,res)=>{const data=body(z.object({name:z.string().min(1),description:z.string().default('')}),req),policyId=id();run('INSERT INTO policies(id,name,description,owner_user_id) VALUES(?,?,?,?)',policyId,data.name,data.description,req.user.id);audit(req.user.id,'policy.create','policy',policyId,null,data);res.status(201).json(getPolicy(policyId))})
 api.get('/policies/:id',(req,res)=>{const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy');if(!canReadResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});res.json({...policy,versions:all('SELECT id,version_no,created_at,comment FROM policy_versions WHERE policy_id=? ORDER BY version_no DESC',policy.id),assignments:all('SELECT * FROM policy_assignments WHERE policy_id=?',policy.id)})})
-api.get('/policies/:id/versions',(req,res)=>{const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy');if(!canReadResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});res.json(all('SELECT * FROM policy_versions WHERE policy_id=? ORDER BY version_no DESC',policy.id).map(v=>({...v,graph:parse(v.graph_json),rules:parse(v.rules_compiled_json)})))})
+api.get('/policies/:id/versions',(req,res)=>{const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy');if(!canReadResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});res.json(all('SELECT * FROM policy_versions WHERE policy_id=? ORDER BY version_no DESC',policy.id).map(v=>{const graph=parse(v.graph_json)||{nodes:[],edges:[]};return {...v,graph,rules:parse(v.rules_compiled_json),mfaGates:extractMfaGates(graph)}}))})
 api.get('/policies/:id/learning-preview',(req,res)=>{
   const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy')
   if(!canReadResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'})
@@ -1497,7 +1586,7 @@ api.post('/policies/:id/versions',requireRole('editor'),(req,res)=>{
   if(conflicts.length)return rejectConflicts(res,conflicts)
   const last=one('SELECT MAX(version_no) as n FROM policy_versions WHERE policy_id=?',policy.id)?.n||0
   db.transaction(()=>{run('INSERT INTO policy_versions(id,policy_id,version_no,graph_json,rules_compiled_json,created_by,comment) VALUES(?,?,?,?,?,?,?)',versionId,policy.id,last+1,json(data.graph),json(rules),req.user.id,data.comment);run('UPDATE policies SET current_version_id=? WHERE id=?',versionId,policy.id);audit(req.user.id,'policy.version.create','policy',policy.id,null,{versionId,versionNo:last+1,rules})})()
-  res.status(201).json({id:versionId,versionNo:last+1,rules})
+  res.status(201).json({id:versionId,versionNo:last+1,rules,mfaGates:extractMfaGates(data.graph)})
 })
 api.post('/policies/:id/versions/:versionId/recall',requireRole('editor'),(req,res)=>{const policy=getPolicy(reqId(req)),version=one('SELECT * FROM policy_versions WHERE id=? AND policy_id=?',req.params.versionId,reqId(req));if(!policy||!version)return notFound(res,'Version');if(!canWriteResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});if(hasActiveLearning(policy.id))return res.status(409).json({error:'Automatic learning owns this policy until training ends'});if(one('SELECT id FROM policy_assignments WHERE policy_id=? AND removal_job_id IS NOT NULL',policy.id))return res.status(409).json({error:'Wait for pending agent firewall cleanup before changing this policy'});const conflicts=assignmentConflicts(policy.id,parse(version.rules_compiled_json)||[],assignedNodes(policy.id));if(conflicts.length)return rejectConflicts(res,conflicts);run('UPDATE policies SET current_version_id=? WHERE id=?',version.id,policy.id);audit(req.user.id,'policy.recall','policy',policy.id,{versionId:policy.current_version_id},{versionId:version.id});res.json({versionId:version.id,pendingSync:true})})
 api.post('/policies/:id/assignments',requireRole('editor'),(req,res)=>{const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy');if(!canWriteResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'});if(hasActiveLearning(policy.id))return res.status(409).json({error:'Automatic learning owns this policy until training ends'});if(one('SELECT id FROM policy_assignments WHERE policy_id=? AND removal_job_id IS NOT NULL',policy.id))return res.status(409).json({error:'Wait for pending agent firewall cleanup before assigning this policy'});if(one("SELECT id FROM learning_sessions WHERE generated_policy_id=? AND status IN ('review','apply-failed')",policy.id))return res.status(409).json({error:'Approve the learning proposal before assigning it'});const data=body(z.object({nodeId:z.string().optional(),nodeGroupId:z.string().optional()}),req);if(Number(!!data.nodeId)+Number(!!data.nodeGroupId)!==1)return res.status(400).json({error:'Specify exactly one nodeId or nodeGroupId'});const targets=data.nodeId?[getNode(data.nodeId)].filter(Boolean):all('SELECT n.* FROM nodes n JOIN node_group_members m ON m.node_id=n.id WHERE m.group_id=?',data.nodeGroupId);if(data.nodeId&&!targets.length)return notFound(res,'Node');const targetGroup=data.nodeGroupId?one('SELECT * FROM node_groups WHERE id=?',data.nodeGroupId):null;if(data.nodeGroupId&&!targetGroup)return notFound(res,'Node group');if(targetGroup&&!canWriteResource(req.user,'node_group',targetGroup))return res.status(403).json({error:'Insufficient permission for node group'});const rules=parse(one('SELECT rules_compiled_json FROM policy_versions WHERE id=?',policy.current_version_id)?.rules_compiled_json)||[];const conflicts=assignmentConflicts(policy.id,rules,targets);if(conflicts.length)return rejectConflicts(res,conflicts);const assignmentId=id();run('INSERT INTO policy_assignments(id,policy_id,node_id,node_group_id,assigned_by) VALUES(?,?,?,?,?)',assignmentId,policy.id,data.nodeId||null,data.nodeGroupId||null,req.user.id);audit(req.user.id,'policy.assign','policy',policy.id,null,data);res.status(201).json({id:assignmentId,...data})})
@@ -1856,27 +1945,47 @@ async function changeLsaRight(node,accountSid,right,present){
 }
 api.get('/segments',(_req,res)=>res.json(all('SELECT * FROM identity_segments ORDER BY created_at DESC').map(segment=>({...segment,lsaBaselines:segmentBaselines(segment.id)}))))
 api.post('/segments',requireRole('admin'),(req,res)=>{
-  const data=body(z.object({name:z.string().min(1),nodeId:z.string().optional(),nodeGroupId:z.string().optional(),policyId:z.string().nullable().optional(),port:z.number().int().min(1).max(65535),accountSid:z.string().max(184).optional(),sourceIp:z.string().max(255).optional(),extraPorts:z.array(z.number().int().min(1).max(65535)).max(100).default([]),sourceProcess:z.string().max(1024).optional(),fallbackToLoggedOnUser:z.boolean().default(false),failOpen:z.boolean().default(false),ttlMinutes:z.number().int().min(2).max(10080).default(240),mode:z.enum(['agentless','agent']).default('agentless'),mfaProvider:z.enum(['totp','entra']).default('totp'),allowedUpns:z.array(z.email()).max(100).default([]),portalEnabled:z.boolean().default(true),autoPromptEnabled:z.boolean().default(false)}),req)
+  const data=body(z.object({name:z.string().min(1),nodeId:z.string().optional(),nodeGroupId:z.string().optional(),policyId:z.string().nullable().optional(),port:z.number().int().min(1).max(65535),accountSid:z.string().max(184).optional(),sourceIp:z.string().max(255).optional(),extraPorts:z.array(z.number().int().min(1).max(65535)).max(100).default([]),sourceProcess:z.string().max(1024).optional(),fallbackToLoggedOnUser:z.boolean().default(false),failOpen:z.boolean().default(false),ttlMinutes:z.number().int().min(2).max(10080).default(240),mode:z.enum(['agentless','agent']).default('agentless'),mfaProvider:z.enum(['totp','entra']).default('totp'),allowedUpns:z.array(z.email()).max(100).default([]),entraGroupId:z.string().trim().max(256).optional().default(''),portalEnabled:z.boolean().default(true),autoPromptEnabled:z.boolean().default(false)}),req)
   if(Number(!!data.nodeId)+Number(!!data.nodeGroupId)!==1)return res.status(400).json({error:'Choose one node or node group'})
   if(data.nodeId&&!getNode(data.nodeId))return notFound(res,'Node')
   if(data.nodeGroupId&&!one('SELECT id FROM node_groups WHERE id=?',data.nodeGroupId))return notFound(res,'Node group')
   if(data.policyId&&!getPolicy(data.policyId))return notFound(res,'Policy')
   if(data.accountSid&&!/^S-1-\d+-\d+(?:-\d+)+$/.test(data.accountSid))return res.status(400).json({error:'A valid account SID is required'})
   data.extraPorts=[...new Set(data.extraPorts)].filter(port=>port!==data.port)
-  const segmentId=id();run('INSERT INTO identity_segments(id,name,node_id,node_group_id,policy_id,port,account_sid,source_ip,extra_ports,source_process,fallback_to_logged_on_user,fail_open,ttl_minutes,mode,mfa_provider,allowed_upns,portal_enabled,auto_prompt_enabled) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',segmentId,data.name,data.nodeId||null,data.nodeGroupId||null,data.policyId||null,data.port,data.accountSid||null,data.sourceIp||null,json(data.extraPorts),data.sourceProcess||null,Number(data.fallbackToLoggedOnUser),Number(data.failOpen),data.ttlMinutes,data.mode,data.mfaProvider,json(data.allowedUpns.map(value=>value.toLowerCase())),Number(data.portalEnabled),Number(data.autoPromptEnabled))
+  const segmentId=id();run('INSERT INTO identity_segments(id,name,node_id,node_group_id,policy_id,port,account_sid,source_ip,extra_ports,source_process,fallback_to_logged_on_user,fail_open,ttl_minutes,mode,mfa_provider,allowed_upns,entra_group_id,portal_enabled,auto_prompt_enabled) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',segmentId,data.name,data.nodeId||null,data.nodeGroupId||null,data.policyId||null,data.port,data.accountSid||null,data.sourceIp||null,json(data.extraPorts),data.sourceProcess||null,Number(data.fallbackToLoggedOnUser),Number(data.failOpen),data.ttlMinutes,data.mode,data.mfaProvider,json(data.allowedUpns.map(value=>value.toLowerCase())),data.entraGroupId||null,Number(data.portalEnabled),Number(data.autoPromptEnabled))
   audit(req.user.id,'segment.create','segment',segmentId,null,data);res.status(201).json(one('SELECT * FROM identity_segments WHERE id=?',segmentId))
 })
 api.patch('/segments/:id',requireRole('admin'),(req,res)=>{
   const before=one('SELECT * FROM identity_segments WHERE id=?',reqId(req))
   if(!before)return notFound(res,'Segment')
-  const data=body(z.object({allowedUpns:z.array(z.email()).max(100).optional(),mfaProvider:z.enum(['totp','entra']).optional(),portalEnabled:z.boolean().optional(),autoPromptEnabled:z.boolean().optional(),ttlMinutes:z.number().int().min(2).max(10080).optional(),sourceIp:z.string().max(255).optional(),policyId:z.string().nullable().optional(),accountSid:z.string().max(184).optional(),extraPorts:z.array(z.number().int().min(1).max(65535)).max(100).optional(),sourceProcess:z.string().max(1024).optional(),fallbackToLoggedOnUser:z.boolean().optional(),failOpen:z.boolean().optional()}),req)
+  const data=body(z.object({allowedUpns:z.array(z.email()).max(100).optional(),entraGroupId:z.string().trim().max(256).optional().nullable(),mfaProvider:z.enum(['totp','entra']).optional(),portalEnabled:z.boolean().optional(),autoPromptEnabled:z.boolean().optional(),ttlMinutes:z.number().int().min(2).max(10080).optional(),sourceIp:z.string().max(255).optional(),policyId:z.string().nullable().optional(),accountSid:z.string().max(184).optional(),extraPorts:z.array(z.number().int().min(1).max(65535)).max(100).optional(),sourceProcess:z.string().max(1024).optional(),fallbackToLoggedOnUser:z.boolean().optional(),failOpen:z.boolean().optional()}),req)
   if(data.policyId&&!getPolicy(data.policyId))return notFound(res,'Policy')
-  const next={allowedUpns:data.allowedUpns?data.allowedUpns.map(value=>value.toLowerCase()):parse(before.allowed_upns)||[],mfaProvider:data.mfaProvider||before.mfa_provider,portalEnabled:data.portalEnabled===undefined?!!before.portal_enabled:data.portalEnabled,autoPromptEnabled:data.autoPromptEnabled===undefined?!!before.auto_prompt_enabled:data.autoPromptEnabled,ttlMinutes:data.ttlMinutes||before.ttl_minutes,sourceIp:data.sourceIp===undefined?before.source_ip:data.sourceIp||null,policyId:data.policyId===undefined?before.policy_id:data.policyId,accountSid:data.accountSid===undefined?before.account_sid:data.accountSid||null,extraPorts:data.extraPorts===undefined?parse(before.extra_ports)||[]:[...new Set(data.extraPorts)].filter(port=>port!==before.port),sourceProcess:data.sourceProcess===undefined?before.source_process:data.sourceProcess||null,fallbackToLoggedOnUser:data.fallbackToLoggedOnUser===undefined?!!before.fallback_to_logged_on_user:data.fallbackToLoggedOnUser,failOpen:data.failOpen===undefined?!!before.fail_open:data.failOpen}
+  const next={allowedUpns:data.allowedUpns?data.allowedUpns.map(value=>value.toLowerCase()):parse(before.allowed_upns)||[],entraGroupId:data.entraGroupId===undefined?before.entra_group_id:data.entraGroupId||null,mfaProvider:data.mfaProvider||before.mfa_provider,portalEnabled:data.portalEnabled===undefined?!!before.portal_enabled:data.portalEnabled,autoPromptEnabled:data.autoPromptEnabled===undefined?!!before.auto_prompt_enabled:data.autoPromptEnabled,ttlMinutes:data.ttlMinutes||before.ttl_minutes,sourceIp:data.sourceIp===undefined?before.source_ip:data.sourceIp||null,policyId:data.policyId===undefined?before.policy_id:data.policyId,accountSid:data.accountSid===undefined?before.account_sid:data.accountSid||null,extraPorts:data.extraPorts===undefined?parse(before.extra_ports)||[]:[...new Set(data.extraPorts)].filter(port=>port!==before.port),sourceProcess:data.sourceProcess===undefined?before.source_process:data.sourceProcess||null,fallbackToLoggedOnUser:data.fallbackToLoggedOnUser===undefined?!!before.fallback_to_logged_on_user:data.fallbackToLoggedOnUser,failOpen:data.failOpen===undefined?!!before.fail_open:data.failOpen}
   if(next.accountSid&&!/^S-1-\d+-\d+(?:-\d+)+$/.test(next.accountSid))return res.status(400).json({error:'A valid account SID is required'})
   if(next.accountSid!==before.account_sid&&one('SELECT 1 FROM segment_lsa_baselines WHERE segment_id=?',before.id))return res.status(409).json({error:'Restore this segment’s LSA baselines before changing its account SID'})
-  run('UPDATE identity_segments SET allowed_upns=?,mfa_provider=?,portal_enabled=?,auto_prompt_enabled=?,ttl_minutes=?,source_ip=?,policy_id=?,account_sid=?,extra_ports=?,source_process=?,fallback_to_logged_on_user=?,fail_open=? WHERE id=?',json(next.allowedUpns),next.mfaProvider,Number(next.portalEnabled),Number(next.autoPromptEnabled),next.ttlMinutes,next.sourceIp,next.policyId,next.accountSid,json(next.extraPorts),next.sourceProcess,Number(next.fallbackToLoggedOnUser),Number(next.failOpen),before.id)
-  audit(req.user.id,'segment.update','segment',before.id,{allowedUpns:parse(before.allowed_upns),mfaProvider:before.mfa_provider,portalEnabled:!!before.portal_enabled,autoPromptEnabled:!!before.auto_prompt_enabled,ttlMinutes:before.ttl_minutes,sourceIp:before.source_ip,policyId:before.policy_id,accountSid:before.account_sid,extraPorts:parse(before.extra_ports)||[],sourceProcess:before.source_process,fallbackToLoggedOnUser:!!before.fallback_to_logged_on_user,failOpen:!!before.fail_open},next)
+  run('UPDATE identity_segments SET allowed_upns=?,entra_group_id=?,mfa_provider=?,portal_enabled=?,auto_prompt_enabled=?,ttl_minutes=?,source_ip=?,policy_id=?,account_sid=?,extra_ports=?,source_process=?,fallback_to_logged_on_user=?,fail_open=? WHERE id=?',json(next.allowedUpns),next.entraGroupId,next.mfaProvider,Number(next.portalEnabled),Number(next.autoPromptEnabled),next.ttlMinutes,next.sourceIp,next.policyId,next.accountSid,json(next.extraPorts),next.sourceProcess,Number(next.fallbackToLoggedOnUser),Number(next.failOpen),before.id)
+  audit(req.user.id,'segment.update','segment',before.id,{allowedUpns:parse(before.allowed_upns),entraGroupId:before.entra_group_id||null,mfaProvider:before.mfa_provider,portalEnabled:!!before.portal_enabled,autoPromptEnabled:!!before.auto_prompt_enabled,ttlMinutes:before.ttl_minutes,sourceIp:before.source_ip,policyId:before.policy_id,accountSid:before.account_sid,extraPorts:parse(before.extra_ports)||[],sourceProcess:before.source_process,fallbackToLoggedOnUser:!!before.fallback_to_logged_on_user,failOpen:!!before.fail_open},next)
   res.json(one('SELECT * FROM identity_segments WHERE id=?',before.id))
+})
+api.post('/segments/:id/entra-group/sync',requireRole('admin'),wrap(async(req,res)=>{
+  const segment=one('SELECT * FROM identity_segments WHERE id=?',reqId(req))
+  if(!segment)return notFound(res,'Segment')
+  if(!segment.entra_group_id)return res.status(400).json({error:'This segment has no Entra group configured'})
+  try{
+    const result=await syncEntraGroup(segment.entra_group_id,{force:true})
+    audit(req.user.id,'entra.group.sync','segment',segment.id,null,result)
+    res.json(result)
+  }catch(error){
+    audit(req.user.id,'entra.group.sync.failed','segment',segment.id,null,{error:String(error.message).slice(0,500)})
+    throw error
+  }
+}))
+api.get('/segments/:id/entra-group/members',requireRole('admin'),(req,res)=>{
+  const segment=one('SELECT * FROM identity_segments WHERE id=?',reqId(req))
+  if(!segment)return notFound(res,'Segment')
+  if(!segment.entra_group_id)return res.status(400).json({error:'This segment has no Entra group configured'})
+  const group=String(segment.entra_group_id).trim().toLowerCase()
+  res.json({groupId:group,members:cachedEntraGroupMembers(group)})
 })
 api.get('/segments/:id/lsa-baselines',requireRole('admin'),(req,res)=>{
   const segment=one('SELECT * FROM identity_segments WHERE id=?',reqId(req));if(!segment)return notFound(res,'Segment')
@@ -1884,7 +1993,8 @@ api.get('/segments/:id/lsa-baselines',requireRole('admin'),(req,res)=>{
 })
 api.post('/segments/:id/lsa-baselines',requireRole('admin'),wrap(async(req,res)=>{
   const segment=one('SELECT * FROM identity_segments WHERE id=?',reqId(req));if(!segment)return notFound(res,'Segment')
-  const data=body(z.object({enabled:z.boolean(),nodeId:z.string().uuid().optional(),reason:z.string().trim().min(10).max(500),confirmation:z.literal('ENFORCE LSA GATE')}),req)
+  const data=body(z.object({enabled:z.boolean(),nodeId:z.string().uuid().optional(),reason:z.string().trim().min(10).max(500),confirmed:z.boolean().optional(),confirmation:z.string().optional()}),req)
+  if(!data.confirmed&&data.confirmation!=='ENFORCE LSA GATE')return res.status(400).json({error:'Confirmation is required'})
   const rights=assertLsaSegment(segment),targets=segmentNodes(segment,data.nodeId)
   const results=[]
   for(const node of targets){
@@ -1932,7 +2042,6 @@ function portalTarget(req,segment,requestedNodeId){
   if(!(parse(segment.allowed_upns)||[]).includes(req.user.email.toLowerCase()))throw Object.assign(new Error('Your account is not assigned to this segment'),{status:403})
   if(segment.fail_open)throw Object.assign(new Error('Portal access requires a fail-closed segment'),{status:409})
   if(segment.source_process)throw Object.assign(new Error('Agentless portal access cannot enforce a source process'),{status:409})
-  if(segment.fallback_to_logged_on_user)throw Object.assign(new Error('Agentless portal access cannot safely resolve a fallback logged-on user'),{status:409})
   const nodeId=segment.node_id||requestedNodeId
   if(!nodeId||segment.node_id&&requestedNodeId&&requestedNodeId!==segment.node_id||segment.node_group_id&&!one('SELECT 1 FROM node_group_members WHERE group_id=? AND node_id=?',segment.node_group_id,nodeId))throw Object.assign(new Error('Choose a node covered by this segment'),{status:400})
   const node=getNode(nodeId)
@@ -2020,24 +2129,26 @@ async function grantPortalAccess(req,segment,node,sourceIp,provider,promptId=nul
     throw error
   }
 }
-api.get('/segments/access',(req,res)=>{
-  const segments=all("SELECT * FROM identity_segments WHERE portal_enabled=1 AND mode='agentless' ORDER BY name")
-    .filter(segment=>(parse(segment.allowed_upns)||[]).includes(req.user.email.toLowerCase()))
-    .map(segment=>({id:segment.id,name:segment.name,nodeId:segment.node_id,nodeGroupId:segment.node_group_id,port:segment.port,ttlMinutes:segment.ttl_minutes,mfaProvider:segment.mfa_provider,nodes:segment.node_group_id?all('SELECT n.id,n.hostname FROM nodes n JOIN node_group_members m ON m.node_id=n.id WHERE m.group_id=? ORDER BY n.hostname',segment.node_group_id):[{id:segment.node_id,hostname:getNode(segment.node_id)?.hostname||segment.node_id}]}))
+api.get('/segments/access',wrap(async(req,res)=>{
+  const segments=[]
+  for(const segment of all("SELECT * FROM identity_segments WHERE portal_enabled=1 AND mode='agentless' ORDER BY name")){
+    if(!await segmentAllowsOperatorAsync(segment,req.user.email))continue
+    segments.push({id:segment.id,name:segment.name,nodeId:segment.node_id,nodeGroupId:segment.node_group_id,port:segment.port,ttlMinutes:segment.ttl_minutes,mfaProvider:segment.mfa_provider,nodes:segment.node_group_id?all('SELECT n.id,n.hostname FROM nodes n JOIN node_group_members m ON m.node_id=n.id WHERE m.group_id=? ORDER BY n.hostname',segment.node_group_id):[{id:segment.node_id,hostname:getNode(segment.node_id)?.hostname||segment.node_id}]})
+  }
   res.json(segments)
-})
+}))
 api.get('/segments/access/grants',(req,res)=>{
   const admin=['owner','admin'].includes(req.user.role)
   const grants=all(`SELECT g.id,g.node_id,g.src_ip,g.dst_port,g.ports_json,g.granted_at,g.expires_at,g.segment_id,g.fallback_reason,c.user_upn,n.hostname FROM jit_grants g LEFT JOIN mfa_challenges c ON c.id=g.mfa_challenge_id LEFT JOIN nodes n ON n.id=g.node_id WHERE g.grant_type='portal_firewall' AND g.revoked_at IS NULL AND g.expires_at>? AND (?=1 OR c.user_upn=?) ORDER BY g.expires_at`,now(),Number(admin),req.user.email)
   res.json(grants.map(({ports_json,...grant})=>({...grant,ports:parse(ports_json)||[grant.dst_port]})))
 })
-api.get('/segments/access/prompts/:promptId',(req,res)=>{
+api.get('/segments/access/prompts/:promptId',wrap(async(req,res)=>{
   const prompt=one('SELECT * FROM mfa_prompt_events WHERE id=?',req.params.promptId)
   if(!prompt||prompt.status!=='opened'||prompt.expires_at<=now()||prompt.source_ip!==normalizeSourceIp(req.ip))return notFound(res,'MFA prompt')
   const segment=one('SELECT * FROM identity_segments WHERE id=?',prompt.segment_id)
-  if(!segment?.portal_enabled||!(parse(segment.allowed_upns)||[]).includes(req.user.email.toLowerCase()))return notFound(res,'MFA prompt')
+  if(!segment?.portal_enabled||!await segmentAllowsOperatorAsync(segment,req.user.email))return notFound(res,'MFA prompt')
   res.json({id:prompt.id,segmentId:prompt.segment_id,nodeId:prompt.target_node_id,sourceIp:prompt.source_ip,sourceNode:one('SELECT hostname FROM nodes WHERE id=?',prompt.source_node_id)?.hostname||null,sessionUser:prompt.opened_user,sessionId:prompt.opened_session_id,processId:prompt.opened_process_id,port:segment.port,expiresAt:prompt.expires_at})
-})
+}))
 api.post('/segments/access/grants/:grantId/revoke',wrap(async(req,res)=>{
   const grant=one(`SELECT g.*,c.user_upn FROM jit_grants g LEFT JOIN mfa_challenges c ON c.id=g.mfa_challenge_id WHERE g.id=? AND g.grant_type='portal_firewall'`,req.params.grantId)
   if(!grant)return notFound(res,'Access grant')
@@ -2153,7 +2264,8 @@ api.post('/logon-rights/baseline',requireRole('admin'),wrap(async(req,res)=>{
 }))
 
 api.post('/logon-rights/change',requireRole('admin'),wrap(async(req,res)=>{
-  const data=body(z.object({nodeId:z.string().uuid(),accountSid:z.string().regex(/^S-1-\d+-\d+(?:-\d+)+$/),right:z.enum(['SeNetworkLogonRight','SeDenyNetworkLogonRight','SeRemoteInteractiveLogonRight','SeDenyRemoteInteractiveLogonRight','SeInteractiveLogonRight','SeDenyInteractiveLogonRight','SeBatchLogonRight','SeDenyBatchLogonRight','SeServiceLogonRight','SeDenyServiceLogonRight']),present:z.boolean(),reason:z.string().trim().min(10).max(500),confirmation:z.literal('CHANGE LOGON RIGHT')}),req)
+  const data=body(z.object({nodeId:z.string().uuid(),accountSid:z.string().regex(/^S-1-\d+-\d+(?:-\d+)+$/),right:z.enum(['SeNetworkLogonRight','SeDenyNetworkLogonRight','SeRemoteInteractiveLogonRight','SeDenyRemoteInteractiveLogonRight','SeInteractiveLogonRight','SeDenyInteractiveLogonRight','SeBatchLogonRight','SeDenyBatchLogonRight','SeServiceLogonRight','SeDenyServiceLogonRight']),present:z.boolean(),reason:z.string().trim().min(10).max(500),confirmed:z.boolean().optional(),confirmation:z.string().optional()}),req)
+  if(!data.confirmed&&data.confirmation!=='CHANGE LOGON RIGHT')return res.status(400).json({error:'Confirmation is required'})
   const node=getNode(data.nodeId);if(!node)return notFound(res,'Node')
   if(!['winrm','winrms'].includes(node.transport)||node.connection_mode!=='agentless')return res.status(409).json({error:'Logon rights changes require an agentless WinRM node'})
   if(data.right==='SeNetworkLogonRight'&&!data.present||data.right==='SeDenyNetworkLogonRight'&&data.present)return res.status(409).json({error:'This network logon change could block WinRM administration; use a separately validated enforcement workflow'})
@@ -2306,6 +2418,19 @@ function insertCollectedEvents(nodeId,events,ignoreLoopback){
     if(!result.changes&&item.eventType==='firewall'&&item.direction==='in')run('UPDATE log_events SET src_ip=?,src_port=?,dst_ip=?,dst_port=? WHERE node_id=? AND record_id=? AND pattern_id IS NULL AND (src_ip IS NOT ? OR src_port IS NOT ? OR dst_ip IS NOT ? OR dst_port IS NOT ?)',item.srcIp,item.srcPort,item.dstIp,item.dstPort,nodeId,item.recordId,item.srcIp,item.srcPort,item.dstIp,item.dstPort)
   }})()
   return inserted
+}
+function wefNodeForRequest(req) {
+  const hint=String(req.query.node||req.get('x-winfire-node')||'').trim()
+  if(hint){
+    const exact=one('SELECT * FROM nodes WHERE id=? OR hostname=? OR fqdn=? OR ip=?',hint,hint,hint,hint)
+    if(exact)return exact
+    throw Object.assign(new Error('WEF source node was not found'),{status:404})
+  }
+  const address=String(req.socket.remoteAddress||req.ip||'').replace(/^::ffff:/,'')
+  const matches=all('SELECT * FROM nodes WHERE ip=? OR fqdn=?',address,address)
+  if(matches.length===1)return matches[0]
+  if(matches.length>1)throw Object.assign(new Error('WEF source address matches more than one node'),{status:409})
+  throw Object.assign(new Error('WEF source node identity is required'),{status:401})
 }
 async function refreshUnknownEventAccounts(node){
   if(node.connection_mode!=='agentless'||!['winrm','winrms'].includes(node.transport))return

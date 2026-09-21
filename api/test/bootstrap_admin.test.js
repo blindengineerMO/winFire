@@ -28,6 +28,11 @@ test('demo admin survives restart and follows environment credentials',async()=>
   await ensureBootstrapAdmin()
   const repeated=db.prepare('SELECT password_hash FROM users WHERE id=?').get(original.id)
   assert.equal(repeated.password_hash,original.password_hash)
+  db.prepare('UPDATE users SET failed_attempts=5,locked_until=? WHERE id=?').run(new Date(Date.now()+900000).toISOString(),original.id)
+  await ensureBootstrapAdmin()
+  const recovered=db.prepare('SELECT failed_attempts,locked_until FROM users WHERE id=?').get(original.id)
+  assert.equal(recovered.failed_attempts,0)
+  assert.equal(recovered.locked_until,null)
   process.env.BOOTSTRAP_ADMIN_EMAIL='changed@bootstrap.test'
   process.env.BOOTSTRAP_ADMIN_PASSWORD='changed-bootstrap-password'
   await ensureBootstrapAdmin()

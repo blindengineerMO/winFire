@@ -38,7 +38,7 @@ function normalizeUrl(raw,collectionLevel){
 }
 
 function publicDevice(row){
-  return {id:row.id,nodeId:row.node_id||null,nodeGroupId:row.node_group_id||null,userId:row.user_id||null,browser:row.browser,extensionVersion:row.extension_version,status:row.status,capabilities:parse(row.capabilities_json)||{},lastSeenAt:row.last_seen_at,enrolledAt:row.enrolled_at,revokedAt:row.revoked_at||null}
+  return {id:row.id,nodeId:row.node_id||null,nodeGroupId:row.node_group_id||null,userId:row.user_id||null,userEmail:row.user_email||null,browser:row.browser,extensionVersion:row.extension_version,status:row.status,capabilities:parse(row.capabilities_json)||{},lastSeenAt:row.last_seen_at,enrolledAt:row.enrolled_at,revokedAt:row.revoked_at||null}
 }
 
 function requireDevice(req,res,next){
@@ -83,15 +83,18 @@ function deduplicateRules(rules){
 }
 
 internetRoutes.post('/enrollment',auth,requireRole('editor'),wrap(async(req,res)=>{
-  const data=z.object({nodeId:z.string().min(1).optional(),nodeGroupId:z.string().min(1).optional(),collectionLevel:collectionSchema}).refine(value=>Number(!!value.nodeId)+Number(!!value.nodeGroupId)===1,{message:'Choose exactly one node or node group'}).parse(req.body)
+  const data=z.object({nodeId:z.string().min(1).optional(),nodeGroupId:z.string().min(1).optional(),userId:z.string().uuid().optional(),collectionLevel:collectionSchema}).refine(value=>Number(!!value.nodeId)+Number(!!value.nodeGroupId)===1,{message:'Choose exactly one node or node group'}).parse(req.body)
   const node=data.nodeId?one('SELECT id,hostname FROM nodes WHERE id=?',data.nodeId):null
   const group=data.nodeGroupId?one('SELECT id,name FROM node_groups WHERE id=?',data.nodeGroupId):null
   if(data.nodeId&&!node)return res.status(404).json({error:'Node not found'})
   if(data.nodeGroupId&&!group)return res.status(404).json({error:'Node group not found'})
+  const user=data.userId?one('SELECT id,email,suspended FROM users WHERE id=?',data.userId):null
+  if(data.userId&&!user)return res.status(404).json({error:'User not found'})
+  if(user?.suspended)return res.status(409).json({error:'Suspended users cannot be assigned browser visibility'})
   const raw=crypto.randomBytes(32).toString('base64url'),enrollmentId=id(),createdAt=now(),expiresAt=new Date(Date.now()+15*60_000).toISOString()
-  run('INSERT INTO internet_enrollment_tokens(id,token_hash,node_id,node_group_id,collection_level,created_by,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)',enrollmentId,hashToken(raw),data.nodeId||null,data.nodeGroupId||null,data.collectionLevel,req.user.id,createdAt,expiresAt)
-  audit(req.user.id,'internet.enrollment.create','internet-enrollment',enrollmentId,null,{nodeId:data.nodeId||null,nodeGroupId:data.nodeGroupId||null,collectionLevel:data.collectionLevel,expiresAt})
-  res.status(201).json({id:enrollmentId,token:raw,expiresAt,collectionLevel:data.collectionLevel,installUrl:`${publicBase(req)}/tools`})
+  run('INSERT INTO internet_enrollment_tokens(id,token_hash,node_id,node_group_id,user_id,collection_level,created_by,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)',enrollmentId,hashToken(raw),data.nodeId||null,data.nodeGroupId||null,data.userId||null,data.collectionLevel,req.user.id,createdAt,expiresAt)
+  audit(req.user.id,'internet.enrollment.create','internet-enrollment',enrollmentId,null,{nodeId:data.nodeId||null,nodeGroupId:data.nodeGroupId||null,userId:data.userId||null,userEmail:user?.email||null,collectionLevel:data.collectionLevel,expiresAt})
+  res.status(201).json({id:enrollmentId,token:raw,expiresAt,collectionLevel:data.collectionLevel,userId:data.userId||null,userEmail:user?.email||null,installUrl:`${publicBase(req)}/tools`})
 }))
 
 internetRoutes.post('/enroll',internetEnrollLimit,wrap(async(req,res)=>{
@@ -102,8 +105,8 @@ internetRoutes.post('/enroll',internetEnrollLimit,wrap(async(req,res)=>{
   db.transaction(()=>{
     const consumed=run('UPDATE internet_enrollment_tokens SET used_at=? WHERE id=? AND used_at IS NULL',stamp,enrollment.id)
     if(consumed.changes!==1)throw Object.assign(new Error('Internet enrollment token was already used'),{status:409})
-    run('INSERT INTO internet_extension_devices(id,node_id,node_group_id,browser,extension_version,install_id_hash,token_hash,collection_level,status,capabilities_json,last_seen_at,enrolled_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',deviceId,enrollment.node_id,enrollment.node_group_id,data.browser,data.extensionVersion,hashToken(data.installId),hashToken(rawDeviceToken),enrollment.collection_level,'active',json(data.capabilities),stamp,stamp)
-    audit(enrollment.created_by,'internet.device.enroll','internet-device',deviceId,null,{nodeId:enrollment.node_id,nodeGroupId:enrollment.node_group_id,browser:data.browser,extensionVersion:data.extensionVersion})
+    run('INSERT INTO internet_extension_devices(id,node_id,node_group_id,user_id,browser,extension_version,install_id_hash,token_hash,collection_level,status,capabilities_json,last_seen_at,enrolled_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',deviceId,enrollment.node_id,enrollment.node_group_id,enrollment.user_id||null,data.browser,data.extensionVersion,hashToken(data.installId),hashToken(rawDeviceToken),enrollment.collection_level,'active',json(data.capabilities),stamp,stamp)
+    audit(enrollment.created_by,'internet.device.enroll','internet-device',deviceId,null,{nodeId:enrollment.node_id,nodeGroupId:enrollment.node_group_id,userId:enrollment.user_id||null,browser:data.browser,extensionVersion:data.extensionVersion})
   })()
   res.set('Cache-Control','no-store').status(201).json({deviceId,deviceToken:rawDeviceToken,serverUrl:publicBase(req),collectionLevel:enrollment.collection_level,heartbeatSeconds:300})
 }))
@@ -197,11 +200,11 @@ internetRoutes.post('/events:batch',internetIngestLimit,requireDevice,wrap(async
 }))
 
 internetRoutes.get('/summary',auth,requireRole('auditor'),(req,res)=>{
-  const row=one("SELECT COUNT(*) events,COUNT(DISTINCT registrable_domain) domains,COUNT(DISTINCT device_id) devices,SUM(CASE WHEN action='blocked' THEN 1 ELSE 0 END) blocked FROM internet_events")||{}
-  res.json({events:Number(row.events||0),domains:Number(row.domains||0),devices:Number(row.devices||0),blocked:Number(row.blocked||0),unmappedUsers:0})
+  const row=one("SELECT COUNT(*) events,COUNT(DISTINCT registrable_domain) domains,COUNT(DISTINCT device_id) devices,SUM(CASE WHEN action='blocked' THEN 1 ELSE 0 END) blocked,SUM(CASE WHEN d.user_id IS NULL THEN 1 ELSE 0 END) unmappedUsers FROM internet_events e JOIN internet_extension_devices d ON d.id=e.device_id")||{}
+  res.json({events:Number(row.events||0),domains:Number(row.domains||0),devices:Number(row.devices||0),blocked:Number(row.blocked||0),unmappedUsers:Number(row.unmappedUsers||0)})
 })
 
-internetRoutes.get('/devices',auth,requireRole('auditor'),(req,res)=>res.json(all(`SELECT d.*,n.hostname node_hostname,g.name group_name FROM internet_extension_devices d LEFT JOIN nodes n ON n.id=d.node_id LEFT JOIN node_groups g ON g.id=d.node_group_id ORDER BY d.last_seen_at DESC,d.id`).map(row=>({...publicDevice(row),nodeHostname:row.node_hostname||null,nodeGroupName:row.group_name||null}))))
+internetRoutes.get('/devices',auth,requireRole('auditor'),(req,res)=>res.json(all(`SELECT d.*,n.hostname node_hostname,g.name group_name,u.email user_email FROM internet_extension_devices d LEFT JOIN nodes n ON n.id=d.node_id LEFT JOIN node_groups g ON g.id=d.node_group_id LEFT JOIN users u ON u.id=d.user_id ORDER BY d.last_seen_at DESC,d.id`).map(row=>({...publicDevice(row),nodeHostname:row.node_hostname||null,nodeGroupName:row.group_name||null}))))
 
 internetRoutes.post('/devices/:id/revoke',auth,requireRole('admin'),(req,res)=>{
   const device=one('SELECT * FROM internet_extension_devices WHERE id=?',req.params.id)
@@ -212,19 +215,19 @@ internetRoutes.post('/devices/:id/revoke',auth,requireRole('admin'),(req,res)=>{
 })
 
 internetRoutes.get('/events',auth,requireRole('auditor'),(req,res)=>{
-  const query=z.object({q:z.string().max(200).optional(),domain:z.string().max(253).optional(),path:z.string().max(240).optional(),browser:browserSchema.optional(),action:z.enum(['observed','allowed','blocked']).optional(),deviceId:z.string().optional(),nodeId:z.string().optional(),from:z.string().datetime({offset:true}).optional(),to:z.string().datetime({offset:true}).optional(),page:z.coerce.number().int().min(1).default(1),pageSize:z.coerce.number().int().min(1).max(500).default(100),sortBy:z.enum(['time','domain','hostname','browser','action']).default('time'),sortDir:z.enum(['asc','desc']).default('desc')}).parse(req.query)
+  const query=z.object({q:z.string().max(200).optional(),domain:z.string().max(253).optional(),path:z.string().max(240).optional(),browser:browserSchema.optional(),action:z.enum(['observed','allowed','blocked']).optional(),deviceId:z.string().optional(),nodeId:z.string().optional(),userId:z.string().uuid().optional(),from:z.string().datetime({offset:true}).optional(),to:z.string().datetime({offset:true}).optional(),page:z.coerce.number().int().min(1).default(1),pageSize:z.coerce.number().int().min(1).max(500).default(100),sortBy:z.enum(['time','domain','hostname','browser','action']).default('time'),sortDir:z.enum(['asc','desc']).default('desc')}).parse(req.query)
   const where=[],values=[]
   if(query.q){where.push('(e.hostname LIKE ? OR e.registrable_domain LIKE ? OR COALESCE(e.path_prefix,\'\') LIKE ?)');values.push(`%${query.q}%`,`%${query.q}%`,`%${query.q}%`)}
   if(query.domain){where.push('(e.hostname=? OR e.registrable_domain=?)');values.push(query.domain.toLowerCase(),query.domain.toLowerCase())}
   if(query.path){where.push('e.path_prefix LIKE ?');values.push(`${query.path}%`)}
-  for(const [key,column] of [['browser','e.browser'],['action','e.action'],['deviceId','e.device_id'],['nodeId','d.node_id']])if(query[key]){where.push(`${column}=?`);values.push(query[key])}
+  for(const [key,column] of [['browser','e.browser'],['action','e.action'],['deviceId','e.device_id'],['nodeId','d.node_id'],['userId','d.user_id']])if(query[key]){where.push(`${column}=?`);values.push(query[key])}
   if(query.from){where.push('e.observed_at>=?');values.push(query.from)}
   if(query.to){where.push('e.observed_at<=?');values.push(query.to)}
   const condition=where.length?`WHERE ${where.join(' AND ')}`:''
-  const fromSql=`FROM internet_events e JOIN internet_extension_devices d ON d.id=e.device_id LEFT JOIN nodes n ON n.id=d.node_id LEFT JOIN node_groups g ON g.id=d.node_group_id ${condition}`
+  const fromSql=`FROM internet_events e JOIN internet_extension_devices d ON d.id=e.device_id LEFT JOIN nodes n ON n.id=d.node_id LEFT JOIN node_groups g ON g.id=d.node_group_id LEFT JOIN users u ON u.id=d.user_id ${condition}`
   const total=Number(one(`SELECT COUNT(*) count ${fromSql}`,...values)?.count||0)
   const sortColumn={time:'e.observed_at',domain:'e.registrable_domain',hostname:'e.hostname',browser:'e.browser',action:'e.action'}[query.sortBy]
-  const items=all(`SELECT e.id,e.client_event_id,e.observed_at,e.received_at,e.browser,e.hostname,e.registrable_domain,e.path_prefix,e.action,e.redaction_level,d.id device_id,d.node_id,d.node_group_id,n.hostname node_hostname,g.name node_group_name FROM ${fromSql.replace(/^FROM /,'')} ORDER BY ${sortColumn} ${query.sortDir.toUpperCase()},e.id DESC LIMIT ? OFFSET ?`,...values,query.pageSize,(query.page-1)*query.pageSize)
+  const items=all(`SELECT e.id,e.client_event_id,e.observed_at,e.received_at,e.browser,e.hostname,e.registrable_domain,e.path_prefix,e.action,e.redaction_level,d.id device_id,d.node_id,d.node_group_id,d.user_id,u.email user_email,n.hostname node_hostname,g.name node_group_name FROM ${fromSql.replace(/^FROM /,'')} ORDER BY ${sortColumn} ${query.sortDir.toUpperCase()},e.id DESC LIMIT ? OFFSET ?`,...values,query.pageSize,(query.page-1)*query.pageSize)
   res.json({items,total,page:query.page,pageSize:query.pageSize,totalPages:Math.ceil(total/query.pageSize)})
 })
 
