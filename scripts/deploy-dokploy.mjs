@@ -149,7 +149,10 @@ async function waitForDeployment(base, key, composeId, timeoutMs) {
       const list = Array.isArray(deployments) ? deployments : deployments?.deployments || []
       latest = list[0] || latest
       const status = String(latest?.status || latest?.state || '').toLowerCase()
-      if (['done', 'success', 'succeeded', 'running'].includes(status)) return latest
+      // Dokploy reports `running` while images are still being built and
+      // containers are starting. Keep polling so the URL check reflects the
+      // deployed stack rather than the first accepted job state.
+      if (['done', 'success', 'succeeded'].includes(status)) return latest
       if (['error', 'failed', 'failure', 'cancelled'].includes(status)) throw new Error(`Deployment failed (${status})`)
     } catch (error) {
       if (error.message.startsWith('Deployment failed')) throw error
