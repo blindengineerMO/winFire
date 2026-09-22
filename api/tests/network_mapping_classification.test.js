@@ -6,7 +6,7 @@ import path from 'node:path'
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'winfire-mapping-'))
 process.env.DATA_DIR = dir
-const {classifyNetworkFlow,recordArpEntries} = await import('../src/services/networkMapping.js')
+const {classifyNetworkFlow,recordArpEntries,recordNetworkFlow,mappingRows} = await import('../src/services/networkMapping.js')
 const {db}=await import('../src/db.js')
 
 test.after(() => fs.rmSync(dir, {recursive: true, force: true}))
@@ -69,6 +69,21 @@ test('well-known ports identify common services for mapping and event analysis',
   assert.equal(classifyNetworkFlow({sourceIp: '8.8.8.8', destinationIp: '192.168.88.10', protocol: '6', destinationPort: 443}).service, 'HTTPS web traffic')
   assert.equal(classifyNetworkFlow({sourceIp: '10.0.0.20', destinationIp: '192.168.88.10', protocol: 'UDP', sourcePort: 443}).service, 'HTTP/3 (QUIC) web traffic')
   assert.equal(classifyNetworkFlow({sourceIp: '192.168.88.10', destinationIp: '224.0.0.1', protocol: '2'}).trafficClass, 'multicast')
+})
+
+test('classification normalizes connector port values and identifies response traffic', () => {
+  assert.equal(classifyNetworkFlow({sourceIp: '192.168.88.10', destinationIp: '10.0.0.20', protocol: '6', destinationPort: '443'}).service, 'HTTPS web traffic')
+  assert.equal(classifyNetworkFlow({sourceIp: '10.0.0.20', destinationIp: '192.168.88.10', protocol: 'TCPv4', sourcePort: '443', destinationPort: '50123'}).service, 'HTTPS web traffic')
+  assert.equal(classifyNetworkFlow({sourceIp: '192.168.88.10', destinationIp: '224.0.0.251', protocol: '17', sourcePort: '5353', destinationPort: '5353'}).service, 'mDNS service discovery')
+  assert.equal(classifyNetworkFlow({sourceIp: '192.168.88.10', destinationIp: '239.255.255.250', protocol: 'UDP', destinationPort: '1900'}).service, 'SSDP/UPnP discovery')
+})
+
+test('mapping read repairs legacy unidentified service values', () => {
+  db.prepare("INSERT INTO nodes(id,hostname,ip,status) VALUES(?,?,?,?)").run('mapping-node','MAPPING-NODE','192.168.88.40','reachable')
+  assert.equal(recordNetworkFlow('mapping-node', {eventType:'firewall', srcIp:'192.168.88.40', dstIp:'8.8.8.8', protocol:'6', srcPort:'50123', dstPort:'443', direction:'out'}), true)
+  db.prepare("UPDATE network_map_pairs SET traffic_service='Unidentified' WHERE source_ip='192.168.88.40'").run()
+  const row = mappingRows({nodeId:'mapping-node'}).rows[0]
+  assert.equal(row.traffic_service, 'HTTPS web traffic')
 })
 
 test('managed-node ARP observations queue only new passive discovery candidates',()=>{

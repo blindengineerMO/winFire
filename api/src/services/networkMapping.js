@@ -57,7 +57,13 @@ const addressCategory = value => {
 
 export const normalizeNetworkProtocol = value => {
   const raw = String(value || '').trim().toUpperCase()
-  return ({'1': 'ICMP', '2': 'IGMP', '6': 'TCP', '17': 'UDP', '41': 'IPv6-in-IPv4', '47': 'GRE', '50': 'ESP', '51': 'AH', '58': 'ICMPv6', '89': 'OSPF', '132': 'SCTP', ICMPV6: 'ICMPv6', TCPV4: 'TCP', TCPV6: 'TCP', UDPV4: 'UDP', UDPV6: 'UDP'})[raw] || raw
+  const known = ({'1': 'ICMP', '2': 'IGMP', '6': 'TCP', '17': 'UDP', '41': 'IPv6-in-IPv4', '47': 'GRE', '50': 'ESP', '51': 'AH', '58': 'ICMPv6', '89': 'OSPF', '132': 'SCTP', ICMPV6: 'ICMPv6', TCPV4: 'TCP', TCPV6: 'TCP', UDPV4: 'UDP', UDPV6: 'UDP'})[raw]
+  if (known) return known
+  // Some Windows providers label the address family as “TCP/IPv4” or
+  // “UDP (IPv6)”. Keep those records on the same service catalog path.
+  if (/\bTCP\b/.test(raw)) return 'TCP'
+  if (/\bUDP\b/.test(raw)) return 'UDP'
+  return raw
 }
 
 // Well-known services are intentionally kept in the classifier instead of in
@@ -82,6 +88,8 @@ const servicePorts = {
   119: {TCP: 'NNTP news transfer'},
   123: {UDP: 'NTP time synchronization'},
   135: {TCP: 'MS RPC endpoint mapper', UDP: 'MS RPC endpoint mapper'},
+  1900: {UDP: 'SSDP/UPnP device discovery'},
+  3702: {UDP: 'WS-Discovery'},
   137: {UDP: 'NetBIOS name service'},
   138: {UDP: 'NetBIOS datagram service'},
   139: {TCP: 'NetBIOS session service'},
@@ -131,9 +139,21 @@ const servicePorts = {
   27017: {TCP: 'MongoDB database'},
 }
 
+// Firewall connectors and SQLite can return ports as numbers, numeric strings,
+// or empty values depending on the source (WFP, WinRM, an agent, or a compacted
+// event pattern). Normalize at the classifier boundary so every caller gets
+// the same service result.
+const normalizePort = value => {
+  if (value === null || value === undefined || value === '') return null
+  const number = typeof value === 'number' ? value : Number(String(value).trim())
+  return Number.isInteger(number) && number > 0 && number <= 65535 ? number : null
+}
+
 const serviceFor = ({source, destination, protocol, sourcePort, destinationPort}) => {
   const proto = normalizeNetworkProtocol(protocol)
-  const ports = new Set([sourcePort, destinationPort].filter(Number.isInteger))
+  const normalizedSourcePort = normalizePort(sourcePort)
+  const normalizedDestinationPort = normalizePort(destinationPort)
+  const ports = new Set([normalizedSourcePort, normalizedDestinationPort].filter(Number.isInteger))
   const addresses = new Set([normalizedIp(source), normalizedIp(destination)])
   const has = port => ports.has(port)
   if ((addresses.has('224.0.0.251') || addresses.has('ff02::fb')) && has(5353)) return 'mDNS service discovery'
@@ -143,7 +163,7 @@ const serviceFor = ({source, destination, protocol, sourcePort, destinationPort}
   if (proto === 'UDP' && (has(67) || has(68)) && (addresses.has('0.0.0.0') || addresses.has('255.255.255.255') || addresses.has('::'))) return 'DHCPv4 address assignment'
   if (proto === 'UDP' && (has(546) || has(547)) && (addresses.has('ff02::1:2') || addresses.has('::'))) return 'DHCPv6 address assignment'
   // Prefer the destination port, then use the source port for response flows.
-  for (const candidate of [destinationPort, sourcePort]) {
+  for (const candidate of [normalizedDestinationPort, normalizedSourcePort]) {
     if (!Number.isInteger(candidate)) continue
     const service = servicePorts[candidate]?.[proto]
     if (service) return service
@@ -205,7 +225,11 @@ export function classifyNetworkFlow({node, sourceIp, destinationIp, sourceNode, 
   return {trafficClass, scope, service, reason, sourceCategory, destinationCategory, external: scope === 'external' ? 1 : 0}
 }
 const clean = value => value === undefined || value === null || value === '' ? null : String(value)
-const port = value => Number.isInteger(Number(value)) && Number(value) > 0 && Number(value) <= 65535 ? Number(value) : null
+const port = normalizePort
+const hasIdentifiedService = value => {
+  const service = String(value || '').trim()
+  return Boolean(service) && !/^(?:unknown|unidentified|unclassified)(?:\s+service)?$|^n\/a$|^-$/.test(service.toLowerCase())
+}
 const localNode = nodeId => one('SELECT n.id,n.ip,n.hostname,f.snapshot_json FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id WHERE n.id=?', nodeId)
 const nodeForIp = address => address ? one('SELECT id,hostname FROM nodes WHERE lower(ip)=lower(?) LIMIT 1', address) : null
 
@@ -289,7 +313,10 @@ export function mappingRows({nodeId = null, external = null, trafficClass = null
       protocol: normalizeNetworkProtocol(row.protocol),
       traffic_class: row.traffic_class || classification.trafficClass,
       traffic_scope: row.traffic_scope || classification.scope,
-      traffic_service: row.traffic_service || classification.service,
+      // Reclassify legacy rows whose old analyzer stored a placeholder. This
+      // makes existing mappings immediately show a known service after the
+      // catalog or port normalization is updated.
+      traffic_service: hasIdentifiedService(row.traffic_service) ? row.traffic_service : classification.service,
       classification_reason: row.classification_reason || classification.reason,
     }
   })
