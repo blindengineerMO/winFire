@@ -64,6 +64,11 @@ For automation, `DOKPLOY_URL`, `DOKPLOY_API_KEY`, `DOKPLOY_PROJECT_ID`,
 provide wizard values through a secret manager or CI job; they remain
 process-only values.
 
+When an internal DNS record is not yet visible from the machine running the
+wizard, `DOKPLOY_REACHABILITY_IP` can be set to the Dokploy address for a test
+request. The generated hostname is still sent as the HTTP Host/SNI value, so
+the domain routing is tested without changing normal DNS behavior.
+
 The initial stack sets one replica for every service and includes health checks,
 persistent API/PostgreSQL volumes, and an Nginx UI proxy. WinFire's current
 database migration engine remains SQLite backed by the API data volume; the
