@@ -17,6 +17,7 @@ import VerifyEmail from './views/VerifyEmail.vue'
 import EnrollAuthenticator from './views/EnrollAuthenticator.vue'
 import Tools from './views/Tools.vue'
 import Internet from './views/Internet.vue'
+import Mapping from './views/Mapping.vue'
 import {session} from './lib/api.js'
 import '@mdi/font/css/materialdesignicons.css'
 import './styles.scss'
@@ -38,6 +39,7 @@ const routes=[
   {path:'/reports',component:Reports},
   {path:'/logs',component:Logs},
   {path:'/internet',component:Internet},
+  {path:'/mapping',component:Mapping},
   {path:'/identity',component:Identity},
   {path:'/admin',component:Administration}
 ]

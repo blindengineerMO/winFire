@@ -48,6 +48,7 @@ const requestSchemas={
   'POST /agents/enroll':'AgentEnrollRequest',
   'POST /agents/{id}/heartbeat':'AgentHeartbeatRequest',
   'POST /agents/{id}/events':'AgentEventBatchRequest',
+  'POST /agents/{id}/network':'AgentNetworkRequest',
   'POST /agents/{id}/jobs/{jobId}/result':'AgentJobResultRequest',
   'POST /nodes/{id}/wef/configure':'WefConfigureRequest',
   'PATCH /settings/entra':'EntraSettingsRequest',
@@ -56,7 +57,8 @@ const requestSchemas={
   'POST /segments/{id}/challenges':'MfaChallengeRequest',
   'POST /segments/{id}/challenges/{challengeId}/resolve':'MfaResolveRequest',
   'POST /segments/{id}/lsa-baselines':'LsaBaselineRequest',
-  'POST /logon-rights/baseline':'LogsPullRequest'
+  'POST /logon-rights/baseline':'LogsPullRequest',
+  'POST /discovery/scans':'DiscoveryScanRequest'
 }
 
 const responseSchemas={
@@ -130,10 +132,12 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
       InternetRule:{type:'object',required:['pattern','action'],properties:{pattern:{type:'string',minLength:1,maxLength:500},match:{type:'string',enum:['hostname','domain','prefix'],default:'hostname'},action:{type:'string',enum:['allow','block']},nodeIds:{type:'array',maxItems:500,items:{type:'string'}},nodeGroupIds:{type:'array',maxItems:500,items:{type:'string'}},resourceTypes:{type:'array',minItems:1,maxItems:20,items:{type:'string',enum:['main_frame','sub_frame','script','image','stylesheet','font','object','xmlhttprequest','other']}}}},
       InternetCleanupRequest:{type:'object',required:['confirmed'],properties:{confirmed:{const:true},before:{type:'string',format:'date-time'},domain:{type:'string',maxLength:253}}},
       AgentEnrollRequest:{type:'object',required:['token','csr'],properties:{token:{type:'string',minLength:32},csr:{type:'string',minLength:100,maxLength:12000}}},
-      AgentHeartbeatRequest:{type:'object',required:['version'],properties:{version:{type:'string',minLength:1,maxLength:100},mode:{type:'string',enum:['pull','push'],default:'pull'}}},
+      AgentHeartbeatRequest:{type:'object',required:['version'],properties:{version:{type:'string',minLength:1,maxLength:100},mode:{type:'string',enum:['pull','push'],default:'pull'},platform:{type:'string',maxLength:80},osVersion:{type:'string',maxLength:200},firewallBackend:{type:'string',maxLength:80},capabilities:{type:'array',maxItems:100,items:{type:'string',maxLength:80}}}},
       AgentEventBatchRequest:{type:'object',required:['events'],properties:{events:{type:'array',minItems:1,maxItems:500,items:{$ref:'#/components/schemas/AgentEvent'}}}},
       AgentEvent:{type:'object',required:['recordId','id','timeCreated'],properties:{recordId:{type:'integer',minimum:1},id:{type:'integer',minimum:1},timeCreated:{type:'string',format:'date-time'},fields:{type:'object',additionalProperties:{type:'string'}}}},
       AgentJobResultRequest:{type:'object',required:['leaseToken','success'],properties:{leaseToken:{type:'string',minLength:20},success:{type:'boolean'},diff:{},result:{},error:{type:'string',maxLength:2000}}},
+      AgentNetworkRequest:{type:'object',properties:{flows:{type:'array',maxItems:2000,items:{type:'object'}},arp:{type:'array',maxItems:5000,items:{type:'object'}}}},
+      DiscoveryScanRequest:{type:'object',required:['cidrs'],properties:{cidrs:{type:'array',minItems:1,maxItems:32,items:{type:'string',maxLength:64}}}},
       WefConfigureRequest:{type:'object',properties:{refreshSeconds:{type:'integer',minimum:60,maximum:86400,default:900}}},
       EntraSettingsRequest:{type:'object',required:['tenantId','clientId','enabled'],properties:{tenantId:{type:'string',format:'uuid'},clientId:{type:'string',format:'uuid'},clientAuthMethod:{type:'string',enum:['secret','certificate'],default:'secret'},clientSecret:{type:'string',format:'password',minLength:8,maxLength:4096},clientCertificate:{type:'string',maxLength:30000},clientPrivateKey:{type:'string',format:'password',maxLength:30000},enabled:{type:'boolean'}},additionalProperties:false},
       EntraSettingsResponse:{type:'object',required:['source','enabled','tenantId','clientId','clientAuthMethod','clientSecretConfigured','clientCertificateConfigured','ready'],properties:{source:{type:'string',enum:['environment','settings']},enabled:{type:'boolean'},tenantId:{type:'string'},clientId:{type:'string'},clientAuthMethod:{type:'string',enum:['secret','certificate']},clientSecretConfigured:{type:'boolean'},clientCertificateConfigured:{type:'boolean'},clientCertificateThumbprint:{type:['string','null']},publicBaseUrl:{type:'string'},redirectUris:{type:'array',items:{type:'string',format:'uri'}},ready:{type:'boolean'},updatedAt:{type:['string','null'],format:'date-time'}}},

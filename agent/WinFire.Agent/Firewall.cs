@@ -73,7 +73,7 @@ public static class Firewall
 
     private static async Task<JsonElement> RunAsync(JsonElement payload, CancellationToken cancellationToken)
     {
-        if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("Windows Firewall is required");
+        if (!OperatingSystem.IsWindows()) return await CrossPlatformFirewall.RunAsync(payload, cancellationToken);
         if (!payload.TryGetProperty("group", out var group) || !group.GetString()!.StartsWith("WinFireSecure:", StringComparison.Ordinal))
             throw new InvalidDataException("Policy job has an invalid firewall group");
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);

@@ -14,6 +14,7 @@ import {effectiveAgentPollSeconds,effectiveAgentChannelMode} from './agentPoll.j
 import {isExcludedFirewallEvent} from './processExclusions.js'
 import {isIgnoredFirewallEvent} from './trafficIgnores.js'
 import {getAgentUpdateManifest,getAgentUpdatePackagePath} from './agentUpdate.js'
+import {recordNetworkFlow,recordArpEntries} from './networkMapping.js'
 
 export const agentRoutes=express.Router()
 const wrap=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next)
@@ -58,11 +59,12 @@ agentRoutes.post('/enroll',enrollLimit,wrap(async(req,res)=>{
 }))
 
 agentRoutes.post('/:id/heartbeat',requireAgent,(req,res)=>{
-  const {version}=z.object({version:z.string().trim().min(1).max(100),mode:z.enum(['pull','push']).default('pull')}).parse(req.body)
+  const {version,platform,osVersion,firewallBackend,capabilities}=z.object({version:z.string().trim().min(1).max(100),mode:z.enum(['pull','push']).default('pull'),platform:z.string().trim().max(80).optional(),osVersion:z.string().trim().max(200).optional(),firewallBackend:z.string().trim().max(80).optional(),capabilities:z.array(z.string().trim().max(80)).max(100).optional()}).parse(req.body)
   const channelMode=effectiveAgentChannelMode(req.agent.node_id)
   const previous=one('SELECT status FROM nodes WHERE id=?',req.agent.node_id)?.status
   run('UPDATE agents SET version=?,mode=?,last_checkin_at=? WHERE id=?',version,channelMode,now(),req.agent.id)
-  run("UPDATE nodes SET status='reachable',last_seen_at=?,failures=0 WHERE id=?",now(),req.agent.node_id)
+  run("UPDATE nodes SET status='reachable',last_seen_at=?,failures=0,platform=COALESCE(?,platform),os_version=COALESCE(?,os_version),firewall_backend=COALESCE(?,firewall_backend),agent_required=0 WHERE id=?",now(),platform||null,osVersion||null,firewallBackend||null,req.agent.node_id)
+  if(platform||osVersion||firewallBackend||capabilities)run('UPDATE agents SET capabilities_json=? WHERE id=?',json({platform:platform||null,osVersion:osVersion||null,firewallBackend:firewallBackend||null,capabilities:capabilities||[]}),req.agent.id)
   if(previous==='unreachable')audit(null,'agent.online','node',req.agent.node_id,null,{agentId:req.agent.id})
   let update={available:false}
   try {
@@ -120,6 +122,7 @@ agentRoutes.post('/:id/events',requireAgent,(req,res)=>{
       if(isExcludedFirewallEvent(item)||isIgnoredFirewallEvent(item)){excluded++;continue}
       const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,program,process_id,account_sid,event_time,event_type,logon_type,filter_origin,filter_runtime_id,logon_status,logon_sub_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),req.agent.node_id,item.recordId,item.eventId,item.action,item.protocol,item.srcIp,item.srcPort,item.dstIp,item.dstPort,item.direction,item.program,item.processId,item.accountSid,item.eventTime,item.eventType,item.logonType,item.filterOrigin,item.filterRuntimeId,item.logonStatus,item.logonSubStatus)
       inserted+=result.changes
+      if(result.changes && item.eventType==='firewall')recordNetworkFlow(req.agent.node_id,item)
       if(!result.changes&&item.filterOrigin)run('UPDATE log_events SET filter_origin=COALESCE(filter_origin,?),filter_runtime_id=COALESCE(filter_runtime_id,?) WHERE node_id=? AND record_id=? AND filter_origin IS NULL',item.filterOrigin,item.filterRuntimeId,req.agent.node_id,item.recordId)
       if(!result.changes&&item.eventType==='firewall'&&item.direction==='in')run('UPDATE log_events SET src_ip=?,src_port=?,dst_ip=?,dst_port=? WHERE node_id=? AND record_id=? AND pattern_id IS NULL AND (src_ip IS NOT ? OR src_port IS NOT ? OR dst_ip IS NOT ? OR dst_port IS NOT ?)',item.srcIp,item.srcPort,item.dstIp,item.dstPort,req.agent.node_id,item.recordId,item.srcIp,item.srcPort,item.dstIp,item.dstPort)
     }
@@ -128,6 +131,15 @@ agentRoutes.post('/:id/events',requireAgent,(req,res)=>{
     audit(null,'agent.events.ingest','node',req.agent.node_id,null,{agentId:req.agent.id,received:events.length,inserted,excluded,lastRecordId:events.at(-1).recordId})
   })()
   res.status(201).json({received:events.length,inserted,excluded,lastRecordId:events.at(-1).recordId})
+})
+
+agentRoutes.post('/:id/network',requireAgent,(req,res)=>{
+  const data=z.object({flows:z.array(z.object({srcIp:z.string().max(64).optional(),dstIp:z.string().max(64).optional(),srcPort:z.number().int().min(0).max(65535).optional(),dstPort:z.number().int().min(0).max(65535).optional(),protocol:z.string().max(20).optional(),direction:z.string().max(12).optional(),program:z.string().max(512).optional(),eventType:z.string().max(30).optional(),eventTime:z.string().max(80).optional()})).max(2000).default([]),arp:z.array(z.object({ip:z.string().max(64),mac:z.string().max(80).optional(),hostname:z.string().max(255).optional(),interface:z.string().max(128).optional(),state:z.string().max(40).optional(),observedAt:z.string().max(80).optional()})).max(5000).default([])}).parse(req.body)
+  let mapped=0
+  for(const flow of data.flows)if(recordNetworkFlow(req.agent.node_id,{...flow,eventType:'firewall'}))mapped++
+  const arp=recordArpEntries(req.agent.node_id,data.arp,'agent')
+  run('UPDATE agents SET last_checkin_at=? WHERE id=?',now(),req.agent.id)
+  res.status(201).json({received:data.flows.length+data.arp.length,mapped,arp})
 })
 
 agentRoutes.get('/:id/jobs',requireAgent,(req,res)=>{
@@ -192,6 +204,7 @@ agentRoutes.post('/:id/jobs/:jobId/result',requireAgent,(req,res)=>{
   const resultError=data.error||(!breakGlassValid?'Agent break-glass readback was invalid':job.type==='mfa.prompt'&&!mfaActive?'MFA prompt expired or was already resolved':!mfaOpened?'No interactive browser session was confirmed':null)
   db.transaction(()=>{
     run('UPDATE agent_jobs SET status=?,result_json=?,error=?,finished_at=?,lease_until=NULL,lease_token=NULL WHERE id=?',status,json(data.result||data.diff||null),resultError,now(),job.id)
+    if(job.type==='arp.collect'&&data.success&&Array.isArray(data.result?.arp))recordArpEntries(req.agent.node_id,data.result.arp,'agent')
     if(payload.applyRunId)run('UPDATE policy_apply_runs SET status=?,diff_json=?,error=?,finished_at=? WHERE id=?',status,json(data.diff||null),resultError,now(),payload.applyRunId)
     if(payload.loopbackBaseline){
       run('UPDATE node_loopback_baseline SET status=?,applied_at=?,last_error=?,job_id=NULL WHERE node_id=? AND job_id=?',data.success?'applied':'failed',data.success?now():null,data.error||null,req.agent.node_id,job.id)

@@ -11,7 +11,6 @@ public static class Enrollment
 
     public static async Task EnrollAsync(string serverUrl, string token)
     {
-        if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("Agent enrollment stores its key in the Windows machine certificate store");
         var baseUri = new Uri(serverUrl.TrimEnd('/') + "/");
         if (baseUri.Scheme != Uri.UriSchemeHttps) throw new ArgumentException("Agent enrollment requires HTTPS");
         using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);

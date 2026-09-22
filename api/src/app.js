@@ -49,6 +49,8 @@ import {segmentAllowsOperatorAsync} from './segmentAccess.js'
 import {syncEntraGroup,cachedEntraGroupMembers} from './entraGraph.js'
 import {parseWefEvents,timingSafeSecret,wefNodeToken,wefSubscriptionUrl,publicWefSettings} from './wefReceiver.js'
 import {internetRoutes} from './internet.js'
+import {mappingRows,arpRows,recordNetworkFlow,recordArpEntries} from './networkMapping.js'
+import {expandCidrs,runDiscoveryScan} from './networkDiscovery.js'
 
 export const app=express()
 app.disable('x-powered-by')
@@ -499,6 +501,39 @@ api.post('/wef/wsman',express.raw({type:['application/soap+xml','text/xml','appl
   res.status(200).type('application/soap+xml').send(wefSoapResponse())
 }))
 api.use(auth)
+api.get('/mapping',(req,res)=>{
+  const query=z.object({nodeId:z.string().optional(),external:z.enum(['0','1']).optional(),from:z.string().optional(),to:z.string().optional(),page:z.coerce.number().int().min(1).default(1),pageSize:z.coerce.number().int().min(10).max(500).default(100)}).parse(req.query)
+  res.json(mappingRows(query))
+})
+api.post('/mapping/rebuild',requireRole('admin'),(req,res)=>{
+  const events=all("SELECT node_id,event_id,action,protocol,src_ip srcIp,src_port srcPort,dst_ip dstIp,dst_port dstPort,direction,program,event_type eventType,event_time eventTime FROM log_events WHERE (event_type='firewall' OR event_id IN (5150,5151,5156,5157)) ORDER BY rowid")
+  db.transaction(()=>{
+    run('DELETE FROM network_map_pairs')
+    for(const event of events)recordNetworkFlow(event.node_id,event,event.eventTime)
+  })()
+  audit(req.user.id,'network-mapping.rebuild','network-map','global',null,{events:events.length})
+  res.json({ok:true,events:events.length,rows:one('SELECT COUNT(*) count FROM network_map_pairs').count})
+})
+api.get('/discovery/scans',requireRole('admin'),(_req,res)=>res.json(all('SELECT * FROM discovery_scans ORDER BY created_at DESC LIMIT 100').map(scan=>({...scan,cidrs:parse(scan.cidrs_json)||[],results:parse(scan.results_json)||[]}))))
+api.get('/discovery/scans/:id',requireRole('admin'),(req,res)=>{const scan=one('SELECT * FROM discovery_scans WHERE id=?',reqId(req));if(!scan)return notFound(res,'Discovery scan');res.json({...scan,cidrs:parse(scan.cidrs_json)||[],results:parse(scan.results_json)||[]})})
+api.post('/discovery/scans',requireRole('admin'),(req,res)=>{
+  const data=body(z.object({cidrs:z.array(z.string().trim().min(1).max(64)).min(1).max(32)}),req)
+  let hosts;try{hosts=expandCidrs(data.cidrs)}catch(error){return res.status(400).json({error:error.message})}
+  const scanId=id();run('INSERT INTO discovery_scans(id,cidrs_json,status,created_at,requested_by) VALUES(?,?,\'queued\',?,?)',scanId,json(data.cidrs),now(),req.user.id)
+  audit(req.user.id,'network-discovery.start','discovery-scan',scanId,null,{cidrs:data.cidrs,addresses:hosts.length})
+  setImmediate(()=>runDiscoveryScan(scanId).catch(error=>console.error('Discovery scan failed:',error)))
+  res.status(202).json({id:scanId,status:'queued',addresses:hosts.length})
+})
+api.get('/mapping/arp',(req,res)=>res.json({items:arpRows(req.query.nodeId||null,Number(req.query.limit)||500)}))
+api.post('/nodes/:id/arp/collect',requireRole('editor'),(req,res)=>{
+  const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
+  if(!node.agent_id)return res.status(409).json({error:'ARP collection requires an enrolled agent on this node'})
+  const agent=one('SELECT id,last_checkin_at FROM agents WHERE id=? AND revoked_at IS NULL',node.agent_id)
+  if(!agent||!agent.last_checkin_at||Date.parse(agent.last_checkin_at)<Date.now()-5*60_000)return res.status(409).json({error:'Agent is offline'})
+  const jobId=id();run('INSERT INTO agent_jobs(id,agent_id,type,payload_json) VALUES(?,?,?,?)',jobId,agent.id,'arp.collect',json({nodeId:node.id}))
+  audit(req.user.id,'network-mapping.arp.collect','node',node.id,null,{jobId})
+  res.status(202).json({queued:true,jobId})
+})
 const securityAutomationSchema=z.object({name:z.string().trim().min(3).max(120),triggerType:z.enum(['destination','mfa_failures']),destination:z.string().trim().max(255).default(''),failureCount:z.number().int().min(2).max(100).default(3),windowMinutes:z.number().int().min(1).max(1440).default(15),cooldownMinutes:z.number().int().min(1).max(10080).default(60),actionType:z.enum(['alert','disable_ad','disable_ad_logoff']).default('alert'),disableMinutes:z.number().int().min(5).max(10080).default(60),enabled:z.boolean().default(false)})
 function validAutomation(data){
   if(data.triggerType==='destination'&&!data.destination)return 'A destination IP address or hostname is required'
@@ -1207,7 +1242,7 @@ api.post('/nodes',requireRole('editor'),wrap(async(req,res)=>{
   })()
   const node=getNode(nodeId),dns=await lookupDns(node);res.status(201).json({...node,dns,training})
 }))
-api.get('/nodes/:id',(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');const factsRow=one('SELECT snapshot_json FROM node_facts WHERE node_id=?',node.id);res.json({...node,ad:parse(node.ad_snapshot_json),training:latestTraining(node.id)||null,verification:latestVerification(node.id),managementVerification:managementVerification({...node,snapshot_json:factsRow?.snapshot_json}),facts:parse(factsRow?.snapshot_json),dns:one('SELECT * FROM dns_lookups WHERE node_id=?',node.id),groups:all('SELECT g.* FROM node_groups g JOIN node_group_members m ON m.group_id=g.id WHERE m.node_id=? ORDER BY g.name',node.id).filter(group=>canReadResource(req.user,'node_group',group)).map(group=>({id:group.id,name:group.name,canWrite:canWriteResource(req.user,'node_group',group)}))})})
+api.get('/nodes/:id',(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');const factsRow=one('SELECT snapshot_json FROM node_facts WHERE node_id=?',node.id);res.json({...node,ad:parse(node.ad_snapshot_json),training:latestTraining(node.id)||null,verification:latestVerification(node.id),managementVerification:managementVerification({...node,snapshot_json:factsRow?.snapshot_json}),facts:parse(factsRow?.snapshot_json),dns:one('SELECT * FROM dns_lookups WHERE node_id=?',node.id),credentialIds:all('SELECT credential_id FROM credential_assignments WHERE node_id=?',node.id).map(item=>item.credential_id),groups:all('SELECT g.* FROM node_groups g JOIN node_group_members m ON m.group_id=g.id WHERE m.node_id=? ORDER BY g.name',node.id).filter(group=>canReadResource(req.user,'node_group',group)).map(group=>({id:group.id,name:group.name,canWrite:canWriteResource(req.user,'node_group',group)}))})})
 api.post('/nodes/:id/training',requireRole('editor'),(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
   const {durationDays}=body(z.object({durationDays:z.number().int().min(1).max(365)}),req)
@@ -1232,6 +1267,19 @@ api.patch('/nodes/:id',requireRole('editor'),wrap(async(req,res)=>{
   if(identityChanged)await lookupDns(getNode(node.id))
   res.json(getNode(node.id))
 }))
+api.put('/nodes/:id/credentials',requireRole('editor'),(req,res)=>{
+  const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
+  const data=body(z.object({credentialIds:z.array(z.string()).max(20)}),req)
+  const credentials=data.credentialIds.map(credentialId=>one('SELECT * FROM credentials WHERE id=?',credentialId))
+  if(credentials.some((credential,index)=>!credential||!canUseCredential(req.user,credential)))return res.status(403).json({error:'One or more credentials are unavailable'})
+  const before=all('SELECT credential_id FROM credential_assignments WHERE node_id=?',node.id).map(item=>item.credential_id)
+  db.transaction(()=>{
+    run('DELETE FROM credential_assignments WHERE node_id=?',node.id)
+    for(const credentialId of data.credentialIds)run('INSERT INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,NULL)',credentialId,node.id)
+    audit(req.user.id,'node.credentials.replace','node',node.id,{credentialIds:before},{credentialIds:data.credentialIds})
+  })()
+  res.json({credentialIds:data.credentialIds})
+})
 api.delete('/nodes/:id',requireRole('admin'),(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
   const data=z.object({confirmed:z.boolean().optional(),confirmation:z.string().optional()}).parse(req.body||{})
@@ -2402,7 +2450,7 @@ api.post('/logs/:id/rule',requireRole('admin'),(req,res)=>{
 api.post('/logs/ingest',requireRole('editor'),(req,res)=>{
   const data=body(z.object({nodeId:z.string(),events:z.array(z.object({recordId:z.number().optional(),eventId:z.number().int(),action:z.string().optional(),protocol:z.string().optional(),srcIp:z.string().optional(),dstIp:z.string().optional(),dstPort:z.number().optional(),direction:z.string().optional(),program:z.string().optional(),accountSid:z.string().optional(),challengeId:z.string().optional(),logonType:z.string().optional(),logonStatus:z.string().optional(),logonSubStatus:z.string().optional()})).max(1000)}),req)
   const ignoreLoopback=observabilitySettings().ignoreLoopbackIngest
-  let inserted=0;db.transaction(()=>{for(const event of data.events){if(ignoreLoopback&&isLoopbackEvent(event)||isExcludedFirewallEvent(event)||isIgnoredFirewallEvent(event))continue;const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,dst_ip,dst_port,direction,program,account_sid,challenge_id,logon_type,logon_status,logon_sub_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),data.nodeId,event.recordId??null,event.eventId,event.action||null,event.protocol||null,event.srcIp||null,event.dstIp||null,event.dstPort||null,event.direction||null,event.program||null,event.accountSid||null,event.challengeId||null,event.logonType||null,event.logonStatus||null,event.logonSubStatus||null);inserted+=result.changes}})()
+  let inserted=0;db.transaction(()=>{for(const event of data.events){if(ignoreLoopback&&isLoopbackEvent(event)||isExcludedFirewallEvent(event)||isIgnoredFirewallEvent(event))continue;const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,dst_ip,dst_port,direction,program,account_sid,challenge_id,logon_type,logon_status,logon_sub_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),data.nodeId,event.recordId??null,event.eventId,event.action||null,event.protocol||null,event.srcIp||null,event.dstIp||null,event.dstPort||null,event.direction||null,event.program||null,event.accountSid||null,event.challengeId||null,event.logonType||null,event.logonStatus||null,event.logonSubStatus||null);inserted+=result.changes;if(result.changes&&event.eventId>=5156)recordNetworkFlow(data.nodeId,{...event,eventType:'firewall'})}})()
   res.status(201).json({inserted})
 })
 
@@ -2414,6 +2462,7 @@ function insertCollectedEvents(nodeId,events,ignoreLoopback){
     if(isExcludedFirewallEvent(item)||isIgnoredFirewallEvent(item))continue
     const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,program,process_id,account_sid,event_time,event_type,logon_type,filter_origin,filter_runtime_id,logon_status,logon_sub_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),nodeId,item.recordId,item.eventId,item.action,item.protocol,item.srcIp,item.srcPort,item.dstIp,item.dstPort,item.direction,item.program,item.processId,item.accountSid,item.eventTime,item.eventType,item.logonType,item.filterOrigin,item.filterRuntimeId,item.logonStatus,item.logonSubStatus)
     inserted+=result.changes
+    if(result.changes&&item.eventType==='firewall')recordNetworkFlow(nodeId,item)
     if(!result.changes&&item.filterOrigin)run('UPDATE log_events SET filter_origin=COALESCE(filter_origin,?),filter_runtime_id=COALESCE(filter_runtime_id,?) WHERE node_id=? AND record_id=? AND filter_origin IS NULL',item.filterOrigin,item.filterRuntimeId,nodeId,item.recordId)
     if(!result.changes&&item.eventType==='firewall'&&item.direction==='in')run('UPDATE log_events SET src_ip=?,src_port=?,dst_ip=?,dst_port=? WHERE node_id=? AND record_id=? AND pattern_id IS NULL AND (src_ip IS NOT ? OR src_port IS NOT ? OR dst_ip IS NOT ? OR dst_port IS NOT ?)',item.srcIp,item.srcPort,item.dstIp,item.dstPort,nodeId,item.recordId,item.srcIp,item.srcPort,item.dstIp,item.dstPort)
   }})()

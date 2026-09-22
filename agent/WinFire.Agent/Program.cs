@@ -14,8 +14,9 @@ if (args.Length > 0 && args[0].Equals("enroll", StringComparison.OrdinalIgnoreCa
 }
 
 var builder = Host.CreateApplicationBuilder(args);
-builder.Services.AddWindowsService(options => options.ServiceName = "WinFireAgent");
+if (OperatingSystem.IsWindows()) builder.Services.AddWindowsService(options => options.ServiceName = "WinFireAgent");
 builder.Services.AddHostedService<Worker>();
-builder.Services.AddHostedService<EventLogWorker>();
+if (OperatingSystem.IsWindows()) builder.Services.AddHostedService<EventLogWorker>();
+builder.Services.AddHostedService<NetworkTelemetryWorker>();
 await builder.Build().RunAsync();
 return 0;
