@@ -78,6 +78,13 @@ test('classification normalizes connector port values and identifies response tr
   assert.equal(classifyNetworkFlow({sourceIp: '192.168.88.10', destinationIp: '239.255.255.250', protocol: 'UDP', destinationPort: '1900'}).service, 'SSDP/UPnP discovery')
 })
 
+test('protocol 2 is identified as IGMP without a port', () => {
+  for (const protocol of ['2', 2, 'IGMP']) {
+    const result = classifyNetworkFlow({sourceIp: '192.168.88.10', destinationIp: '224.0.0.1', protocol})
+    assert.equal(result.service, 'Internet Group Management Protocol (IGMP)', String(protocol))
+  }
+})
+
 test('mapping read repairs legacy unidentified service values', () => {
   db.prepare("INSERT INTO nodes(id,hostname,ip,status) VALUES(?,?,?,?)").run('mapping-node','MAPPING-NODE','192.168.88.40','reachable')
   assert.equal(recordNetworkFlow('mapping-node', {eventType:'firewall', srcIp:'192.168.88.40', dstIp:'8.8.8.8', protocol:'6', srcPort:'50123', dstPort:'443', direction:'out'}), true)
