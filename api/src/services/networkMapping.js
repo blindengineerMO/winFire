@@ -150,13 +150,18 @@ const normalizePort = value => {
   return Number.isInteger(number) && number > 0 && number <= 65535 ? number : null
 }
 
-const serviceFor = ({source, destination, protocol, sourcePort, destinationPort}) => {
+const serviceFor = ({source, destination, protocol, sourcePort, destinationPort, program}) => {
   const proto = normalizeNetworkProtocol(protocol)
   const normalizedSourcePort = normalizePort(sourcePort)
   const normalizedDestinationPort = normalizePort(destinationPort)
   const ports = new Set([normalizedSourcePort, normalizedDestinationPort].filter(Number.isInteger))
   const addresses = new Set([normalizedIp(source), normalizedIp(destination)])
   const has = port => ports.has(port)
+  // Windows reports this process with a device path (for example
+  // \\Device\\HarddiskVolume3\\Windows\\System32\\lsass.exe). The process
+  // is a stronger signal than a port because LSASS can use several dynamic
+  // RPC ports, so identify it before the protocol and catalog rules.
+  if (/(^|[\\/])lsass\.exe(?:$|[\\/?\\s])/i.test(String(program || '').trim())) return 'Local Security Authority Subsystem Service'
   // Customer rules have precedence over the built-in and IANA catalog,
   // regardless of the customer-selected priority value.
   if (classifierRuleSuppresses(proto, normalizedSourcePort, normalizedDestinationPort, {sources: ['custom']})) return null
@@ -202,12 +207,12 @@ const directedBroadcastFor = (address, node) => {
   return false
 }
 
-export function classifyNetworkFlow({node, sourceIp, destinationIp, sourceNode, destinationNode, protocol, sourcePort, destinationPort}) {
+export function classifyNetworkFlow({node, sourceIp, destinationIp, sourceNode, destinationNode, protocol, sourcePort, destinationPort, program}) {
   const source = normalizedIp(sourceIp), destination = normalizedIp(destinationIp)
   const sourceCategory = addressCategory(source), destinationCategory = addressCategory(destination)
   const broadcast = sourceCategory === 'broadcast' || destinationCategory === 'broadcast' || directedBroadcastFor(source, node) || directedBroadcastFor(destination, node)
   const multicast = sourceCategory === 'multicast' || destinationCategory === 'multicast'
-  const service = serviceFor({source, destination, protocol, sourcePort, destinationPort})
+  const service = serviceFor({source, destination, protocol, sourcePort, destinationPort, program})
   let trafficClass = 'unicast'
   if (broadcast) trafficClass = 'broadcast'
   else if (multicast) trafficClass = 'multicast'
@@ -259,7 +264,7 @@ export function recordNetworkFlow(nodeId, event, observedAt = null) {
   const protocol = normalizeNetworkProtocol(event.protocol || 'UNKNOWN')
   const sourcePort = port(event.srcPort)
   const destinationPort = port(event.dstPort)
-  const classification = classifyNetworkFlow({node, sourceIp, destinationIp, sourceNode, destinationNode, protocol, sourcePort, destinationPort})
+  const classification = classifyNetworkFlow({node, sourceIp, destinationIp, sourceNode, destinationNode, protocol, sourcePort, destinationPort, program:event.program})
   const key = [sourceNode?.id || '', destinationNode?.id || '', sourceIp, destinationIp, protocol, sourcePort || '', destinationPort || ''].join('|')
   const at = observedAt || event.eventTime || now()
   const existing = one('SELECT map_key FROM network_map_pairs WHERE map_key=?', key)
@@ -318,6 +323,7 @@ export function mappingRows({nodeId = null, external = null, trafficClass = null
       protocol: row.protocol,
       sourcePort: row.source_port,
       destinationPort: row.destination_port,
+      program: row.sample_program,
       sourceNode: row.source_node_id ? {id: row.source_node_id} : null,
       destinationNode: row.destination_node_id ? {id: row.destination_node_id} : null,
     })
