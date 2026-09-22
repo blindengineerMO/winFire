@@ -58,7 +58,9 @@ const requestSchemas={
   'POST /segments/{id}/challenges/{challengeId}/resolve':'MfaResolveRequest',
   'POST /segments/{id}/lsa-baselines':'LsaBaselineRequest',
   'POST /logon-rights/baseline':'LogsPullRequest',
-  'POST /discovery/scans':'DiscoveryScanRequest'
+  'POST /discovery/scans':'DiscoveryScanRequest',
+  'POST /settings/classifier/rules':'ClassifierRuleRequest',
+  'PATCH /settings/classifier/rules/{id}':'ClassifierRuleRequest'
 }
 
 const responseSchemas={
@@ -138,6 +140,7 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
       AgentJobResultRequest:{type:'object',required:['leaseToken','success'],properties:{leaseToken:{type:'string',minLength:20},success:{type:'boolean'},diff:{},result:{},error:{type:'string',maxLength:2000}}},
       AgentNetworkRequest:{type:'object',properties:{flows:{type:'array',maxItems:2000,items:{type:'object'}},arp:{type:'array',maxItems:5000,items:{type:'object'}}}},
       DiscoveryScanRequest:{type:'object',required:['cidrs'],properties:{cidrs:{type:'array',minItems:1,maxItems:32,items:{type:'string',maxLength:64}}}},
+      ClassifierRuleRequest:{type:'object',required:['protocol','service'],properties:{protocol:{type:'string',enum:['ANY','TCP','UDP','SCTP','DCCP','ICMP','ICMPv6','IGMP','IPv6-in-IPv4','GRE','ESP','AH','OSPF']},portStart:{type:['integer','null'],minimum:1,maximum:65535},portEnd:{type:['integer','null'],minimum:1,maximum:65535},service:{type:'string',minLength:1,maxLength:160},description:{type:'string',maxLength:500},priority:{type:'integer',minimum:1,maximum:10000,default:10},enabled:{type:'boolean',default:true}},additionalProperties:false,description:'Provide both port bounds for a port rule or omit both for a protocol rule. ICMP and IGMP rules do not use ports.'},
       WefConfigureRequest:{type:'object',properties:{refreshSeconds:{type:'integer',minimum:60,maximum:86400,default:900}}},
       EntraSettingsRequest:{type:'object',required:['tenantId','clientId','enabled'],properties:{tenantId:{type:'string',format:'uuid'},clientId:{type:'string',format:'uuid'},clientAuthMethod:{type:'string',enum:['secret','certificate'],default:'secret'},clientSecret:{type:'string',format:'password',minLength:8,maxLength:4096},clientCertificate:{type:'string',maxLength:30000},clientPrivateKey:{type:'string',format:'password',maxLength:30000},enabled:{type:'boolean'}},additionalProperties:false},
       EntraSettingsResponse:{type:'object',required:['source','enabled','tenantId','clientId','clientAuthMethod','clientSecretConfigured','clientCertificateConfigured','ready'],properties:{source:{type:'string',enum:['environment','settings']},enabled:{type:'boolean'},tenantId:{type:'string'},clientId:{type:'string'},clientAuthMethod:{type:'string',enum:['secret','certificate']},clientSecretConfigured:{type:'boolean'},clientCertificateConfigured:{type:'boolean'},clientCertificateThumbprint:{type:['string','null']},publicBaseUrl:{type:'string'},redirectUris:{type:'array',items:{type:'string',format:'uri'}},ready:{type:'boolean'},updatedAt:{type:['string','null'],format:'date-time'}}},

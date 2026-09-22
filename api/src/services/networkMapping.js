@@ -1,5 +1,6 @@
 import {isIP} from 'node:net'
 import {all, one, run, id, now} from '../db.js'
+import {resolveClassifierService,classifierRuleSuppresses} from './classifierRules.js'
 
 const ipv4 = value => String(value || '').trim().split('/')[0]
   .split('%')[0].toLowerCase()
@@ -156,6 +157,11 @@ const serviceFor = ({source, destination, protocol, sourcePort, destinationPort}
   const ports = new Set([normalizedSourcePort, normalizedDestinationPort].filter(Number.isInteger))
   const addresses = new Set([normalizedIp(source), normalizedIp(destination)])
   const has = port => ports.has(port)
+  // Customer rules have precedence over the built-in and IANA catalog,
+  // regardless of the customer-selected priority value.
+  if (classifierRuleSuppresses(proto, normalizedSourcePort, normalizedDestinationPort, {sources: ['custom']})) return null
+  const customService = resolveClassifierService(proto, normalizedSourcePort, normalizedDestinationPort, {sources: ['custom']})
+  if (customService) return customService
   // ICMP and IGMP do not use TCP/UDP ports. Identify them directly from the
   // protocol number/name so control and multicast membership traffic are never
   // shown as unidentified services.
@@ -167,6 +173,8 @@ const serviceFor = ({source, destination, protocol, sourcePort, destinationPort}
   if (has(3702) && (addresses.has('239.255.255.250') || addresses.has('ff02::c'))) return 'WS-Discovery'
   if (proto === 'UDP' && (has(67) || has(68)) && (addresses.has('0.0.0.0') || addresses.has('255.255.255.255') || addresses.has('::'))) return 'DHCPv4 address assignment'
   if (proto === 'UDP' && (has(546) || has(547)) && (addresses.has('ff02::1:2') || addresses.has('::'))) return 'DHCPv6 address assignment'
+  const catalogService = resolveClassifierService(proto, normalizedSourcePort, normalizedDestinationPort)
+  if (catalogService) return catalogService
   // Prefer the destination port, then use the source port for response flows.
   for (const candidate of [normalizedDestinationPort, normalizedSourcePort]) {
     if (!Number.isInteger(candidate)) continue

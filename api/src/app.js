@@ -50,6 +50,7 @@ import {syncEntraGroup,cachedEntraGroupMembers} from './entraGraph.js'
 import {parseWefEvents,timingSafeSecret,wefNodeToken,wefSubscriptionUrl,publicWefSettings} from './wefReceiver.js'
 import {internetRoutes} from './routes/internet.js'
 import {classifyNetworkFlow,normalizeNetworkProtocol,recordNetworkFlow} from './services/networkMapping.js'
+import {classifierRuleRows,classifierRuleById,createClassifierRule,updateClassifierRule,deleteClassifierRule} from './services/classifierRules.js'
 import {mappingRoutes} from './routes/mapping.js'
 import {expandCidrs,runDiscoveryScan} from './networkDiscovery.js'
 import {validSnmpHost,normalizeSnmpSecret} from './snmpDiscovery.js'
@@ -930,6 +931,43 @@ api.put('/settings/process-exclusions',requireRole('admin'),(req,res)=>{
   })()
   refreshProcessExclusions(db)
   res.json({names})
+})
+const classifierProtocol=z.enum(['ANY','TCP','UDP','SCTP','DCCP','ICMP','ICMPv6','IGMP','IPv6-in-IPv4','GRE','ESP','AH','OSPF'])
+const classifierRuleBody=z.object({
+  protocol:classifierProtocol,
+  portStart:z.number().int().min(1).max(65535).nullable().optional(),
+  portEnd:z.number().int().min(1).max(65535).nullable().optional(),
+  service:z.string().trim().min(1).max(160),
+  description:z.string().trim().max(500).optional().default(''),
+  priority:z.number().int().min(1).max(10000).default(10),
+  enabled:z.boolean().default(true),
+}).superRefine((value,ctx)=>{
+  const start=value.portStart??null,end=value.portEnd??null
+  if((start===null)!==(end===null))ctx.addIssue({code:'custom',path:['portStart'],message:'Provide both port bounds or leave both empty for a protocol rule'})
+  if(start!==null&&end!==null&&start>end)ctx.addIssue({code:'custom',path:['portEnd'],message:'Port end must be greater than or equal to port start'})
+  if((value.protocol==='ICMP'||value.protocol==='ICMPv6'||value.protocol==='IGMP')&&(start!==null||end!==null))ctx.addIssue({code:'custom',path:['portStart'],message:'ICMP and IGMP rules do not use ports'})
+})
+api.get('/settings/classifier',requireRole('admin'),(req,res)=>{
+  const query=z.object({search:z.string().max(200).optional(),protocol:z.string().max(32).optional(),source:z.enum(['built-in','iana','custom']).optional(),enabled:z.enum(['true','false']).optional(),page:z.coerce.number().int().min(1).default(1),pageSize:z.coerce.number().int().min(10).max(500).default(100),sortBy:z.enum(['port','protocol','service','source','priority','enabled']).default('port'),sortDir:z.enum(['asc','desc']).default('asc')}).parse(req.query)
+  res.json(classifierRuleRows(query))
+})
+api.post('/settings/classifier/rules',requireRole('admin'),(req,res)=>{
+  const data=body(classifierRuleBody,req),rule=createClassifierRule(data,req.user.id)
+  audit(req.user.id,'classifier-rule.create','classifier-rule',rule.id,null,rule)
+  res.status(201).json(rule)
+})
+api.patch('/settings/classifier/rules/:id',requireRole('admin'),(req,res)=>{
+  const data=body(classifierRuleBody,req),before=classifierRuleById(req.params.id)
+  const rule=updateClassifierRule(req.params.id,data,req.user.id)
+  if(!rule)return notFound(res,'Classifier rule')
+  audit(req.user.id,'classifier-rule.update','classifier-rule',rule.id,before,rule)
+  res.json(rule)
+})
+api.delete('/settings/classifier/rules/:id',requireRole('admin'),(req,res)=>{
+  const before=classifierRuleById(req.params.id)
+  if(!deleteClassifierRule(req.params.id,req.user.id))return notFound(res,'Classifier rule')
+  audit(req.user.id,'classifier-rule.delete','classifier-rule',req.params.id,before,null)
+  res.status(204).end()
 })
 api.get('/settings/traffic-ignores',requireRole('admin'),(_req,res)=>res.json(all('SELECT * FROM traffic_ignore_rules ORDER BY created_at DESC,id DESC').map(publicTrafficIgnore)))
 api.post('/settings/traffic-ignores',requireRole('admin'),(req,res)=>{

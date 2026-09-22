@@ -100,7 +100,7 @@ Administration → **TLS** accepts PEM encoded server and agent CA certificates 
 - `AGENT_CA_CERT`, `AGENT_CA_KEY`: client certificate authority used by enrolled agents.
 - `AGENT_CA_PASSPHRASE`, `TLS_KEY_PASSPHRASE`: private-key passphrases; production agent CA and server keys must be encrypted.
 
-Administration exposes the operational settings that can be changed without editing environment files: directory connections and fallback approval, training, event retention and compaction, loopback handling, WEF, process and traffic ignores, portal branding, Entra, MFA prompt behavior, discovery CIDRs, agent polling, event exports, security automation, RPC filters, users, teams, credentials, and audit retention. `PUBLIC_BASE_URL` must be the externally reachable HTTPS origin for email links, MFA portal links, WEF, and agent bootstrap. Set `CORS_ORIGIN` to a comma-separated allow list when the interface is served from another origin.
+Administration exposes the operational settings that can be changed without editing environment files: directory connections and fallback approval, training, event retention and compaction, loopback handling, WEF, process and traffic ignores, the IANA-backed classifier catalog and custom service rules, portal branding, Entra, MFA prompt behavior, discovery CIDRs, agent polling, event exports, security automation, RPC filters, users, teams, credentials, and audit retention. `PUBLIC_BASE_URL` must be the externally reachable HTTPS origin for email links, MFA portal links, WEF, and agent bootstrap. Set `CORS_ORIGIN` to a comma-separated allow list when the interface is served from another origin.
 
 ## Operator workflow
 
@@ -149,7 +149,7 @@ All API routes are under `/api/v1` and require a bearer access token unless mark
 - `/identity`, `/segments`, `/mfa`: identity segments, access requests, challenges, temporary grants, and portal callbacks.
 - `/mapping`, `/discovery`, `/internet`: network maps, ARP, CIDR scans, browser enrollment, Internet events, and URL policy.
 - `/agents`, `/agent-package`, `/settings/agent-poll`, `/settings/tls`: certificate enrollment, jobs, packages, delivery modes, polling, and TLS status/material uploads.
-- `/settings/*`: training, observability, WEF, directory, Entra, portal branding, MFA fallback, RPC filters, discovery, and other administrator settings.
+- `/settings/*`: training, observability, WEF, directory, Entra, portal branding, MFA fallback, classifier catalog and custom rules, RPC filters, discovery, and other administrator settings.
 
 ## Security and operational guidance
 
@@ -159,11 +159,32 @@ Firewall event collection depends on host audit policy. Filtering Platform Conne
 
 ## Screenshots and visual references
 
+# Simple Dashboard
 ![ScreenShot1](assets/dashboardEnterprise.png)
+
+# Intuitive Administration
 ![ScreenShot2](assets/admin.png)
+
+# Easily Identify Assets using Active Directory, ICMP, or SNMP Scanning.
 ![ScreenShot3](assets/assetsView.png)
+
+# Drag and Drop Policy Editor
 ![ScreenShot4](assets/PolicyStudio.png)
+
+# Easily Identify Firewall Events from every node in one place with simple one-click rule creation.
 ![ScreenShot5](assets/firewallevents.png)
+
+# Enterprise Logon
 ![ScreenShot6](assets/login.png)
+
+# Dynamic Rules Engine Auto-Learns from traffic detected at the firewalls.
 ![ScreenShot7](assets/autoRules.png)
+
+# Active Directory Integration for Seciroty and MFA Identity.
 ![ScreenShot8](assets/adUsers.png)
+
+# Network Mapping Features to identify who is talking to who as well as top talkers.
+![ScreenShot9](assets/netmapping.png)
+
+# Browser Extension for Enterprise Deployment allows URL monitoring / policy blocking
+![ScreenShot10](assets/browserwatch.png)
