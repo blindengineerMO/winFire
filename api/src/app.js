@@ -17,7 +17,7 @@ import {firewallConnectorFor,applyManagedRules} from './firewallConnectors.js'
 import {classifyVerification,findMatchingDenyEvent,hasManagedRule} from './verifier.js'
 import {makeTotpSecret,verifyTotp,matchingTotpCounter} from './totp.js'
 import {agentRoutes} from './agentRoutes.js'
-import {agentPkiReady} from './agentPki.js'
+import {agentPkiReady,tlsMaterialPaths} from './agentPki.js'
 import {agentBootstrapScript,normalizeSignerThumbprint} from './agentBootstrap.js'
 import {agentPollSettings,effectiveAgentChannelMode} from './agentPoll.js'
 import {normalizeWindowsEvent} from './eventNormalizer.js'
@@ -501,6 +501,24 @@ api.post('/wef/wsman',express.raw({type:['application/soap+xml','text/xml','appl
   res.status(200).type('application/soap+xml').send(wefSoapResponse())
 }))
 api.use(auth)
+api.get('/settings/tls',requireRole('admin'),(_req,res)=>{
+  const paths=tlsMaterialPaths(),files=Object.fromEntries(Object.entries(paths).map(([name,file])=>[name,{configured:fs.existsSync(file),source:process.env[name]?'environment':'administration',path:process.env[name]?null:file}]))
+  res.json({httpsEnabled:Object.values(files).every(item=>item.configured),files,restartRequired:true})
+})
+api.put('/settings/tls/:kind',requireRole('admin'),(req,res)=>{
+  const kinds={serverCert:{key:'TLS_CERT',file:'server.crt',begin:'CERTIFICATE'},serverKey:{key:'TLS_KEY',file:'server.key',begin:'(?:RSA )?PRIVATE KEY'},agentCaCert:{key:'AGENT_CA_CERT',file:'agent-ca.crt',begin:'CERTIFICATE'},agentCaKey:{key:'AGENT_CA_KEY',file:'agent-ca.key',begin:'(?:RSA )?PRIVATE KEY'}}
+  const target=kinds[req.params.kind]
+  if(!target)return res.status(400).json({error:'Unknown TLS material type'})
+  const data=body(z.object({base64:z.string().min(1).max(4_000_000)}),req)
+  let pem
+  try{pem=Buffer.from(data.base64,'base64').toString('utf8')}catch{ return res.status(400).json({error:'Invalid base64 TLS material'}) }
+  const pemPattern=target.begin==='CERTIFICATE'?/-----BEGIN CERTIFICATE-----[\s\S]+-----END CERTIFICATE-----/:/-----BEGIN (?:RSA |ENCRYPTED )?PRIVATE KEY-----[\s\S]+-----END (?:RSA |ENCRYPTED )?PRIVATE KEY-----/
+  if(!pemPattern.test(pem))return res.status(400).json({error:'Uploaded material is not a valid PEM certificate or private key'})
+  if(process.env[target.key])return res.status(409).json({error:`${target.key} is configured by the deployment environment; change that path instead of uploading through the control plane`})
+  try{if(target.begin==='CERTIFICATE')new crypto.X509Certificate(pem);else crypto.createPrivateKey({key:pem,format:'pem',passphrase:process.env[target.key==='TLS_KEY'?'TLS_KEY_PASSPHRASE':'AGENT_CA_PASSPHRASE']||undefined})}catch(error){return res.status(400).json({error:`TLS material could not be parsed: ${error.message}`})}
+  const file=tlsMaterialPaths()[target.key];fs.mkdirSync(path.dirname(file),{recursive:true,mode:0o700});fs.writeFileSync(file,pem,{mode:0o600});audit(req.user.id,'tls.material.upload','app-settings',target.key,null,{bytes:Buffer.byteLength(pem)})
+  res.json({ok:true,kind:req.params.kind,restartRequired:true})
+})
 api.get('/mapping',(req,res)=>{
   const query=z.object({nodeId:z.string().optional(),external:z.enum(['0','1']).optional(),from:z.string().optional(),to:z.string().optional(),page:z.coerce.number().int().min(1).default(1),pageSize:z.coerce.number().int().min(10).max(500).default(100)}).parse(req.query)
   res.json(mappingRows(query))
@@ -1074,17 +1092,27 @@ api.post('/nodes/:id/local-accounts/refresh',requireRole('admin'),wrap(async(req
   res.json(result)
 }))
 api.post('/directory/local-accounts/:id/network-rule',requireRole('admin'),(req,res)=>{
-  const data=body(z.object({remoteAddress:z.string().trim().min(1).max(500),remotePort:z.string().trim().min(1).max(100),protocol:z.enum(['TCP','UDP']),reason:z.string().trim().min(10).max(500)}),req)
-  if(!validateAddressExpression(data.remoteAddress)||!validatePortExpression(data.remotePort)||data.remotePort==='Any')return res.status(400).json({error:'Invalid destination address or port'})
+  const data=body(z.object({destinationType:z.enum(['address','node','group']).default('address'),destinationId:z.string().trim().optional(),remoteAddress:z.string().trim().max(500).default(''),remotePort:z.string().trim().min(1).max(100),protocol:z.enum(['TCP','UDP']),reason:z.string().trim().min(10).max(500)}),req)
+  let remoteAddress=data.remoteAddress
+  if(data.destinationType==='node'){
+    const destination=getNode(data.destinationId)
+    if(!destination)return notFound(res,'Destination node')
+    remoteAddress=destination.ip||''
+  }else if(data.destinationType==='group'){
+    const group=one('SELECT id FROM node_groups WHERE id=?',data.destinationId)
+    if(!group)return notFound(res,'Destination node group')
+    remoteAddress=all('SELECT DISTINCT n.ip FROM nodes n JOIN node_group_members m ON m.node_id=n.id WHERE m.group_id=? AND n.ip IS NOT NULL AND n.ip<>\'\'',group.id).map(row=>row.ip).join(',')
+  }
+  if(!remoteAddress||!validateAddressExpression(remoteAddress)||!validatePortExpression(data.remotePort)||data.remotePort==='Any')return res.status(400).json({error:'Choose a destination with a current IP address, or enter a valid destination address and port'})
   const account=one('SELECT * FROM local_accounts WHERE id=? AND missing=0',reqId(req));if(!account)return notFound(res,'Local account')
   const node=getNode(account.node_id);if(!node)return notFound(res,'Node')
   if(node.connection_mode!=='agentless'||!['winrm','winrms'].includes(node.transport)||/^(?:5\.[12]\.|windows (?:xp|server 2003))/i.test(node.os_version||''))return res.status(409).json({error:'Account-scoped firewall rules require Windows with NetSecurity and an agentless WinRM source node'})
   const policy=ensurePersonalPolicy(node,req.user.id)
   const previous=one('SELECT * FROM policy_versions WHERE id=?',policy.current_version_id)
   const graph=parse(previous.graph_json)||{nodes:[],edges:[]}
-  const matched=graph.nodes.find(item=>item.type==='deny'&&item.data?.localUserSid===account.sid&&item.data?.direction==='out'&&item.data?.remoteAddress===data.remoteAddress&&item.data?.remotePort===data.remotePort&&item.data?.protocol===data.protocol)
+  const matched=graph.nodes.find(item=>item.type==='deny'&&item.data?.localUserSid===account.sid&&item.data?.direction==='out'&&item.data?.remoteAddress===remoteAddress&&item.data?.remotePort===data.remotePort&&item.data?.protocol===data.protocol)
   if(matched)return res.json({policyId:policy.id,versionId:previous.id,versionNo:previous.version_no,duplicate:true,pendingSync:true})
-  const ruleNode={id:id(),type:'deny',data:{name:`Block ${account.qualified_name} to ${data.remoteAddress}:${data.remotePort}`,direction:'out',protocol:data.protocol,localPort:'Any',remotePort:data.remotePort,remoteAddress:data.remoteAddress,program:'Any',profile:'Any',localUserSid:account.sid}}
+  const ruleNode={id:id(),type:'deny',data:{name:`Block ${account.qualified_name} to ${data.destinationType==='address'?remoteAddress:data.destinationType==='node'?'node':'node group'}:${data.remotePort}`,direction:'out',protocol:data.protocol,localPort:'Any',remotePort:data.remotePort,remoteAddress,program:'Any',profile:'Any',localUserSid:account.sid}}
   const next={nodes:[...graph.nodes,ruleNode],edges:graph.edges||[]},rules=compilePolicy(next,policy.id)
   assertManagementAccess(rules)
   const conflicts=assignmentConflicts(policy.id,rules,[node]);if(conflicts.length)return rejectConflicts(res,conflicts)
@@ -1093,7 +1121,7 @@ api.post('/directory/local-accounts/:id/network-rule',requireRole('admin'),(req,
     if(!one('SELECT id FROM policy_assignments WHERE policy_id=? AND node_id=?',policy.id,node.id))run('INSERT INTO policy_assignments(id,policy_id,node_id,assigned_by) VALUES(?,?,?,?)',id(),policy.id,node.id,req.user.id)
     run('INSERT INTO policy_versions(id,policy_id,version_no,graph_json,rules_compiled_json,created_by,comment) VALUES(?,?,?,?,?,?,?)',versionId,policy.id,versionNo,json(next),json(rules),req.user.id,data.reason)
     run('UPDATE policies SET current_version_id=? WHERE id=?',versionId,policy.id)
-    audit(req.user.id,'local-account.network-rule.stage','policy',policy.id,null,{nodeId:node.id,accountSid:account.sid,remoteAddress:data.remoteAddress,remotePort:data.remotePort,protocol:data.protocol,versionId,reason:data.reason})
+      audit(req.user.id,'local-account.network-rule.stage','policy',policy.id,null,{nodeId:node.id,accountSid:account.sid,destinationType:data.destinationType,destinationId:data.destinationId||null,remoteAddress,remotePort:data.remotePort,protocol:data.protocol,versionId,reason:data.reason})
   })()
   res.status(201).json({policyId:policy.id,versionId,versionNo,pendingSync:true})
 })
@@ -1113,8 +1141,9 @@ api.get('/directory/users/:id',requireRole('auditor'),(req,res)=>{
   const user=one('SELECT * FROM directory_users WHERE id=?',reqId(req));if(!user)return notFound(res,'Directory user')
   const mfa=all('SELECT id,segment_id,node_id,status,challenged_at,resolved_at FROM mfa_challenges WHERE lower(user_upn) IN (?,?) ORDER BY challenged_at DESC LIMIT 100',String(user.upn||'').toLowerCase(),String(user.email||'').toLowerCase())
   const logons=all('SELECT e.id,e.node_id,n.hostname,e.event_id,e.action,e.src_ip,e.event_time,e.logon_type FROM log_events e LEFT JOIN nodes n ON n.id=e.node_id WHERE e.account_sid=? AND e.event_id IN (4624,4625,4634,4647,528,540,529,530,531,532,533,534,535,536,537,539,538,551) ORDER BY e.event_time DESC,e.record_id DESC LIMIT 100',user.sid)
+  const associatedNodes=all('SELECT n.id,n.hostname,n.fqdn,n.ip,n.status,MAX(e.event_time) last_event_at FROM log_events e JOIN nodes n ON n.id=e.node_id WHERE e.account_sid=? GROUP BY n.id ORDER BY last_event_at DESC',user.sid)
   const {member_of_json,...publicUser}=user
-  res.json({...publicUser,memberOf:parse(member_of_json)||[],mfaEnrolled:!!one('SELECT 1 FROM users WHERE ad_guid=? AND totp_secret IS NOT NULL',user.id),operatorImported:!!one("SELECT 1 FROM users WHERE ad_guid=? AND auth_source='ad'",user.id),mfaEvents:mfa,logonEvents:logons})
+  res.json({...publicUser,memberOf:parse(member_of_json)||[],mfaEnrolled:!!one('SELECT 1 FROM users WHERE ad_guid=? AND totp_secret IS NOT NULL',user.id),operatorImported:!!one("SELECT 1 FROM users WHERE ad_guid=? AND auth_source='ad'",user.id),mfaEvents:mfa,logonEvents:logons,associatedNodes})
 })
 api.post('/directory/users/:id/status',requireRole('admin'),wrap(async(req,res)=>{
   const data=body(z.object({enabled:z.boolean(),reason:z.string().trim().min(10).max(500),confirmed:z.boolean().optional(),confirmation:z.string().optional(),durationMinutes:z.number().int().min(5).max(10080).optional()}),req)
@@ -1527,7 +1556,7 @@ api.get('/nodes/:id/firewall-rules',wrap(async(req,res)=>{
 }))
 api.get('/nodes/:id/dns',(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json(one('SELECT * FROM dns_lookups WHERE node_id=?',node.id)||{})})
 api.post('/nodes/:id/dns/refresh',requireRole('editor'),wrap(async(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json(await lookupDns(node))}))
-api.get('/node-groups',(req,res)=>res.json(all('SELECT * FROM node_groups ORDER BY name').filter(group=>canReadResource(req.user,'node_group',group))))
+api.get('/node-groups',(req,res)=>res.json(all('SELECT * FROM node_groups ORDER BY name').filter(group=>canReadResource(req.user,'node_group',group)).map(group=>({...group,count:Number(one('SELECT COUNT(*) count FROM node_group_members WHERE group_id=?',group.id)?.count||0),policy_count:Number(one('SELECT COUNT(*) count FROM policy_assignments WHERE node_group_id=?',group.id)?.count||0),canWrite:canWriteResource(req.user,'node_group',group)}))))
 api.get('/node-groups/:id',(req,res)=>{
   const group=one('SELECT * FROM node_groups WHERE id=?',reqId(req));if(!group)return notFound(res,'Node group')
   if(!canReadResource(req.user,'node_group',group))return res.status(403).json({error:'Insufficient permission for node group'})

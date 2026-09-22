@@ -7,7 +7,7 @@ import {app,runVerification,runDriftCheck,pullLogs,pullRecentLogs,processDueTrai
 import {processSecurityAutomations} from './securityAutomations.js'
 import {bootstrap,ensureBootstrapAdmin} from './security.js'
 import {all,one,run,now,audit} from './db.js'
-import {agentTlsOptions} from './agentPki.js'
+import {agentTlsOptions,tlsMaterialPaths} from './agentPki.js'
 import {sweepAgentHealth} from './agentHealth.js'
 import {collectFacts} from './connector.js'
 import {pruneOldEvents,refreshDueDns,runCompactionIfDue} from './maintenance.js'
@@ -26,8 +26,8 @@ if(fs.existsSync(dist)){
   app.use(express.static(dist))
   app.get(/^(?!\/api\/).*/,(_req,res)=>res.sendFile(path.join(dist,'index.html')))
 }
-const tlsSettings=['TLS_CERT','TLS_KEY','AGENT_CA_CERT','AGENT_CA_KEY'].map(name=>process.env[name])
-if(tlsSettings.some(Boolean)&&!tlsSettings.every(Boolean))throw new Error('TLS_CERT, TLS_KEY, AGENT_CA_CERT and AGENT_CA_KEY must be configured together')
+const tlsPaths=tlsMaterialPaths(),tlsSettings=Object.values(tlsPaths).map(file=>fs.existsSync(file)?file:null)
+if(tlsSettings.some(Boolean)&&!tlsSettings.every(Boolean))throw new Error('TLS certificate, key, agent CA certificate and agent CA key must all be configured together')
 const tls=agentTlsOptions()
 const server=tls?https.createServer(tls,app):app
 const listener=server.listen(Number(process.env.PORT||3000),process.env.HOST||'0.0.0.0',()=>console.log(`WinFire ready on ${tls?'https':'http'}://localhost:${process.env.PORT||3000}`))
