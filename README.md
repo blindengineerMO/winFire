@@ -52,10 +52,15 @@ environments returned by Dokploy, and asks for a service name, base DNS domain,
 GitHub repository/branch, and bootstrap administrator values. It generates a
 random hostname below the base domain, creates the compose application, saves
 the generated environment, attaches the hostname to the `ui` service, deploys,
-and prints the deployment status and URL. The API key is read interactively and
+and prints the deployment status and URLs. The API key is read interactively and
 is never written to disk. Point internal DNS at the printed hostname with a
-CNAME. HTTPS can be enabled in the wizard after the CNAME resolves publicly so
-Dokploy can complete a Let's Encrypt challenge.
+CNAME. The wizard attaches two Dokploy domains for the same hostname: an HTTP
+route and an HTTPS route using Let's Encrypt. Dokploy serves the HTTPS route on
+public port 443 and forwards it to the UI container's port 80; the domain
+`port` value is the container port, not a second public listener. The generated
+hostname must resolve publicly to the Dokploy server and allow ports 80/443 for
+the Let's Encrypt challenge. Set `WINFIRE_HTTPS=false` when deploying an
+internal-only test domain that cannot satisfy ACME validation.
 
 For automation, `DOKPLOY_URL`, `DOKPLOY_API_KEY`, `DOKPLOY_PROJECT_ID`,
 `DOKPLOY_ENVIRONMENT_ID`, `WINFIRE_SERVICE_NAME`, `WINFIRE_BASE_DOMAIN`,

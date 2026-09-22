@@ -55,7 +55,7 @@ export function randomSecret(bytes = 32) { return crypto.randomBytes(bytes).toSt
 
 const envLine = (name, value) => `${name}=${JSON.stringify(String(value))}`
 
-export function buildEnvironment({hostname, postgresPassword, jwtSecret, vaultMasterKey, bootstrapEmail, bootstrapPassword, httpsEnabled = false}) {
+export function buildEnvironment({hostname, postgresPassword, jwtSecret, vaultMasterKey, bootstrapEmail, bootstrapPassword, httpsEnabled = true}) {
   const origin = `${httpsEnabled ? 'https' : 'http'}://${hostname}`
   return [
     envLine('NODE_ENV', 'production'),
@@ -81,6 +81,28 @@ export function buildEnvironment({hostname, postgresPassword, jwtSecret, vaultMa
     envLine('SWEEP_INTERVAL_MINUTES', 60),
     envLine('LOG_POLL_INTERVAL_SECONDS', 120),
   ].join('\n') + '\n'
+}
+
+/**
+ * Build the Dokploy domain records for the generated host.
+ *
+ * `port` is Dokploy's container port, not the public listener. Traefik maps an
+ * HTTPS domain to its external websecure entrypoint (443), while the UI
+ * container continues to listen on port 80. Keeping both records at port 80
+ * is intentional and avoids exposing a second container port.
+ */
+export function buildDomainPayloads({hostname, composeId, httpsEnabled = true, serviceName = 'ui', containerPort = 80}) {
+  const common = {host: hostname, composeId, serviceName, domainType: 'compose', port: containerPort}
+  const domains = [{...common, https: false, certificateType: 'none'}]
+  if (httpsEnabled) domains.push({...common, https: true, certificateType: 'letsencrypt'})
+  return domains
+}
+
+export function buildDomainUrls(hostname, httpsEnabled = true) {
+  return {
+    http: `http://${hostname}`,
+    ...(httpsEnabled ? {https: `https://${hostname}`} : {}),
+  }
 }
 
 async function request(base, key, endpoint, options = {}) {
@@ -184,7 +206,7 @@ async function reachability(url, timeoutMs = 15_000, resolveIp = '') {
   })
 }
 
-export async function deploy({dokployUrl, apiKey, project, environment, serviceName, baseDomain, repository = DEFAULT_REPOSITORY, branch = 'main', bootstrapEmail = 'admin@winfire.local', bootstrapPassword = randomSecret(18), httpsEnabled = false, timeoutMs = 20 * 60_000, reachabilityIp = process.env.DOKPLOY_REACHABILITY_IP || ''}) {
+export async function deploy({dokployUrl, apiKey, project, environment, serviceName, baseDomain, repository = DEFAULT_REPOSITORY, branch = 'main', bootstrapEmail = 'admin@winfire.local', bootstrapPassword = randomSecret(18), httpsEnabled = true, timeoutMs = 20 * 60_000, reachabilityIp = process.env.DOKPLOY_REACHABILITY_IP || ''}) {
   const base = normalizeDokployUrl(dokployUrl)
   if (!apiKey) throw new Error('Dokploy API key is required')
   const hostname = randomSubdomain(baseDomain)
@@ -199,12 +221,39 @@ export async function deploy({dokployUrl, apiKey, project, environment, serviceN
   const env = buildEnvironment({hostname, postgresPassword, jwtSecret: randomSecret(), vaultMasterKey: randomSecret(), bootstrapEmail, bootstrapPassword, httpsEnabled})
   await request(base, apiKey, '/compose.update', {method: 'POST', body: jsonBody({composeId, sourceType: 'git', customGitUrl: repository, customGitBranch: branch, composePath: COMPOSE_PATH, composeType: 'docker-compose'})})
   await request(base, apiKey, '/compose.saveEnvironment', {method: 'POST', body: jsonBody({composeId, env})})
-  const domain = await request(base, apiKey, '/domain.create', {method: 'POST', body: jsonBody({host: hostname, https: httpsEnabled, certificateType: httpsEnabled ? 'letsencrypt' : 'none', composeId, serviceName: 'ui', domainType: 'compose', port: 80})})
+  const domainPayloads = buildDomainPayloads({hostname, composeId, httpsEnabled})
+  const domains = []
+  for (const payload of domainPayloads) {
+    try {
+      domains.push(await request(base, apiKey, '/domain.create', {method: 'POST', body: jsonBody(payload)}))
+    } catch (error) {
+      if (payload.https) {
+        throw new Error(`${error.message}. Confirm that ${hostname} resolves to the Dokploy server and that ports 80/443 are reachable before requesting the Let's Encrypt certificate.`)
+      }
+      throw error
+    }
+  }
   const deployment = await request(base, apiKey, '/compose.deploy', {method: 'POST', body: jsonBody({composeId, title: `Deploy ${serviceName}`})})
   const finished = await waitForDeployment(base, apiKey, composeId, timeoutMs)
-  const url = `${httpsEnabled ? 'https' : 'http'}://${hostname}`
-  const check = await reachability(url, 15_000, reachabilityIp)
-  return {composeId, hostname, url, domain, deployment, finished, reachability: check, projectId: project.projectId, environmentId: environment.environmentId}
+  const urls = buildDomainUrls(hostname, httpsEnabled)
+  const checks = {}
+  for (const [protocol, url] of Object.entries(urls)) checks[protocol] = await reachability(url, 15_000, reachabilityIp)
+  const url = urls.https || urls.http
+  return {
+    composeId,
+    hostname,
+    url,
+    httpUrl: urls.http,
+    httpsUrl: urls.https || null,
+    domains,
+    domain: domains[0],
+    httpsDomain: domains[1] || null,
+    deployment,
+    finished,
+    reachability: checks,
+    projectId: project.projectId,
+    environmentId: environment.environmentId,
+  }
 }
 
 async function main() {
@@ -234,10 +283,10 @@ async function main() {
     if (bootstrapPassword.length < 12) throw new Error('Bootstrap admin password must contain at least 12 characters')
     const httpsEnabled = process.env.WINFIRE_HTTPS !== undefined
       ? process.env.WINFIRE_HTTPS === 'true'
-      : /^y(es)?$/i.test(await question(rl, 'Request a Let\'s Encrypt certificate? (y/N)', 'N'))
-    console.log('\nCreating the compose service and generated domain...')
+      : /^y(es)?$/i.test(await question(rl, 'Attach HTTP and HTTPS domains and request a Let\'s Encrypt certificate? (Y/n)', 'Y'))
+    console.log('\nCreating the compose service and HTTP/HTTPS domains...')
     const result = await deploy({dokployUrl, apiKey, project, environment, serviceName, baseDomain, repository, branch, bootstrapEmail, bootstrapPassword, httpsEnabled})
-    console.log(JSON.stringify({status: result.finished?.status || result.deployment?.status || 'submitted', service: serviceName, url: result.url, hostname: result.hostname, composeId: result.composeId, reachability: result.reachability}, null, 2))
+    console.log(JSON.stringify({status: result.finished?.status || result.deployment?.status || 'submitted', service: serviceName, url: result.url, httpUrl: result.httpUrl, httpsUrl: result.httpsUrl, hostname: result.hostname, composeId: result.composeId, reachability: result.reachability}, null, 2))
   } catch (error) {
     console.error(`Deployment failed: ${error.message}`)
     process.exitCode = 1
