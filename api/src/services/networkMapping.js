@@ -156,9 +156,10 @@ const serviceFor = ({source, destination, protocol, sourcePort, destinationPort}
   const ports = new Set([normalizedSourcePort, normalizedDestinationPort].filter(Number.isInteger))
   const addresses = new Set([normalizedIp(source), normalizedIp(destination)])
   const has = port => ports.has(port)
-  // IGMP is a protocol without TCP/UDP ports. Identify it directly from the
-  // protocol number/name so multicast membership traffic is never shown as an
-  // unidentified service.
+  // ICMP and IGMP do not use TCP/UDP ports. Identify them directly from the
+  // protocol number/name so control and multicast membership traffic are never
+  // shown as unidentified services.
+  if (proto === 'ICMP') return 'ICMP (Internet Control Message Protocol)'
   if (proto === 'IGMP') return 'Internet Group Management Protocol (IGMP)'
   if ((addresses.has('224.0.0.251') || addresses.has('ff02::fb')) && has(5353)) return 'mDNS service discovery'
   if ((addresses.has('224.0.0.252') || addresses.has('ff02::1:3')) && has(5355)) return 'LLMNR name resolution'

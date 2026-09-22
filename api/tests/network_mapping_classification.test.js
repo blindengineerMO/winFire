@@ -85,6 +85,13 @@ test('protocol 2 is identified as IGMP without a port', () => {
   }
 })
 
+test('protocol 1 is identified as ICMP without a port', () => {
+  for (const protocol of ['1', 1, 'ICMP']) {
+    const result = classifyNetworkFlow({sourceIp: '192.168.88.10', destinationIp: '192.168.88.20', protocol})
+    assert.equal(result.service, 'ICMP (Internet Control Message Protocol)', String(protocol))
+  }
+})
+
 test('mapping read repairs legacy unidentified service values', () => {
   db.prepare("INSERT INTO nodes(id,hostname,ip,status) VALUES(?,?,?,?)").run('mapping-node','MAPPING-NODE','192.168.88.40','reachable')
   assert.equal(recordNetworkFlow('mapping-node', {eventType:'firewall', srcIp:'192.168.88.40', dstIp:'8.8.8.8', protocol:'6', srcPort:'50123', dstPort:'443', direction:'out'}), true)
