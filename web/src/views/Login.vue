@@ -1,7 +1,7 @@
 <script setup>
 import {computed,onMounted,ref} from 'vue'
 import {useRoute,useRouter} from 'vue-router'
-import {api,session} from '../lib/api.js'
+import {api,session} from '../services/api.js'
 const router=useRouter(),route=useRoute(),email=ref(''),password=ref(''),totp=ref(''),showTotp=ref(false),error=ref(''),working=ref(false),loginMode=ref('local')
 const portalBrand=ref({companyName:'WinFire Secure',imageUrl:null})
 const prompted=computed(()=>/^\/identity\?prompt=[0-9a-f-]{36}$/i.test(String(route.query.next||'')))

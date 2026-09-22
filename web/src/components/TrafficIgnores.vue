@@ -1,6 +1,6 @@
 <script setup>
 import {onMounted,ref} from 'vue'
-import {api} from '../lib/api.js'
+import {api} from '../services/api.js'
 import GlassWindow from './GlassWindow.vue'
 
 const rules=ref([]),busy=ref(false),error=ref(''),message=ref(''),cleanupOpen=ref(false),cleanupConfirmed=ref(false),cleanupBusy=ref(false)

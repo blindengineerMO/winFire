@@ -4,7 +4,7 @@ import PageHeader from '../components/PageHeader.vue'
 import GlassWindow from '../components/GlassWindow.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import NodeFacts from '../components/NodeFacts.vue'
-import {api,session} from '../lib/api.js'
+import {api,session} from '../services/api.js'
 import {activeTheme} from '../lib/theme.js'
 const nodes=ref([]),groups=ref([]),credentials=ref([]),search=ref(''),groupName=ref(''),memberGroup=ref(''),formOpen=ref(false),detailOpen=ref(false),editOpen=ref(false),deleteOpen=ref(false),auditEnableOpen=ref(false),auditConfirmation=ref(false),deleteConfirmation=ref(false),editForm=ref({hostname:'',fqdn:'',ip:''}),selected=ref(null),credentialSelection=ref([]),error=ref(''),message=ref(''),busy=ref(false),form=ref({hostname:'',fqdn:'',ip:'',credentialIds:[]})
 const canEdit=computed(()=>['owner','admin','editor'].includes(session.user?.role))

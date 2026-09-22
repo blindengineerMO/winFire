@@ -1,6 +1,6 @@
 <script setup>
 import {onMounted,ref,watch} from 'vue'
-import {api} from '../lib/api.js'
+import {api} from '../services/api.js'
 
 const props=defineProps({nodes:{type:Array,required:true},groups:{type:Array,required:true}})
 const settings=ref({defaultPollSeconds:30,defaultChannelMode:'pull',overrides:[]})

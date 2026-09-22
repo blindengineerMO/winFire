@@ -1,6 +1,6 @@
 <script setup>
 import {ref,watch} from 'vue'
-import {api,session} from '../lib/api.js'
+import {api,session} from '../services/api.js'
 
 const props=defineProps({me:{type:Object,default:null}})
 const categories=[['policy_drift','Policy drift'],['verifier_failure','Verifier failure'],['mfa_access_request','MFA access request'],['mfa_challenge_failure','MFA challenge failure'],['agent_offline','Agent offline'],['node_unreachable','Node unreachable'],['security_policy','Security policy']]

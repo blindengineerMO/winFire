@@ -16,7 +16,7 @@ import {probeNode, collectFacts, enrichNode, lookupDns, remote, diffRules, tcpPr
 import {firewallConnectorFor,applyManagedRules} from './firewallConnectors.js'
 import {classifyVerification,findMatchingDenyEvent,hasManagedRule} from './verifier.js'
 import {makeTotpSecret,verifyTotp,matchingTotpCounter} from './totp.js'
-import {agentRoutes} from './agentRoutes.js'
+import {agentRoutes} from './routes/agents.js'
 import {agentPkiReady,tlsMaterialPaths} from './agentPki.js'
 import {agentBootstrapScript,normalizeSignerThumbprint} from './agentBootstrap.js'
 import {agentPollSettings,effectiveAgentChannelMode} from './agentPoll.js'
@@ -48,9 +48,11 @@ import {normalizeRpcFilter,publicRpcFilter} from './rpcFilters.js'
 import {segmentAllowsOperatorAsync} from './segmentAccess.js'
 import {syncEntraGroup,cachedEntraGroupMembers} from './entraGraph.js'
 import {parseWefEvents,timingSafeSecret,wefNodeToken,wefSubscriptionUrl,publicWefSettings} from './wefReceiver.js'
-import {internetRoutes} from './internet.js'
-import {mappingRows,arpRows,recordNetworkFlow,recordArpEntries} from './networkMapping.js'
+import {internetRoutes} from './routes/internet.js'
+import {recordNetworkFlow} from './services/networkMapping.js'
+import {mappingRoutes} from './routes/mapping.js'
 import {expandCidrs,runDiscoveryScan} from './networkDiscovery.js'
+import {asyncHandler} from './middleware/asyncHandler.js'
 
 export const app=express()
 app.disable('x-powered-by')
@@ -75,7 +77,7 @@ app.use(express.json({limit:'2mb'}))
 const api=express.Router()
 app.use('/api/v1',api)
 api.use('/internet',internetRoutes)
-const wrap=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next)
+const wrap=asyncHandler
 const body=(schema,req)=>schema.parse(req.body)
 const reqId=req=>String(req.params.id)
 const notFound=(res,label='Record')=>res.status(404).json({error:`${label} not found`})
@@ -294,7 +296,7 @@ api.get('/agent-package/enroll.ps1',wrap(async(req,res)=>{
   catch(error){return res.status(503).json({error:error.message})}
   res.set('Cache-Control','private, no-store').type('text/plain').send(script)
 }))
-api.get('/openapi.json',(_req,res)=>res.json(buildOpenApi(api,agentRoutes,{internet:internetRoutes})))
+api.get('/openapi.json',(_req,res)=>res.json(buildOpenApi(api,agentRoutes,{internet:internetRoutes,mapping:mappingRoutes})))
 const loginLimit=rateLimit({windowMs:15*60*1000,limit:Number(process.env.AUTH_RATE_LIMIT||20),standardHeaders:'draft-8',legacyHeaders:false})
 const publicMfaLimit=rateLimit({windowMs:15*60*1000,limit:10,standardHeaders:'draft-8',legacyHeaders:false})
 api.post('/auth/login',loginLimit,wrap(async(req,res)=>{
@@ -501,6 +503,7 @@ api.post('/wef/wsman',express.raw({type:['application/soap+xml','text/xml','appl
   res.status(200).type('application/soap+xml').send(wefSoapResponse())
 }))
 api.use(auth)
+api.use('/mapping',mappingRoutes)
 api.get('/settings/tls',requireRole('admin'),(_req,res)=>{
   const paths=tlsMaterialPaths(),files=Object.fromEntries(Object.entries(paths).map(([name,file])=>[name,{configured:fs.existsSync(file),source:process.env[name]?'environment':'administration',path:process.env[name]?null:file}]))
   res.json({httpsEnabled:Object.values(files).every(item=>item.configured),files,restartRequired:true})
@@ -519,19 +522,6 @@ api.put('/settings/tls/:kind',requireRole('admin'),(req,res)=>{
   const file=tlsMaterialPaths()[target.key];fs.mkdirSync(path.dirname(file),{recursive:true,mode:0o700});fs.writeFileSync(file,pem,{mode:0o600});audit(req.user.id,'tls.material.upload','app-settings',target.key,null,{bytes:Buffer.byteLength(pem)})
   res.json({ok:true,kind:req.params.kind,restartRequired:true})
 })
-api.get('/mapping',(req,res)=>{
-  const query=z.object({nodeId:z.string().optional(),external:z.enum(['0','1']).optional(),from:z.string().optional(),to:z.string().optional(),page:z.coerce.number().int().min(1).default(1),pageSize:z.coerce.number().int().min(10).max(500).default(100)}).parse(req.query)
-  res.json(mappingRows(query))
-})
-api.post('/mapping/rebuild',requireRole('admin'),(req,res)=>{
-  const events=all("SELECT node_id,event_id,action,protocol,src_ip srcIp,src_port srcPort,dst_ip dstIp,dst_port dstPort,direction,program,event_type eventType,event_time eventTime FROM log_events WHERE (event_type='firewall' OR event_id IN (5150,5151,5156,5157)) ORDER BY rowid")
-  db.transaction(()=>{
-    run('DELETE FROM network_map_pairs')
-    for(const event of events)recordNetworkFlow(event.node_id,event,event.eventTime)
-  })()
-  audit(req.user.id,'network-mapping.rebuild','network-map','global',null,{events:events.length})
-  res.json({ok:true,events:events.length,rows:one('SELECT COUNT(*) count FROM network_map_pairs').count})
-})
 api.get('/discovery/scans',requireRole('admin'),(_req,res)=>res.json(all('SELECT * FROM discovery_scans ORDER BY created_at DESC LIMIT 100').map(scan=>({...scan,cidrs:parse(scan.cidrs_json)||[],results:parse(scan.results_json)||[]}))))
 api.get('/discovery/scans/:id',requireRole('admin'),(req,res)=>{const scan=one('SELECT * FROM discovery_scans WHERE id=?',reqId(req));if(!scan)return notFound(res,'Discovery scan');res.json({...scan,cidrs:parse(scan.cidrs_json)||[],results:parse(scan.results_json)||[]})})
 api.post('/discovery/scans',requireRole('admin'),(req,res)=>{
@@ -542,7 +532,6 @@ api.post('/discovery/scans',requireRole('admin'),(req,res)=>{
   setImmediate(()=>runDiscoveryScan(scanId).catch(error=>console.error('Discovery scan failed:',error)))
   res.status(202).json({id:scanId,status:'queued',addresses:hosts.length})
 })
-api.get('/mapping/arp',(req,res)=>res.json({items:arpRows(req.query.nodeId||null,Number(req.query.limit)||500)}))
 api.post('/nodes/:id/arp/collect',requireRole('editor'),(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
   if(!node.agent_id)return res.status(409).json({error:'ARP collection requires an enrolled agent on this node'})

@@ -1,7 +1,7 @@
 <script setup>
 import {onMounted,onUnmounted,ref} from 'vue'
 import {useRouter} from 'vue-router'
-import {api,session} from '../lib/api.js'
+import {api,session} from '../services/api.js'
 
 const router=useRouter(),open=ref(false),items=ref([]),unread=ref(0),error=ref('')
 let timer

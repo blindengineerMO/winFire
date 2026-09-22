@@ -2,7 +2,7 @@
 import {onMounted,ref,computed} from 'vue'
 import PageHeader from '../components/PageHeader.vue'
 import GlassWindow from '../components/GlassWindow.vue'
-import {api,session} from '../lib/api.js'
+import {api,session} from '../services/api.js'
 import {useRoute} from 'vue-router'
 
 const route=useRoute()

@@ -1,6 +1,6 @@
 <script setup>
 import {onMounted,ref} from 'vue'
-import {api} from '../lib/api.js'
+import {api} from '../services/api.js'
 
 const settings=ref({enabled:false,tenantId:'',clientId:'',clientAuthMethod:'secret',clientSecretConfigured:false,clientCertificateConfigured:false,redirectUris:[],ready:false,source:'environment'})
 const secret=ref(''),certificate=ref(''),privateKey=ref(''),busy=ref(false),error=ref(''),message=ref('')

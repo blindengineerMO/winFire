@@ -2,7 +2,7 @@
 import {computed,onMounted,ref} from 'vue'
 import PageHeader from '../components/PageHeader.vue'
 import GlassWindow from '../components/GlassWindow.vue'
-import {api,session} from '../lib/api.js'
+import {api,session} from '../services/api.js'
 
 const items=ref([]),total=ref(0),page=ref(1),pageSize=ref(50),sortBy=ref('name'),sortDir=ref('asc')
 const query=ref(''),source=ref('all'),enabled=ref('all'),mfa=ref('all'),loading=ref(false),busy=ref(false),error=ref(''),message=ref('')

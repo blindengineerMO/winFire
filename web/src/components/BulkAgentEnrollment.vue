@@ -1,6 +1,6 @@
 <script setup>
 import {computed,ref} from 'vue'
-import {api} from '../lib/api.js'
+import {api} from '../services/api.js'
 
 const props=defineProps({nodes:{type:Array,required:true},agents:{type:Array,required:true}})
 const selected=ref([]),issued=ref(null),busy=ref(false),error=ref('')

@@ -1,6 +1,6 @@
 <script setup>
 import {onMounted,ref} from 'vue'
-import {api} from '../lib/api.js'
+import {api} from '../services/api.js'
 
 const policies=ref([]),incidents=ref([]),error=ref(''),message=ref(''),busy=ref(false),preview=ref(null)
 const fresh=()=>({name:'',triggerType:'destination',destination:'',failureCount:3,windowMinutes:15,cooldownMinutes:60,actionType:'alert',disableMinutes:60,enabled:false})

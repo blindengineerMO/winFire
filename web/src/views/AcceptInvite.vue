@@ -1,7 +1,7 @@
 <script setup>
 import {ref} from 'vue'
 import {useRoute,useRouter} from 'vue-router'
-import {api} from '../lib/api.js'
+import {api} from '../services/api.js'
 
 const route=useRoute(),router=useRouter()
 const password=ref(''),confirm=ref(''),error=ref(''),working=ref(false),done=ref(false)

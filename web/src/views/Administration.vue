@@ -14,7 +14,7 @@ import WefSettings from '../components/WefSettings.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import DiscoverySettings from '../components/DiscoverySettings.vue'
 import {applyTheme,localTheme,normalizeTheme,setLocalTheme} from '../lib/theme.js'
-import {api,session,download} from '../lib/api.js'
+import {api,session,download} from '../services/api.js'
 const tab=ref('credentials'),credentials=ref([]),users=ref([]),invites=ref([]),teams=ref([]),nodeGroups=ref([]),audit=ref([]),agents=ref([]),nodes=ref([]),error=ref(''),message=ref(''),formOpen=ref(false),credentialForm=ref({name:'',type:'local',username:'',password:'',visibility:'private',priority:100}),userForm=ref({email:'',password:'',role:'auditor'}),inviteForm=ref({email:'',role:'auditor',teamId:''}),inviteResult=ref(null),teamName=ref(''),enrollNode=ref(''),token=ref(null)
 const me=ref(null),totpSetup=ref(null),totpCode=ref(''),disablePassword=ref(''),disableCode=ref('')
 const newEmail=ref('')

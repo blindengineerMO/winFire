@@ -1,7 +1,7 @@
 <script setup>
 import {onMounted,ref,computed} from 'vue'
 import PageHeader from '../components/PageHeader.vue'
-import {api,download,session} from '../lib/api.js'
+import {api,download,session} from '../services/api.js'
 const tab=ref('coverage'),rows=ref([]),search=ref(''),error=ref(''),message=ref(''),busy=ref(false)
 const canEdit=computed(()=>['owner','admin','editor'].includes(session.user?.role))
 const filtered=computed(()=>rows.value.filter(row=>JSON.stringify(row).toLowerCase().includes(search.value.toLowerCase())))

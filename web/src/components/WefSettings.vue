@@ -1,6 +1,6 @@
 <script setup>
 import {computed,onMounted,ref} from 'vue'
-import {api} from '../lib/api.js'
+import {api} from '../services/api.js'
 
 const settings=ref({enabled:false,secretConfigured:false,baseUrl:null,path:'/api/v1/wef/wsman'})
 const nodes=ref([]),nodeId=ref(''),refreshSeconds=ref(900),busy=ref(false),error=ref(''),message=ref(''),result=ref(null)

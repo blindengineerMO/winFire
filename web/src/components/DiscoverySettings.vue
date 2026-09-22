@@ -1,6 +1,6 @@
 <script setup>
 import {onMounted, ref} from 'vue'
-import {api} from '../lib/api.js'
+import {api} from '../services/api.js'
 const cidrs=ref(''),scans=ref([]),busy=ref(false),error=ref(''),message=ref('')
 async function load(){try{scans.value=await api('/discovery/scans')}catch(e){error.value=e.message}}
 async function scan(){busy.value=true;error.value='';message.value='';try{const values=cidrs.value.split(/[\n,]/).map(value=>value.trim()).filter(Boolean);const result=await api('/discovery/scans',{method:'POST',body:{cidrs:values}});message.value=`Scan queued for ${result.addresses} address${result.addresses===1?'':'es'}.`;cidrs.value='';await load()}catch(e){error.value=e.message}finally{busy.value=false}}

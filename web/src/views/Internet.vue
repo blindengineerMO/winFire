@@ -1,7 +1,7 @@
 <script setup>
 import {computed,onMounted,ref} from 'vue'
 import PageHeader from '../components/PageHeader.vue'
-import {api,session} from '../lib/api.js'
+import {api,session} from '../services/api.js'
 
 const events=ref([]),devices=ref([]),nodes=ref([]),groups=ref([]),users=ref([]),summary=ref({events:0,domains:0,devices:0,blocked:0,unmappedUsers:0})
 const loading=ref(false),error=ref(''),page=ref(1),pageSize=ref(100),total=ref(0),totalPages=ref(0)

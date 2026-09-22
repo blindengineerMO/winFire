@@ -1,7 +1,7 @@
 <script setup>
 import {computed,ref,watch} from 'vue'
 import {useRoute,useRouter} from 'vue-router'
-import {session,api} from './lib/api.js'
+import {session,api} from './services/api.js'
 import {activeTheme,applyTheme,setLocalTheme} from './lib/theme.js'
 import NotificationCenter from './components/NotificationCenter.vue'
 import GlassWindow from './components/GlassWindow.vue'

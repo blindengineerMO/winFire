@@ -5,7 +5,7 @@ import {Chart as ChartJS,ArcElement,BarElement,CategoryScale,LinearScale,Tooltip
 import PageHeader from '../components/PageHeader.vue'
 import OperationalTrends from '../components/OperationalTrends.vue'
 import EnterpriseDashboard from '../components/EnterpriseDashboard.vue'
-import {api} from '../lib/api.js'
+import {api} from '../services/api.js'
 const chartAccessibility={id:'winfire-chart-accessibility',afterInit(chart,_args,options){chart.canvas.setAttribute('aria-label',options?.label||'Data chart')}}
 ChartJS.register(ArcElement,BarElement,CategoryScale,LinearScale,Tooltip,Legend,chartAccessibility)
 const stats=ref(null),coverage=ref([]),events=ref([]),error=ref('')

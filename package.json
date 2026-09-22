@@ -19,10 +19,10 @@
     "dev:api": "node --watch api/src/server.js",
     "dev:web": "npm run dev -w web",
     "setup:winrm": "python3 -m venv .venv && .venv/bin/pip install -r api/sidecar/requirements.txt",
-    "test": "node --test api/test/*.test.js",
-    "test:winrm:live": "node api/test/live_winrm_smoke.mjs",
-    "test:winrm:rights": "node api/test/live_rights_read.mjs",
-    "test:winrm:rights:write": "node api/test/live_rights_write.mjs",
+    "test": "node --test api/tests/*.test.js",
+    "test:winrm:live": "node api/tests/live_winrm_smoke.mjs",
+    "test:winrm:rights": "node api/tests/live_rights_read.mjs",
+    "test:winrm:rights:write": "node api/tests/live_rights_write.mjs",
     "audit:deps": "npm audit --omit=dev --audit-level=high"
   },
   "dependencies": {

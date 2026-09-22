@@ -1,6 +1,6 @@
 <script setup>
 import {onMounted,ref} from 'vue'
-import {api} from '../lib/api.js'
+import {api} from '../services/api.js'
 import TrafficIgnores from './TrafficIgnores.vue'
 
 const names=ref('')

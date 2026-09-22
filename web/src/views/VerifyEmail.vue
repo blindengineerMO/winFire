@@ -1,7 +1,7 @@
 <script setup>
 import {ref} from 'vue'
 import {useRoute,useRouter} from 'vue-router'
-import {api,session} from '../lib/api.js'
+import {api,session} from '../services/api.js'
 
 const route=useRoute(),router=useRouter(),error=ref(''),working=ref(false),verified=ref(false)
 async function verify(){

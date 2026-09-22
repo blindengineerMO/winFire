@@ -1,6 +1,6 @@
 <script setup>
 import {computed,onMounted,ref,watch} from 'vue'
-import {api} from '../lib/api.js'
+import {api} from '../services/api.js'
 
 const resources=ref([]),users=ref([]),grants=ref([]),resourceKey=ref(''),userId=ref(''),permission=ref('read'),busy=ref(false),error=ref(''),message=ref('')
 const selected=computed(()=>resources.value.find(item=>`${item.type}:${item.id}`===resourceKey.value))

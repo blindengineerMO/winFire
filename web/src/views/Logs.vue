@@ -2,7 +2,7 @@
 import {onMounted,onUnmounted,ref,computed,nextTick} from 'vue'
 import PageHeader from '../components/PageHeader.vue'
 import GlassWindow from '../components/GlassWindow.vue'
-import {api,session} from '../lib/api.js'
+import {api,session} from '../services/api.js'
 
 const events=ref([]),nodes=ref([]),sessions=ref([]),policies=ref([])
 const eventContext=ref(null),eventContextEl=ref(null),ruleOpen=ref(false),ruleEvent=ref(null),ruleAction=ref('allow'),rulePolicyId=ref('personal'),ruleBusy=ref(false),ignoreBusy=ref(false)
