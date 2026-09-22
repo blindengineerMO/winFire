@@ -10,7 +10,7 @@ defineEmits(['previous','next'])
         <tr v-for="row in rows" :key="row.map_key">
           <td><strong>{{row.source_hostname||row.source_ip}}</strong><small class="mono">{{row.source_ip}}</small></td>
           <td><strong>{{row.destination_hostname||row.destination_ip}}</strong><small class="mono">{{row.destination_ip}}</small></td>
-          <td><span class="status" :class="row.traffic_scope==='external'?'pending':row.traffic_scope==='host-local'?'neutral':'reachable'">{{row.traffic_class||'Unclassified'}} · {{row.traffic_scope||'Unknown'}}</span><small class="mapping-reason">{{row.traffic_service||row.classification_reason||'No analyzer detail'}}</small></td>
+          <td><span class="status" :class="row.traffic_scope==='external'?'pending':row.traffic_scope==='host-local'?'neutral':'reachable'">{{row.traffic_class||'Unclassified'}} · {{row.traffic_scope||'Unknown'}}</span><strong v-if="row.traffic_service" class="mapping-service">{{row.traffic_service}}</strong><small class="mapping-reason">{{row.classification_reason||'No analyzer detail'}}</small></td>
           <td>{{row.protocol}}</td><td class="mono">{{row.destination_port||'—'}}</td><td><strong>{{row.connection_count}}</strong></td>
           <td>{{row.last_seen_at?new Date(row.last_seen_at).toLocaleString():'—'}}</td>
         </tr>
@@ -21,5 +21,5 @@ defineEmits(['previous','next'])
   <div class="pagination"><span>{{total}} pair{{total===1?'':'s'}}</span><button class="button small secondary" :disabled="page<=1" @click="$emit('previous')">Previous</button><button class="button small secondary" :disabled="page>=pages" @click="$emit('next')">Next</button></div>
 </template>
 <style scoped>
-.mapping-reason{display:block;max-width:260px;color:var(--muted);font-size:.7rem;line-height:1.25;margin-top:3px}
+.mapping-service{display:block;max-width:260px;font-size:.7rem;line-height:1.25;margin-top:3px}.mapping-reason{display:block;max-width:260px;color:var(--muted);font-size:.7rem;line-height:1.25;margin-top:3px}
 </style>

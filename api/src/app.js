@@ -49,7 +49,7 @@ import {segmentAllowsOperatorAsync} from './segmentAccess.js'
 import {syncEntraGroup,cachedEntraGroupMembers} from './entraGraph.js'
 import {parseWefEvents,timingSafeSecret,wefNodeToken,wefSubscriptionUrl,publicWefSettings} from './wefReceiver.js'
 import {internetRoutes} from './routes/internet.js'
-import {recordNetworkFlow} from './services/networkMapping.js'
+import {classifyNetworkFlow,normalizeNetworkProtocol,recordNetworkFlow} from './services/networkMapping.js'
 import {mappingRoutes} from './routes/mapping.js'
 import {expandCidrs,runDiscoveryScan} from './networkDiscovery.js'
 import {asyncHandler} from './middleware/asyncHandler.js'
@@ -2405,9 +2405,15 @@ api.get('/logs/search',(req,res)=>{
   if((query.hideLoopback===undefined?observabilitySettings().hideLoopbackEvents:query.hideLoopback==='true'))filters.push("NOT ((COALESCE(e.src_ip,p.src_ip,'') LIKE '127.%' OR COALESCE(e.src_ip,p.src_ip,'') IN ('::1','0:0:0:0:0:0:0:1')) AND (COALESCE(e.dst_ip,p.dst_ip,'') LIKE '127.%' OR COALESCE(e.dst_ip,p.dst_ip,'') IN ('::1','0:0:0:0:0:0:0:1')))")
   const where=filters.length?'WHERE '+filters.join(' AND '):''
   const sortColumns={time:'julianday(COALESCE(e.event_time,e.received_at))',node:'n.hostname COLLATE NOCASE',eventId:'e.event_id',action:'e.action COLLATE NOCASE',direction:'COALESCE(e.direction,p.direction) COLLATE NOCASE',srcIp:'COALESCE(e.src_ip,p.src_ip) COLLATE NOCASE',dstIp:'COALESCE(e.dst_ip,p.dst_ip) COLLATE NOCASE',port:'COALESCE(e.dst_port,p.dst_port)',program:'COALESCE(e.program,p.program) COLLATE NOCASE',account:'COALESCE(ad.sam_account_name,ad.upn,la.qualified_name,sr.qualified_name,e.account_sid) COLLATE NOCASE'}
-  const fromSql=`FROM log_events e LEFT JOIN nodes n ON n.id=e.node_id LEFT JOIN event_patterns p ON p.id=e.pattern_id LEFT JOIN directory_users ad ON ad.sid=e.account_sid LEFT JOIN local_accounts la ON la.node_id=e.node_id AND la.sid=e.account_sid AND la.missing=0 LEFT JOIN sid_resolutions sr ON sr.node_id=e.node_id AND sr.sid=e.account_sid ${where}`
+  const fromSql=`FROM log_events e LEFT JOIN nodes n ON n.id=e.node_id LEFT JOIN node_facts f ON f.node_id=e.node_id LEFT JOIN event_patterns p ON p.id=e.pattern_id LEFT JOIN directory_users ad ON ad.sid=e.account_sid LEFT JOIN local_accounts la ON la.node_id=e.node_id AND la.sid=e.account_sid AND la.missing=0 LEFT JOIN sid_resolutions sr ON sr.node_id=e.node_id AND sr.sid=e.account_sid ${where}`
   const total=one(`SELECT COUNT(*) AS count ${fromSql}`,...args).count
-  const items=all(`SELECT e.*,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,COALESCE(e.dst_ip,p.dst_ip) dst_ip,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.direction,p.direction) direction,COALESCE(e.program,p.program) program,COALESCE(e.event_type,p.event_type) event_type,COALESCE(ad.sam_account_name,ad.upn,la.qualified_name,sr.qualified_name) account_name ${fromSql} ORDER BY ${sortColumns[query.sortBy]} ${query.sortDir.toUpperCase()}, e.id DESC LIMIT ? OFFSET ?`,...args,query.pageSize,(query.page-1)*query.pageSize).map(event=>event.account_name?event:{...event,account_name:event.account_sid?accountName(event.node_id,event.account_sid).accountName:null})
+  const items=all(`SELECT e.*,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,e.src_port,COALESCE(e.dst_ip,p.dst_ip) dst_ip,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.direction,p.direction) direction,COALESCE(e.program,p.program) program,COALESCE(e.event_type,p.event_type) event_type,n.ip node_ip,f.snapshot_json node_snapshot_json,COALESCE(ad.sam_account_name,ad.upn,la.qualified_name,sr.qualified_name) account_name ${fromSql} ORDER BY ${sortColumns[query.sortBy]} ${query.sortDir.toUpperCase()}, e.id DESC LIMIT ? OFFSET ?`,...args,query.pageSize,(query.page-1)*query.pageSize).map(event=>{
+    const sourceIp=event.src_ip||(event.direction==='out'?event.node_ip:null),destinationIp=event.dst_ip||(event.direction==='in'?event.node_ip:null)
+    const classification=classifyNetworkFlow({node:{ip:event.node_ip,snapshot_json:event.node_snapshot_json},sourceIp,destinationIp,protocol:event.protocol,sourcePort:event.src_port,destinationPort:event.dst_port})
+    const account=event.account_name?event.account_name:event.account_sid?accountName(event.node_id,event.account_sid).accountName:null
+    const {node_ip:_nodeIp,node_snapshot_json:_snapshot,...publicEvent}=event
+    return {...publicEvent,protocol:normalizeNetworkProtocol(publicEvent.protocol),account_name:account,traffic_service:classification.service,traffic_class:classification.trafficClass,traffic_scope:classification.scope,traffic_reason:classification.reason}
+  })
   res.json({items,total,page:query.page,pageSize:query.pageSize,totalPages:Math.ceil(total/query.pageSize)})
 })
 const publicEventExport=destination=>({id:destination.id,name:destination.name,kind:destination.kind,endpoint:destination.endpoint,hasToken:!!destination.token_blob,createdAt:destination.created_at,updatedAt:destination.updated_at})

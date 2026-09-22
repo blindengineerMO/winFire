@@ -51,6 +51,7 @@ test('log filters, retention and scheduled DNS refresh use saved settings',async
   const result=await auth(request.get('/api/v1/logs/search').query({nodeId:node.body.id,action:'allow',direction:'out',program:'C:\\New.exe',challengeId:'new-challenge',port:443,from:'2026-09-19T12:00:00.000Z',to:'2026-09-19T13:00:00.000Z'})).expect(200)
   assert.deepEqual(result.body.items.map(row=>row.id),['new-log'])
   assert.equal(result.body.total,1)
+  assert.equal(result.body.items[0].traffic_service,'HTTPS web traffic')
   await auth(request.get('/api/v1/logs/search').query({port:99999})).expect(400)
   await auth(request.get('/api/v1/logs/search').query({from:'2026-09-20T00:00:00.000Z',to:'2026-09-19T00:00:00.000Z'})).expect(400)
   assert.equal(pruneOldEvents(new Date('2026-09-19T13:00:00.000Z')),1)

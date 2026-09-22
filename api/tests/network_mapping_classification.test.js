@@ -44,3 +44,27 @@ test('private node pairs and public peers are separated by scope', () => {
   assert.equal(publicInternet.scope, 'external')
   assert.equal(publicInternet.service, 'DNS name resolution')
 })
+
+test('well-known ports identify common services for mapping and event analysis', () => {
+  const cases = [
+    ['TCP', 443, 'HTTPS web traffic'],
+    ['TCP', 80, 'HTTP web traffic'],
+    ['UDP', 53, 'DNS name resolution'],
+    ['TCP', 53, 'DNS name resolution'],
+    ['TCP', 389, 'LDAP directory access'],
+    ['TCP', 636, 'LDAPS secure directory access'],
+    ['TCP', 445, 'SMB file or management traffic'],
+    ['TCP', 3389, 'RDP remote desktop'],
+    ['TCP', 5985, 'WinRM management over HTTP'],
+    ['TCP', 5986, 'WinRM management over HTTPS'],
+    ['TCP', 3268, 'Active Directory Global Catalog'],
+    ['TCP', 5432, 'PostgreSQL database'],
+    ['TCP', 3306, 'MySQL database'],
+  ]
+  for (const [protocol, port, service] of cases) {
+    const result = classifyNetworkFlow({sourceIp: '192.168.88.10', destinationIp: '10.0.0.20', protocol, destinationPort: port})
+    assert.equal(result.service, service, `${protocol}/${port}`)
+  }
+  assert.equal(classifyNetworkFlow({sourceIp: '8.8.8.8', destinationIp: '192.168.88.10', protocol: '6', destinationPort: 443}).service, 'HTTPS web traffic')
+  assert.equal(classifyNetworkFlow({sourceIp: '10.0.0.20', destinationIp: '192.168.88.10', protocol: 'UDP', sourcePort: 443}).service, 'HTTP/3 (QUIC) web traffic')
+})
