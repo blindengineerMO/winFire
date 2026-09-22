@@ -1,6 +1,6 @@
 import {isIP} from 'node:net'
 import {all, one, run, id, now} from '../db.js'
-import {resolveClassifierService,classifierRuleSuppresses} from './classifierRules.js'
+import {resolveClassifierService,resolveProcessService,classifierRuleSuppresses} from './classifierRules.js'
 
 const ipv4 = value => String(value || '').trim().split('/')[0]
   .split('%')[0].toLowerCase()
@@ -157,14 +157,11 @@ const serviceFor = ({source, destination, protocol, sourcePort, destinationPort,
   const ports = new Set([normalizedSourcePort, normalizedDestinationPort].filter(Number.isInteger))
   const addresses = new Set([normalizedIp(source), normalizedIp(destination)])
   const has = port => ports.has(port)
-  // Windows reports this process with a device path (for example
-  // \\Device\\HarddiskVolume3\\Windows\\System32\\lsass.exe). The process
-  // is a stronger signal than a port because LSASS can use several dynamic
-  // RPC ports, so identify it before the protocol and catalog rules.
-  if (/(^|[\\/])lsass\.exe(?:$|[\\/?\\s])/i.test(String(program || '').trim())) return 'Local Security Authority Subsystem Service'
-  // DFS Replication likewise uses dynamic RPC traffic, so the executable path
-  // is the reliable service signal when a Windows firewall event includes it.
-  if (/(^|[\\/])dfsrs\.exe(?:$|[\\/?\\s])/i.test(String(program || '').trim())) return 'Distributed File System Replication (DFSR)'
+  // Process rules identify services that use dynamic or ambiguous ports. The
+  // administrator can add, edit, disable, or restore these patterns in the
+  // Classifier administration view.
+  const processService = resolveProcessService(program)
+  if (processService) return processService
   // Customer rules have precedence over the built-in and IANA catalog,
   // regardless of the customer-selected priority value.
   if (classifierRuleSuppresses(proto, normalizedSourcePort, normalizedDestinationPort, {sources: ['custom']})) return null

@@ -50,7 +50,7 @@ import {syncEntraGroup,cachedEntraGroupMembers} from './entraGraph.js'
 import {parseWefEvents,timingSafeSecret,wefNodeToken,wefSubscriptionUrl,publicWefSettings} from './wefReceiver.js'
 import {internetRoutes} from './routes/internet.js'
 import {classifyNetworkFlow,normalizeNetworkProtocol,recordNetworkFlow} from './services/networkMapping.js'
-import {classifierRuleRows,classifierRuleById,createClassifierRule,updateClassifierRule,deleteClassifierRule} from './services/classifierRules.js'
+import {classifierRuleRows,classifierRuleById,createClassifierRule,updateClassifierRule,deleteClassifierRule,processRuleRows,processRuleById,createProcessRule,updateProcessRule,deleteProcessRule} from './services/classifierRules.js'
 import {mappingRoutes} from './routes/mapping.js'
 import {expandCidrs,runDiscoveryScan} from './networkDiscovery.js'
 import {validSnmpHost,normalizeSnmpSecret} from './snmpDiscovery.js'
@@ -1011,6 +1011,35 @@ api.delete('/settings/classifier/rules/:id',requireRole('admin'),(req,res)=>{
   const before=classifierRuleById(req.params.id)
   if(!deleteClassifierRule(req.params.id,req.user.id))return notFound(res,'Classifier rule')
   audit(req.user.id,'classifier-rule.delete','classifier-rule',req.params.id,before,null)
+  res.status(204).end()
+})
+const classifierProcessRuleBody=z.object({
+  executablePattern:z.string().trim().min(1).max(512),
+  service:z.string().trim().min(1).max(160),
+  description:z.string().trim().max(500).optional().default(''),
+  priority:z.number().int().min(1).max(10000).default(10),
+  enabled:z.boolean().default(true),
+})
+api.get('/settings/classifier/process-rules',requireRole('admin'),(req,res)=>{
+  const query=z.object({search:z.string().max(200).optional(),source:z.enum(['built-in','custom']).optional(),enabled:z.enum(['true','false']).optional(),page:z.coerce.number().int().min(1).default(1),pageSize:z.coerce.number().int().min(10).max(500).default(100),sortBy:z.enum(['pattern','service','source','priority','enabled']).default('priority'),sortDir:z.enum(['asc','desc']).default('asc')}).parse(req.query)
+  res.json(processRuleRows(query))
+})
+api.post('/settings/classifier/process-rules',requireRole('admin'),(req,res)=>{
+  const data=body(classifierProcessRuleBody,req),rule=createProcessRule(data,req.user.id)
+  audit(req.user.id,'classifier-process-rule.create','classifier-process-rule',rule.id,null,rule)
+  res.status(201).json(rule)
+})
+api.patch('/settings/classifier/process-rules/:id',requireRole('admin'),(req,res)=>{
+  const data=body(classifierProcessRuleBody,req),before=processRuleById(req.params.id)
+  const rule=updateProcessRule(req.params.id,data,req.user.id)
+  if(!rule)return notFound(res,'Classifier process rule')
+  audit(req.user.id,'classifier-process-rule.update','classifier-process-rule',rule.id,before,rule)
+  res.json(rule)
+})
+api.delete('/settings/classifier/process-rules/:id',requireRole('admin'),(req,res)=>{
+  const before=processRuleById(req.params.id)
+  if(!deleteProcessRule(req.params.id,req.user.id))return notFound(res,'Classifier process rule')
+  audit(req.user.id,'classifier-process-rule.disable','classifier-process-rule',req.params.id,before,null)
   res.status(204).end()
 })
 api.get('/settings/traffic-ignores',requireRole('admin'),(_req,res)=>res.json(all('SELECT * FROM traffic_ignore_rules ORDER BY created_at DESC,id DESC').map(publicTrafficIgnore)))

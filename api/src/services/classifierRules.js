@@ -11,6 +11,7 @@ const protocolRules = [
 ]
 
 let cached = null
+let processCached = null
 const normalizeProtocol = value => {
   const raw = String(value || '').trim().toUpperCase()
   const mapped = ({'1': 'ICMP', '2': 'IGMP', '6': 'TCP', '17': 'UDP', '41': 'IPv6-in-IPv4', '47': 'GRE', '50': 'ESP', '51': 'AH', '58': 'ICMPv6', '89': 'OSPF', '132': 'SCTP', ICMPV6: 'ICMPv6', TCPV4: 'TCP', TCPV6: 'TCP', UDPV4: 'UDP', UDPV6: 'UDP'})[raw]
@@ -38,6 +39,17 @@ const publicRule = rule => ({
   createdAt: rule.created_at ?? rule.createdAt ?? null,
   updatedAt: rule.updated_at ?? rule.updatedAt ?? null,
 })
+const publicProcessRule = rule => ({
+  id: rule.id,
+  executablePattern: rule.executable_pattern ?? rule.executablePattern ?? '',
+  service: rule.service,
+  description: rule.description || '',
+  source: rule.source || 'custom',
+  priority: Number(rule.priority ?? 10),
+  enabled: Boolean(rule.enabled ?? 1),
+  createdAt: rule.created_at ?? rule.createdAt ?? null,
+  updatedAt: rule.updated_at ?? rule.updatedAt ?? null,
+})
 const catalogRows = () => [...protocolRules, ...catalog.rules]
 
 function effectiveRules() {
@@ -53,7 +65,7 @@ function effectiveRules() {
   return cached
 }
 
-export function invalidateClassifierRules() { cached = null }
+export function invalidateClassifierRules() { cached = null; processCached = null }
 export function classifierCatalogMetadata() {
   return {source: catalog.source, sourceUrl: catalog.sourceUrl, retrieved: catalog.retrieved, catalogCount: catalogRows().length}
 }
@@ -176,6 +188,72 @@ export function deleteClassifierRule(ruleId, actorId) {
   if (!catalogRule) return false
   const timestamp = now(), overrideId = id()
   run('INSERT INTO classifier_rules(id,catalog_id,protocol,port_start,port_end,service,description,source,priority,enabled,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)', overrideId, catalogRule.id, catalogRule.protocol, catalogRule.portStart, catalogRule.portEnd, catalogRule.service, catalogRule.description || null, 'custom', catalogRule.priority, 0, actorId, actorId, timestamp, timestamp)
+  invalidateClassifierRules()
+  return true
+}
+
+function effectiveProcessRules() {
+  if (!processCached) processCached = all('SELECT * FROM classifier_process_rules ORDER BY priority ASC, LENGTH(executable_pattern) DESC, updated_at DESC, id').map(publicProcessRule)
+  return processCached
+}
+
+export function processRuleRows({search = '', source = '', enabled = '', page = 1, pageSize = 100, sortBy = 'priority', sortDir = 'asc'} = {}) {
+  let rows = effectiveProcessRules()
+  const term = String(search || '').trim().toLowerCase()
+  if (term) rows = rows.filter(rule => `${rule.executablePattern} ${rule.service} ${rule.description}`.toLowerCase().includes(term))
+  if (source) rows = rows.filter(rule => rule.source === source)
+  if (enabled === true || enabled === false || enabled === 'true' || enabled === 'false') rows = rows.filter(rule => rule.enabled === (enabled === true || enabled === 'true'))
+  const sorters = {
+    pattern: rule => rule.executablePattern.toLowerCase(),
+    service: rule => rule.service.toLowerCase(),
+    source: rule => rule.source,
+    priority: rule => rule.priority,
+    enabled: rule => Number(rule.enabled),
+  }
+  const sorter = sorters[sortBy] || sorters.priority
+  const direction = sortDir === 'desc' ? -1 : 1
+  rows = [...rows].sort((left, right) => {
+    const a = sorter(left), b = sorter(right)
+    return (a < b ? -1 : a > b ? 1 : left.id.localeCompare(right.id)) * direction
+  })
+  const safePage = Math.max(1, Number(page) || 1)
+  const safePageSize = Math.min(500, Math.max(10, Number(pageSize) || 100))
+  return {items: rows.slice((safePage - 1) * safePageSize, safePage * safePageSize), total: rows.length, page: safePage, pageSize: safePageSize, totalPages: Math.max(1, Math.ceil(rows.length / safePageSize))}
+}
+
+export function processRuleById(ruleId) {
+  const row = one('SELECT * FROM classifier_process_rules WHERE id=?', ruleId)
+  return row ? publicProcessRule(row) : null
+}
+
+export function resolveProcessService(program) {
+  const value = String(program || '').trim().toLowerCase()
+  if (!value) return null
+  const match = effectiveProcessRules().find(rule => rule.enabled && value.includes(rule.executablePattern.toLowerCase()))
+  return match?.service || null
+}
+
+export function createProcessRule(data, actorId) {
+  const timestamp = now(), ruleId = id()
+  run('INSERT INTO classifier_process_rules(id,executable_pattern,service,description,source,priority,enabled,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)', ruleId, data.executablePattern, data.service, data.description || null, 'custom', data.priority, Number(data.enabled), actorId, actorId, timestamp, timestamp)
+  invalidateClassifierRules()
+  return processRuleById(ruleId)
+}
+
+export function updateProcessRule(ruleId, data, actorId) {
+  const existing = processRuleById(ruleId)
+  if (!existing) return null
+  run('UPDATE classifier_process_rules SET executable_pattern=?,service=?,description=?,priority=?,enabled=?,updated_by=?,updated_at=? WHERE id=?', data.executablePattern, data.service, data.description || null, data.priority, Number(data.enabled), actorId, now(), ruleId)
+  invalidateClassifierRules()
+  return processRuleById(ruleId)
+}
+
+export function deleteProcessRule(ruleId, actorId) {
+  const existing = processRuleById(ruleId)
+  if (!existing) return false
+  // Keep built-in and customer entries in the table so they can be restored
+  // from the classifier UI without losing their audit history.
+  run('UPDATE classifier_process_rules SET enabled=0,updated_by=?,updated_at=? WHERE id=?', actorId, now(), ruleId)
   invalidateClassifierRules()
   return true
 }

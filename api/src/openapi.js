@@ -62,7 +62,9 @@ const requestSchemas={
   'POST /logon-rights/baseline':'LogsPullRequest',
   'POST /discovery/scans':'DiscoveryScanRequest',
   'POST /settings/classifier/rules':'ClassifierRuleRequest',
-  'PATCH /settings/classifier/rules/{id}':'ClassifierRuleRequest'
+  'PATCH /settings/classifier/rules/{id}':'ClassifierRuleRequest',
+  'POST /settings/classifier/process-rules':'ClassifierProcessRuleRequest',
+  'PATCH /settings/classifier/process-rules/{id}':'ClassifierProcessRuleRequest'
 }
 
 const responseSchemas={
@@ -145,6 +147,7 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
       ServerSettingsRequest:{type:'object',required:['fqdn','publicBaseUrl'],properties:{fqdn:{type:'string',maxLength:253},publicBaseUrl:{type:'string',maxLength:2048,format:'uri'}},additionalProperties:false},
       WefSettingsRequest:{type:'object',required:['enabled'],properties:{enabled:{type:'boolean'},sharedSecret:{type:'string',minLength:8,maxLength:512,format:'password'},clearSecret:{type:'boolean'}},additionalProperties:false},
       ClassifierRuleRequest:{type:'object',required:['protocol','service'],properties:{protocol:{type:'string',enum:['ANY','TCP','UDP','SCTP','DCCP','ICMP','ICMPv6','IGMP','IPv6-in-IPv4','GRE','ESP','AH','OSPF']},portStart:{type:['integer','null'],minimum:1,maximum:65535},portEnd:{type:['integer','null'],minimum:1,maximum:65535},service:{type:'string',minLength:1,maxLength:160},description:{type:'string',maxLength:500},priority:{type:'integer',minimum:1,maximum:10000,default:10},enabled:{type:'boolean',default:true}},additionalProperties:false,description:'Provide both port bounds for a port rule or omit both for a protocol rule. ICMP and IGMP rules do not use ports.'},
+      ClassifierProcessRuleRequest:{type:'object',required:['executablePattern','service'],properties:{executablePattern:{type:'string',minLength:1,maxLength:512},service:{type:'string',minLength:1,maxLength:160},description:{type:'string',maxLength:500},priority:{type:'integer',minimum:1,maximum:10000,default:10},enabled:{type:'boolean',default:true}},additionalProperties:false,description:'Matches a case-insensitive executable path substring, such as lsass.exe, to identify traffic from a process.'},
       WefConfigureRequest:{type:'object',properties:{refreshSeconds:{type:'integer',minimum:60,maximum:86400,default:900}}},
       EntraSettingsRequest:{type:'object',required:['tenantId','clientId','enabled'],properties:{tenantId:{type:'string',format:'uuid'},clientId:{type:'string',format:'uuid'},clientAuthMethod:{type:'string',enum:['secret','certificate'],default:'secret'},clientSecret:{type:'string',format:'password',minLength:8,maxLength:4096},clientCertificate:{type:'string',maxLength:30000},clientPrivateKey:{type:'string',format:'password',maxLength:30000},enabled:{type:'boolean'}},additionalProperties:false},
       EntraSettingsResponse:{type:'object',required:['source','enabled','tenantId','clientId','clientAuthMethod','clientSecretConfigured','clientCertificateConfigured','ready'],properties:{source:{type:'string',enum:['environment','settings']},enabled:{type:'boolean'},tenantId:{type:'string'},clientId:{type:'string'},clientAuthMethod:{type:'string',enum:['secret','certificate']},clientSecretConfigured:{type:'boolean'},clientCertificateConfigured:{type:'boolean'},clientCertificateThumbprint:{type:['string','null']},publicBaseUrl:{type:'string'},redirectUris:{type:'array',items:{type:'string',format:'uri'}},ready:{type:'boolean'},updatedAt:{type:['string','null'],format:'date-time'}}},

@@ -44,3 +44,21 @@ test('IANA catalog is available and custom classifier rules override and restore
   await auth(request.delete(`/api/v1/settings/classifier/rules/${disabled.id}`)).expect(204)
   assert.equal(classifyNetworkFlow({sourceIp:'10.0.0.1',destinationIp:'10.0.0.2',protocol:'TCP',destinationPort:443}).service,'HTTPS web traffic')
 })
+
+test('process classifier rules can be created, changed, disabled, and restored',async()=>{
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@classifier.test',password:'classifier-password-123'}).expect(200)
+  const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
+  const builtins=(await auth(request.get('/api/v1/settings/classifier/process-rules')).expect(200)).body.items
+  assert.ok(builtins.some(rule=>rule.executablePattern==='lsass.exe'&&rule.service==='Local Security Authority Subsystem Service'))
+  const created=await auth(request.post('/api/v1/settings/classifier/process-rules')).send({executablePattern:'contoso-agent.exe',service:'Contoso Agent',description:'Internal endpoint agent',priority:50,enabled:true}).expect(201)
+  assert.equal(classifyNetworkFlow({sourceIp:'10.0.0.1',destinationIp:'10.0.0.2',protocol:'TCP',program:'\\\\Device\\HarddiskVolume3\\Program Files\\Contoso\\contoso-agent.exe'}).service,'Contoso Agent')
+  await auth(request.patch(`/api/v1/settings/classifier/process-rules/${created.body.id}`)).send({executablePattern:'contoso-agent.exe',service:'Renamed Contoso Agent',description:'Updated',priority:50,enabled:true}).expect(200)
+  assert.equal(classifyNetworkFlow({sourceIp:'10.0.0.1',destinationIp:'10.0.0.2',protocol:'TCP',program:'C:\\Program Files\\Contoso\\contoso-agent.exe'}).service,'Renamed Contoso Agent')
+  await auth(request.patch(`/api/v1/settings/classifier/process-rules/${created.body.id}`)).send({executablePattern:'contoso-agent.exe',service:'Renamed Contoso Agent',description:'Updated',priority:50,enabled:false}).expect(200)
+  assert.notEqual(classifyNetworkFlow({sourceIp:'10.0.0.1',destinationIp:'10.0.0.2',protocol:'TCP',program:'contoso-agent.exe'}).service,'Renamed Contoso Agent')
+  const lsass=builtins.find(rule=>rule.executablePattern==='lsass.exe')
+  await auth(request.patch(`/api/v1/settings/classifier/process-rules/${lsass.id}`)).send({executablePattern:lsass.executablePattern,service:lsass.service,description:lsass.description,priority:lsass.priority,enabled:false}).expect(200)
+  assert.notEqual(classifyNetworkFlow({sourceIp:'10.0.0.1',destinationIp:'10.0.0.2',protocol:'TCP',program:'C:\\Windows\\System32\\lsass.exe'}).service,'Local Security Authority Subsystem Service')
+  await auth(request.patch(`/api/v1/settings/classifier/process-rules/${lsass.id}`)).send({executablePattern:lsass.executablePattern,service:lsass.service,description:lsass.description,priority:lsass.priority,enabled:true}).expect(200)
+  await auth(request.delete(`/api/v1/settings/classifier/process-rules/${created.body.id}`)).expect(204)
+})
