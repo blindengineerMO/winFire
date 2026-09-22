@@ -47,3 +47,20 @@ test('authenticated WEF push inserts events and returns a SOAP acknowledgement',
   await request.post(`/api/v1/wef/wsman?node=${nodeId}&token=wrong`).set('content-type','application/soap+xml').send(eventXml(45)).expect(401)
   await request.post(`/api/v1/wef/wsman?node=${nodeId}&token=${encodeURIComponent(token)}`).set('content-type','application/soap+xml').send('<Envelope/>').expect(400)
 })
+
+test('administrator can store an encrypted WEF secret when environment configuration is absent',async()=>{
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@wef.test',password:'wef-owner-password-123'}).expect(200)
+  const authorization=`Bearer ${login.body.accessToken}`
+  const previous=process.env.WEF_SHARED_SECRET
+  const previousPublic=process.env.PUBLIC_BASE_URL
+  delete process.env.WEF_SHARED_SECRET
+  delete process.env.PUBLIC_BASE_URL
+  try{
+    const saved=await request.patch('/api/v1/settings/wef').set('Authorization',authorization).send({enabled:false,sharedSecret:'administration-secret'}).expect(200)
+    assert.equal(saved.body.secretConfigured,true)
+    assert.equal(saved.body.secretSource,'administration')
+    const server=await request.patch('/api/v1/settings/server').set('Authorization',authorization).send({fqdn:'control.example.test',publicBaseUrl:'https://control.example.test'}).expect(200)
+    assert.equal(server.body.fqdn,'control.example.test')
+    assert.equal(server.body.publicBaseUrl,'https://control.example.test')
+  }finally{process.env.WEF_SHARED_SECRET=previous;process.env.PUBLIC_BASE_URL=previousPublic}
+})

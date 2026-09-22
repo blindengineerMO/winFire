@@ -100,7 +100,7 @@ Administration → **TLS** accepts PEM encoded server and agent CA certificates 
 - `AGENT_CA_CERT`, `AGENT_CA_KEY`: client certificate authority used by enrolled agents.
 - `AGENT_CA_PASSPHRASE`, `TLS_KEY_PASSPHRASE`: private-key passphrases; production agent CA and server keys must be encrypted.
 
-Administration exposes the operational settings that can be changed without editing environment files: directory connections and fallback approval, training, event retention and compaction, loopback handling, WEF, process and traffic ignores, the IANA-backed classifier catalog and custom service rules, portal branding, Entra, MFA prompt behavior, discovery CIDRs, agent polling, event exports, security automation, RPC filters, users, teams, credentials, and audit retention. `PUBLIC_BASE_URL` must be the externally reachable HTTPS origin for email links, MFA portal links, WEF, and agent bootstrap. Set `CORS_ORIGIN` to a comma-separated allow list when the interface is served from another origin.
+Administration exposes the operational settings that can be changed without editing environment files: server FQDN and public URL, directory connections and fallback approval, training, event retention and compaction, loopback handling, WEF (including its encrypted shared secret), process and traffic ignores, the IANA-backed classifier catalog and custom service rules, portal branding, Entra, MFA prompt behavior, discovery CIDRs, agent polling, event exports, security automation, RPC filters, users, teams, credentials, and audit retention. `PUBLIC_BASE_URL` and `SERVER_FQDN` take precedence over values saved in Administration. Set `CORS_ORIGIN` to a comma-separated allow list when the interface is served from another origin.
 
 ## Operator workflow
 

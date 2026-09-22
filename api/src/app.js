@@ -120,10 +120,20 @@ function progressiveSettings() {return {
 const directorySettings=()=>one("SELECT * FROM directory_connections WHERE id='default'")
 const wefPath=()=>one("SELECT value FROM app_settings WHERE key='wef_path'")?.value||'/api/v1/wef/wsman'
 const wefEnabled=()=>one("SELECT value FROM app_settings WHERE key='wef_enabled'")?.value==='true'
-const wefSecret=()=>String(process.env.WEF_SHARED_SECRET||'').trim()
+const savedSetting=key=>String(one('SELECT value FROM app_settings WHERE key=?',key)?.value||'').trim()
+const serverFqdn=()=>savedSetting('server_fqdn')
+const serverPublicBaseUrl=()=>savedSetting('server_public_base_url')
+const savedWefSecret=()=>{
+  const value=savedSetting('wef_shared_secret_sealed')
+  if(!value)return ''
+  try{return String(openSealed(value)?.secret||'').trim()}catch{return ''}
+}
+const wefSecret=()=>String(process.env.WEF_SHARED_SECRET||'').trim()||savedWefSecret()
+const wefSecretSource=()=>process.env.WEF_SHARED_SECRET?'environment':savedWefSecret()?'administration':'unset'
+const effectiveServerFqdn=()=>String(process.env.SERVER_FQDN||serverFqdn()).trim()
+const effectivePublicBaseUrl=req=>String(process.env.PUBLIC_BASE_URL||serverPublicBaseUrl()||`${req.protocol}://${effectiveServerFqdn()||req.get('host')}`).replace(/\/$/,'')
 function publicWef(req){
-  const base=process.env.PUBLIC_BASE_URL||`${req.protocol}://${req.get('host')}`
-  return publicWefSettings({enabled:wefEnabled(),secretConfigured:!!wefSecret(),baseUrl:base,path:wefPath()})
+  return {...publicWefSettings({enabled:wefEnabled(),secretConfigured:!!wefSecret(),baseUrl:effectivePublicBaseUrl(req),path:wefPath()}),secretSource:wefSecretSource(),baseUrlSource:process.env.PUBLIC_BASE_URL?'environment':serverPublicBaseUrl()?'administration':'request'}
 }
 const publicDirectory=settings=>settings&&({url:settings.url||'',baseDn:settings.base_dn||'',bindCredentialId:settings.bind_credential_id||null,nodeCredentialId:settings.node_credential_id||null,actionCredentialId:settings.action_credential_id||null,enabled:!!settings.enabled,syncIntervalMinutes:settings.sync_interval_minutes,allowLdapFallback:!!settings.allow_ldap_fallback,ldapFallbackApprovedBy:settings.ldap_fallback_approved_by||null,ldapFallbackApprovedAt:settings.ldap_fallback_approved_at||null,lastTransport:settings.last_transport||null,lastSyncedAt:settings.last_synced_at,lastSyncAttemptAt:settings.last_sync_attempt_at,lastSyncStatus:settings.last_sync_status,lastSyncError:settings.last_sync_error,lastSyncCount:settings.last_sync_count})
 function directoryCredential(settings) {
@@ -293,11 +303,12 @@ api.get('/agent-package/WinFire.Agent.msi',(req,res)=>{
 })
 api.get('/agent-package/enroll.ps1',wrap(async(req,res)=>{
   if(!req.secure||!agentPkiReady()||!process.env.AGENT_PACKAGE_PATH)return res.status(503).json({error:'Agent bootstrap requires HTTPS, PKI, and a configured package'})
-  if(!process.env.PUBLIC_BASE_URL)return res.status(503).json({error:'Set an HTTPS PUBLIC_BASE_URL for agent bootstrap'})
+  const base=effectivePublicBaseUrl(req)
+  if(!base.startsWith('https://'))return res.status(503).json({error:'Configure an HTTPS public base URL in Server config or PUBLIC_BASE_URL'})
   const packagePath=path.resolve(process.env.AGENT_PACKAGE_PATH)
   if(!fs.existsSync(packagePath)||!fs.statSync(packagePath).isFile())return notFound(res,'Agent package')
   let script
-  try{script=await agentBootstrapScript(packagePath,process.env.PUBLIC_BASE_URL,process.env.AGENT_SIGNER_THUMBPRINT)}
+  try{script=await agentBootstrapScript(packagePath,base,process.env.AGENT_SIGNER_THUMBPRINT)}
   catch(error){return res.status(503).json({error:error.message})}
   res.set('Cache-Control','private, no-store').type('text/plain').send(script)
 }))
@@ -909,13 +920,46 @@ api.patch('/settings/training',requireRole('admin'),(req,res)=>{
   res.json(publicTrainingSettings())
 })
 api.get('/settings/observability',requireRole('admin'),(_req,res)=>res.json(observabilitySettings()))
+const serverFqdnSchema=z.string().trim().max(253).refine(value=>!value||/^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(value),{message:'FQDN may contain letters, numbers, dots, and hyphens'})
+const serverPublicUrlSchema=z.string().trim().max(2048).refine(value=>{
+  if(!value)return true
+  try{const parsed=new URL(value);return ['http:','https:'].includes(parsed.protocol)&&!parsed.username&&!parsed.password&&!parsed.hash&&!parsed.search}catch{return false}
+},{message:'Public base URL must be an absolute HTTP or HTTPS URL without credentials, query, or fragment'})
+api.get('/settings/server',requireRole('admin'),(req,res)=>res.json({
+  fqdn:effectiveServerFqdn()||null,
+  configuredFqdn:serverFqdn()||null,
+  fqdnSource:process.env.SERVER_FQDN?'environment':serverFqdn()?'administration':'unset',
+  publicBaseUrl:effectivePublicBaseUrl(req),
+  configuredPublicBaseUrl:serverPublicBaseUrl()||null,
+  publicBaseUrlConfigured:!!(process.env.PUBLIC_BASE_URL||serverPublicBaseUrl()),
+  publicBaseUrlSource:process.env.PUBLIC_BASE_URL?'environment':serverPublicBaseUrl()?'administration':'request',
+  environmentOverrides:{fqdn:!!process.env.SERVER_FQDN,publicBaseUrl:!!process.env.PUBLIC_BASE_URL},
+}))
+api.patch('/settings/server',requireRole('admin'),(req,res)=>{
+  const data=body(z.object({fqdn:serverFqdnSchema,publicBaseUrl:serverPublicUrlSchema}),req)
+  if(process.env.SERVER_FQDN&&data.fqdn&&data.fqdn!==process.env.SERVER_FQDN.trim())return res.status(409).json({error:'SERVER_FQDN is configured by the deployment environment; change that value instead'})
+  if(process.env.PUBLIC_BASE_URL&&data.publicBaseUrl&&data.publicBaseUrl!==process.env.PUBLIC_BASE_URL.trim())return res.status(409).json({error:'PUBLIC_BASE_URL is configured by the deployment environment; change that value instead'})
+  const before={fqdn:serverFqdn()||null,publicBaseUrl:serverPublicBaseUrl()||null}
+  const next={fqdn:data.fqdn||'',publicBaseUrl:data.publicBaseUrl||''}
+  db.transaction(()=>{
+    if(!process.env.SERVER_FQDN)run("INSERT INTO app_settings(key,value) VALUES('server_fqdn',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",next.fqdn)
+    if(!process.env.PUBLIC_BASE_URL)run("INSERT INTO app_settings(key,value) VALUES('server_public_base_url',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",next.publicBaseUrl)
+    audit(req.user.id,'server.settings.update','app-settings','server',before,next)
+  })()
+  res.json({fqdn:process.env.SERVER_FQDN||next.fqdn||null,configuredFqdn:next.fqdn||null,fqdnSource:process.env.SERVER_FQDN?'environment':next.fqdn?'administration':'unset',publicBaseUrl:effectivePublicBaseUrl(req),configuredPublicBaseUrl:next.publicBaseUrl||null,publicBaseUrlConfigured:!!(process.env.PUBLIC_BASE_URL||next.publicBaseUrl),publicBaseUrlSource:process.env.PUBLIC_BASE_URL?'environment':next.publicBaseUrl?'administration':'request',environmentOverrides:{fqdn:!!process.env.SERVER_FQDN,publicBaseUrl:!!process.env.PUBLIC_BASE_URL}})
+})
 api.get('/settings/wef',requireRole('admin'),(req,res)=>res.json(publicWef(req)))
 api.patch('/settings/wef',requireRole('admin'),(req,res)=>{
-  const data=body(z.object({enabled:z.boolean()}),req)
-  if(data.enabled&&!wefSecret())return res.status(503).json({error:'Set WEF_SHARED_SECRET on the control plane before enabling WEF push'})
+  const data=body(z.object({enabled:z.boolean(),sharedSecret:z.string().trim().min(8).max(512).optional(),clearSecret:z.boolean().optional()}),req)
+  if(process.env.WEF_SHARED_SECRET&&(data.sharedSecret!==undefined||data.clearSecret))return res.status(409).json({error:'WEF_SHARED_SECRET is configured by the deployment environment; change that value instead'})
+  const nextSecret=data.clearSecret?'':data.sharedSecret??wefSecret()
+  if(data.enabled&&!nextSecret)return res.status(503).json({error:'Configure a WEF shared secret before enabling WEF push'})
   const before=wefEnabled()
-  run("UPDATE app_settings SET value=? WHERE key='wef_enabled'",String(data.enabled))
-  audit(req.user.id,'wef.settings.update','app-settings','wef',{enabled:before},{enabled:data.enabled,secretConfigured:!!wefSecret()})
+  db.transaction(()=>{
+    if(!process.env.WEF_SHARED_SECRET&&(data.sharedSecret!==undefined||data.clearSecret))run("INSERT INTO app_settings(key,value) VALUES('wef_shared_secret_sealed',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",nextSecret?seal({secret:nextSecret}):'')
+    run("UPDATE app_settings SET value=? WHERE key='wef_enabled'",String(data.enabled))
+    audit(req.user.id,'wef.settings.update','app-settings','wef',{enabled:before,secretConfigured:!!wefSecret()},{enabled:data.enabled,secretConfigured:!!nextSecret,secretSource:process.env.WEF_SHARED_SECRET?'environment':data.sharedSecret!==undefined||data.clearSecret?'administration':wefSecretSource()})
+  })()
   res.json(publicWef(req))
 })
 api.get('/settings/process-exclusions',requireRole('admin'),(_req,res)=>res.json({names:all('SELECT name FROM process_exclusions ORDER BY name').map(row=>row.name)}))
@@ -1440,7 +1484,7 @@ api.post('/nodes/:id/wef/configure',requireRole('admin'),wrap(async(req,res)=>{
   const secret=wefSecret();if(!secret)return res.status(503).json({error:'Set WEF_SHARED_SECRET on the control plane before configuring WEF push'})
   if(!['winrm','winrms'].includes(node.transport)||node.connection_mode!=='agentless'||node.status!=='reachable')return res.status(409).json({error:'WEF source configuration requires a reachable authenticated WinRM node'})
   const data=body(z.object({refreshSeconds:z.number().int().min(60).max(86400).default(900)}),req)
-  const base=process.env.PUBLIC_BASE_URL||`${req.protocol}://${req.get('host')}`
+  const base=effectivePublicBaseUrl(req)
   let subscriptionUrl
   try {
     const parsed=new URL(base)
@@ -1466,8 +1510,8 @@ api.post('/nodes/:id/deploy-agent',requireRole('admin'),wrap(async(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
   if(node.connection_mode!=='agentless'||!['winrm','winrms'].includes(node.transport)||node.agent_id||one('SELECT id FROM agents WHERE node_id=?',node.id))return res.status(409).json({error:'Agent deployment requires an unenrolled WinRM agentless node'})
   if(!req.secure||!agentPkiReady())return res.status(503).json({error:'Agent deployment requires HTTPS and configured agent PKI'})
-  const base=process.env.PUBLIC_BASE_URL
-  if(!base||!base.startsWith('https://'))return res.status(503).json({error:'Set an HTTPS PUBLIC_BASE_URL for agent deployment'})
+  const base=effectivePublicBaseUrl(req)
+  if(!base.startsWith('https://'))return res.status(503).json({error:'Configure an HTTPS public base URL in Server config or PUBLIC_BASE_URL'})
   if(!process.env.AGENT_PACKAGE_PATH)return res.status(503).json({error:'Set AGENT_PACKAGE_PATH to a signed Windows agent executable'})
   let signerThumbprint
   try{signerThumbprint=normalizeSignerThumbprint(process.env.AGENT_SIGNER_THUMBPRINT)}
