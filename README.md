@@ -159,32 +159,32 @@ Firewall event collection depends on host audit policy. Filtering Platform Conne
 
 ## Screenshots and visual references
 
-# Simple Dashboard
+## Simple Dashboard
 ![ScreenShot1](assets/dashboardEnterprise.png)
 
-# Intuitive Administration
+## Intuitive Administration
 ![ScreenShot2](assets/admin.png)
 
-# Easily Identify Assets using Active Directory, ICMP, or SNMP Scanning.
+## Easily Identify Assets using Active Directory, ICMP, or SNMP Scanning.
 ![ScreenShot3](assets/assetsView.png)
 
-# Drag and Drop Policy Editor
+## Drag and Drop Policy Editor
 ![ScreenShot4](assets/PolicyStudio.png)
 
-# Easily Identify Firewall Events from every node in one place with simple one-click rule creation.
+## Easily Identify Firewall Events from every node in one place with simple one-click rule creation.
 ![ScreenShot5](assets/firewallevents.png)
 
-# Enterprise Logon
+## Enterprise Logon
 ![ScreenShot6](assets/login.png)
 
-# Dynamic Rules Engine Auto-Learns from traffic detected at the firewalls.
+## Dynamic Rules Engine Auto-Learns from traffic detected at the firewalls.
 ![ScreenShot7](assets/autoRules.png)
 
-# Active Directory Integration for Seciroty and MFA Identity.
+## Active Directory Integration for Seciroty and MFA Identity.
 ![ScreenShot8](assets/adUsers.png)
 
-# Network Mapping Features to identify who is talking to who as well as top talkers.
+## Network Mapping Features to identify who is talking to who as well as top talkers.
 ![ScreenShot9](assets/netmapping.png)
 
-# Browser Extension for Enterprise Deployment allows URL monitoring / policy blocking
+## Browser Extension for Enterprise Deployment allows URL monitoring / policy blocking
 ![ScreenShot10](assets/browserwatch.png)
