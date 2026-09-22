@@ -14,9 +14,11 @@ exports.up = async knex => {
     traffic_scope: knex.raw("CASE WHEN external=1 THEN 'external' ELSE 'internal' END"),
     classification_reason: knex.raw("CASE WHEN external=1 THEN 'Imported mapping row; rebuild the map to analyze its address scope' ELSE 'Imported mapping row; rebuild the map to identify its traffic type' END")
   })
+  await knex.raw('CREATE INDEX IF NOT EXISTS idx_network_map_class_scope ON network_map_pairs(traffic_class,traffic_scope,connection_count)')
 }
 
 exports.down = async knex => {
+  await knex.raw('DROP INDEX IF EXISTS idx_network_map_class_scope')
   for (const name of ['classification_json', 'classification_reason', 'traffic_service', 'traffic_scope', 'traffic_class']) {
     if (await knex.schema.hasColumn('network_map_pairs', name)) await knex.schema.alterTable('network_map_pairs', table => table.dropColumn(name))
   }
