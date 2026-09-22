@@ -57,7 +57,7 @@ const addressCategory = value => {
 
 export const normalizeNetworkProtocol = value => {
   const raw = String(value || '').trim().toUpperCase()
-  return ({'6': 'TCP', '17': 'UDP', '1': 'ICMP', '58': 'ICMPV6', TCPV4: 'TCP', TCPV6: 'TCP', UDPV4: 'UDP', UDPV6: 'UDP'})[raw] || raw
+  return ({'1': 'ICMP', '2': 'IGMP', '6': 'TCP', '17': 'UDP', '41': 'IPv6-in-IPv4', '47': 'GRE', '50': 'ESP', '51': 'AH', '58': 'ICMPv6', '89': 'OSPF', '132': 'SCTP', ICMPV6: 'ICMPv6', TCPV4: 'TCP', TCPV6: 'TCP', UDPV4: 'UDP', UDPV6: 'UDP'})[raw] || raw
 }
 
 // Well-known services are intentionally kept in the classifier instead of in
@@ -259,7 +259,28 @@ export function mappingRows({nodeId = null, external = null, trafficClass = null
   const where = filters.length ? `WHERE ${filters.join(' AND ')}` : ''
   const total = one(`SELECT COUNT(*) count FROM network_map_pairs m ${where}`, ...args)?.count || 0
   const safePage = Math.max(1, Number(page) || 1), safeSize = Math.min(500, Math.max(10, Number(pageSize) || 100))
-  const rows = all(`SELECT m.*,sn.hostname source_hostname,dn.hostname destination_hostname FROM network_map_pairs m LEFT JOIN nodes sn ON sn.id=m.source_node_id LEFT JOIN nodes dn ON dn.id=m.destination_node_id ${where} ORDER BY m.connection_count DESC,m.last_seen_at DESC LIMIT ? OFFSET ?`, ...args, safeSize, (safePage - 1) * safeSize)
+  const rows = all(`SELECT m.*,sn.hostname source_hostname,dn.hostname destination_hostname FROM network_map_pairs m LEFT JOIN nodes sn ON sn.id=m.source_node_id LEFT JOIN nodes dn ON dn.id=m.destination_node_id ${where} ORDER BY m.connection_count DESC,m.last_seen_at DESC LIMIT ? OFFSET ?`, ...args, safeSize, (safePage - 1) * safeSize).map(row => {
+    // Older map rows predate the classification columns. Enrich those rows at
+    // read time so the table remains useful before an administrator rebuilds
+    // the map, while preserving the stored values for current rows.
+    const classification = classifyNetworkFlow({
+      sourceIp: row.source_ip,
+      destinationIp: row.destination_ip,
+      protocol: row.protocol,
+      sourcePort: row.source_port,
+      destinationPort: row.destination_port,
+      sourceNode: row.source_node_id ? {id: row.source_node_id} : null,
+      destinationNode: row.destination_node_id ? {id: row.destination_node_id} : null,
+    })
+    return {
+      ...row,
+      protocol: normalizeNetworkProtocol(row.protocol),
+      traffic_class: row.traffic_class || classification.trafficClass,
+      traffic_scope: row.traffic_scope || classification.scope,
+      traffic_service: row.traffic_service || classification.service,
+      classification_reason: row.classification_reason || classification.reason,
+    }
+  })
   const topTalkers = all(`SELECT node_id,hostname,SUM(connections) connections FROM (SELECT source_node_id node_id,COALESCE(sn.hostname,source_ip) hostname,connection_count connections FROM network_map_pairs m LEFT JOIN nodes sn ON sn.id=m.source_node_id ${where} UNION ALL SELECT destination_node_id,COALESCE(dn.hostname,destination_ip),connection_count FROM network_map_pairs m LEFT JOIN nodes dn ON dn.id=m.destination_node_id ${where}) GROUP BY node_id,hostname ORDER BY connections DESC LIMIT 20`, ...args, ...args)
   return {rows, topTalkers, total: Number(total), page: safePage, pageSize: safeSize, pages: Math.ceil(Number(total) / safeSize)}
 }

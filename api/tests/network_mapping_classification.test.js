@@ -67,4 +67,5 @@ test('well-known ports identify common services for mapping and event analysis',
   }
   assert.equal(classifyNetworkFlow({sourceIp: '8.8.8.8', destinationIp: '192.168.88.10', protocol: '6', destinationPort: 443}).service, 'HTTPS web traffic')
   assert.equal(classifyNetworkFlow({sourceIp: '10.0.0.20', destinationIp: '192.168.88.10', protocol: 'UDP', sourcePort: 443}).service, 'HTTP/3 (QUIC) web traffic')
+  assert.equal(classifyNetworkFlow({sourceIp: '192.168.88.10', destinationIp: '224.0.0.1', protocol: '2'}).trafficClass, 'multicast')
 })
