@@ -5,6 +5,7 @@ import {mappingRows, arpRows, recordNetworkFlow} from '../services/networkMappin
 const querySchema = z.object({
   nodeId: z.string().optional(),
   external: z.enum(['0', '1']).optional(),
+  trafficClass: z.string().regex(/^[a-z-]+$/).optional(),
   from: z.string().optional(),
   to: z.string().optional(),
   page: z.coerce.number().int().min(1).default(1),

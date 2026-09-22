@@ -2,17 +2,140 @@ import {isIP} from 'node:net'
 import {all, one, run, id, now} from '../db.js'
 
 const ipv4 = value => String(value || '').trim().split('/')[0]
-const privateV4 = value => {
+  .split('%')[0].toLowerCase()
+const ipv4Int = value => {
   const ip = ipv4(value)
-  if (isIP(ip) !== 4) return false
-  const [a,b] = ip.split('.').map(Number)
-  return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || a === 127 || (a === 169 && b === 254)
+  if (isIP(ip) !== 4) return null
+  const octets = ip.split('.').map(Number)
+  return octets.reduce((result, octet) => (result * 256) + octet, 0) >>> 0
 }
-const privateV6 = value => /^::1$|^fe80:/i.test(ipv4(value)) || /^fd|^fc/i.test(ipv4(value))
-export const isInternalAddress = value => privateV4(value) || privateV6(value)
+const inV4 = (value, start, end) => {
+  const number = ipv4Int(value)
+  if (number === null) return false
+  return number >= start && number <= end
+}
+const V4 = {
+  private10: [0x0a000000, 0x0affffff],
+  private172: [0xac100000, 0xac1fffff],
+  private192: [0xc0a80000, 0xc0a8ffff],
+  loopback: [0x7f000000, 0x7fffffff],
+  linkLocal: [0xa9fe0000, 0xa9feffff],
+  shared: [0x64400000, 0x647fffff],
+  documentation192: [0xc0000200, 0xc00002ff],
+  documentation198: [0xc6336400, 0xc63364ff],
+  documentation203: [0xcb007100, 0xcb0071ff],
+  benchmark: [0xc6120000, 0xc612ffff],
+  multicast: [0xe0000000, 0xefffffff],
+  reserved: [0xf0000000, 0xffffffff],
+}
+const privateV4 = value => inV4(value, ...V4.private10) || inV4(value, ...V4.private172) || inV4(value, ...V4.private192)
+const privateV6 = value => /^fc|^fd/i.test(ipv4(value))
+const normalizedIp = value => ipv4(value)
+const isLoopback = value => inV4(value, ...V4.loopback) || normalizedIp(value) === '::1'
+const isLinkLocal = value => inV4(value, ...V4.linkLocal) || /^fe[89ab][0-9a-f]:/i.test(normalizedIp(value))
+const isMulticast = value => inV4(value, ...V4.multicast) || /^ff[0-9a-f]{2}:/i.test(normalizedIp(value))
+const isBroadcast = value => normalizedIp(value) === '255.255.255.255'
+const isUnspecified = value => normalizedIp(value) === '0.0.0.0' || normalizedIp(value) === '::'
+const isDocumentation = value => inV4(value, ...V4.documentation192) || inV4(value, ...V4.documentation198) || inV4(value, ...V4.documentation203) || /^2001:db8:/i.test(normalizedIp(value))
+const isReserved = value => inV4(value, ...V4.reserved) || inV4(value, ...V4.benchmark)
+export const isInternalAddress = value => privateV4(value) || privateV6(value) || isLoopback(value) || isLinkLocal(value) || isMulticast(value) || isBroadcast(value)
+
+const addressCategory = value => {
+  const address = normalizedIp(value)
+  if (!address || isIP(address) === 0) return 'unknown'
+  if (isBroadcast(address)) return 'broadcast'
+  if (isMulticast(address)) return 'multicast'
+  if (isLoopback(address)) return 'loopback'
+  if (isUnspecified(address)) return 'unspecified'
+  if (isLinkLocal(address)) return 'link-local'
+  if (privateV4(address) || privateV6(address)) return 'private'
+  if (inV4(address, ...V4.shared)) return 'shared'
+  if (isDocumentation(address)) return 'documentation'
+  if (isReserved(address)) return 'reserved'
+  return 'public'
+}
+
+const serviceFor = ({source, destination, protocol, sourcePort, destinationPort}) => {
+  const proto = String(protocol || '').toUpperCase()
+  const ports = new Set([sourcePort, destinationPort].filter(Number.isInteger))
+  const addresses = new Set([normalizedIp(source), normalizedIp(destination)])
+  const has = port => ports.has(port)
+  if ((addresses.has('224.0.0.251') || addresses.has('ff02::fb')) && has(5353)) return 'mDNS service discovery'
+  if ((addresses.has('224.0.0.252') || addresses.has('ff02::1:3')) && has(5355)) return 'LLMNR name resolution'
+  if ((addresses.has('239.255.255.250') || addresses.has('ff02::c')) && has(1900)) return 'SSDP/UPnP discovery'
+  if (has(3702) && (addresses.has('239.255.255.250') || addresses.has('ff02::c'))) return 'WS-Discovery'
+  if (proto === 'UDP' && (has(67) || has(68)) && (addresses.has('0.0.0.0') || addresses.has('255.255.255.255') || addresses.has('::'))) return 'DHCPv4 address assignment'
+  if (proto === 'UDP' && (has(546) || has(547)) && (addresses.has('ff02::1:2') || addresses.has('::'))) return 'DHCPv6 address assignment'
+  if (proto === 'UDP' && (has(137) || has(138))) return 'NetBIOS name or datagram service'
+  if (proto === 'UDP' && has(5353)) return 'mDNS service discovery'
+  if (has(53)) return 'DNS name resolution'
+  if (has(123)) return 'NTP time synchronization'
+  if (has(22)) return 'SSH remote access'
+  if (has(88)) return 'Kerberos authentication'
+  if (has(389) || has(636)) return 'LDAP directory access'
+  if (has(445)) return 'SMB file or management traffic'
+  if (has(3389)) return 'RDP remote desktop'
+  if (has(5985) || has(5986)) return 'WinRM management'
+  if (has(80) || has(443)) return 'HTTP or HTTPS web traffic'
+  return null
+}
+
+const directedBroadcastFor = (address, node) => {
+  const number = ipv4Int(address)
+  if (number === null || number === 0xffffffff || (number & 0xff) !== 0xff) return false
+  let facts
+  try { facts = node?.snapshot_json ? JSON.parse(node.snapshot_json) : null } catch { facts = null }
+  for (const adapter of facts?.network || []) {
+    const ips = Array.isArray(adapter.ipAddresses) ? adapter.ipAddresses : []
+    const masks = Array.isArray(adapter.subnets) ? adapter.subnets : []
+    for (let index = 0; index < ips.length; index++) {
+      const host = ipv4Int(ips[index]), maskValue = ipv4Int(masks[index])
+      if (host === null || maskValue === null || isIP(ipv4(ips[index])) !== 4) continue
+      const broadcast = ((host & maskValue) | (~maskValue >>> 0)) >>> 0
+      if (broadcast === number) return true
+    }
+  }
+  return false
+}
+
+export function classifyNetworkFlow({node, sourceIp, destinationIp, sourceNode, destinationNode, protocol, sourcePort, destinationPort}) {
+  const source = normalizedIp(sourceIp), destination = normalizedIp(destinationIp)
+  const sourceCategory = addressCategory(source), destinationCategory = addressCategory(destination)
+  const broadcast = sourceCategory === 'broadcast' || destinationCategory === 'broadcast' || directedBroadcastFor(source, node) || directedBroadcastFor(destination, node)
+  const multicast = sourceCategory === 'multicast' || destinationCategory === 'multicast'
+  const service = serviceFor({source, destination, protocol, sourcePort, destinationPort})
+  let trafficClass = 'unicast'
+  if (broadcast) trafficClass = 'broadcast'
+  else if (multicast) trafficClass = 'multicast'
+  else if (sourceCategory === 'loopback' || destinationCategory === 'loopback') trafficClass = 'loopback'
+  else if (sourceCategory === 'link-local' || destinationCategory === 'link-local') trafficClass = 'link-local'
+  else if (sourceCategory === 'unspecified' || destinationCategory === 'unspecified') trafficClass = 'unspecified'
+  else if (sourceNode && destinationNode) trafficClass = 'node-to-node'
+  else if (sourceCategory === 'private' && destinationCategory === 'private') trafficClass = 'private'
+  else if (sourceCategory === 'documentation' || destinationCategory === 'documentation' || sourceCategory === 'reserved' || destinationCategory === 'reserved') trafficClass = 'special-purpose'
+  else if (sourceCategory === 'shared' || destinationCategory === 'shared') trafficClass = 'shared-address'
+  else if (sourceCategory === 'public' || destinationCategory === 'public') trafficClass = 'public-unicast'
+
+  const localCategories = new Set(['broadcast', 'multicast', 'loopback', 'link-local', 'private', 'unspecified'])
+  const hasPublic = sourceCategory === 'public' || destinationCategory === 'public'
+  const scope = trafficClass === 'loopback' ? 'host-local' : (localCategories.has(sourceCategory) && localCategories.has(destinationCategory) && !hasPublic) || sourceNode && destinationNode ? 'internal' : hasPublic ? 'external' : 'unknown'
+  let reason
+  if (trafficClass === 'multicast') reason = `${destination || source} is a multicast group; multicast is link or site scoped and is treated as internal traffic`
+  else if (trafficClass === 'broadcast') reason = `${destination || source} is an IPv4 broadcast address; broadcast is local to the attached network`
+  else if (trafficClass === 'node-to-node') reason = 'Both endpoints resolve to managed nodes in the inventory'
+  else if (trafficClass === 'link-local') reason = 'A link-local address is valid only on the local network segment'
+  else if (trafficClass === 'loopback') reason = 'Loopback traffic terminates on the originating host'
+  else if (trafficClass === 'private') reason = 'Both endpoints use private address space'
+  else if (trafficClass === 'special-purpose') reason = 'At least one endpoint is a documentation or reserved address and should not be treated as Internet traffic'
+  else if (trafficClass === 'shared-address') reason = '100.64.0.0/10 is shared carrier-grade NAT space, not a public Internet destination'
+  else if (trafficClass === 'public-unicast') reason = 'At least one endpoint is globally routable and no local-scope exception matched'
+  else reason = 'Address scope could not be determined from the observed tuple'
+  if (service) reason += `; identified as ${service}`
+  return {trafficClass, scope, service, reason, sourceCategory, destinationCategory, external: scope === 'external' ? 1 : 0}
+}
 const clean = value => value === undefined || value === null || value === '' ? null : String(value)
 const port = value => Number.isInteger(Number(value)) && Number(value) > 0 && Number(value) <= 65535 ? Number(value) : null
-const localNode = nodeId => one('SELECT id,ip,hostname FROM nodes WHERE id=?', nodeId)
+const localNode = nodeId => one('SELECT n.id,n.ip,n.hostname,f.snapshot_json FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id WHERE n.id=?', nodeId)
 const nodeForIp = address => address ? one('SELECT id,hostname FROM nodes WHERE lower(ip)=lower(?) LIMIT 1', address) : null
 
 export function recordNetworkFlow(nodeId, event, observedAt = null) {
@@ -28,14 +151,14 @@ export function recordNetworkFlow(nodeId, event, observedAt = null) {
   const protocol = String(event.protocol || 'UNKNOWN').toUpperCase()
   const sourcePort = port(event.srcPort)
   const destinationPort = port(event.dstPort)
-  const external = !(sourceNode && destinationNode) && (!isInternalAddress(sourceIp) || !isInternalAddress(destinationIp))
+  const classification = classifyNetworkFlow({node, sourceIp, destinationIp, sourceNode, destinationNode, protocol, sourcePort, destinationPort})
   const key = [sourceNode?.id || '', destinationNode?.id || '', sourceIp, destinationIp, protocol, sourcePort || '', destinationPort || ''].join('|')
   const at = observedAt || event.eventTime || now()
   const existing = one('SELECT map_key FROM network_map_pairs WHERE map_key=?', key)
   if (existing) {
-    run('UPDATE network_map_pairs SET connection_count=connection_count+1,last_seen_at=?,updated_at=?,sample_program=COALESCE(sample_program,?) WHERE map_key=?', at, now(), clean(event.program), key)
+    run('UPDATE network_map_pairs SET connection_count=connection_count+1,last_seen_at=?,updated_at=?,sample_program=COALESCE(sample_program,?),traffic_class=?,traffic_scope=?,traffic_service=?,classification_reason=?,classification_json=?,external=? WHERE map_key=?', at, now(), clean(event.program), classification.trafficClass, classification.scope, classification.service, classification.reason, JSON.stringify(classification), classification.external, key)
   } else {
-    run('INSERT INTO network_map_pairs(map_key,source_node_id,destination_node_id,source_ip,destination_ip,protocol,source_port,destination_port,direction,external,connection_count,sample_program,first_seen_at,last_seen_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', key, sourceNode?.id || null, destinationNode?.id || null, sourceIp, destinationIp, protocol, sourcePort, destinationPort, direction, Number(external), 1, clean(event.program), at, at, now())
+    run('INSERT INTO network_map_pairs(map_key,source_node_id,destination_node_id,source_ip,destination_ip,protocol,source_port,destination_port,direction,external,traffic_class,traffic_scope,traffic_service,classification_reason,classification_json,connection_count,sample_program,first_seen_at,last_seen_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', key, sourceNode?.id || null, destinationNode?.id || null, sourceIp, destinationIp, protocol, sourcePort, destinationPort, direction, classification.external, classification.trafficClass, classification.scope, classification.service, classification.reason, JSON.stringify(classification), 1, clean(event.program), at, at, now())
   }
   return true
 }
@@ -55,10 +178,11 @@ export function recordArpEntries(nodeId, entries, source = 'agent') {
   return saved
 }
 
-export function mappingRows({nodeId = null, external = null, from = null, to = null, page = 1, pageSize = 100} = {}) {
+export function mappingRows({nodeId = null, external = null, trafficClass = null, from = null, to = null, page = 1, pageSize = 100} = {}) {
   const filters = [], args = []
   if (nodeId) { filters.push('(m.source_node_id=? OR m.destination_node_id=?)'); args.push(nodeId, nodeId) }
   if (external !== null && external !== undefined && external !== '') { filters.push('m.external=?'); args.push(Number(external) ? 1 : 0) }
+  if (trafficClass) { filters.push('m.traffic_class=?'); args.push(trafficClass) }
   if (from) { filters.push('datetime(m.last_seen_at)>=datetime(?)'); args.push(from) }
   if (to) { filters.push('datetime(m.first_seen_at)<=datetime(?)'); args.push(to) }
   const where = filters.length ? `WHERE ${filters.join(' AND ')}` : ''

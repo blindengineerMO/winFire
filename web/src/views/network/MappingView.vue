@@ -9,14 +9,14 @@ import {mappingService} from '../../services/mapping.js'
 
 const activeTab=ref('pairs')
 const rows=ref([]),topTalkers=ref([]),arp=ref([]),nodes=ref([])
-const nodeId=ref(''),external=ref(''),page=ref(1),pageSize=ref(100),pages=ref(1),total=ref(0)
+const nodeId=ref(''),external=ref(''),trafficClass=ref(''),page=ref(1),pageSize=ref(100),pages=ref(1),total=ref(0)
 const loading=ref(false),error=ref(''),message=ref('')
 const selectedNode=computed(()=>nodes.value.find(node=>node.id===nodeId.value))
 
 async function load(){
   loading.value=true;error.value=''
   try{
-    const [result,arpResult]=await Promise.all([mappingService.listPairs({page:page.value,pageSize:pageSize.value,nodeId:nodeId.value,external:external.value}),mappingService.listArp(nodeId.value)])
+    const [result,arpResult]=await Promise.all([mappingService.listPairs({page:page.value,pageSize:pageSize.value,nodeId:nodeId.value,external:external.value,trafficClass:trafficClass.value}),mappingService.listArp(nodeId.value)])
     rows.value=result.rows;topTalkers.value=result.topTalkers;pages.value=Math.max(result.pages,1);total.value=result.total;arp.value=arpResult.items
   }catch(cause){error.value=cause.message}
   finally{loading.value=false}
@@ -51,7 +51,7 @@ onMounted(async()=>{try{nodes.value=await mappingService.listNodes();await load(
     </nav>
 
     <section v-if="activeTab==='pairs'" class="mapping-tab" role="tabpanel">
-      <section class="panel glass"><div class="panel-title"><div><span class="eyebrow">CONNECTION GRAPH</span><h2>Node pairs and external traffic</h2></div><MappingFilters :nodes="nodes" :node-id="nodeId" :external="external" @update:nodeId="nodeId=$event" @update:external="external=$event" @change="changeFilter" /></div><MappingPairsTable :rows="rows" :loading="loading" :total="total" :page="page" :pages="pages" @previous="next(-1)" @next="next(1)" /></section>
+      <section class="panel glass"><div class="panel-title"><div><span class="eyebrow">CONNECTION GRAPH</span><h2>Node pairs and analyzed traffic</h2></div><MappingFilters :nodes="nodes" :node-id="nodeId" :external="external" :traffic-class="trafficClass" @update:nodeId="nodeId=$event" @update:external="external=$event" @update:trafficClass="trafficClass=$event" @change="changeFilter" /></div><MappingPairsTable :rows="rows" :loading="loading" :total="total" :page="page" :pages="pages" @previous="next(-1)" @next="next(1)" /></section>
       <ArpSnapshotTable :entries="arp" :node-selected="!!nodeId" @collect="collectArp" />
     </section>
     <section v-else class="mapping-tab" role="tabpanel"><TopTalkersTable :talkers="topTalkers" /><p class="mapping-note">Top talkers are calculated from the observed connection pairs and include both managed nodes and external peers.</p></section>

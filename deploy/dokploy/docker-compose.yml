@@ -1,0 +1,78 @@
+name: winfire
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-winfire}
+      POSTGRES_USER: ${POSTGRES_USER:-winfire}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy:
+      replicas: 1
+
+  api:
+    build:
+      context: ../..
+      dockerfile: deploy/dokploy/api.Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: 3000
+      HOST: 0.0.0.0
+      DATA_DIR: /data
+      DATABASE_DRIVER: ${DATABASE_DRIVER:-sqlite}
+      DATABASE_URL: ${POSTGRES_URL:?POSTGRES_URL is required}
+      POSTGRES_URL: ${POSTGRES_URL:?POSTGRES_URL is required}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      VAULT_MASTER_KEY: ${VAULT_MASTER_KEY:?VAULT_MASTER_KEY is required}
+      BOOTSTRAP_ADMIN_ENABLED: ${BOOTSTRAP_ADMIN_ENABLED:-false}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@winfire.local}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:?BOOTSTRAP_ADMIN_PASSWORD is required}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?PUBLIC_BASE_URL is required}
+      CORS_ORIGIN: ${CORS_ORIGIN:?CORS_ORIGIN is required}
+      WINRM_INSECURE_HTTP: ${WINRM_INSECURE_HTTP:-false}
+      LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-90}
+      SWEEP_INTERVAL_MINUTES: ${SWEEP_INTERVAL_MINUTES:-60}
+      LOG_POLL_INTERVAL_SECONDS: ${LOG_POLL_INTERVAL_SECONDS:-120}
+    volumes:
+      - api-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/api/v1/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    deploy:
+      replicas: 1
+
+  ui:
+    build:
+      context: ../..
+      dockerfile: deploy/dokploy/ui.Dockerfile
+    restart: unless-stopped
+    ports:
+      - "80"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    deploy:
+      replicas: 1
+
+volumes:
+  api-data:
+  postgres-data:

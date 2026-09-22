@@ -13,7 +13,7 @@ WinFire Secure is a control plane for firewall visibility, policy design, host i
 - **Policy studio:** visual flow editor, classic rule editor, version history, comparisons, deduplication, compatible rule merging, conflict checks, assignments to nodes, groups, or all nodes, verification, staged deployment, and a top-bar **Sync policies** action.
 - **Learning:** automatic new-host training, progressive learning, live policy previews, evidence for learned flows, review and approval, personal learned policies, and group/global policy composition.
 - **Firewall events:** server-side paging (100 rows by default), filters, sorting, search, loopback controls, event exports, event-to-rule actions, account and process ignore rules, retroactive cleanup, WEF ingestion, and WinRM/WMI collection.
-- **Network visibility:** internal and external connection mapping, node pairs, top talkers, ARP snapshots, CIDR discovery scans, agent telemetry, and separate Internet visibility for browser navigation metadata.
+- **Network visibility:** internal and external connection mapping, node pairs, top talkers, ARP snapshots, CIDR discovery scans, agent telemetry, and separate Internet visibility for browser navigation metadata. Mapping explains local broadcast, multicast, loopback, link-local, private, shared CGNAT, special-purpose, and public traffic and recognizes common services such as mDNS, LLMNR, DNS, DHCP, SMB, RDP, and WinRM.
 - **Agentless MFA:** portal-based RDP/SSH access requests with TOTP or Entra authentication, optional browser prompting through a managed WinRM workstation, temporary firewall grants, expiry, and fail-open or fail-closed controls.
 - **Optional universal agent:** Windows, Linux, and macOS builds with native firewall backends where supported; policy jobs, event shipment, heartbeats, ARP collection, certificate enrollment, and optional deployment from Inventory.
 - **Administration:** training, observability, process and traffic exclusions, WEF, discovery, directory, Entra, portal branding, event export destinations, security automation, RPC filters, agent delivery, and TLS certificate uploads.
@@ -36,6 +36,39 @@ npm start
 `npm start` builds the operator interface and starts the API and interface on the same port. The default is `http://localhost:3000`; set `PORT` and `HOST` to change the listener. Use `DATA_DIR` to place the database, encrypted secrets, uploaded branding, and administration-managed TLS material in another directory.
 
 For local development, `npm run dev:api` starts the API watcher and `npm run dev:web` starts the interface development server. Run `npm test` for the API test suite and `npm run build` for a production interface build.
+
+### Deploy to Dokploy
+
+The checked-in `deploy/dokploy/docker-compose.yml` defines separate `api`, `ui`,
+and PostgreSQL services. Run the interactive deployment wizard from a machine
+that can reach the Dokploy API:
+
+```bash
+npm run deploy:dokploy
+```
+
+The wizard asks for the Dokploy URL/IP and API key, lists the projects and
+environments returned by Dokploy, and asks for a service name, base DNS domain,
+GitHub repository/branch, and bootstrap administrator values. It generates a
+random hostname below the base domain, creates the compose application, saves
+the generated environment, attaches the hostname to the `ui` service, deploys,
+and prints the deployment status and URL. The API key is read interactively and
+is never written to disk. Point internal DNS at the printed hostname with a
+CNAME. HTTPS can be enabled in the wizard after the CNAME resolves publicly so
+Dokploy can complete a Let's Encrypt challenge.
+
+For automation, `DOKPLOY_URL`, `DOKPLOY_API_KEY`, `DOKPLOY_PROJECT_ID`,
+`DOKPLOY_ENVIRONMENT_ID`, `WINFIRE_SERVICE_NAME`, `WINFIRE_BASE_DOMAIN`,
+`WINFIRE_BOOTSTRAP_EMAIL`, `WINFIRE_BOOTSTRAP_PASSWORD`,
+`WINFIRE_GITHUB_REPOSITORY`, `WINFIRE_GITHUB_BRANCH`, and `WINFIRE_HTTPS` can
+provide wizard values through a secret manager or CI job; they remain
+process-only values.
+
+The initial stack sets one replica for every service and includes health checks,
+persistent API/PostgreSQL volumes, and an Nginx UI proxy. WinFire's current
+database migration engine remains SQLite backed by the API data volume; the
+PostgreSQL service and `POSTGRES_URL` are provisioned for the database adapter
+migration and are ready for a later PostgreSQL cutover.
 
 ### Bootstrap administrator
 

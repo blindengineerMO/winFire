@@ -16,6 +16,7 @@
     "build:agent-macos-arm64": "dotnet publish agent/WinFire.Agent/WinFire.Agent.csproj -c Release -r osx-arm64 --self-contained true -p:PublishSingleFile=true -o agent/dist/osx-arm64",
     "build:agent-msi": "npm run build:agent && dotnet build agent/WinFire.Agent.Setup/WinFire.Agent.Setup.wixproj -c Release",
     "start": "npm run build && node api/src/server.js",
+    "deploy:dokploy": "node scripts/deploy-dokploy.mjs",
     "dev:api": "node --watch api/src/server.js",
     "dev:web": "npm run dev -w web",
     "setup:winrm": "python3 -m venv .venv && .venv/bin/pip install -r api/sidecar/requirements.txt",
