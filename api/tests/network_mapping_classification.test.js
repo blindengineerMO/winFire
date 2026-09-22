@@ -105,6 +105,19 @@ test('LSASS program paths identify the Local Security Authority service', () => 
   }
 })
 
+test('DFSR program paths identify Distributed File System Replication', () => {
+  for (const program of [
+    '\\\\Device\\HarddiskVolume3\\Windows\\System32\\dfsrs.exe',
+    'C:\\Windows\\System32\\dfsrs.exe',
+  ]) {
+    const result = classifyNetworkFlow({
+      sourceIp: '192.168.88.10', destinationIp: '10.0.0.20', protocol: 'TCP',
+      sourcePort: 50123, destinationPort: 49152, program,
+    })
+    assert.equal(result.service, 'Distributed File System Replication (DFSR)', program)
+  }
+})
+
 test('mapping read repairs legacy unidentified service values', () => {
   db.prepare("INSERT INTO nodes(id,hostname,ip,status) VALUES(?,?,?,?)").run('mapping-node','MAPPING-NODE','192.168.88.40','reachable')
   assert.equal(recordNetworkFlow('mapping-node', {eventType:'firewall', srcIp:'192.168.88.40', dstIp:'8.8.8.8', protocol:'6', srcPort:'50123', dstPort:'443', direction:'out'}), true)

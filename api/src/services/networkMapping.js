@@ -162,6 +162,9 @@ const serviceFor = ({source, destination, protocol, sourcePort, destinationPort,
   // is a stronger signal than a port because LSASS can use several dynamic
   // RPC ports, so identify it before the protocol and catalog rules.
   if (/(^|[\\/])lsass\.exe(?:$|[\\/?\\s])/i.test(String(program || '').trim())) return 'Local Security Authority Subsystem Service'
+  // DFS Replication likewise uses dynamic RPC traffic, so the executable path
+  // is the reliable service signal when a Windows firewall event includes it.
+  if (/(^|[\\/])dfsrs\.exe(?:$|[\\/?\\s])/i.test(String(program || '').trim())) return 'Distributed File System Replication (DFSR)'
   // Customer rules have precedence over the built-in and IANA catalog,
   // regardless of the customer-selected priority value.
   if (classifierRuleSuppresses(proto, normalizedSourcePort, normalizedDestinationPort, {sources: ['custom']})) return null
