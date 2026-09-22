@@ -19,6 +19,7 @@ import {expireMfaChallenges} from './mfaChallenges.js'
 import {pollFleet} from './fleetPoll.js'
 import {refreshDynamicGroups} from './dynamicNodeGroups.js'
 import {dueSnmpTargets,pollSnmpDiscoveryTarget} from './snmpDiscoveryService.js'
+import {processPassiveDiscovery} from './passiveDiscovery.js'
 
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..')
 const dist=path.join(root,'web/dist')
@@ -134,6 +135,17 @@ async function sweepSnmpDiscovery(){
 setTimeout(sweepSnmpDiscovery,20_000).unref()
 const snmpDiscoveryTimer=setInterval(sweepSnmpDiscovery,60_000)
 snmpDiscoveryTimer.unref()
+let passiveDiscoveryRunning=false
+async function sweepPassiveDiscovery(){
+  if(passiveDiscoveryRunning)return
+  passiveDiscoveryRunning=true
+  try{await processPassiveDiscovery({limit:32})}
+  catch(error){console.error('Passive ARP discovery failed:',error.message)}
+  finally{passiveDiscoveryRunning=false}
+}
+setTimeout(sweepPassiveDiscovery,25_000).unref()
+const passiveDiscoveryTimer=setInterval(sweepPassiveDiscovery,60_000)
+passiveDiscoveryTimer.unref()
 setTimeout(()=>processDueAdAccountHolds().catch(error=>console.error('AD account hold sweep failed:',error)),10_000).unref()
 const adHoldTimer=setInterval(()=>processDueAdAccountHolds().catch(error=>console.error('AD account hold sweep failed:',error)),60_000)
 adHoldTimer.unref()

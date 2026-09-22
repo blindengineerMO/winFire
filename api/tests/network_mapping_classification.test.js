@@ -6,7 +6,8 @@ import path from 'node:path'
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'winfire-mapping-'))
 process.env.DATA_DIR = dir
-const {classifyNetworkFlow} = await import('../src/services/networkMapping.js')
+const {classifyNetworkFlow,recordArpEntries} = await import('../src/services/networkMapping.js')
+const {db}=await import('../src/db.js')
 
 test.after(() => fs.rmSync(dir, {recursive: true, force: true}))
 
@@ -68,4 +69,17 @@ test('well-known ports identify common services for mapping and event analysis',
   assert.equal(classifyNetworkFlow({sourceIp: '8.8.8.8', destinationIp: '192.168.88.10', protocol: '6', destinationPort: 443}).service, 'HTTPS web traffic')
   assert.equal(classifyNetworkFlow({sourceIp: '10.0.0.20', destinationIp: '192.168.88.10', protocol: 'UDP', sourcePort: 443}).service, 'HTTP/3 (QUIC) web traffic')
   assert.equal(classifyNetworkFlow({sourceIp: '192.168.88.10', destinationIp: '224.0.0.1', protocol: '2'}).trafficClass, 'multicast')
+})
+
+test('managed-node ARP observations queue only new passive discovery candidates',()=>{
+  db.prepare("INSERT INTO nodes(id,hostname,ip,status) VALUES(?,?,?,?)").run('arp-source','ARP-SOURCE','192.168.88.10','reachable')
+  db.prepare("INSERT INTO nodes(id,hostname,ip,status) VALUES(?,?,?,?)").run('known-node','KNOWN','192.168.88.20','reachable')
+  assert.equal(recordArpEntries('arp-source',[
+    {ip:'192.168.88.10',mac:'00:00:00:00:00:10'},
+    {ip:'192.168.88.20',mac:'00:00:00:00:00:20'},
+    {ip:'192.168.88.30',mac:'00:00:00:00:00:30',hostname:'new-host'},
+    {ip:'192.168.88.30',mac:'00:00:00:00:00:30',hostname:'new-host'}
+  ]),4)
+  const candidate=db.prepare('SELECT ip,mac,source_node_id,status,hostname FROM passive_discovery_candidates').all()
+  assert.deepEqual(candidate,[{ip:'192.168.88.30',mac:'00:00:00:00:00:30',source_node_id:'arp-source',status:'queued',hostname:'new-host'}])
 })

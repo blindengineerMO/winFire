@@ -237,13 +237,25 @@ export function recordNetworkFlow(nodeId, event, observedAt = null) {
 export function recordArpEntries(nodeId, entries, source = 'agent') {
   const items = Array.isArray(entries) ? entries.slice(0, 5000) : []
   let saved = 0
+  const sourceNode = one('SELECT id,ip FROM nodes WHERE id=?', nodeId)
   for (const item of items) {
     const ip = clean(item.ip)
     if (!ip || isIP(ipv4(ip)) === 0) continue
-    const existing = one('SELECT id FROM arp_entries WHERE node_id=? AND ip=? AND mac IS ?', nodeId, ip, clean(item.mac))
+    const mac = clean(item.mac) || null
+    const existing = one('SELECT id FROM arp_entries WHERE node_id=? AND ip=? AND mac IS ?', nodeId, ip, mac)
     const at = clean(item.observedAt) || now()
     if (existing) run('UPDATE arp_entries SET hostname=?,interface=?,state=?,source=?,observed_at=? WHERE id=?', clean(item.hostname), clean(item.interface), clean(item.state), source, at, existing.id)
-    else run('INSERT INTO arp_entries(id,node_id,ip,mac,hostname,interface,state,source,observed_at) VALUES(?,?,?,?,?,?,?,?,?)', id(), nodeId, ip, clean(item.mac), clean(item.hostname), clean(item.interface), clean(item.state), source, at)
+    else run('INSERT INTO arp_entries(id,node_id,ip,mac,hostname,interface,state,source,observed_at) VALUES(?,?,?,?,?,?,?,?,?)', id(), nodeId, ip, mac, clean(item.hostname), clean(item.interface), clean(item.state), source, at)
+    // A managed node's ARP cache is a passive discovery source. Queue only
+    // addresses that are not already inventory records and never queue the
+    // reporting node's own address. The queue keeps ingestion synchronous and
+    // lets the normal DNS/WinRM onboarding worker handle network operations.
+    const inventoryNode = one('SELECT id FROM nodes WHERE lower(ip)=lower(?) LIMIT 1', ip)
+    if (sourceNode && ip !== sourceNode.ip && !inventoryNode) run(`INSERT INTO passive_discovery_candidates(id,ip,mac,source_node_id,hostname,first_seen_at,last_seen_at,status,attempts,next_attempt_at,node_id,last_error,updated_at)
+      VALUES(?,?,?,?,?,?,?,'queued',0,NULL,NULL,NULL,?)
+      ON CONFLICT(ip) DO UPDATE SET mac=COALESCE(excluded.mac,passive_discovery_candidates.mac),source_node_id=excluded.source_node_id,hostname=COALESCE(excluded.hostname,passive_discovery_candidates.hostname),last_seen_at=excluded.last_seen_at,updated_at=excluded.updated_at,
+        status=CASE WHEN passive_discovery_candidates.status='registered' THEN passive_discovery_candidates.status ELSE 'queued' END,
+        next_attempt_at=CASE WHEN passive_discovery_candidates.status='registered' THEN passive_discovery_candidates.next_attempt_at ELSE NULL END`, id(), ip, mac, nodeId, clean(item.hostname) || null, at, at, at)
     saved++
   }
   return saved

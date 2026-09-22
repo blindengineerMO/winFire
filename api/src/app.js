@@ -54,6 +54,7 @@ import {mappingRoutes} from './routes/mapping.js'
 import {expandCidrs,runDiscoveryScan} from './networkDiscovery.js'
 import {validSnmpHost,normalizeSnmpSecret} from './snmpDiscovery.js'
 import {snmpTargets,pollSnmpDiscoveryTarget} from './snmpDiscoveryService.js'
+import {passiveDiscoveryRows,passiveDiscoverySummary,processPassiveDiscovery} from './passiveDiscovery.js'
 import {asyncHandler} from './middleware/asyncHandler.js'
 import {normalizeDynamicRules,dynamicNodeGroupSettings,publicDynamicGroup,updateDynamicGroup,refreshDynamicGroups} from './dynamicNodeGroups.js'
 
@@ -576,6 +577,8 @@ api.post('/discovery/snmp-targets/:id/poll',requireRole('admin'),wrap(async(req,
   const result=await pollSnmpDiscoveryTarget(reqId(req),{actorId:req.user.id})
   res.json(result)
 }))
+api.get('/discovery/passive-candidates',requireRole('admin'),(req,res)=>res.json({summary:passiveDiscoverySummary(),items:passiveDiscoveryRows({status:req.query.status||null,limit:req.query.limit})}))
+api.post('/discovery/passive-candidates/process',requireRole('admin'),wrap(async(req,res)=>res.json(await processPassiveDiscovery({limit:32,actorId:req.user.id}))))
 api.post('/nodes/:id/arp/collect',requireRole('editor'),(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
   if(!node.agent_id)return res.status(409).json({error:'ARP collection requires an enrolled agent on this node'})
