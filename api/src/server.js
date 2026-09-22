@@ -17,6 +17,7 @@ import {revokeExpiredGrants} from './mfaPortal.js'
 import {sweepMfaPrompts} from './mfaPrompt.js'
 import {expireMfaChallenges} from './mfaChallenges.js'
 import {pollFleet} from './fleetPoll.js'
+import {refreshDynamicGroups} from './dynamicNodeGroups.js'
 
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..')
 const dist=path.join(root,'web/dist')
@@ -108,6 +109,17 @@ async function sweepDirectory(){
 setTimeout(sweepDirectory,2000).unref()
 const directoryTimer=setInterval(sweepDirectory,5*60_000)
 directoryTimer.unref()
+let dynamicGroupsRunning=false
+async function sweepDynamicGroups(){
+  if(dynamicGroupsRunning)return
+  dynamicGroupsRunning=true
+  try{refreshDynamicGroups()}
+  catch(error){console.error('Dynamic node group sweep failed:',error)}
+  finally{dynamicGroupsRunning=false}
+}
+setTimeout(sweepDynamicGroups,2500).unref()
+const dynamicGroupsTimer=setInterval(sweepDynamicGroups,60_000)
+dynamicGroupsTimer.unref()
 setTimeout(()=>processDueAdAccountHolds().catch(error=>console.error('AD account hold sweep failed:',error)),10_000).unref()
 const adHoldTimer=setInterval(()=>processDueAdAccountHolds().catch(error=>console.error('AD account hold sweep failed:',error)),60_000)
 adHoldTimer.unref()

@@ -9,7 +9,7 @@ WinFire Secure is a control plane for firewall visibility, policy design, host i
 - **Secure operator access:** owner, administrator, policy editor, and auditor roles; resource grants; invitations; password changes; session revocation; optional authenticator login; rate limiting; account lockout; and an auditable change history.
 - **Credential vault:** encrypted credentials with write-only passwords, local and domain accounts, node and group assignments, authentication tests, rotation, and priority ordering.
 - **Directory and identity:** LDAPS computer and user discovery, explicit LDAP 389 fallback approval, AD and local account inventory, account detail windows, MFA enrollment status, logon and logoff history, operator import, account status controls, logon-rights baseline, and identity segments.
-- **Monitored assets:** DNS forward and reverse lookups, OS and hardware facts, domain status, SIDs and GUIDs, users, network interfaces, firewall profiles, paged firewall rules, training status, group membership, management credentials, and agent status.
+- **Monitored assets:** DNS forward and reverse lookups, OS and hardware facts, domain status, SIDs and GUIDs, users, network interfaces, firewall profiles, paged firewall rules, training status, manual and dynamic group membership, management credentials, and agent status. Dynamic groups can match hostnames, FQDNs, IP addresses, or CIDRs and refresh on an administrator-selected interval.
 - **Policy studio:** visual flow editor, classic rule editor, version history, comparisons, deduplication, compatible rule merging, conflict checks, assignments to nodes, groups, or all nodes, verification, staged deployment, and a top-bar **Sync policies** action.
 - **Learning:** automatic new-host training, progressive learning, live policy previews, evidence for learned flows, review and approval, personal learned policies, and group/global policy composition.
 - **Firewall events:** server-side paging (100 rows by default), filters, sorting, search, loopback controls, event exports, event-to-rule actions, account and process ignore rules, retroactive cleanup, WEF ingestion, and WinRM/WMI collection.
@@ -62,7 +62,7 @@ Administration exposes the operational settings that can be changed without edit
 ## Operator workflow
 
 1. Sign in with the bootstrap administrator and change the password.
-2. Open Administration → Credentials and store the directory bind account and management credentials.
+2. Open Administration → Credentials and store the directory bind account and management credentials. Set the Dynamic node group refresh interval in Administration → Observability.
 3. Open Administration → Directory, configure the controller URL and search base, select credentials, and test the connection. LDAPS is the default. LDAP 389 requires an explicit administrator approval checkbox and is used only as a transport fallback when LDAPS is unavailable.
 4. Run a computer sync. AD computers are matched by directory GUID, resolved with forward and reverse DNS, assigned the directory management credential, and placed into automatic training. Manual nodes follow the same fact, audit, and event collection workflow.
 5. Use Entities → Directory to search AD and local accounts. Click an account for its AD-style detail view, groups, SID, status, MFA enrollment, operator mapping, associated nodes, and recent logon or MFA events. Use the account controls only with an approved reason and confirmation.
@@ -99,7 +99,7 @@ All API routes are under `/api/v1` and require a bearer access token unless mark
 - `/auth/*`: sign-in, refresh, sign-out, password changes, TOTP, email verification, and authenticator enrollment.
 - `/users`, `/teams`, `/invites`, `/access`, `/audit`: operator administration, resource grants, invitations, and audit search/export.
 - `/credentials`: vault records, assignments, tests, and rotation.
-- `/nodes`, `/node-groups`: inventory, facts, DNS, probes, credentials, firewall rules, training, agentless verification, break glass, and group membership.
+- `/nodes`, `/node-groups`: inventory, facts, DNS, probes, credentials, firewall rules, training, agentless verification, break glass, manual and dynamic group membership, and scheduled group refresh.
 - `/directory/*`: directory test/sync, AD and local account inventories, account status, operator import, and account-scoped rules.
 - `/policies`, `/learning-sessions`, `/policy-sync`: policy versions, assignments, verification, learned previews, approvals, and deployment queues.
 - `/logs`, `/event-export`, `/settings/process-exclusions`, `/settings/traffic-ignores`: event search, collection, exports, filtering, ignore rules, and cleanup.

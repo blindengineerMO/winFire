@@ -42,7 +42,7 @@ test('log filters, retention and scheduled DNS refresh use saved settings',async
   const auth=req=>req.set('Authorization',`Bearer ${login.body.accessToken}`)
   const node=await auth(request.post('/api/v1/nodes')).send({hostname:'localhost',ip:'127.0.0.1'}).expect(201)
   const read=await auth(request.get('/api/v1/settings/observability')).expect(200)
-  assert.deepEqual(read.body,{logRetentionDays:90,dnsRefreshHours:24,eventCompactHours:24,hideLoopbackEvents:true,ignoreLoopbackIngest:false})
+  assert.deepEqual(read.body,{logRetentionDays:90,dnsRefreshHours:24,eventCompactHours:24,dynamicNodeGroupsIntervalMinutes:60,hideLoopbackEvents:true,ignoreLoopbackIngest:false})
   await auth(request.patch('/api/v1/settings/observability')).send({logRetentionDays:0,dnsRefreshHours:24}).expect(400)
   await auth(request.patch('/api/v1/settings/observability')).send({logRetentionDays:30,dnsRefreshHours:12}).expect(200)
   const event=db.prepare('INSERT INTO log_events(id,node_id,record_id,event_id,action,protocol,dst_port,direction,program,challenge_id,event_time,received_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')

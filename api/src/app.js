@@ -53,6 +53,7 @@ import {recordNetworkFlow} from './services/networkMapping.js'
 import {mappingRoutes} from './routes/mapping.js'
 import {expandCidrs,runDiscoveryScan} from './networkDiscovery.js'
 import {asyncHandler} from './middleware/asyncHandler.js'
+import {normalizeDynamicRules,dynamicNodeGroupSettings,publicDynamicGroup,updateDynamicGroup,refreshDynamicGroups} from './dynamicNodeGroups.js'
 
 export const app=express()
 app.disable('x-powered-by')
@@ -933,12 +934,14 @@ api.post('/settings/traffic-ignores/cleanup',requireRole('admin'),(req,res)=>{
 })
 api.get('/settings/logs-display',(_req,res)=>res.json({hideLoopbackEvents:observabilitySettings().hideLoopbackEvents}))
 api.patch('/settings/observability',requireRole('admin'),(req,res)=>{
-  const data=body(z.object({logRetentionDays:z.number().int().min(1).max(3650),dnsRefreshHours:z.number().int().min(1).max(720),eventCompactHours:z.number().int().min(1).max(720).optional(),hideLoopbackEvents:z.boolean().optional(),ignoreLoopbackIngest:z.boolean().optional()}),req)
+  const data=body(z.object({logRetentionDays:z.number().int().min(1).max(3650),dnsRefreshHours:z.number().int().min(1).max(720),eventCompactHours:z.number().int().min(1).max(720).optional(),dynamicNodeGroupsIntervalMinutes:z.number().int().min(5).max(10080).optional(),hideLoopbackEvents:z.boolean().optional(),ignoreLoopbackIngest:z.boolean().optional()}),req)
   const before=observabilitySettings()
   db.transaction(()=>{
     run("UPDATE app_settings SET value=? WHERE key='log_retention_days'",String(data.logRetentionDays))
     run("UPDATE app_settings SET value=? WHERE key='dns_refresh_hours'",String(data.dnsRefreshHours))
     if(data.eventCompactHours!==undefined)run("UPDATE app_settings SET value=? WHERE key='event_compact_hours'",String(data.eventCompactHours))
+    if(data.dynamicNodeGroupsIntervalMinutes!==undefined)run("UPDATE app_settings SET value=? WHERE key='dynamic_node_groups_interval_minutes'",String(data.dynamicNodeGroupsIntervalMinutes))
+    if(data.dynamicNodeGroupsIntervalMinutes!==undefined)run("UPDATE node_groups SET dynamic_next_evaluation_at=? WHERE dynamic_enabled=1",now())
     if(data.hideLoopbackEvents!==undefined)run("UPDATE app_settings SET value=? WHERE key='hide_loopback_events'",String(data.hideLoopbackEvents))
     if(data.ignoreLoopbackIngest!==undefined)run("UPDATE app_settings SET value=? WHERE key='ignore_loopback_ingest'",String(data.ignoreLoopbackIngest))
     audit(req.user.id,'observability.settings.update','app-settings','observability',before,data)
@@ -1545,18 +1548,44 @@ api.get('/nodes/:id/firewall-rules',wrap(async(req,res)=>{
 }))
 api.get('/nodes/:id/dns',(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json(one('SELECT * FROM dns_lookups WHERE node_id=?',node.id)||{})})
 api.post('/nodes/:id/dns/refresh',requireRole('editor'),wrap(async(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json(await lookupDns(node))}))
-api.get('/node-groups',(req,res)=>res.json(all('SELECT * FROM node_groups ORDER BY name').filter(group=>canReadResource(req.user,'node_group',group)).map(group=>({...group,count:Number(one('SELECT COUNT(*) count FROM node_group_members WHERE group_id=?',group.id)?.count||0),policy_count:Number(one('SELECT COUNT(*) count FROM policy_assignments WHERE node_group_id=?',group.id)?.count||0),canWrite:canWriteResource(req.user,'node_group',group)}))))
+api.get('/node-groups',(req,res)=>res.json(all('SELECT * FROM node_groups ORDER BY name').filter(group=>canReadResource(req.user,'node_group',group)).map(group=>({...group,...publicDynamicGroup(group),count:Number(one('SELECT COUNT(*) count FROM node_group_members WHERE group_id=?',group.id)?.count||0),policy_count:Number(one('SELECT COUNT(*) count FROM policy_assignments WHERE node_group_id=?',group.id)?.count||0),canWrite:canWriteResource(req.user,'node_group',group)}))))
 api.get('/node-groups/:id',(req,res)=>{
   const group=one('SELECT * FROM node_groups WHERE id=?',reqId(req));if(!group)return notFound(res,'Node group')
   if(!canReadResource(req.user,'node_group',group))return res.status(403).json({error:'Insufficient permission for node group'})
   const members=all('SELECT n.id,n.hostname,n.fqdn,n.ip,n.status,n.firewall_state FROM nodes n JOIN node_group_members m ON m.node_id=n.id WHERE m.group_id=? ORDER BY n.hostname',group.id)
-  res.json({...group,count:members.length,members,canWrite:canWriteResource(req.user,'node_group',group)})
+  res.json({...group,...publicDynamicGroup(group),count:members.length,members,canWrite:canWriteResource(req.user,'node_group',group)})
 })
-api.post('/node-groups',requireRole('editor'),(req,res)=>{const {name}=body(z.object({name:z.string().min(1)}),req),groupId=id();run('INSERT INTO node_groups(id,name,owner_user_id) VALUES(?,?,?)',groupId,name,req.user.id);audit(req.user.id,'node-group.create','node-group',groupId,null,{name});res.status(201).json({id:groupId,name,owner_user_id:req.user.id})})
+api.post('/node-groups',requireRole('editor'),(req,res)=>{
+  const data=body(z.object({name:z.string().trim().min(1).max(120),dynamic:z.object({enabled:z.boolean().optional(),match:z.enum(['all','any']).optional(),rules:z.array(z.object({field:z.enum(['name','hostname','fqdn','ip']),operator:z.enum(['contains','equals','cidr']),value:z.string().trim().min(1).max(255)})).max(25).optional()}).optional()}),req)
+  let dynamic
+  try{dynamic=normalizeDynamicRules(data.dynamic||{})}catch(error){return res.status(400).json({error:error.message})}
+  const groupId=id(),next=dynamic.enabled?new Date(Date.now()+dynamicNodeGroupSettings().intervalMinutes*60_000).toISOString():null
+  run('INSERT INTO node_groups(id,name,owner_user_id,dynamic_enabled,dynamic_match,dynamic_rules_json,dynamic_next_evaluation_at) VALUES(?,?,?,?,?,?,?)',groupId,data.name,req.user.id,Number(dynamic.enabled),dynamic.match,json(dynamic.rules),next)
+  audit(req.user.id,'node-group.create','node-group',groupId,null,{name:data.name,dynamic})
+  let group=one('SELECT * FROM node_groups WHERE id=?',groupId)
+  if(dynamic.enabled){refreshDynamicGroups({groupId,force:true});group=one('SELECT * FROM node_groups WHERE id=?',groupId)}
+  res.status(201).json({...group,...publicDynamicGroup(group),count:Number(one('SELECT COUNT(*) count FROM node_group_members WHERE group_id=?',groupId)?.count||0),owner_user_id:req.user.id})
+})
+api.patch('/node-groups/:id',requireRole('editor'),(req,res)=>{
+  const group=one('SELECT * FROM node_groups WHERE id=?',reqId(req));if(!group)return notFound(res,'Node group')
+  if(!canWriteResource(req.user,'node_group',group))return res.status(403).json({error:'Insufficient permission for node group'})
+  const data=body(z.object({name:z.string().trim().min(1).max(120).optional(),dynamic:z.object({enabled:z.boolean().optional(),match:z.enum(['all','any']).optional(),rules:z.array(z.object({field:z.enum(['name','hostname','fqdn','ip']),operator:z.enum(['contains','equals','cidr']),value:z.string().trim().min(1).max(255)})).max(25).optional()}).optional()}),req)
+  if(data.name!==undefined)run('UPDATE node_groups SET name=? WHERE id=?',data.name,group.id)
+  if(data.dynamic!==undefined){let dynamicGroup;try{dynamicGroup=updateDynamicGroup(group.id,data.dynamic,req.user.id)}catch(error){return res.status(error.status||400).json({error:error.message})};if(dynamicGroup?.dynamic_enabled)refreshDynamicGroups({groupId:group.id,force:true})}
+  const updated=one('SELECT * FROM node_groups WHERE id=?',group.id)
+  res.json({...updated,...publicDynamicGroup(updated),count:Number(one('SELECT COUNT(*) count FROM node_group_members WHERE group_id=?',group.id)?.count||0),canWrite:canWriteResource(req.user,'node_group',updated)})
+})
+api.post('/node-groups/:id/refresh',requireRole('editor'),(req,res)=>{
+  const group=one('SELECT * FROM node_groups WHERE id=?',reqId(req));if(!group)return notFound(res,'Node group')
+  if(!group.dynamic_enabled)return res.status(409).json({error:'This node group does not use dynamic membership'})
+  if(!canWriteResource(req.user,'node_group',group))return res.status(403).json({error:'Insufficient permission for node group'})
+  res.json({results:refreshDynamicGroups({groupId:group.id,force:true})})
+})
 api.post('/node-groups/:id/members',requireRole('editor'),(req,res)=>{
   const {nodeId}=body(z.object({nodeId:z.string()}),req),node=getNode(nodeId),group=one('SELECT * FROM node_groups WHERE id=?',reqId(req))
   if(!node)return notFound(res,'Node')
   if(!group)return notFound(res,'Node group')
+  if(group.dynamic_enabled)return res.status(409).json({error:'Dynamic node group membership is managed by its rules'})
   if(!canWriteResource(req.user,'node_group',group))return res.status(403).json({error:'Insufficient permission for node group'})
   const assigned=all(`SELECT DISTINCT p.id,p.name,v.rules_compiled_json FROM policies p JOIN policy_assignments a ON a.policy_id=p.id JOIN policy_versions v ON v.id=p.current_version_id WHERE a.node_group_id=?`,group.id)
   if(assigned.some(policy=>one('SELECT id FROM policy_assignments WHERE policy_id=? AND removal_job_id IS NOT NULL',policy.id)))return res.status(409).json({error:'Wait for pending agent firewall cleanup before changing this group'})
@@ -1572,6 +1601,7 @@ api.delete('/node-groups/:id/members/:nodeId',requireRole('editor'),wrap(async(r
   if(!group)return notFound(res,'Node group')
   if(!node)return notFound(res,'Node')
   if(group.id==='winfire-global-all-nodes')return res.status(409).json({error:'Every node belongs to the global policy scope'})
+  if(group.dynamic_enabled)return res.status(409).json({error:'Dynamic node group membership is managed by its rules'})
   if(!canWriteResource(req.user,'node_group',group))return res.status(403).json({error:'Insufficient permission for node group'})
   if(!one('SELECT 1 FROM node_group_members WHERE group_id=? AND node_id=?',group.id,node.id))return notFound(res,'Group membership')
   const policies=all('SELECT DISTINCT p.* FROM policies p JOIN policy_assignments a ON a.policy_id=p.id WHERE a.node_group_id=?',group.id)

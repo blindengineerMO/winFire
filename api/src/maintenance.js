@@ -1,11 +1,12 @@
 import crypto from 'node:crypto'
 import {db,all,one,run,id,now} from './db.js'
 import {lookupDns} from './connector.js'
+import {dynamicNodeGroupIntervalMinutes} from './dynamicNodeGroups.js'
 
 const setting=(key,fallback)=>Number(one('SELECT value FROM app_settings WHERE key=?',key)?.value||fallback)
 
 export function observabilitySettings() {
-  return {logRetentionDays:setting('log_retention_days',90),dnsRefreshHours:setting('dns_refresh_hours',24),eventCompactHours:setting('event_compact_hours',24),hideLoopbackEvents:one("SELECT value FROM app_settings WHERE key='hide_loopback_events'")?.value!=='false',ignoreLoopbackIngest:one("SELECT value FROM app_settings WHERE key='ignore_loopback_ingest'")?.value==='true'}
+  return {logRetentionDays:setting('log_retention_days',90),dnsRefreshHours:setting('dns_refresh_hours',24),eventCompactHours:setting('event_compact_hours',24),dynamicNodeGroupsIntervalMinutes:dynamicNodeGroupIntervalMinutes(),hideLoopbackEvents:one("SELECT value FROM app_settings WHERE key='hide_loopback_events'")?.value!=='false',ignoreLoopbackIngest:one("SELECT value FROM app_settings WHERE key='ignore_loopback_ingest'")?.value==='true'}
 }
 
 export function compactDueEvents(at=new Date(),limit=2000){
