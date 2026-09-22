@@ -52,6 +52,8 @@ import {internetRoutes} from './routes/internet.js'
 import {classifyNetworkFlow,normalizeNetworkProtocol,recordNetworkFlow} from './services/networkMapping.js'
 import {mappingRoutes} from './routes/mapping.js'
 import {expandCidrs,runDiscoveryScan} from './networkDiscovery.js'
+import {validSnmpHost,normalizeSnmpSecret} from './snmpDiscovery.js'
+import {snmpTargets,pollSnmpDiscoveryTarget} from './snmpDiscoveryService.js'
 import {asyncHandler} from './middleware/asyncHandler.js'
 import {normalizeDynamicRules,dynamicNodeGroupSettings,publicDynamicGroup,updateDynamicGroup,refreshDynamicGroups} from './dynamicNodeGroups.js'
 
@@ -533,6 +535,47 @@ api.post('/discovery/scans',requireRole('admin'),(req,res)=>{
   setImmediate(()=>runDiscoveryScan(scanId).catch(error=>console.error('Discovery scan failed:',error)))
   res.status(202).json({id:scanId,status:'queued',addresses:hosts.length})
 })
+const snmpCidr=value=>{
+  const [address,prefixText]=String(value||'').trim().split('/')
+  const prefix=prefixText===undefined?32:Number(prefixText)
+  return isIP(address)===4&&Number.isInteger(prefix)&&prefix>=0&&prefix<=32?`${address}/${prefix}`:null
+}
+api.get('/discovery/snmp-targets',requireRole('admin'),(_req,res)=>res.json(snmpTargets()))
+api.post('/discovery/snmp-targets',requireRole('admin'),(req,res)=>{
+  const data=body(z.object({name:z.string().trim().min(1).max(120),host:z.string().trim().min(1).max(253),cidr:z.string().trim().max(32).optional(),credentialId:z.string().min(1),enabled:z.boolean().default(true),pollIntervalMinutes:z.number().int().min(5).max(10080).default(60)}),req)
+  const host=validSnmpHost(data.host),cidr=data.cidr?snmpCidr(data.cidr):null
+  if(!host)return res.status(400).json({error:'SNMP target host must be an IP address or DNS hostname'})
+  if(data.cidr&&!cidr)return res.status(400).json({error:'SNMP discovery scope must be an IPv4 CIDR'})
+  const credential=one('SELECT * FROM credentials WHERE id=?',data.credentialId)
+  if(!credential)return notFound(res,'Credential')
+  if(!['snmp-v2c','snmp-v3'].includes(credential.type))return res.status(400).json({error:'Select an SNMP v2c or SNMP v3 credential'})
+  if(!canUseCredential(req.user,credential))return res.status(403).json({error:'Insufficient permission'})
+  if(one('SELECT id FROM snmp_discovery_targets WHERE lower(host)=lower(?) AND COALESCE(cidr,\'\')=COALESCE(?,\'\')',host,cidr))return res.status(409).json({error:'An SNMP target already exists for this host and scope'})
+  const targetId=id(),stamp=now()
+  run('INSERT INTO snmp_discovery_targets(id,name,host,cidr,credential_id,enabled,poll_interval_minutes,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)',targetId,data.name,host,cidr,data.credentialId,Number(data.enabled),data.pollIntervalMinutes,req.user.id,stamp,stamp)
+  audit(req.user.id,'snmp-discovery.target.create','snmp-target',targetId,null,{name:data.name,host,cidr,credentialId:data.credentialId,pollIntervalMinutes:data.pollIntervalMinutes})
+  res.status(201).json(snmpTargets().find(item=>item.id===targetId))
+})
+api.patch('/discovery/snmp-targets/:id',requireRole('admin'),(req,res)=>{
+  const target=one('SELECT * FROM snmp_discovery_targets WHERE id=?',reqId(req));if(!target)return notFound(res,'SNMP target')
+  const data=body(z.object({name:z.string().trim().min(1).max(120).optional(),host:z.string().trim().min(1).max(253).optional(),cidr:z.string().trim().max(32).nullable().optional(),credentialId:z.string().min(1).optional(),enabled:z.boolean().optional(),pollIntervalMinutes:z.number().int().min(5).max(10080).optional()}),req)
+  const host=data.host===undefined?target.host:validSnmpHost(data.host),cidr=data.cidr===undefined?target.cidr:(data.cidr?snmpCidr(data.cidr):null)
+  if(!host)return res.status(400).json({error:'SNMP target host must be an IP address or DNS hostname'})
+  if(data.cidr&&!cidr)return res.status(400).json({error:'SNMP discovery scope must be an IPv4 CIDR'})
+  const credentialId=data.credentialId||target.credential_id,credential=one('SELECT * FROM credentials WHERE id=?',credentialId)
+  if(!credential)return notFound(res,'Credential')
+  if(!['snmp-v2c','snmp-v3'].includes(credential.type))return res.status(400).json({error:'Select an SNMP v2c or SNMP v3 credential'})
+  if(!canUseCredential(req.user,credential))return res.status(403).json({error:'Insufficient permission'})
+  const stamp=now()
+  run('UPDATE snmp_discovery_targets SET name=?,host=?,cidr=?,credential_id=?,enabled=?,poll_interval_minutes=?,updated_at=? WHERE id=?',data.name||target.name,host,cidr,credentialId,data.enabled===undefined?target.enabled:Number(data.enabled),data.pollIntervalMinutes||target.poll_interval_minutes,stamp,target.id)
+  audit(req.user.id,'snmp-discovery.target.update','snmp-target',target.id,target,{name:data.name||target.name,host,cidr,credentialId})
+  res.json(snmpTargets().find(item=>item.id===target.id))
+})
+api.delete('/discovery/snmp-targets/:id',requireRole('admin'),(req,res)=>{const target=one('SELECT * FROM snmp_discovery_targets WHERE id=?',reqId(req));if(!target)return notFound(res,'SNMP target');run('DELETE FROM snmp_discovery_targets WHERE id=?',target.id);audit(req.user.id,'snmp-discovery.target.delete','snmp-target',target.id,target,null);res.status(204).end()})
+api.post('/discovery/snmp-targets/:id/poll',requireRole('admin'),wrap(async(req,res)=>{
+  const result=await pollSnmpDiscoveryTarget(reqId(req),{actorId:req.user.id})
+  res.json(result)
+}))
 api.post('/nodes/:id/arp/collect',requireRole('editor'),(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
   if(!node.agent_id)return res.status(409).json({error:'ARP collection requires an enrolled agent on this node'})
@@ -1204,17 +1247,28 @@ api.post('/directory/users/:id/import-operator',requireRole('admin'),wrap(async(
 
 const visibleCredentials=user=>(user.role==='owner'||user.role==='admin' ? all('SELECT id,name,type,username,owner_user_id,visibility,team_id,priority,created_at FROM credentials ORDER BY priority,name') : all(`SELECT id,name,type,username,owner_user_id,visibility,team_id,priority,created_at FROM credentials WHERE owner_user_id=? OR (visibility='team' AND team_id=?) OR EXISTS (SELECT 1 FROM resource_grants g WHERE g.resource_type='credential' AND g.resource_id=credentials.id AND g.grantee_user_id=?) ORDER BY priority,name`,user.id,user.team_id,user.id)).map(credential=>({...credential,canWrite:canWriteResource(user,'credential',credential)}))
 api.get('/credentials',(req,res)=>res.json(visibleCredentials(req.user)))
+const credentialInputSchema=z.object({name:z.string().trim().min(1).max(120),type:z.enum(['local','domain','snmp-v2c','snmp-v3']),username:z.string().trim().max(255).default(''),password:z.string().max(4096).optional(),community:z.string().max(255).optional(),securityLevel:z.enum(['noAuthNoPriv','authNoPriv','authPriv']).optional(),authProtocol:z.enum(['md5','sha','sha224','sha256','sha384','sha512']).optional(),authKey:z.string().max(4096).optional(),privProtocol:z.enum(['des','aes','aes256b','aes256r']).optional(),privKey:z.string().max(4096).optional(),visibility:z.enum(['private','team']).default('private'),teamId:z.string().optional(),priority:z.number().int().min(-100000).max(100000).default(100)}).superRefine((value,ctx)=>{
+  if(['local','domain'].includes(value.type)&&(!value.username||!value.password))ctx.addIssue({code:'custom',path:['password'],message:'Username and password are required for Windows credentials'})
+  if(value.type==='snmp-v2c'&&!value.community&&!value.password)ctx.addIssue({code:'custom',path:['community'],message:'SNMP v2c requires a community string'})
+  if(value.type==='snmp-v3')try{normalizeSnmpSecret(value.type,value)}catch(error){ctx.addIssue({code:'custom',path:['username'],message:error.message})}
+})
+const sealedCredentialSecret=data=>['snmp-v2c','snmp-v3'].includes(data.type)?normalizeSnmpSecret(data.type,data):{password:data.password}
 api.post('/credentials',requireRole('editor'),(req,res)=>{
-  const data=body(z.object({name:z.string().min(1),type:z.enum(['local','domain']),username:z.string().min(1),password:z.string().min(1),visibility:z.enum(['private','team']).default('private'),teamId:z.string().optional(),priority:z.number().int().default(100)}),req)
-  const credentialId=id();run('INSERT INTO credentials(id,name,type,username,encrypted_blob,owner_user_id,visibility,team_id,priority) VALUES(?,?,?,?,?,?,?,?,?)',credentialId,data.name,data.type,data.username,seal({password:data.password}),req.user.id,data.visibility,data.teamId||req.user.team_id||null,data.priority)
-  audit(req.user.id,'credential.create','credential',credentialId,null,{name:data.name,type:data.type});res.status(201).json({id:credentialId,name:data.name,type:data.type,username:data.username,visibility:data.visibility})
+  const data=body(credentialInputSchema,req),credentialId=id(),username=data.type==='snmp-v2c'?(data.username||'community') : data.username
+  run('INSERT INTO credentials(id,name,type,username,encrypted_blob,owner_user_id,visibility,team_id,priority) VALUES(?,?,?,?,?,?,?,?,?)',credentialId,data.name,data.type,username,seal(sealedCredentialSecret(data)),req.user.id,data.visibility,data.teamId||req.user.team_id||null,data.priority)
+  audit(req.user.id,'credential.create','credential',credentialId,null,{name:data.name,type:data.type});res.status(201).json({id:credentialId,name:data.name,type:data.type,username,visibility:data.visibility})
 })
 api.patch('/credentials/:id',requireRole('editor'),(req,res)=>{
   const credential=one('SELECT * FROM credentials WHERE id=?',reqId(req));if(!credential)return notFound(res)
   if(!canWriteResource(req.user,'credential',credential))return res.status(403).json({error:'Insufficient permission'})
-  const data=body(z.object({name:z.string().min(1).optional(),username:z.string().min(1).optional(),password:z.string().min(1).optional(),priority:z.number().int().optional()}),req)
+  const data=body(z.object({name:z.string().trim().min(1).max(120).optional(),username:z.string().trim().max(255).optional(),password:z.string().max(4096).optional(),community:z.string().max(255).optional(),securityLevel:z.enum(['noAuthNoPriv','authNoPriv','authPriv']).optional(),authProtocol:z.enum(['md5','sha','sha224','sha256','sha384','sha512']).optional(),authKey:z.string().max(4096).optional(),privProtocol:z.enum(['des','aes','aes256b','aes256r']).optional(),privKey:z.string().max(4096).optional(),priority:z.number().int().min(-100000).max(100000).optional()}),req)
+  let encrypted=credential.encrypted_blob
+  if(['snmp-v2c','snmp-v3'].includes(credential.type)&&(data.password||data.community||data.securityLevel||data.authProtocol||data.authKey||data.privProtocol||data.privKey||data.username)){
+    const current=openSealed(credential.encrypted_blob),next={...current,...data,username:data.username||credential.username}
+    encrypted=seal(normalizeSnmpSecret(credential.type,next))
+  }else if(data.password)encrypted=seal({password:data.password})
   db.transaction(()=>{
-    run('UPDATE credentials SET name=?,username=?,encrypted_blob=?,priority=? WHERE id=?',data.name||credential.name,data.username||credential.username,data.password?seal({password:data.password}):credential.encrypted_blob,data.priority??credential.priority,credential.id)
+    run('UPDATE credentials SET name=?,username=?,encrypted_blob=?,priority=? WHERE id=?',data.name||credential.name,data.username||credential.username,encrypted,data.priority??credential.priority,credential.id)
     if(data.password||data.username&&data.username!==credential.username){
       const directory=directorySettings()
       if(directory?.bind_credential_id===credential.id&&directory.allow_ldap_fallback&&directory.ldap_fallback_approved_at){

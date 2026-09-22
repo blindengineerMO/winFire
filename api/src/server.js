@@ -18,6 +18,7 @@ import {sweepMfaPrompts} from './mfaPrompt.js'
 import {expireMfaChallenges} from './mfaChallenges.js'
 import {pollFleet} from './fleetPoll.js'
 import {refreshDynamicGroups} from './dynamicNodeGroups.js'
+import {dueSnmpTargets,pollSnmpDiscoveryTarget} from './snmpDiscoveryService.js'
 
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..')
 const dist=path.join(root,'web/dist')
@@ -120,6 +121,19 @@ async function sweepDynamicGroups(){
 setTimeout(sweepDynamicGroups,2500).unref()
 const dynamicGroupsTimer=setInterval(sweepDynamicGroups,60_000)
 dynamicGroupsTimer.unref()
+let snmpRunning=false
+async function sweepSnmpDiscovery(){
+  if(snmpRunning)return
+  snmpRunning=true
+  try{
+    for(const target of dueSnmpTargets()){
+      try{await pollSnmpDiscoveryTarget(target.id)}catch(error){console.error(`SNMP discovery failed for ${target.id}:`,error.message)}
+    }
+  }finally{snmpRunning=false}
+}
+setTimeout(sweepSnmpDiscovery,20_000).unref()
+const snmpDiscoveryTimer=setInterval(sweepSnmpDiscovery,60_000)
+snmpDiscoveryTimer.unref()
 setTimeout(()=>processDueAdAccountHolds().catch(error=>console.error('AD account hold sweep failed:',error)),10_000).unref()
 const adHoldTimer=setInterval(()=>processDueAdAccountHolds().catch(error=>console.error('AD account hold sweep failed:',error)),60_000)
 adHoldTimer.unref()

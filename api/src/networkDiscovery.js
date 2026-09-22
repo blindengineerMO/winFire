@@ -95,7 +95,7 @@ function existingNode(ip,hostname){
   const lower=String(hostname||'').toLowerCase()
   return one('SELECT * FROM nodes WHERE ip=? OR lower(hostname)=? OR lower(fqdn)=? ORDER BY CASE WHEN inventory_source=\'ad\' THEN 0 ELSE 1 END LIMIT 1',ip,lower,lower)
 }
-async function registerHost(ip,scanId,livenessMethod='icmp'){
+export async function registerHost(ip,scanId,livenessMethod='icmp'){
   let hostname=ip,fqdn=null
   try{const names=await dns.reverse(ip);if(names[0]){fqdn=names[0];hostname=fqdn.split('.')[0]}}catch{}
   const found=existingNode(ip,hostname)

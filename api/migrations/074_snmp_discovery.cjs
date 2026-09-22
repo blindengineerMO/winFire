@@ -1,0 +1,40 @@
+exports.up = async knex => {
+  await knex.schema.createTable('snmp_discovery_targets', table => {
+    table.text('id').primary()
+    table.text('name').notNullable()
+    table.text('host').notNullable()
+    table.text('cidr')
+    table.text('credential_id').notNullable().references('id').inTable('credentials').onDelete('CASCADE')
+    table.integer('enabled').notNullable().defaultTo(1)
+    table.integer('poll_interval_minutes').notNullable().defaultTo(60)
+    table.text('last_poll_at')
+    table.text('last_status')
+    table.text('last_error')
+    table.text('last_result_json').notNullable().defaultTo('{}')
+    table.text('created_by').references('id').inTable('users').onDelete('SET NULL')
+    table.text('created_at').notNullable()
+    table.text('updated_at').notNullable()
+  })
+  await knex.schema.createTable('snmp_discovery_polls', table => {
+    table.text('id').primary()
+    table.text('target_id').notNullable().references('id').inTable('snmp_discovery_targets').onDelete('CASCADE')
+    table.text('status').notNullable()
+    table.integer('arp_count').notNullable().defaultTo(0)
+    table.integer('mac_port_count').notNullable().defaultTo(0)
+    table.integer('registered_count').notNullable().defaultTo(0)
+    table.text('result_json').notNullable().defaultTo('{}')
+    table.text('error')
+    table.text('started_at').notNullable()
+    table.text('finished_at')
+    table.text('requested_by').references('id').inTable('users').onDelete('SET NULL')
+  })
+  await knex.raw('CREATE INDEX idx_snmp_target_due ON snmp_discovery_targets(enabled,last_poll_at)')
+  await knex.raw('CREATE INDEX idx_snmp_poll_target ON snmp_discovery_polls(target_id,started_at)')
+}
+
+exports.down = async knex => {
+  await knex.raw('DROP INDEX IF EXISTS idx_snmp_poll_target')
+  await knex.raw('DROP INDEX IF EXISTS idx_snmp_target_due')
+  await knex.schema.dropTableIfExists('snmp_discovery_polls')
+  await knex.schema.dropTableIfExists('snmp_discovery_targets')
+}
