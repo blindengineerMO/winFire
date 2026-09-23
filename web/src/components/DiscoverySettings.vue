@@ -4,11 +4,12 @@ import {api} from '../services/api.js'
 import ConfirmDialog from './ConfirmDialog.vue'
 import SnmpDiscoverySettings from './SnmpDiscoverySettings.vue'
 
-defineProps({credentials: {type: Array, default: () => []}})
+const props = defineProps({credentials: {type: Array, default: () => []}})
 
 const activeTab = ref('cidr')
 const cidrs = ref(''), scans = ref([]), schedules = ref([]), passive = ref({summary: {}, items: []})
 const busy = ref(false), scheduleBusy = ref(false), error = ref(''), message = ref(''), passiveAvailable = ref(true)
+const preflightBusy = ref(false), preflightResult = ref(null), preflightHost = ref(''), preflightCredentialId = ref('')
 const confirmOpen = ref(false), scheduleToDelete = ref(null)
 const scheduleForm = ref({name: '', cidrs: '', intervalMinutes: 60, enabled: true})
 
@@ -26,8 +27,16 @@ async function load() {
   else if (!error.value) error.value = passiveResult.reason?.message || 'Unable to load passive discovery candidates'
 }
 const cidrValues = value => String(value || '').split(/[\n,]/).map(item => item.trim()).filter(Boolean)
+const preflightLabel = result => { if (!result) return ''; if (!result.success) return result.error || 'Credential test failed'; return `Verified ${(result.transport || 'management').toUpperCase()}${result.computerName ? ` · ${result.computerName}` : ''}` }
 const diffText = scan => { const summary = scan?.diff?.summary; if (!summary) return '—'; return `${summary.new ?? summary.newCount ?? 0} new · ${summary.gone ?? summary.goneCount ?? 0} dark · ${summary.changed ?? summary.changedCount ?? 0} changed` }
 async function scan() { busy.value = true; error.value = ''; message.value = ''; try { const result = await api('/discovery/scans', {method: 'POST', body: {cidrs: cidrValues(cidrs.value)}}); message.value = `Scan queued for ${result.addresses} address${result.addresses === 1 ? '' : 'es'}.`; cidrs.value = ''; await load() } catch (cause) { error.value = cause.message } finally { busy.value = false } }
+async function preflightDiscoveryCredential() {
+  if (!preflightHost.value.trim() || !preflightCredentialId.value) { preflightResult.value = {success: false, error: 'Enter a host from the CIDR and select a Windows credential.'}; return }
+  preflightBusy.value = true; preflightResult.value = null
+  try { preflightResult.value = await api(`/credentials/${preflightCredentialId.value}/preflight`, {method: 'POST', body: {host: preflightHost.value.trim()}}) }
+  catch (cause) { preflightResult.value = {success: false, error: cause.message} }
+  finally { preflightBusy.value = false }
+}
 async function saveSchedule() { scheduleBusy.value = true; error.value = ''; message.value = ''; try { const form = scheduleForm.value; const result = await api('/discovery/schedules', {method: 'POST', body: {name: form.name, cidrs: cidrValues(form.cidrs), intervalMinutes: Number(form.intervalMinutes), enabled: !!form.enabled}}); message.value = `Schedule “${result.name}” saved.`; scheduleForm.value = {name: '', cidrs: '', intervalMinutes: 60, enabled: true}; await load() } catch (cause) { error.value = cause.message } finally { scheduleBusy.value = false } }
 async function toggleSchedule(schedule) { scheduleBusy.value = true; error.value = ''; try { await api(`/discovery/schedules/${schedule.id}`, {method: 'PATCH', body: {enabled: !schedule.enabled}}); await load() } catch (cause) { error.value = cause.message } finally { scheduleBusy.value = false } }
 async function runSchedule(schedule) { scheduleBusy.value = true; error.value = ''; message.value = ''; try { const result = await api(`/discovery/schedules/${schedule.id}/run-now`, {method: 'POST', body: {}}); message.value = `Scheduled scan queued (${result.scanId}).`; await load() } catch (cause) { error.value = cause.message } finally { scheduleBusy.value = false } }
@@ -48,7 +57,7 @@ onMounted(load)
 
     <template v-if="activeTab === 'cidr'">
       <p class="muted">Probe bounded IPv4 CIDRs with ICMP first, then a same-subnet ARP request and a small TCP management-port fallback (445, 3389, 5985, 5986). Hosts that block ping can still be discovered and are marked with the liveness method used.</p>
-      <form class="form-grid" @submit.prevent="scan"><label>CIDRs (one per line)<textarea v-model="cidrs" rows="4" required placeholder="10.20.0.0/24&#10;192.168.50.0/24"></textarea></label><div class="form-actions"><button class="button primary" :disabled="busy">{{busy ? 'Starting…' : 'Start discovery scan'}}</button></div></form>
+      <form class="form-grid" @submit.prevent="scan"><label>CIDRs (one per line)<textarea v-model="cidrs" rows="4" required placeholder="10.20.0.0/24&#10;192.168.50.0/24"></textarea></label><div class="form-actions"><button class="button primary" :disabled="busy">{{busy ? 'Starting…' : 'Start discovery scan'}}</button></div></form><section class="preflight-panel"><div><span class="eyebrow">CREDENTIAL PREFLIGHT</span><h3>Test Windows credentials before discovery</h3><p class="muted">Test a representative host from this subnet before saving it to the discovery workflow. A failed test does not create an asset.</p></div><div class="form-grid preflight-grid"><label>Host or IP<input v-model.trim="preflightHost" placeholder="192.168.50.10"></label><label>Windows credential<select v-model="preflightCredentialId"><option value="">Select credential</option><option v-for="credential in props.credentials.filter(item=>['local','domain'].includes(item.type))" :key="credential.id" :value="credential.id">{{credential.name}} · {{credential.username}}</option></select></label></div><div class="inline-actions"><button type="button" class="button secondary" :disabled="preflightBusy" @click="preflightDiscoveryCredential">{{preflightBusy ? 'Testing…' : 'Test connection'}}</button><span v-if="preflightResult" class="status" :class="preflightResult.success ? 'reachable' : 'failed'">{{preflightLabel(preflightResult)}}</span></div></section>
       <section class="schedule-panel">
         <div class="panel-title"><div><span class="eyebrow">AUTOMATION</span><h2>Recurring discovery scans</h2></div><span class="status reachable">5 minutes–weekly</span></div>
         <p class="muted">Save a CIDR set to scan repeatedly. Each completed run is compared with the previous run and records new, dark, and changed hosts.</p>
@@ -71,5 +80,5 @@ onMounted(load)
 </template>
 
 <style scoped>
-.discovery-settings{display:grid;gap:1rem}.discovery-settings .panel-title{padding:0 0 .8rem}.discovery-settings textarea{width:100%;box-sizing:border-box}.discovery-settings .muted{padding:0 1rem}.schedule-panel{display:grid;gap:.75rem;border-top:1px solid var(--border);padding-top:1rem}.schedule-panel .panel-title{padding:0 1rem}.schedule-form{grid-template-columns:repeat(2,minmax(0,1fr))}.schedule-form label:first-child,.schedule-form label:nth-child(2){grid-column:span 2}.schedule-panel table{min-width:1000px}.schedule-panel td small{display:block}.danger-text{display:block;color:var(--danger)}.passive-discovery,.other-discovery{display:grid;gap:.75rem;border-top:1px solid var(--border);padding-top:1rem}.passive-discovery .panel-title,.other-discovery .panel-title{padding:0 1rem}.other-discovery{min-height:180px}@media(max-width:700px){.schedule-form{grid-template-columns:1fr}.schedule-form label:first-child,.schedule-form label:nth-child(2){grid-column:auto}}
+.discovery-settings{display:grid;gap:1rem}.preflight-panel{display:grid;gap:.75rem;border:1px solid var(--border);border-radius:8px;padding:1rem}.preflight-panel h3{margin:.25rem 0}.preflight-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.preflight-panel .muted{padding:0}@media(max-width:700px){.preflight-grid{grid-template-columns:1fr}}.discovery-settings .panel-title{padding:0 0 .8rem}.discovery-settings textarea{width:100%;box-sizing:border-box}.discovery-settings .muted{padding:0 1rem}.schedule-panel{display:grid;gap:.75rem;border-top:1px solid var(--border);padding-top:1rem}.schedule-panel .panel-title{padding:0 1rem}.schedule-form{grid-template-columns:repeat(2,minmax(0,1fr))}.schedule-form label:first-child,.schedule-form label:nth-child(2){grid-column:span 2}.schedule-panel table{min-width:1000px}.schedule-panel td small{display:block}.danger-text{display:block;color:var(--danger)}.passive-discovery,.other-discovery{display:grid;gap:.75rem;border-top:1px solid var(--border);padding-top:1rem}.passive-discovery .panel-title,.other-discovery .panel-title{padding:0 1rem}.other-discovery{min-height:180px}@media(max-width:700px){.schedule-form{grid-template-columns:1fr}.schedule-form label:first-child,.schedule-form label:nth-child(2){grid-column:auto}}
 </style>

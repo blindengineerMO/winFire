@@ -18,7 +18,7 @@ import {sweepMfaPrompts} from './mfaPrompt.js'
 import {expireMfaChallenges} from './mfaChallenges.js'
 import {pollFleet} from './fleetPoll.js'
 import {refreshDynamicGroups} from './dynamicNodeGroups.js'
-import {dueSnmpTargets,pollSnmpDiscoveryTarget} from './snmpDiscoveryService.js'
+import {dueSnmpTargets,dueSnmpNodes,pollSnmpDiscoveryTarget,pollAssignedSnmpNode} from './snmpDiscoveryService.js'
 import {processPassiveDiscovery} from './passiveDiscovery.js'
 import {processDueDiscoverySchedules} from './networkDiscovery.js'
 
@@ -128,6 +128,13 @@ async function sweepSnmpDiscovery(){
   if(snmpRunning)return
   snmpRunning=true
   try{
+    // Node-level SNMP credentials are also discovery sources. Poll them on the
+    // same cadence as configured SNMP targets so assigning a credential to an
+    // existing asset immediately produces identity, ARP, routing and state
+    // facts without requiring a separate target record.
+    for(const node of dueSnmpNodes()){
+      try{await pollAssignedSnmpNode(node.id)}catch(error){console.error(`SNMP node poll failed for ${node.id}:`,error.message)}
+    }
     for(const target of dueSnmpTargets()){
       try{await pollSnmpDiscoveryTarget(target.id)}catch(error){console.error(`SNMP discovery failed for ${target.id}:`,error.message)}
     }

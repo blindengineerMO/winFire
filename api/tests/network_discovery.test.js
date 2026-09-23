@@ -7,7 +7,8 @@ import path from 'node:path'
 
 const dir=fs.mkdtempSync(path.join(os.tmpdir(),'winfire-discovery-'))
 process.env.DATA_DIR=dir
-const {parseNeighborTable,parsePingTtl,classifyTtl,probeHostLiveness,tcpProbe,DISCOVERY_TCP_PORTS}=await import('../src/networkDiscovery.js')
+const {parseNeighborTable,parsePingTtl,classifyTtl,probeHostLiveness,tcpProbe,DISCOVERY_TCP_PORTS,persistHypervisor}=await import('../src/networkDiscovery.js')
+const {run,one,id}=await import('../src/db.js')
 const {classifyInfrastructureResponse,classifyOperatingSystem}=await import('../src/infrastructureDiscovery.js')
 
 test.after(()=>fs.rmSync(dir,{recursive:true,force:true}))
@@ -58,4 +59,18 @@ test('TCP liveness treats an established connection and an explicit reset as ali
   assert.equal(refused,true)
   const timeout=await tcpProbe('127.0.0.1',443,5,()=>{const socket=new EventEmitter();socket.destroy=()=>{};return socket})
   assert.equal(timeout,false)
+})
+
+test('authenticated ESXi guest inventory marks matching assets as virtual machines',()=>{
+  const hypervisorId=id(),guestId=id()
+  run('INSERT INTO nodes(id,hostname,ip,connection_mode,status) VALUES(?,?,?,?,?)',hypervisorId,'esxi-01','192.168.88.3','agentless','reachable')
+  run('INSERT INTO nodes(id,hostname,fqdn,ip,connection_mode,status) VALUES(?,?,?,?,?,?)',guestId,'web-01','web-01.example.test','192.168.88.42','agentless','reachable')
+  persistHypervisor(hypervisorId,{detected:true,authenticated:true,api:'soap',osName:'VMware ESXi',hypervisor:'VMware ESXi',virtualMachines:[{name:'web-01',uuid:'uuid-42',ip:'192.168.88.42',hostname:'web-01.example.test',guestOs:'Ubuntu Linux (64-bit)',powerState:'poweredOn',cpuCount:4,memoryMb:8192}]})
+  const guest=one('SELECT virtual_machine,virtual_machine_host_id,virtual_machine_details_json FROM nodes WHERE id=?',guestId)
+  assert.equal(guest.virtual_machine,1)
+  assert.equal(guest.virtual_machine_host_id,hypervisorId)
+  assert.equal(JSON.parse(guest.virtual_machine_details_json).hypervisorHost,'esxi-01')
+  const facts=JSON.parse(one('SELECT snapshot_json FROM node_facts WHERE node_id=?',hypervisorId).snapshot_json)
+  assert.equal(one('SELECT device_type,transport,manageability,snmp_capable FROM nodes WHERE id=?',hypervisorId).device_type,'esxi')
+  assert.equal(facts.virtualMachines[0].guestOs,'Ubuntu Linux (64-bit)')
 })

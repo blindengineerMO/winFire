@@ -12,7 +12,7 @@ import {z} from 'zod'
 import {compilePolicy, graphSchema, findRuleConflicts,validateAddressExpression,validatePortExpression,validateProgramPath,activePolicyRules,scheduleStateKey,extractMfaGates} from '@winfire/shared'
 import {db, all, one, run, id, now, audit, json, parse} from './db.js'
 import {auth, requireRole, publicUser, issueAccess, issueRefresh, rotateRefresh, hashToken, seal, openSealed} from './security.js'
-import {probeNode, collectFacts, enrichNode, lookupDns, remote, diffRules, tcpProbe,testNodeCredential} from './connector.js'
+import {probeNode, collectFacts, enrichNode, lookupDns, remote, diffRules, tcpProbe,testNodeCredential,preflightCredential} from './connector.js'
 import {firewallConnectorFor,applyManagedRules} from './firewallConnectors.js'
 import {classifyVerification,findMatchingDenyEvent,hasManagedRule} from './verifier.js'
 import {makeTotpSecret,verifyTotp,matchingTotpCounter} from './totp.js'
@@ -52,9 +52,9 @@ import {internetRoutes} from './routes/internet.js'
 import {classifyNetworkFlow,normalizeNetworkProtocol,recordNetworkFlow} from './services/networkMapping.js'
 import {classifierRuleRows,classifierRuleById,createClassifierRule,updateClassifierRule,deleteClassifierRule,processRuleRows,processRuleById,createProcessRule,updateProcessRule,deleteProcessRule} from './services/classifierRules.js'
 import {mappingRoutes} from './routes/mapping.js'
-import {expandCidrs,runDiscoveryScan,queueDiscoveryScan,publicDiscoverySchedule,runDiscoveryScheduleNow,DISCOVERY_MIN_INTERVAL_MINUTES,DISCOVERY_MAX_INTERVAL_MINUTES} from './networkDiscovery.js'
+import {expandCidrs,runDiscoveryScan,queueDiscoveryScan,publicDiscoverySchedule,runDiscoveryScheduleNow,persistHypervisor,DISCOVERY_MIN_INTERVAL_MINUTES,DISCOVERY_MAX_INTERVAL_MINUTES} from './networkDiscovery.js'
 import {validSnmpHost,normalizeSnmpSecret,ipInCidr} from './snmpDiscovery.js'
-import {snmpTargets,pollSnmpDiscoveryTarget} from './snmpDiscoveryService.js'
+import {snmpTargets,pollSnmpDiscoveryTarget,pollSnmpNode} from './snmpDiscoveryService.js'
 import {passiveDiscoveryRows,passiveDiscoverySummary,processPassiveDiscovery} from './passiveDiscovery.js'
 import {asyncHandler} from './middleware/asyncHandler.js'
 import {normalizeDynamicRules,dynamicNodeGroupSettings,publicDynamicGroup,updateDynamicGroup,refreshDynamicGroups} from './dynamicNodeGroups.js'
@@ -128,8 +128,18 @@ function normalizedNodeOs(node){
   if(/^xenserver$/i.test(hypervisor))hypervisor='Citrix Hypervisor / XenServer'
   return {os_name:name||null,os_version:version||null,os_build:build||null,hypervisor:hypervisor||null}
 }
-const publicNode=node=>node && ({...node,...normalizedNodeOs(node),failures:Number(node.failures),facts:parse(node.snapshot_json),ad:parse(node.ad_snapshot_json),training:latestTraining(node.id)||null,verification:latestVerification(node.id),managementVerification:managementVerification(node)})
+const safeJson=value=>{try{return parse(value)}catch{return null}}
+const publicNode=node=>node && ({...node,...normalizedNodeOs(node),failures:Number(node.failures),virtualMachine:!!Number(node.virtual_machine),virtualMachineHostId:node.virtual_machine_host_id||null,virtualMachineDetails:safeJson(node.virtual_machine_details_json),facts:safeJson(node.snapshot_json),ad:safeJson(node.ad_snapshot_json),training:latestTraining(node.id)||null,verification:latestVerification(node.id),managementVerification:managementVerification(node)})
 const canUseCredential=(user,credential)=>credential&&(user.role==='owner'||user.role==='admin'||credential.owner_user_id===user.id||credential.visibility==='team'&&credential.team_id&&credential.team_id===user.team_id||canWriteResource(user,'credential',credential))
+const assignedNodeCredentials=nodeId=>all(`SELECT DISTINCT c.* FROM credentials c JOIN credential_assignments a ON a.credential_id=c.id WHERE a.node_id=? OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?) ORDER BY c.priority`,nodeId,nodeId)
+const assignedSnmpCredential=(nodeId,user)=>assignedNodeCredentials(nodeId).filter(credential=>['snmp-v2c','snmp-v3'].includes(credential.type)&&canUseCredential(user,credential))[0]||null
+const assignedEsxiCredentials=(nodeId,user)=>assignedNodeCredentials(nodeId).filter(credential=>credential.type==='esxi'&&canUseCredential(user,credential))
+const accessibleEsxiCredentials=(node,user)=>{
+  const assigned=assignedEsxiCredentials(node.id,user)
+  const available=all("SELECT c.* FROM credentials c WHERE c.type='esxi' AND (c.owner_user_id=? OR c.visibility='team' OR c.visibility='private' OR EXISTS (SELECT 1 FROM credential_assignments a WHERE a.credential_id=c.id AND (a.node_id=? OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?))))",user.id,node.id,node.id).filter(credential=>canUseCredential(user,credential))
+  return node.device_type==='esxi'?assigned:[...assigned,...available.filter(credential=>!assigned.some(item=>item.id===credential.id))]
+}
+const openedCredential=credential=>({type:credential.type,secret:openSealed(credential.encrypted_blob)})
 function getNode(idValue) {return one('SELECT * FROM nodes WHERE id=?',idValue)}
 function getPolicy(idValue) {return one('SELECT * FROM policies WHERE id=?',idValue)}
 function hasActiveLearning(policyId) {return !!one("SELECT id FROM learning_sessions WHERE generated_policy_id=? AND status='active'",policyId)}
@@ -1477,6 +1487,23 @@ api.post('/credentials/:id/test',requireRole('editor'),wrap(async(req,res)=>{
   if(!assigned)return res.status(400).json({error:'Assign credential to node first'})
   try {res.json(await testNodeCredential(node,credential.id))}catch(error){res.json({success:false,transport:node.transport||'winrm',error:error.message})}
 }))
+api.post('/credentials/:id/preflight',requireRole('editor'),wrap(async(req,res)=>{
+  const data=body(z.object({host:z.string().trim().min(1).max(253),expectedName:z.string().trim().max(253).optional()}),req)
+  const credential=one('SELECT * FROM credentials WHERE id=?',reqId(req));if(!credential)return notFound(res,'Credential')
+  if(!canUseCredential(req.user,credential))return res.status(403).json({error:'Insufficient permission'})
+  if(!['local','domain'].includes(credential.type))return res.status(400).json({error:'Only Windows local or domain credentials support WMI/WinRM preflight'})
+  let secret
+  try{secret=openSealed(credential.encrypted_blob)}catch{return res.status(500).json({error:'Credential secret could not be opened'})}
+  try{
+    const result=await preflightCredential({host:data.host,expectedName:data.expectedName,credential:{username:credential.username,secret}})
+    audit(req.user.id,'credential.preflight.success','credential',credential.id,null,{host:data.host,transport:result.transport})
+    res.json(result)
+  }catch(error){
+    audit(req.user.id,'credential.preflight.failure','credential',credential.id,null,{host:data.host,error:String(error.message||error).slice(0,500)})
+    const message=String(error.message||error),redacted=secret?.password?message.replaceAll(secret.password,'[redacted]'):message
+    res.json({success:false,error:redacted,ports:error.ports})
+  }
+}))
 
 const serverNodeManaged=node=>{
   if(!node||node.manageability==='unmanaged')return false
@@ -1493,7 +1520,7 @@ api.get('/nodes',(req,res)=>{
   if(!Object.keys(req.query||{}).length)return res.json(rows.sort((a,b)=>String(b.created_at||'').localeCompare(String(a.created_at||''))).map(publicNode))
   const page=Math.max(1,Number.parseInt(req.query.page||'1',10)||1),pageSize=Math.min(500,Math.max(1,Number.parseInt(req.query.pageSize||'25',10)||25)),term=String(req.query.search||'').trim().toLowerCase(),filter=String(req.query.filter||'all'),sort=String(req.query.sort||'priority'),direction=String(req.query.direction||'asc').toLowerCase()==='desc'?-1:1
   let filtered=rows.filter(node=>{
-    if(term&&!([node.hostname,node.fqdn,node.ip,node.os_name,node.os_version,node.platform,node.device_type,node.transport,node.hypervisor].map(value=>String(value||'').toLowerCase()).join(' ').includes(term)))return false
+    if(term&&!([node.hostname,node.fqdn,node.ip,node.os_name,node.os_version,node.platform,node.device_type,node.transport,node.hypervisor,node.virtual_machine?'virtual machine':''].map(value=>String(value||'').toLowerCase()).join(' ').includes(term)))return false
     const managed=serverNodeManaged(node)
     if(filter==='managed'&& !managed)return false
     if(filter==='unmanaged'&& managed)return false
@@ -1518,7 +1545,7 @@ api.post('/nodes',requireRole('editor'),wrap(async(req,res)=>{
   })()
   const node=getNode(nodeId),dns=await lookupDns(node);res.status(201).json({...node,dns,training})
 }))
-api.get('/nodes/:id',(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');const factsRow=one('SELECT snapshot_json FROM node_facts WHERE node_id=?',node.id);res.json({...node,ad:parse(node.ad_snapshot_json),training:latestTraining(node.id)||null,verification:latestVerification(node.id),managementVerification:managementVerification({...node,snapshot_json:factsRow?.snapshot_json}),facts:parse(factsRow?.snapshot_json),dns:one('SELECT * FROM dns_lookups WHERE node_id=?',node.id),credentialIds:all('SELECT credential_id FROM credential_assignments WHERE node_id=?',node.id).map(item=>item.credential_id),groups:all('SELECT g.* FROM node_groups g JOIN node_group_members m ON m.group_id=g.id WHERE m.node_id=? ORDER BY g.name',node.id).filter(group=>canReadResource(req.user,'node_group',group)).map(group=>({id:group.id,name:group.name,canWrite:canWriteResource(req.user,'node_group',group)}))})})
+api.get('/nodes/:id',(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');const factsRow=one('SELECT snapshot_json FROM node_facts WHERE node_id=?',node.id);res.json({...publicNode({...node,snapshot_json:factsRow?.snapshot_json}),dns:one('SELECT * FROM dns_lookups WHERE node_id=?',node.id),credentialIds:all('SELECT credential_id FROM credential_assignments WHERE node_id=?',node.id).map(item=>item.credential_id),groups:all('SELECT g.* FROM node_groups g JOIN node_group_members m ON m.group_id=g.id WHERE m.node_id=? ORDER BY g.name',node.id).filter(group=>canReadResource(req.user,'node_group',group)).map(group=>({id:group.id,name:group.name,canWrite:canWriteResource(req.user,'node_group',group)}))})})
 api.post('/nodes/:id/training',requireRole('editor'),(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
   const {durationDays}=body(z.object({durationDays:z.number().int().min(1).max(365)}),req)
@@ -1527,7 +1554,7 @@ api.post('/nodes/:id/training',requireRole('editor'),(req,res)=>{
 })
 api.patch('/nodes/:id',requireRole('editor'),wrap(async(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
-  const data=body(z.object({hostname:z.string().trim().min(1).optional(),fqdn:z.string().trim().nullable().optional(),ip:z.string().refine(value=>isIP(value)!==0,'Invalid IP address').nullable().optional(),connectionMode:z.enum(['agentless','agent','snmp']).optional(),deviceType:z.enum(['auto','switch','firewall','router','printer','hypervisor','other']).optional(),managementType:z.enum(['auto','snmp','agentless','agent','manual']).optional()}),req)
+  const data=body(z.object({hostname:z.string().trim().min(1).optional(),fqdn:z.string().trim().nullable().optional(),ip:z.string().refine(value=>isIP(value)!==0,'Invalid IP address').nullable().optional(),connectionMode:z.enum(['agentless','agent','snmp']).optional(),deviceType:z.enum(['auto','switch','firewall','router','printer','hypervisor','esxi','other']).optional(),managementType:z.enum(['auto','snmp','agentless','agent','manual']).optional(),credentialIds:z.array(z.string()).max(20).optional()}),req)
   const hostname=data.hostname??node.hostname,fqdn=data.fqdn===undefined?node.fqdn:data.fqdn,ip=data.ip===undefined?node.ip:data.ip,mode=data.connectionMode||node.connection_mode
   if(node.ad_guid&&(hostname!==node.hostname||fqdn!==node.fqdn))return res.status(409).json({error:'Active Directory manages this computer name and FQDN; edit them in the directory'})
   if(mode==='agent'&&!node.agent_id)return res.status(409).json({error:'Enroll an agent before switching to agent mode'})
@@ -1535,16 +1562,26 @@ api.patch('/nodes/:id',requireRole('editor'),wrap(async(req,res)=>{
   const targetChanged=(fqdn||ip||hostname)!==(node.fqdn||node.ip||node.hostname)
   if(targetChanged&&one('SELECT id FROM policy_assignments WHERE node_id=? OR node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?)',node.id,node.id))return res.status(409).json({error:'Remove assigned policies before changing the management address; existing firewall rules may still be present on the old host'})
   const identityChanged=hostname!==node.hostname||fqdn!==node.fqdn||ip!==node.ip
-  const managementType=data.managementType??node.management_type??'auto',deviceType=data.deviceType??node.device_type??'auto',nextMode=managementType==='snmp'?'snmp':mode,nextTransport=managementType==='snmp'?'snmp':targetChanged?null:node.transport,nextStatus=managementType==='snmp'&&node.status==='reachable'?'reachable':targetChanged?'unknown':node.status
+  const managementType=data.managementType??node.management_type??'auto',requestedDeviceType=data.deviceType??node.device_type??'auto',deviceType=requestedDeviceType==='auto'?(node.device_type||null):requestedDeviceType,isEsxi=deviceType==='esxi'
+  const effectiveManagementType=isEsxi?'manual':managementType,nextMode=isEsxi?'agentless':effectiveManagementType==='snmp'?'snmp':mode,nextTransport=isEsxi?(node.transport==='esxi-soap'?node.transport:null):effectiveManagementType==='snmp'?'snmp':targetChanged?null:node.transport,nextStatus=isEsxi&&node.transport==='esxi-soap'&&node.status==='reachable'?'reachable':effectiveManagementType==='snmp'&&node.status==='reachable'?'reachable':targetChanged?'unknown':node.status
+  const assignedIds=data.credentialIds===undefined?all('SELECT credential_id FROM credential_assignments WHERE node_id=?',node.id).map(item=>item.credential_id):data.credentialIds
+  const assignedCredentials=assignedIds.map(credentialId=>one('SELECT * FROM credentials WHERE id=?',credentialId))
+  if(assignedCredentials.some(credential=>!credential||!canUseCredential(req.user,credential)))return res.status(403).json({error:'One or more credentials are unavailable'})
+  if(isEsxi&&!assignedCredentials.some(credential=>credential.type==='esxi')&&!assignedNodeCredentials(node.id).some(credential=>credential.type==='esxi'&&canUseCredential(req.user,credential)))return res.status(400).json({error:'VMware ESXi nodes require an ESXi credential from the vault'})
+  const nextManageability=isEsxi?'unmanaged':node.manageability,nextSnmpCapable=isEsxi?1:node.snmp_capable,nextFirewallState=isEsxi?'unmanaged':node.firewall_state,nextHypervisor=isEsxi?'VMware ESXi':node.device_type==='esxi'?null:node.hypervisor,nextAgentRequired=isEsxi?0:node.agent_required
   db.transaction(()=>{
-    run('UPDATE nodes SET hostname=?,fqdn=?,ip=?,connection_mode=?,transport=?,device_type=?,management_type=?,status=?,failures=?,next_retry_at=? WHERE id=?',hostname,fqdn,ip,nextMode,nextTransport,deviceType,managementType,nextStatus,targetChanged?0:node.failures,targetChanged?null:node.next_retry_at,node.id)
+    run('UPDATE nodes SET hostname=?,fqdn=?,ip=?,connection_mode=?,transport=?,device_type=?,management_type=?,manageability=?,snmp_capable=?,hypervisor=?,firewall_state=?,agent_required=?,status=?,failures=?,next_retry_at=? WHERE id=?',hostname,fqdn,ip,nextMode,nextTransport,deviceType,effectiveManagementType,nextManageability,nextSnmpCapable,nextHypervisor,nextFirewallState,nextAgentRequired,nextStatus,targetChanged?0:node.failures,targetChanged?null:node.next_retry_at,node.id)
+    if(data.credentialIds!==undefined){
+      run('DELETE FROM credential_assignments WHERE node_id=?',node.id)
+      for(const credentialId of data.credentialIds)run('INSERT INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,NULL)',credentialId,node.id)
+    }
     if(targetChanged)run('DELETE FROM node_facts WHERE node_id=?',node.id)
-    audit(req.user.id,'node.update','node',node.id,node,{hostname,fqdn,ip,connectionMode:nextMode,deviceType,managementType,targetChanged})
+    audit(req.user.id,'node.update','node',node.id,node,{hostname,fqdn,ip,connectionMode:nextMode,deviceType,managementType:effectiveManagementType,credentialIds:data.credentialIds,targetChanged})
   })()
   if(identityChanged)await lookupDns(getNode(node.id))
   res.json(getNode(node.id))
 }))
-api.put('/nodes/:id/credentials',requireRole('editor'),(req,res)=>{
+api.put('/nodes/:id/credentials',requireRole('editor'),wrap(async(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
   const data=body(z.object({credentialIds:z.array(z.string()).max(20)}),req)
   const credentials=data.credentialIds.map(credentialId=>one('SELECT * FROM credentials WHERE id=?',credentialId))
@@ -1555,8 +1592,14 @@ api.put('/nodes/:id/credentials',requireRole('editor'),(req,res)=>{
     for(const credentialId of data.credentialIds)run('INSERT INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,NULL)',credentialId,node.id)
     audit(req.user.id,'node.credentials.replace','node',node.id,{credentialIds:before},{credentialIds:data.credentialIds})
   })()
-  res.json({credentialIds:data.credentialIds})
-})
+  let snmpPoll=null
+  const snmpCredential=credentials.find(credential=>['snmp-v2c','snmp-v3'].includes(credential.type))
+  if(snmpCredential&&node.device_type!=='esxi'){
+    try{snmpPoll=await pollSnmpNode(getNode(node.id),{credential:openedCredential(snmpCredential),actorId:req.user.id})}
+    catch(error){audit(req.user.id,'snmp-node.poll.failed','node',node.id,null,{error:String(error.message||error).slice(0,500)})}
+  }
+  res.json({credentialIds:data.credentialIds,snmpPoll})
+}))
 api.delete('/nodes/:id',requireRole('admin'),(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
   const data=z.object({confirmed:z.boolean().optional(),confirmation:z.string().optional()}).parse(req.body||{})
@@ -1581,15 +1624,29 @@ api.delete('/nodes/:id',requireRole('admin'),(req,res)=>{
 })
 api.post('/nodes/:id/probe',requireRole('editor'),wrap(async(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
-  const credentials=all("SELECT c.* FROM credentials c WHERE c.type='esxi' AND (c.owner_user_id=? OR c.visibility='team' OR c.visibility='private' OR EXISTS (SELECT 1 FROM credential_assignments a WHERE a.credential_id=c.id AND (a.node_id=? OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?))))",req.user.id,node.id,node.id).filter(credential=>canUseCredential(req.user,credential)).flatMap(credential=>{try{const secret=openSealed(credential.encrypted_blob);return secret?.password?[{username:credential.username,password:secret.password}]:[]}catch{return []}})
+  const snmpCredential=assignedSnmpCredential(node.id,req.user)
+  if(snmpCredential&&node.device_type!=='esxi'){
+    try{
+      const result=await pollSnmpNode(node,{credential:openedCredential(snmpCredential),actorId:req.user.id})
+      const refreshed=getNode(node.id)
+      // SNMP fingerprints ESXi reliably, but the SOAP inventory still needs
+      // the separate ESXi vault credential. Run it after the SNMP facts pass
+      // so a hypervisor keeps both its infrastructure identity and VM list.
+      if(result.classification?.deviceType==='hypervisor'&&refreshed?.ip){
+        const esxiCredentials=accessibleEsxiCredentials(refreshed,req.user).flatMap(credential=>{try{const secret=openSealed(credential.encrypted_blob);return secret?.password?[{username:credential.username,password:secret.password}]:[]}catch{return []}})
+        const detected=await identifyHypervisor(refreshed.ip,{credentials:esxiCredentials}).catch(()=>({detected:false}))
+        if(detected.detected){persistHypervisor(node.id,detected);return res.json({transport:detected.api==='soap'?'esxi-soap':'hypervisor',status:'reachable',probeStatus:detected.authenticated?'hypervisor-authenticated':'hypervisor-detected',snmp:result,esxi:detected,hypervisor:detected})}
+      }
+      return res.json({transport:'snmp',status:'reachable',probeStatus:'snmp-authenticated',snmp:result,esxi:{detected:false},hypervisor:refreshed?.hypervisor?{detected:true,hypervisor:refreshed.hypervisor}: {detected:false}})
+    }catch(error){
+      if(node.transport==='snmp'||node.connection_mode==='snmp')return res.status(502).json({error:`SNMP poll failed: ${String(error.message||error).slice(0,500)}`})
+    }
+  }
+  const credentials=accessibleEsxiCredentials(node,req.user).flatMap(credential=>{try{const secret=openSealed(credential.encrypted_blob);return secret?.password?[{username:credential.username,password:secret.password}]:[]}catch{return []}})
   const detected=node.ip?await identifyHypervisor(node.ip,{credentials}):{detected:false}
   const infrastructure=detected.detected?detected:node.ip?await detectInfrastructureHost(node.ip).catch(()=>null):null
   const hypervisor=detected.detected?detected:infrastructure?.hypervisor?{...infrastructure,detected:true,osName:infrastructure.osName||infrastructure.hypervisorName,hypervisor:infrastructure.hypervisorName||infrastructure.hypervisor,api:'https'}:detected
-  if(hypervisor.detected){
-    const esxi=hypervisor.api==='soap',name=hypervisor.osName||hypervisor.hypervisor||'Hypervisor',version=hypervisor.osVersion||hypervisor.fullName||hypervisor.version||hypervisor.build||null
-    run("UPDATE nodes SET os_name=?,os_version=COALESCE(?,os_version),platform=?,hypervisor=?,device_type='hypervisor',management_type='manual',manageability='unmanaged',transport=?,connection_mode='agentless',agent_required=0,status='reachable',firewall_state='unmanaged',snmp_capable=1,probe_status=?,last_probe_at=? WHERE id=?",name,version,name,hypervisor.hypervisor||name,esxi?'esxi-soap':'hypervisor',hypervisor.authenticated?'hypervisor-authenticated':'hypervisor-detected',now(),node.id)
-    run("INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET snapshot_json=excluded.snapshot_json,collected_at=excluded.collected_at",node.id,json({source:esxi?'esxi-soap':'hypervisor',hypervisor}),now())
-  }
+  if(hypervisor.detected)persistHypervisor(node.id,hypervisor)
   const result=hypervisor.detected?{transport:hypervisor.api==='soap'?'esxi-soap':'hypervisor',status:'reachable',probeStatus:hypervisor.authenticated?'hypervisor-authenticated':'hypervisor-detected'}:await probeNode(getNode(node.id)).catch(error=>({transport:getNode(node.id)?.transport||'unknown',error:error.message}))
   res.json({...result,esxi:hypervisor.api==='soap'?hypervisor:{detected:false},hypervisor})
 }))
@@ -1807,7 +1864,22 @@ api.post('/nodes/:id/audit-policy/enable',requireRole('admin'),wrap(async(req,re
     throw error
   }
 }))
-api.post('/nodes/:id/facts/refresh',requireRole('editor'),wrap(async(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');const facts=await collectFacts(node);audit(req.user.id,'node.facts.refresh','node',node.id,null,facts);res.json(facts)}))
+api.post('/nodes/:id/facts/refresh',requireRole('editor'),wrap(async(req,res)=>{
+  const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
+  if(node.device_type==='esxi'){
+    const credentials=accessibleEsxiCredentials(node,req.user).flatMap(credential=>{try{const secret=openSealed(credential.encrypted_blob);return secret?.password?[{username:credential.username,password:secret.password}]:[]}catch{return []}})
+    const hypervisor=await identifyHypervisor(node.ip||node.fqdn||node.hostname,{credentials})
+    if(!hypervisor.detected)return res.status(502).json({error:'VMware ESXi API did not respond or the assigned credential was rejected'})
+    persistHypervisor(node.id,hypervisor)
+    return res.json({source:'esxi',...hypervisor})
+  }
+  const snmpCredential=assignedSnmpCredential(node.id,req.user)
+  if(snmpCredential){
+    const result=await pollSnmpNode(node,{credential:openedCredential(snmpCredential),actorId:req.user.id})
+    return res.json({...result,source:'snmp'})
+  }
+  const facts=await collectFacts(node);audit(req.user.id,'node.facts.refresh','node',node.id,null,facts);res.json(facts)
+}))
 api.get('/nodes/:id/firewall-rules',wrap(async(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
   if(node.connection_mode==='agent')return res.status(409).json({error:'Live rule inventory requires a WinRM node'})

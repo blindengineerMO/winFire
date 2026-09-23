@@ -201,14 +201,31 @@ function existingNode(ip,hostname,mac=null){
   const lower=String(hostname||'').toLowerCase()
   return one('SELECT * FROM nodes WHERE ip=? OR lower(hostname)=? OR lower(fqdn)=? ORDER BY CASE WHEN inventory_source=\'ad\' THEN 0 ELSE 1 END LIMIT 1',ip,lower,lower)
 }
-function persistHypervisor(nodeId,hypervisor){
+export function persistHypervisor(nodeId,hypervisor){
   if(!hypervisor?.detected)return
   const esxi=hypervisor.kind==='esxi'||hypervisor.hypervisor==='VMware ESXi'||hypervisor.api==='soap'
   const name=hypervisor.osName||hypervisor.hypervisor||'Hypervisor'
   const version=hypervisor.osVersion||hypervisor.fullName||hypervisor.version||hypervisor.build||null
   const transport=esxi?'esxi-soap':'hypervisor'
-  run("UPDATE nodes SET os_name=?,os_version=COALESCE(?,os_version),platform=?,hypervisor=?,device_type='hypervisor',management_type='manual',manageability='unmanaged',transport=?,connection_mode='agentless',agent_required=0,status='reachable',firewall_state='unmanaged',snmp_capable=1,probe_status=?,last_probe_at=? WHERE id=?",name,version,name,hypervisor.hypervisor||name,transport,hypervisor.authenticated?'hypervisor-authenticated':'hypervisor-detected',now(),nodeId)
-  run("INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET snapshot_json=excluded.snapshot_json,collected_at=excluded.collected_at",nodeId,json({source:transport,hypervisor}),now())
+  run("UPDATE nodes SET os_name=?,os_version=COALESCE(?,os_version),platform=?,hypervisor=?,device_type=?,management_type='manual',manageability='unmanaged',transport=?,connection_mode='agentless',agent_required=0,status='reachable',firewall_state='unmanaged',snmp_capable=1,probe_status=?,last_probe_at=? WHERE id=?",name,version,name,hypervisor.hypervisor||name,esxi?'esxi':'hypervisor',transport,hypervisor.authenticated?'hypervisor-authenticated':'hypervisor-detected',now(),nodeId)
+  run("INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET snapshot_json=excluded.snapshot_json,collected_at=excluded.collected_at",nodeId,json({source:transport,hypervisor,virtualMachines:Array.isArray(hypervisor.virtualMachines)?hypervisor.virtualMachines:[]}),now())
+  if(Array.isArray(hypervisor.virtualMachines))correlateVirtualMachines(nodeId,hypervisor.virtualMachines)
+}
+function correlationValue(value){const text=String(value||'').trim().toLowerCase().replace(/\.$/,'');return text&&text!=='unknown'?text:null}
+function correlateVirtualMachines(hostNodeId,virtualMachines){
+  const host=one('SELECT hostname,ip,fqdn FROM nodes WHERE id=?',hostNodeId)
+  const hypervisorHost=host?.hostname||host?.fqdn||host?.ip||hostNodeId
+  run('UPDATE nodes SET virtual_machine=0,virtual_machine_host_id=NULL,virtual_machine_details_json=NULL WHERE virtual_machine_host_id=?',hostNodeId)
+  for(const vm of virtualMachines){
+    const values=[vm.ip,vm.hostname,vm.fqdn,vm.name].map(correlationValue).filter(Boolean)
+    if(!values.length)continue
+    const clauses=values.flatMap(()=>['lower(coalesce(ip,\'\'))=?','lower(coalesce(hostname,\'\'))=?','lower(coalesce(fqdn,\'\'))=?']).join(' OR ')
+    const args=[]
+    for(const value of values)args.push(value,value,value)
+    const match=one(`SELECT id FROM nodes WHERE id<>? AND (${clauses}) ORDER BY CASE WHEN status='reachable' THEN 0 ELSE 1 END,created_at LIMIT 1`,hostNodeId,...args)
+    if(!match)continue
+    run('UPDATE nodes SET virtual_machine=1,virtual_machine_host_id=?,virtual_machine_details_json=? WHERE id=?',hostNodeId,json({...vm,hypervisorHostId:hostNodeId,hypervisorHost}),match.id)
+  }
 }
 export async function registerHost(ip,scanId,livenessMethod='icmp',livenessMeta={}){
   let hostname=ip,fqdn=null
@@ -217,7 +234,7 @@ export async function registerHost(ip,scanId,livenessMethod='icmp',livenessMeta=
   const hypervisor=livenessMeta?.hypervisor?.detected?livenessMeta.hypervisor:null
   if(found){
     run('UPDATE nodes SET last_discovered_at=?,discovery_source=?,status=CASE WHEN status=\'unknown\' THEN \'reachable\' ELSE status END,mac_address=COALESCE(?,mac_address),discovery_ttl=COALESCE(?,discovery_ttl),discovery_os_family=COALESCE(?,discovery_os_family) WHERE id=?',now(),`${livenessMethod}:${scanId}`,candidateMac,livenessMeta.ttl||null,livenessMeta.ttlFingerprint?.family||null,found.id)
-    if(livenessMeta?.osHint)run("UPDATE nodes SET os_name=CASE WHEN os_name IS NULL OR lower(os_name) IN ('','unknown','unidentified') THEN ? ELSE os_name END,platform=CASE WHEN platform IS NULL OR lower(platform) IN ('','unknown','unidentified') THEN ? ELSE platform END WHERE id=?",livenessMeta.osHint,livenessMeta.osHint,found.id)
+    if(livenessMeta?.osHint)run("UPDATE nodes SET os_name=CASE WHEN os_name IS NULL OR lower(os_name) IN ('','unknown','unidentified','unknown os') THEN ? ELSE os_name END,platform=CASE WHEN platform IS NULL OR lower(platform) IN ('','unknown','unidentified','unknown os') THEN ? ELSE platform END WHERE id=?",livenessMeta.osHint,livenessMeta.osHint,found.id)
     persistHypervisor(found.id,hypervisor)
     const current=one('SELECT * FROM nodes WHERE id=?',found.id)
     return {ip,nodeId:found.id,existing:true,hostname:current.hostname,fqdn:current.fqdn||null,mac:candidateMac||current.mac_address||null,osName:current.os_name||current.platform||null,osVersion:current.os_version||null,hypervisor:current.hypervisor||null,transport:current.transport||null,managed:current.agent_required===0,livenessMethod,ttl:livenessMeta.ttl||null,ttlFingerprint:livenessMeta.ttlFingerprint||null}

@@ -331,6 +331,44 @@ export async function testNodeCredential(node,credentialId){
   recordNodeSuccess(node.id,'wmi-authenticated')
   return {success:true,transport:'wmi',account:credential.username,computerName:result.computerName}
 }
+/**
+ * Validate a Windows credential against a host before the host is persisted.
+ * This deliberately has no node side effects: callers can use it from add
+ * node and discovery forms without creating a triage record on failure.
+ */
+export async function preflightCredential({host,credential,expectedName=null,wmi=process.platform==='win32'?wmiProbePowerShell:wmiProbePython,winrm=pywinrm,probePort=tcpProbe}={}){
+  const target=String(host||'').trim()
+  if(!target)throw new Error('A host or IP address is required')
+  if(!credential?.username||!credential?.secret?.password)throw new Error('A username and password are required')
+  const ports={
+    rpc:await probePort(target,135),
+    winrm:await probePort(target,5985),
+    winrms:await probePort(target,5986)
+  }
+  const errors=[]
+  const password=credential.secret.password
+  const expected=expectedName&&String(expectedName).trim()&&!/^(?:\d{1,3}\.){3}\d{1,3}$/.test(String(expectedName).trim())?String(expectedName).trim():null
+  try{
+    const result=await wmi({host:target,username:credential.username,password,mode:'probe',expectedName:expected})
+    if(result?.success!==true||result.transport!=='wmi'||!result.computerName)throw new Error('WMI did not confirm access to Win32_ComputerSystem')
+    if(expected&&String(result.computerName).toLowerCase()!==expected.split('.')[0].toLowerCase())throw new Error('WMI computer name does not match the supplied host identity')
+    return {success:true,transport:'wmi',account:credential.username,computerName:String(result.computerName),ports}
+  }catch(error){
+    errors.push(`WMI: ${String(error?.message||error).replaceAll(password,'[redacted]')}`)
+  }
+  for(const transport of ['winrm','winrms']){
+    const port=ports[transport]
+    if(port?.status!=='open')continue
+    try{
+      const result=await winrm({host:target,transport,username:credential.username,password,operation:'auth',args:{}})
+      return {success:true,transport,account:credential.username,ports,authentication:typeof result==='string'?undefined:result}
+    }catch(error){errors.push(`${transport.toUpperCase()}: ${String(error?.message||error).replaceAll(password,'[redacted]')}`)}
+  }
+  const portSummary=Object.entries(ports).map(([name,result])=>`${name} ${result?.status||'unknown'}`).join(', ')
+  const failure=new Error(`Credential preflight failed for ${target}. ${errors.join('; ')||'No WMI or WinRM endpoint accepted the credential'}. Ports: ${portSummary}`)
+  failure.status=502;failure.ports=ports
+  throw failure
+}
 export async function activateWinrmViaWmi(node,{wmi=process.platform==='win32'?wmiProbePowerShell:wmiProbePython,probePort=tcpProbe,invoke=remote,collect=collectFacts,wait=pause}={}){
   if(node.connection_mode!=='agentless')throw new Error('Only agentless nodes can be activated through WMI')
   const credentials=nodeCredential(node.id)

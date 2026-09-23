@@ -73,7 +73,8 @@ export function matchesDynamicNode(node,config){
 }
 
 export function publicDynamicGroup(group){
-  const rules=parse(group?.dynamic_rules_json)||[]
+  let rules=[]
+  try{rules=parse(group?.dynamic_rules_json)||[]}catch{rules=[]}
   return {dynamicEnabled:Number(group?.dynamic_enabled||0)===1,dynamicMatch:group?.dynamic_match==='any'?'any':'all',dynamicRules:rules,dynamicLastEvaluatedAt:group?.dynamic_last_evaluated_at||null,dynamicNextEvaluationAt:group?.dynamic_next_evaluation_at||null}
 }
 
