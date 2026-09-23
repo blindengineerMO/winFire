@@ -3,6 +3,8 @@ import {isIP} from 'node:net'
 
 const ARP_TABLE_OID='1.3.6.1.2.1.4.22'
 const FDB_TABLE_OID='1.3.6.1.2.1.17.4.3'
+export const SNMP_IDENTITY_OIDS={sysDescr:'1.3.6.1.2.1.1.1.0',sysObjectId:'1.3.6.1.2.1.1.2.0',sysUpTime:'1.3.6.1.2.1.1.3.0',sysName:'1.3.6.1.2.1.1.5.0',sysLocation:'1.3.6.1.2.1.1.6.0',interfaceCount:'1.3.6.1.2.1.2.1.0'}
+export const SNMP_VENDOR_OIDS={cisco:'1.3.6.1.4.1.9',pfsenseFreebsd:'1.3.6.1.4.1.8072',sonicwall:'1.3.6.1.4.1.8741',citrixNetscaler:'1.3.6.1.4.1.5951',vmware:'1.3.6.1.4.1.6876',mikrotik:'1.3.6.1.4.1.14988',proxmox:'1.3.6.1.4.1.8072'}
 const MAX_REPETITIONS=25
 const MAX_ARP_ROWS=4096
 
@@ -55,6 +57,23 @@ function valueToMac(value){
 function tableRequest(session,oid,maxRepetitions=MAX_REPETITIONS){
   return new Promise((resolve,reject)=>session.table(oid,maxRepetitions,(error,table)=>error?reject(error):resolve(table||{})))
 }
+function scalarRequest(session,oid){
+  return new Promise((resolve,reject)=>{if(typeof session.get!=='function')return resolve(null);session.get([oid],(error,varbinds)=>error?reject(error):resolve(varbinds?.[0]?.value??null))})
+}
+const scalarText=value=>Buffer.isBuffer(value)?value.toString('utf8'):String(value??'').trim()
+export function classifySnmpIdentity(identity={}){
+  const text=`${identity.sysDescr||''} ${identity.sysObjectId||''}`.toLowerCase()
+  if(/vmware|esxi/.test(text))return {vendor:'VMware',deviceType:'hypervisor',manageability:'unmanaged'}
+  if(/cisco/.test(text)||String(identity.sysObjectId||'').includes('.9.'))return {vendor:'Cisco',deviceType:'switch',manageability:'snmp'}
+  if(/sonicwall/.test(text)||String(identity.sysObjectId||'').includes('.8741.'))return {vendor:'SonicWall',deviceType:'firewall',manageability:'snmp'}
+  if(/netscaler|citrix adc/.test(text)||String(identity.sysObjectId||'').includes('.5951.'))return {vendor:'Citrix NetScaler',deviceType:'firewall',manageability:'snmp'}
+  if(/mikrotik|routeros/.test(text)||String(identity.sysObjectId||'').includes('.14988.'))return {vendor:'MikroTik',deviceType:'router',manageability:'snmp'}
+  if(/pfsense|freebsd/.test(text))return {vendor:'pfSense/FreeBSD',deviceType:'firewall',manageability:'snmp'}
+  if(/proxmox/.test(text))return {vendor:'Proxmox',deviceType:'hypervisor',manageability:'unmanaged'}
+  if(/linux|unix/.test(text))return {vendor:'Linux/Unix',deviceType:'other',manageability:'snmp'}
+  if(/windows/.test(text))return {vendor:'Windows',deviceType:'other',manageability:'snmp'}
+  return {vendor:null,deviceType:'other',manageability:'snmp'}
+}
 function indexIp(index){
   const values=clean(index).split('.').map(Number)
   if(values.length<4||values.slice(-4).some(value=>!Number.isInteger(value)||value<0||value>255))return null
@@ -98,7 +117,10 @@ export async function pollSnmpDevice({host,credential,sessionFactory=createSnmpS
   const session=sessionFactory(target,credential)
   try{
     const [arpTable,forwardingTable]=await Promise.all([tableRequest(session,ARP_TABLE_OID,maxRepetitions),tableRequest(session,FDB_TABLE_OID,maxRepetitions)])
-    return {host:target,arp:normalizeArpTable(arpTable),macPorts:normalizeForwardingTable(forwardingTable)}
+    const identity={}
+    for(const [name,oid] of Object.entries(SNMP_IDENTITY_OIDS)){try{identity[name]=scalarText(await scalarRequest(session,oid))||null}catch{identity[name]=null}}
+    const classification=classifySnmpIdentity(identity)
+    return {host:target,arp:normalizeArpTable(arpTable),macPorts:normalizeForwardingTable(forwardingTable),identity,classification}
   }finally{try{session.close()}catch{}}
 }
 

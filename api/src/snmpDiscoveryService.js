@@ -16,6 +16,21 @@ export function targetWithCredential(targetId){
   if(!row)return null
   return {...row,secret:openSealed(row.encrypted_blob)}
 }
+function ensureSnmpNode(target,device,stamp){
+  const existing=one('SELECT * FROM nodes WHERE ip=? OR lower(hostname)=lower(?) OR lower(fqdn)=lower(?) ORDER BY CASE WHEN inventory_source=\'ad\' THEN 0 ELSE 1 END LIMIT 1',target.host,target.host,target.host)
+  const identity=device.identity||{},classification=device.classification||{}
+  const hostname=identity.sysName||target.host,deviceType=classification.deviceType||'other',manageability=classification.manageability||'snmp'
+  let nodeId=existing?.id
+  if(existing){
+    run("UPDATE nodes SET hostname=COALESCE(NULLIF(?,''),hostname),ip=COALESCE(ip,?),connection_mode='snmp',transport='snmp',status='reachable',agent_required=0,snmp_capable=1,device_type=?,management_type='snmp',manageability=?,hypervisor=CASE WHEN ?='hypervisor' THEN COALESCE(?,hypervisor) ELSE hypervisor END,last_seen_at=?,last_discovered_at=?,last_probe_at=?,probe_status='snmp-authenticated',discovery_source=? WHERE id=?",hostname,target.host,deviceType,manageability,deviceType,classification.vendor||null,stamp,stamp,stamp,`snmp:${target.id}`,existing.id)
+  }else{
+    nodeId=id()
+    run("INSERT INTO nodes(id,hostname,fqdn,ip,connection_mode,transport,status,inventory_source,discovery_source,last_seen_at,last_discovered_at,last_probe_at,probe_status,agent_required,firewall_state,snmp_capable,device_type,management_type,manageability,hypervisor,os_name,os_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,'unmanaged',1,?,?,?,?,?,?)",nodeId,hostname,null,target.host,'snmp','snmp','reachable','snmp',`snmp:${target.id}`,stamp,stamp,stamp,'snmp-authenticated',deviceType,'snmp',manageability,classification.deviceType==='hypervisor'?classification.vendor:null,classification.vendor||null,identity.sysDescr||null)
+  }
+  run("INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET snapshot_json=excluded.snapshot_json,collected_at=excluded.collected_at",nodeId,json({source:'snmp',identity,classification,arp:device.arp||[],macPorts:device.macPorts||[],collectedAt:stamp}),stamp)
+  run("INSERT INTO network_table_snapshots(node_id,arp_json,state_json,source,collected_at,identity_json,routes_json,tcp_states_json) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET arp_json=excluded.arp_json,state_json=excluded.state_json,source=excluded.source,collected_at=excluded.collected_at,identity_json=excluded.identity_json",nodeId,json(device.arp||[]),json(device.macPorts||[]),'snmp',stamp,json(identity),'{}','{}')
+  return nodeId
+}
 export async function pollSnmpDiscoveryTarget(targetId,{actorId=null,devicePoll=pollSnmpDevice,register=registerHost}={}){
   const target=targetWithCredential(targetId)
   if(!target)throw Object.assign(new Error('SNMP discovery target not found'),{status:404})
@@ -23,13 +38,14 @@ export async function pollSnmpDiscoveryTarget(targetId,{actorId=null,devicePoll=
   run('INSERT INTO snmp_discovery_polls(id,target_id,status,started_at,requested_by) VALUES(?,?,?,?,?)',pollId,target.id,'running',started,actorId)
   try{
     const device=await devicePoll({host:target.host,credential:{type:target.credential_type,secret:target.secret}})
+    const targetNodeId=ensureSnmpNode(target,device,now())
     const candidates=filterSnmpCandidates(device.arp,target.cidr)
     const registrations=[]
     for(const candidate of candidates.slice(0,MAX_REGISTER)){
       try{registrations.push(await register(candidate.ip,`snmp:${target.id}`,'snmp'))}
       catch(error){registrations.push({ip:candidate.ip,error:error.message,livenessMethod:'snmp'})}
     }
-    const result={host:device.host,arpCount:device.arp.length,macPortCount:device.macPorts.length,candidateCount:candidates.length,registeredCount:registrations.filter(item=>item.nodeId).length,arp:device.arp.slice(0,MAX_REGISTER),macPorts:device.macPorts.slice(0,MAX_REGISTER),registrations}
+    const result={host:device.host,targetNodeId,identity:device.identity||{},classification:device.classification||{},arpCount:device.arp.length,macPortCount:device.macPorts.length,candidateCount:candidates.length,registeredCount:registrations.filter(item=>item.nodeId).length,arp:device.arp.slice(0,MAX_REGISTER),macPorts:device.macPorts.slice(0,MAX_REGISTER),registrations}
     const finished=now()
     run('UPDATE snmp_discovery_polls SET status=?,arp_count=?,mac_port_count=?,registered_count=?,result_json=?,finished_at=? WHERE id=?','complete',device.arp.length,device.macPorts.length,result.registeredCount,json(result),finished,pollId)
     run('UPDATE snmp_discovery_targets SET last_poll_at=?,last_status=?,last_error=NULL,last_result_json=?,updated_at=? WHERE id=?',finished,'complete',json(result),finished,target.id)
@@ -38,7 +54,7 @@ export async function pollSnmpDiscoveryTarget(targetId,{actorId=null,devicePoll=
   }catch(error){
     const finished=now(),message=String(error.message||error).slice(0,500)
     run('UPDATE snmp_discovery_polls SET status=?,error=?,finished_at=? WHERE id=?','failed',message,finished,pollId)
-    run('UPDATE snmp_discovery_targets SET last_poll_at=?,last_status=?,last_error=?,updated_at=?',finished,'failed',message,finished,target.id)
+    run('UPDATE snmp_discovery_targets SET last_poll_at=?,last_status=?,last_error=?,updated_at=? WHERE id=?',finished,'failed',message,finished,target.id)
     audit(actorId,'snmp-discovery.poll.failed','snmp-target',target.id,null,{pollId,error:message})
     throw error
   }

@@ -1,6 +1,6 @@
 <script setup>
 defineProps({rows:{type:Array,default:()=>[]},loading:{type:Boolean,default:false},total:{type:Number,default:0},page:{type:Number,default:1},pages:{type:Number,default:1}})
-defineEmits(['previous','next'])
+const emit=defineEmits(['previous','next','select'])
 const hasDistinctAddress=(name,address)=>Boolean(name&&address&&String(name).toLowerCase()!==String(address).toLowerCase())
 const serviceLabel=value=>String(value||'Unidentified').split(/\r?\n/,1)[0].trim()||'Unidentified'
 const serviceDetails=row=>[row.traffic_service,row.classification_reason].filter(Boolean).join(' — ')||'Service could not be identified from the observed traffic'
@@ -10,7 +10,7 @@ const serviceDetails=row=>[row.traffic_service,row.classification_reason].filter
     <table>
       <thead><tr><th>SOURCE</th><th>DESTINATION</th><th>CLASSIFICATION</th><th>PROTOCOL</th><th>PORT</th><th>CONNECTIONS</th><th>LAST SEEN</th></tr></thead>
       <tbody>
-        <tr v-for="row in rows" :key="row.map_key">
+        <tr v-for="row in rows" :key="row.map_key" class="mapping-row" tabindex="0" @click="emit('select',row)" @keydown.enter="emit('select',row)">
           <td class="mapping-endpoint"><strong>{{row.source_hostname||row.source_ip||'—'}}</strong><small v-if="hasDistinctAddress(row.source_hostname,row.source_ip)" class="mono">{{row.source_ip}}</small></td>
           <td class="mapping-endpoint"><strong>{{row.destination_hostname||row.destination_ip||'—'}}</strong><small v-if="hasDistinctAddress(row.destination_hostname,row.destination_ip)" class="mono">{{row.destination_ip}}</small></td>
           <td><span class="status" :class="row.traffic_scope==='external'?'pending':row.traffic_scope==='host-local'?'neutral':'reachable'">{{row.traffic_class||'Unclassified'}} · {{row.traffic_scope||'Unknown'}}</span><strong class="mapping-service" :title="serviceDetails(row)" :aria-label="serviceDetails(row)">{{serviceLabel(row.traffic_service)}}</strong></td>

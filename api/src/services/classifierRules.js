@@ -58,7 +58,11 @@ function effectiveRules() {
   const byCatalog = new Map(overrides.filter(rule => rule.catalogId).map(rule => [rule.catalogId, rule]))
   const rows = catalogRows().map(rule => {
     const override = byCatalog.get(rule.id)
-    return override ? {...rule, ...override, id: override.id, catalogId: rule.id} : {...rule, catalogId: rule.id}
+    // Catalog entries are enabled by default.  A persisted override is the
+    // explicit source of truth when an operator disables or edits a rule.
+    return override
+      ? {...rule, ...override, id: override.id, catalogId: rule.id}
+      : {...rule, enabled: rule.enabled ?? true, catalogId: rule.id}
   })
   rows.push(...overrides.filter(rule => !rule.catalogId))
   cached = rows
@@ -132,6 +136,16 @@ export function resolveClassifierService(protocol, sourcePort = null, destinatio
   return protocolRule?.enabled ? protocolRule.service : null
 }
 
+function classifierRulesConflict(candidate, excludeIds = new Set()) {
+  const overlaps=(left,right)=>left.portStart===null||right.portStart===null||(left.portStart<=right.portEnd&&right.portStart<=left.portEnd)
+  const protocolsOverlap=(left,right)=>left.protocol==='ANY'||right.protocol==='ANY'||left.protocol===right.protocol
+  return effectiveRules().find(rule=>!excludeIds.has(rule.id)&&!excludeIds.has(rule.catalogId)&&rule.enabled&&candidate.enabled&&protocolsOverlap(rule,candidate)&&overlaps(rule,candidate)&&String(rule.service).trim().toLowerCase()!==String(candidate.service).trim().toLowerCase())||null
+}
+function rejectClassifierConflict(candidate, excludeIds = new Set()) {
+  const conflict=classifierRulesConflict(candidate,excludeIds)
+  if(conflict)throw Object.assign(new Error(`Classifier rule conflicts with ${conflict.service} (${conflict.protocol} ${conflict.portStart??'any'}${conflict.portEnd&&conflict.portEnd!==conflict.portStart?`-${conflict.portEnd}`:''})`),{status:409,conflict})
+}
+
 export function classifierRuleSuppresses(protocol, sourcePort = null, destinationPort = null, options = {}) {
   const proto = normalizeProtocol(protocol)
   const ports = [normalizePort(destinationPort), normalizePort(sourcePort)].filter(port => port !== null)
@@ -155,6 +169,7 @@ export function classifierRuleSuppresses(protocol, sourcePort = null, destinatio
 
 export function createClassifierRule(data, actorId) {
   const timestamp = now(), ruleId = id()
+  rejectClassifierConflict({...data,enabled:Boolean(data.enabled)})
   run('INSERT INTO classifier_rules(id,catalog_id,protocol,port_start,port_end,service,description,source,priority,enabled,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)', ruleId, null, data.protocol, data.portStart, data.portEnd, data.service, data.description || null, 'custom', data.priority, Number(data.enabled), actorId, actorId, timestamp, timestamp)
   invalidateClassifierRules()
   return publicRule(one('SELECT * FROM classifier_rules WHERE id=?', ruleId))
@@ -165,11 +180,13 @@ export function updateClassifierRule(ruleId, data, actorId) {
   const catalogRule = findClassifierCatalogRule(ruleId)
   const timestamp = now()
   if (existing) {
+    rejectClassifierConflict({...data,enabled:Boolean(data.enabled)},new Set([existing.id,existing.catalogId].filter(Boolean)))
     run('UPDATE classifier_rules SET protocol=?,port_start=?,port_end=?,service=?,description=?,priority=?,enabled=?,updated_by=?,updated_at=? WHERE id=?', data.protocol, data.portStart, data.portEnd, data.service, data.description || null, data.priority, Number(data.enabled), actorId, timestamp, ruleId)
     invalidateClassifierRules()
     return publicRule(one('SELECT * FROM classifier_rules WHERE id=?', ruleId))
   }
   if (!catalogRule) return null
+  rejectClassifierConflict({...data,enabled:Boolean(data.enabled)},new Set([catalogRule.id]))
   const overrideId = id()
   run('INSERT INTO classifier_rules(id,catalog_id,protocol,port_start,port_end,service,description,source,priority,enabled,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)', overrideId, catalogRule.id, data.protocol, data.portStart, data.portEnd, data.service, data.description || null, 'custom', data.priority, Number(data.enabled), actorId, actorId, timestamp, timestamp)
   invalidateClassifierRules()

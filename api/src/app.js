@@ -52,8 +52,8 @@ import {internetRoutes} from './routes/internet.js'
 import {classifyNetworkFlow,normalizeNetworkProtocol,recordNetworkFlow} from './services/networkMapping.js'
 import {classifierRuleRows,classifierRuleById,createClassifierRule,updateClassifierRule,deleteClassifierRule,processRuleRows,processRuleById,createProcessRule,updateProcessRule,deleteProcessRule} from './services/classifierRules.js'
 import {mappingRoutes} from './routes/mapping.js'
-import {expandCidrs,runDiscoveryScan} from './networkDiscovery.js'
-import {validSnmpHost,normalizeSnmpSecret} from './snmpDiscovery.js'
+import {expandCidrs,runDiscoveryScan,queueDiscoveryScan,publicDiscoverySchedule,runDiscoveryScheduleNow,DISCOVERY_MIN_INTERVAL_MINUTES,DISCOVERY_MAX_INTERVAL_MINUTES} from './networkDiscovery.js'
+import {validSnmpHost,normalizeSnmpSecret,ipInCidr} from './snmpDiscovery.js'
 import {snmpTargets,pollSnmpDiscoveryTarget} from './snmpDiscoveryService.js'
 import {passiveDiscoveryRows,passiveDiscoverySummary,processPassiveDiscovery} from './passiveDiscovery.js'
 import {asyncHandler} from './middleware/asyncHandler.js'
@@ -91,6 +91,7 @@ const latestVerification=nodeId=>one('SELECT status,reason,run_at FROM verifier_
 const managementVerification=node=>{
   const probe=String(node?.probe_status||'').toLowerCase()
   const hasFacts=!!node?.snapshot_json
+  if((node?.transport==='snmp'||node?.connection_mode==='snmp')&&node?.status==='reachable')return {status:'reachable',label:'Verified',reason:'SNMP poll completed successfully',transport:'snmp',checkedAt:node.last_probe_at||node.last_seen_at||null}
   if((probe==='winrm-authenticated'||probe==='winrms-authenticated')&&hasFacts)return {status:'reachable',label:'Verified',reason:'WinRM credentials authenticated and host facts collected',transport:node.transport,checkedAt:node.last_probe_at||node.last_seen_at||null}
   if(probe==='wmi-authenticated')return {status:'reachable',label:'WMI authenticated',reason:'Credentialed WMI facts collected; WinRM is not active',transport:node.transport,checkedAt:node.last_probe_at||node.last_seen_at||null}
   if(probe==='rpc-authenticated')return {status:'pending',label:'RPC authenticated',reason:'RPC sign-in passed; credentialed host verification is still required',transport:node.transport,checkedAt:node.last_probe_at||node.last_seen_at||null}
@@ -121,8 +122,12 @@ const directorySettings=()=>one("SELECT * FROM directory_connections WHERE id='d
 const wefPath=()=>one("SELECT value FROM app_settings WHERE key='wef_path'")?.value||'/api/v1/wef/wsman'
 const wefEnabled=()=>one("SELECT value FROM app_settings WHERE key='wef_enabled'")?.value==='true'
 const savedSetting=key=>String(one('SELECT value FROM app_settings WHERE key=?',key)?.value||'').trim()
+const normalizeLogAction=(eventId,action)=>Number(eventId)===4624?'logon':Number(eventId)===4634?'logoff':action||null
 const serverFqdn=()=>savedSetting('server_fqdn')
 const serverPublicBaseUrl=()=>savedSetting('server_public_base_url')
+const localAssetCidrs=()=>{const value=parse(savedSetting('local_asset_cidrs'));return Array.isArray(value)?value:[]}
+const localAssetCidrSchema=z.string().trim().max(43).refine(value=>{const [address,prefix]=value.split('/');const size=Number(prefix);return isIP(address)===4&&Number.isInteger(size)&&size>=0&&size<=32},{message:'Local asset scopes must be IPv4 CIDRs'})
+const isLocalAssetNode=node=>{const scopes=localAssetCidrs();return !scopes.length||!node?.ip||scopes.some(scope=>ipInCidr(node.ip,scope))}
 const savedWefSecret=()=>{
   const value=savedSetting('wef_shared_secret_sealed')
   if(!value)return ''
@@ -538,16 +543,41 @@ api.put('/settings/tls/:kind',requireRole('admin'),(req,res)=>{
   const file=tlsMaterialPaths()[target.key];fs.mkdirSync(path.dirname(file),{recursive:true,mode:0o700});fs.writeFileSync(file,pem,{mode:0o600});audit(req.user.id,'tls.material.upload','app-settings',target.key,null,{bytes:Buffer.byteLength(pem)})
   res.json({ok:true,kind:req.params.kind,restartRequired:true})
 })
-api.get('/discovery/scans',requireRole('admin'),(_req,res)=>res.json(all('SELECT * FROM discovery_scans ORDER BY created_at DESC LIMIT 100').map(scan=>({...scan,cidrs:parse(scan.cidrs_json)||[],results:parse(scan.results_json)||[]}))))
-api.get('/discovery/scans/:id',requireRole('admin'),(req,res)=>{const scan=one('SELECT * FROM discovery_scans WHERE id=?',reqId(req));if(!scan)return notFound(res,'Discovery scan');res.json({...scan,cidrs:parse(scan.cidrs_json)||[],results:parse(scan.results_json)||[]})})
+const publicDiscoveryScan=scan=>({...scan,cidrs:parse(scan.cidrs_json)||[],results:parse(scan.results_json)||[],diff:parse(scan.diff_json)||{}})
+api.get('/discovery/scans',requireRole('admin'),(_req,res)=>res.json(all('SELECT * FROM discovery_scans ORDER BY created_at DESC LIMIT 100').map(publicDiscoveryScan)))
+api.get('/discovery/scans/:id',requireRole('admin'),(req,res)=>{const scan=one('SELECT * FROM discovery_scans WHERE id=?',reqId(req));if(!scan)return notFound(res,'Discovery scan');res.json(publicDiscoveryScan(scan))})
 api.post('/discovery/scans',requireRole('admin'),(req,res)=>{
   const data=body(z.object({cidrs:z.array(z.string().trim().min(1).max(64)).min(1).max(32)}),req)
   let hosts;try{hosts=expandCidrs(data.cidrs)}catch(error){return res.status(400).json({error:error.message})}
-  const scanId=id();run('INSERT INTO discovery_scans(id,cidrs_json,status,created_at,requested_by) VALUES(?,?,\'queued\',?,?)',scanId,json(data.cidrs),now(),req.user.id)
-  audit(req.user.id,'network-discovery.start','discovery-scan',scanId,null,{cidrs:data.cidrs,addresses:hosts.length})
+  const scanId=queueDiscoveryScan({cidrs:data.cidrs,requestedBy:req.user.id})
   setImmediate(()=>runDiscoveryScan(scanId).catch(error=>console.error('Discovery scan failed:',error)))
   res.status(202).json({id:scanId,status:'queued',addresses:hosts.length})
 })
+const discoveryScheduleInput=z.object({name:z.string().trim().min(1).max(120).default('CIDR discovery schedule'),cidrs:z.array(z.string().trim().min(1).max(64)).min(1).max(32),intervalMinutes:z.number().int().min(DISCOVERY_MIN_INTERVAL_MINUTES).max(DISCOVERY_MAX_INTERVAL_MINUTES).default(60),enabled:z.boolean().default(true)})
+const discoveryScheduleUpdate=z.object({name:z.string().trim().min(1).max(120).optional(),cidrs:z.array(z.string().trim().min(1).max(64)).min(1).max(32).optional(),intervalMinutes:z.number().int().min(DISCOVERY_MIN_INTERVAL_MINUTES).max(DISCOVERY_MAX_INTERVAL_MINUTES).optional(),enabled:z.boolean().optional()})
+api.get('/discovery/schedules',requireRole('admin'),(_req,res)=>res.json(all('SELECT * FROM discovery_scan_schedules ORDER BY created_at DESC').map(publicDiscoverySchedule)))
+api.post('/discovery/schedules',requireRole('admin'),(req,res)=>{
+  const data=body(discoveryScheduleInput,req);let addresses
+  try{addresses=expandCidrs(data.cidrs)}catch(error){return res.status(400).json({error:error.message})}
+  const scheduleId=id(),stamp=now(),next=new Date(Date.now()+data.intervalMinutes*60_000).toISOString()
+  run('INSERT INTO discovery_scan_schedules(id,name,cidrs_json,enabled,interval_minutes,status,next_run_at,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?, ?,?,?)',scheduleId,data.name,json(data.cidrs),Number(data.enabled),data.intervalMinutes,data.enabled?'enabled':'paused',next,req.user.id,stamp,stamp)
+  audit(req.user.id,'network-discovery.schedule.create','discovery-schedule',scheduleId,null,{...data,addresses})
+  res.status(201).json(publicDiscoverySchedule(one('SELECT * FROM discovery_scan_schedules WHERE id=?',scheduleId)))
+})
+api.patch('/discovery/schedules/:id',requireRole('admin'),(req,res)=>{
+  const before=one('SELECT * FROM discovery_scan_schedules WHERE id=?',reqId(req));if(!before)return notFound(res,'Discovery schedule')
+  const data=body(discoveryScheduleUpdate,req),name=data.name===undefined?before.name:data.name,cidrs=data.cidrs===undefined?parse(before.cidrs_json)||[]:data.cidrs,intervalMinutes=data.intervalMinutes===undefined?before.interval_minutes:data.intervalMinutes,enabled=data.enabled===undefined?!!before.enabled:data.enabled
+  let addresses;try{addresses=expandCidrs(cidrs)}catch(error){return res.status(400).json({error:error.message})}
+  const status=enabled?(before.status==='running'?'running':'enabled'):'paused',next=data.intervalMinutes===undefined&&before.next_run_at?before.next_run_at:new Date(Date.now()+intervalMinutes*60_000).toISOString()
+  run('UPDATE discovery_scan_schedules SET name=?,cidrs_json=?,enabled=?,interval_minutes=?,status=?,next_run_at=?,last_error=NULL,updated_at=? WHERE id=?',name,json(cidrs),Number(enabled),intervalMinutes,status,next,now(),before.id)
+  const after=one('SELECT * FROM discovery_scan_schedules WHERE id=?',before.id)
+  audit(req.user.id,'network-discovery.schedule.update','discovery-schedule',before.id,{...publicDiscoverySchedule(before)},{...publicDiscoverySchedule(after),addresses})
+  res.json(publicDiscoverySchedule(after))
+})
+api.delete('/discovery/schedules/:id',requireRole('admin'),(req,res)=>{const schedule=one('SELECT * FROM discovery_scan_schedules WHERE id=?',reqId(req));if(!schedule)return notFound(res,'Discovery schedule');run('DELETE FROM discovery_scan_schedules WHERE id=?',schedule.id);audit(req.user.id,'network-discovery.schedule.delete','discovery-schedule',schedule.id,publicDiscoverySchedule(schedule),null);res.status(204).end()})
+const runDiscoveryScheduleRoute=wrap(async(req,res)=>{const result=await runDiscoveryScheduleNow(reqId(req),{actorId:req.user.id});const scan=one('SELECT cidrs_json FROM discovery_scans WHERE id=?',result.scanId);res.status(202).json({...result,addresses:expandCidrs(parse(scan?.cidrs_json)||[]).length})})
+api.post('/discovery/schedules/:id/run-now',requireRole('admin'),runDiscoveryScheduleRoute)
+api.post('/discovery/schedules/:id/run',requireRole('admin'),runDiscoveryScheduleRoute)
 const snmpCidr=value=>{
   const [address,prefixText]=String(value||'').trim().split('/')
   const prefix=prefixText===undefined?32:Number(prefixText)
@@ -933,20 +963,22 @@ api.get('/settings/server',requireRole('admin'),(req,res)=>res.json({
   configuredPublicBaseUrl:serverPublicBaseUrl()||null,
   publicBaseUrlConfigured:!!(process.env.PUBLIC_BASE_URL||serverPublicBaseUrl()),
   publicBaseUrlSource:process.env.PUBLIC_BASE_URL?'environment':serverPublicBaseUrl()?'administration':'request',
+  localCidrs:localAssetCidrs(),
   environmentOverrides:{fqdn:!!process.env.SERVER_FQDN,publicBaseUrl:!!process.env.PUBLIC_BASE_URL},
 }))
 api.patch('/settings/server',requireRole('admin'),(req,res)=>{
-  const data=body(z.object({fqdn:serverFqdnSchema,publicBaseUrl:serverPublicUrlSchema}),req)
+  const data=body(z.object({fqdn:serverFqdnSchema,publicBaseUrl:serverPublicUrlSchema,localCidrs:z.array(localAssetCidrSchema).max(256).default([])}),req)
   if(process.env.SERVER_FQDN&&data.fqdn&&data.fqdn!==process.env.SERVER_FQDN.trim())return res.status(409).json({error:'SERVER_FQDN is configured by the deployment environment; change that value instead'})
   if(process.env.PUBLIC_BASE_URL&&data.publicBaseUrl&&data.publicBaseUrl!==process.env.PUBLIC_BASE_URL.trim())return res.status(409).json({error:'PUBLIC_BASE_URL is configured by the deployment environment; change that value instead'})
-  const before={fqdn:serverFqdn()||null,publicBaseUrl:serverPublicBaseUrl()||null}
-  const next={fqdn:data.fqdn||'',publicBaseUrl:data.publicBaseUrl||''}
+  const before={fqdn:serverFqdn()||null,publicBaseUrl:serverPublicBaseUrl()||null,localCidrs:localAssetCidrs()}
+  const next={fqdn:data.fqdn||'',publicBaseUrl:data.publicBaseUrl||'',localCidrs:data.localCidrs}
   db.transaction(()=>{
     if(!process.env.SERVER_FQDN)run("INSERT INTO app_settings(key,value) VALUES('server_fqdn',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",next.fqdn)
     if(!process.env.PUBLIC_BASE_URL)run("INSERT INTO app_settings(key,value) VALUES('server_public_base_url',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",next.publicBaseUrl)
+    run("INSERT INTO app_settings(key,value) VALUES('local_asset_cidrs',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",json(next.localCidrs))
     audit(req.user.id,'server.settings.update','app-settings','server',before,next)
   })()
-  res.json({fqdn:process.env.SERVER_FQDN||next.fqdn||null,configuredFqdn:next.fqdn||null,fqdnSource:process.env.SERVER_FQDN?'environment':next.fqdn?'administration':'unset',publicBaseUrl:effectivePublicBaseUrl(req),configuredPublicBaseUrl:next.publicBaseUrl||null,publicBaseUrlConfigured:!!(process.env.PUBLIC_BASE_URL||next.publicBaseUrl),publicBaseUrlSource:process.env.PUBLIC_BASE_URL?'environment':next.publicBaseUrl?'administration':'request',environmentOverrides:{fqdn:!!process.env.SERVER_FQDN,publicBaseUrl:!!process.env.PUBLIC_BASE_URL}})
+  res.json({fqdn:process.env.SERVER_FQDN||next.fqdn||null,configuredFqdn:next.fqdn||null,fqdnSource:process.env.SERVER_FQDN?'environment':next.fqdn?'administration':'unset',publicBaseUrl:effectivePublicBaseUrl(req),configuredPublicBaseUrl:next.publicBaseUrl||null,publicBaseUrlConfigured:!!(process.env.PUBLIC_BASE_URL||next.publicBaseUrl),publicBaseUrlSource:process.env.PUBLIC_BASE_URL?'environment':next.publicBaseUrl?'administration':'request',localCidrs:next.localCidrs,environmentOverrides:{fqdn:!!process.env.SERVER_FQDN,publicBaseUrl:!!process.env.PUBLIC_BASE_URL}})
 })
 api.get('/settings/wef',requireRole('admin'),(req,res)=>res.json(publicWef(req)))
 api.patch('/settings/wef',requireRole('admin'),(req,res)=>{
@@ -1418,7 +1450,7 @@ api.post('/credentials/:id/test',requireRole('editor'),wrap(async(req,res)=>{
   try {res.json(await testNodeCredential(node,credential.id))}catch(error){res.json({success:false,transport:node.transport||'winrm',error:error.message})}
 }))
 
-api.get('/nodes',(_req,res)=>res.json(all('SELECT n.*,f.snapshot_json FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id ORDER BY n.created_at DESC').map(publicNode)))
+api.get('/nodes',(_req,res)=>res.json(all('SELECT n.*,f.snapshot_json FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id ORDER BY n.created_at DESC').filter(isLocalAssetNode).map(publicNode)))
 api.post('/nodes',requireRole('editor'),wrap(async(req,res)=>{
   const data=body(z.object({hostname:z.string().min(1),fqdn:z.string().optional(),ip:z.string().optional(),connectionMode:z.enum(['agentless','agent']).default('agentless'),credentialIds:z.array(z.string()).default([])}),req)
   if(data.credentialIds.some(credentialId=>!canUseCredential(req.user,one('SELECT * FROM credentials WHERE id=?',credentialId))))return res.status(403).json({error:'Credential unavailable'})
@@ -1440,7 +1472,7 @@ api.post('/nodes/:id/training',requireRole('editor'),(req,res)=>{
 })
 api.patch('/nodes/:id',requireRole('editor'),wrap(async(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
-  const data=body(z.object({hostname:z.string().trim().min(1).optional(),fqdn:z.string().trim().nullable().optional(),ip:z.string().refine(value=>isIP(value)!==0,'Invalid IP address').nullable().optional(),connectionMode:z.enum(['agentless','agent']).optional()}),req)
+  const data=body(z.object({hostname:z.string().trim().min(1).optional(),fqdn:z.string().trim().nullable().optional(),ip:z.string().refine(value=>isIP(value)!==0,'Invalid IP address').nullable().optional(),connectionMode:z.enum(['agentless','agent','snmp']).optional(),deviceType:z.enum(['auto','switch','firewall','router','printer','hypervisor','other']).optional(),managementType:z.enum(['auto','snmp','agentless','agent','manual']).optional()}),req)
   const hostname=data.hostname??node.hostname,fqdn=data.fqdn===undefined?node.fqdn:data.fqdn,ip=data.ip===undefined?node.ip:data.ip,mode=data.connectionMode||node.connection_mode
   if(node.ad_guid&&(hostname!==node.hostname||fqdn!==node.fqdn))return res.status(409).json({error:'Active Directory manages this computer name and FQDN; edit them in the directory'})
   if(mode==='agent'&&!node.agent_id)return res.status(409).json({error:'Enroll an agent before switching to agent mode'})
@@ -1448,10 +1480,11 @@ api.patch('/nodes/:id',requireRole('editor'),wrap(async(req,res)=>{
   const targetChanged=(fqdn||ip||hostname)!==(node.fqdn||node.ip||node.hostname)
   if(targetChanged&&one('SELECT id FROM policy_assignments WHERE node_id=? OR node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?)',node.id,node.id))return res.status(409).json({error:'Remove assigned policies before changing the management address; existing firewall rules may still be present on the old host'})
   const identityChanged=hostname!==node.hostname||fqdn!==node.fqdn||ip!==node.ip
+  const managementType=data.managementType??node.management_type??'auto',deviceType=data.deviceType??node.device_type??'auto',nextMode=managementType==='snmp'?'snmp':mode,nextTransport=managementType==='snmp'?'snmp':targetChanged?null:node.transport,nextStatus=managementType==='snmp'&&node.status==='reachable'?'reachable':targetChanged?'unknown':node.status
   db.transaction(()=>{
-    run('UPDATE nodes SET hostname=?,fqdn=?,ip=?,connection_mode=?,transport=?,status=?,failures=?,next_retry_at=? WHERE id=?',hostname,fqdn,ip,mode,targetChanged?null:node.transport,targetChanged?'unknown':node.status,targetChanged?0:node.failures,targetChanged?null:node.next_retry_at,node.id)
+    run('UPDATE nodes SET hostname=?,fqdn=?,ip=?,connection_mode=?,transport=?,device_type=?,management_type=?,status=?,failures=?,next_retry_at=? WHERE id=?',hostname,fqdn,ip,nextMode,nextTransport,deviceType,managementType,nextStatus,targetChanged?0:node.failures,targetChanged?null:node.next_retry_at,node.id)
     if(targetChanged)run('DELETE FROM node_facts WHERE node_id=?',node.id)
-    audit(req.user.id,'node.update','node',node.id,node,{hostname,fqdn,ip,connectionMode:mode,targetChanged})
+    audit(req.user.id,'node.update','node',node.id,node,{hostname,fqdn,ip,connectionMode:nextMode,deviceType,managementType,targetChanged})
   })()
   if(identityChanged)await lookupDns(getNode(node.id))
   res.json(getNode(node.id))
@@ -2556,16 +2589,19 @@ api.post('/logon-rights/change',requireRole('admin'),wrap(async(req,res)=>{
 
 api.get('/logs/search',(req,res)=>{
   const query=z.object({
-    nodeId:z.string().optional(),action:z.enum(['allow','block','success','failure']).optional(),direction:z.enum(['in','out']).optional(),
+    nodeId:z.string().optional(),action:z.enum(['allow','block','success','failure','logon','logoff']).optional(),direction:z.enum(['in','out']).optional(),
     program:z.string().max(1024).optional(),challengeId:z.string().max(128).optional(),
     eventId:z.coerce.number().int().min(0).optional(),protocol:z.string().max(32).optional(),srcIp:z.string().max(128).optional(),dstIp:z.string().max(128).optional(),
     port:z.coerce.number().int().min(1).max(65535).optional(),from:z.iso.datetime({local:true,offset:true}).optional(),to:z.iso.datetime({local:true,offset:true}).optional(),
-    page:z.coerce.number().int().min(1).default(1),pageSize:z.coerce.number().int().min(1).max(500).default(100),
+    eventType:z.enum(['firewall','logon','all']).default('all'),page:z.coerce.number().int().min(1).default(1),pageSize:z.coerce.number().int().min(1).max(500).default(100),
     sortBy:z.enum(['time','node','eventId','action','direction','srcIp','dstIp','port','program','account']).default('time'),sortDir:z.enum(['asc','desc']).default('desc'),hideLoopback:z.enum(['true','false']).optional(),account:z.string().max(200).default('')
   }).parse(req.query)
   if(query.from&&query.to&&new Date(query.from)>new Date(query.to))return res.status(400).json({error:'From must be earlier than To'})
   const filters=[visibleFirewallEventSql()],args=[]
-  for(const [key,column] of [['nodeId','e.node_id'],['action','e.action'],['direction','COALESCE(e.direction,p.direction)'],['challengeId','e.challenge_id'],['eventId','e.event_id'],['port','COALESCE(e.dst_port,p.dst_port)']])if(query[key]!==undefined){filters.push(`${column}=?`);args.push(query[key])}
+  if(query.eventType==='logon')filters.push("(COALESCE(e.event_type,p.event_type)='logon' OR e.event_id IN (4624,4634))")
+  if(query.eventType==='firewall')filters.push("COALESCE(e.event_type,p.event_type,'firewall')<>'logon' AND e.event_id NOT IN (4624,4634)")
+  for(const [key,column] of [['nodeId','e.node_id'],['direction','COALESCE(e.direction,p.direction)'],['challengeId','e.challenge_id'],['eventId','e.event_id'],['port','COALESCE(e.dst_port,p.dst_port)']])if(query[key]!==undefined){filters.push(`${column}=?`);args.push(query[key])}
+  if(query.action){if(query.action==='logon')filters.push('e.event_id=4624');else if(query.action==='logoff')filters.push('e.event_id=4634');else{filters.push('e.action=?');args.push(query.action)}}
   for(const [key,column] of [['program','COALESCE(e.program,p.program)'],['protocol','COALESCE(e.protocol,p.protocol)'],['srcIp','COALESCE(e.src_ip,p.src_ip)'],['dstIp','COALESCE(e.dst_ip,p.dst_ip)']])if(query[key]){filters.push(`${column} LIKE ? ESCAPE '\\'`);args.push(`%${query[key].replace(/[\\%_]/g,'\\$&')}%`)}
   if(query.account.trim()){const term=`%${query.account.trim().replace(/[\\%_]/g,'\\$&')}%`;filters.push("(e.account_sid LIKE ? ESCAPE '\\' OR COALESCE(ad.sam_account_name,ad.upn,'') LIKE ? ESCAPE '\\' OR COALESCE(la.qualified_name,'') LIKE ? ESCAPE '\\' OR COALESCE(sr.qualified_name,'') LIKE ? ESCAPE '\\')");args.push(term,term,term,term)}
   if(query.from){filters.push('datetime(COALESCE(e.event_time,e.received_at))>=datetime(?)');args.push(query.from)}
@@ -2580,7 +2616,8 @@ api.get('/logs/search',(req,res)=>{
     const classification=classifyNetworkFlow({node:{ip:event.node_ip,snapshot_json:event.node_snapshot_json},sourceIp,destinationIp,protocol:event.protocol,sourcePort:event.src_port,destinationPort:event.dst_port,program:event.program})
     const account=event.account_name?event.account_name:event.account_sid?accountName(event.node_id,event.account_sid).accountName:null
     const {node_ip:_nodeIp,node_snapshot_json:_snapshot,...publicEvent}=event
-    return {...publicEvent,protocol:normalizeNetworkProtocol(publicEvent.protocol),account_name:account,traffic_service:classification.service,traffic_class:classification.trafficClass,traffic_scope:classification.scope,traffic_reason:classification.reason}
+    const action=Number(publicEvent.event_id)===4624?'logon':Number(publicEvent.event_id)===4634?'logoff':publicEvent.action
+    return {...publicEvent,action,protocol:normalizeNetworkProtocol(publicEvent.protocol),account_name:account,traffic_service:classification.service,traffic_class:classification.trafficClass,traffic_scope:classification.scope,traffic_reason:classification.reason}
   })
   res.json({items,total,page:query.page,pageSize:query.pageSize,totalPages:Math.ceil(total/query.pageSize)})
 })
@@ -2672,7 +2709,7 @@ api.post('/logs/:id/rule',requireRole('admin'),(req,res)=>{
 api.post('/logs/ingest',requireRole('editor'),(req,res)=>{
   const data=body(z.object({nodeId:z.string(),events:z.array(z.object({recordId:z.number().optional(),eventId:z.number().int(),action:z.string().optional(),protocol:z.string().optional(),srcIp:z.string().optional(),dstIp:z.string().optional(),dstPort:z.number().optional(),direction:z.string().optional(),program:z.string().optional(),accountSid:z.string().optional(),challengeId:z.string().optional(),logonType:z.string().optional(),logonStatus:z.string().optional(),logonSubStatus:z.string().optional()})).max(1000)}),req)
   const ignoreLoopback=observabilitySettings().ignoreLoopbackIngest
-  let inserted=0;db.transaction(()=>{for(const event of data.events){if(ignoreLoopback&&isLoopbackEvent(event)||isExcludedFirewallEvent(event)||isIgnoredFirewallEvent(event))continue;const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,dst_ip,dst_port,direction,program,account_sid,challenge_id,logon_type,logon_status,logon_sub_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),data.nodeId,event.recordId??null,event.eventId,event.action||null,event.protocol||null,event.srcIp||null,event.dstIp||null,event.dstPort||null,event.direction||null,event.program||null,event.accountSid||null,event.challengeId||null,event.logonType||null,event.logonStatus||null,event.logonSubStatus||null);inserted+=result.changes;if(result.changes&&event.eventId>=5156)recordNetworkFlow(data.nodeId,{...event,eventType:'firewall'})}})()
+  let inserted=0;db.transaction(()=>{for(const event of data.events){if(ignoreLoopback&&isLoopbackEvent(event)||isExcludedFirewallEvent(event)||isIgnoredFirewallEvent(event))continue;const action=normalizeLogAction(event.eventId,event.action),result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,dst_ip,dst_port,direction,program,account_sid,challenge_id,logon_type,logon_status,logon_sub_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),data.nodeId,event.recordId??null,event.eventId,action,event.protocol||null,event.srcIp||null,event.dstIp||null,event.dstPort||null,event.direction||null,event.program||null,event.accountSid||null,event.challengeId||null,event.logonType||null,event.logonStatus||null,event.logonSubStatus||null);inserted+=result.changes;if(result.changes&&event.eventId>=5156)recordNetworkFlow(data.nodeId,{...event,eventType:'firewall',action})}})()
   res.status(201).json({inserted})
 })
 
@@ -2682,7 +2719,7 @@ function insertCollectedEvents(nodeId,events,ignoreLoopback){
     const item=normalizeWindowsEvent(event)
     if(ignoreLoopback&&isLoopbackEvent(item))continue
     if(isExcludedFirewallEvent(item)||isIgnoredFirewallEvent(item))continue
-    const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,program,process_id,account_sid,event_time,event_type,logon_type,filter_origin,filter_runtime_id,logon_status,logon_sub_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),nodeId,item.recordId,item.eventId,item.action,item.protocol,item.srcIp,item.srcPort,item.dstIp,item.dstPort,item.direction,item.program,item.processId,item.accountSid,item.eventTime,item.eventType,item.logonType,item.filterOrigin,item.filterRuntimeId,item.logonStatus,item.logonSubStatus)
+    const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,program,process_id,account_sid,event_time,event_type,logon_type,filter_origin,filter_runtime_id,logon_status,logon_sub_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),nodeId,item.recordId,item.eventId,normalizeLogAction(item.eventId,item.action),item.protocol,item.srcIp,item.srcPort,item.dstIp,item.dstPort,item.direction,item.program,item.processId,item.accountSid,item.eventTime,item.eventType,item.logonType,item.filterOrigin,item.filterRuntimeId,item.logonStatus,item.logonSubStatus)
     inserted+=result.changes
     if(result.changes&&item.eventType==='firewall')recordNetworkFlow(nodeId,item)
     if(!result.changes&&item.filterOrigin)run('UPDATE log_events SET filter_origin=COALESCE(filter_origin,?),filter_runtime_id=COALESCE(filter_runtime_id,?) WHERE node_id=? AND record_id=? AND filter_origin IS NULL',item.filterOrigin,item.filterRuntimeId,nodeId,item.recordId)

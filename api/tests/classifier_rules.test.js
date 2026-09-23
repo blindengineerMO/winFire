@@ -24,6 +24,7 @@ test('IANA catalog is available and custom classifier rules override and restore
   assert.ok(catalog.body.total>10000)
   const https=(await auth(request.get('/api/v1/settings/classifier').query({search:'HTTPS web traffic',pageSize:500})).expect(200)).body.items
   assert.ok(https.some(rule=>rule.service==='HTTPS web traffic'))
+  assert.ok(https.find(rule=>rule.service==='HTTPS web traffic').enabled)
   const created=await auth(request.post('/api/v1/settings/classifier/rules')).send({protocol:'TCP',portStart:15432,portEnd:15432,service:'Internal Billing API',description:'Customer application',priority:9000,enabled:true}).expect(201)
   assert.equal(classifyNetworkFlow({sourceIp:'10.0.0.1',destinationIp:'10.0.0.2',protocol:'TCP',destinationPort:15432}).service,'Internal Billing API')
   await auth(request.patch(`/api/v1/settings/classifier/rules/${created.body.id}`)).send({protocol:'TCP',portStart:15432,portEnd:15432,service:'Renamed Billing API',description:'Updated application',priority:9000,enabled:true}).expect(200)

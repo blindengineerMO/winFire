@@ -19,6 +19,7 @@ import {asyncHandler} from '../middleware/asyncHandler.js'
 
 export const agentRoutes=express.Router()
 const wrap=asyncHandler
+const normalizeLogAction=(eventId,action)=>Number(eventId)===4624?'logon':Number(eventId)===4634?'logoff':action||null
 const enrollLimit=rateLimit({windowMs:15*60*1000,limit:20,standardHeaders:'draft-8',legacyHeaders:false})
 const readRuleSchema=z.array(z.object({name:z.string(),action:z.string(),direction:z.string(),protocol:z.string(),localPort:z.string(),remotePort:z.string(),remoteAddress:z.string(),program:z.string(),profile:z.string()})).max(1000)
 
@@ -121,7 +122,7 @@ agentRoutes.post('/:id/events',requireAgent,(req,res)=>{
       const item=normalizeWindowsEvent(raw)
       if(ignoreLoopback&&isLoopbackEvent(item))continue
       if(isExcludedFirewallEvent(item)||isIgnoredFirewallEvent(item)){excluded++;continue}
-      const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,program,process_id,account_sid,event_time,event_type,logon_type,filter_origin,filter_runtime_id,logon_status,logon_sub_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),req.agent.node_id,item.recordId,item.eventId,item.action,item.protocol,item.srcIp,item.srcPort,item.dstIp,item.dstPort,item.direction,item.program,item.processId,item.accountSid,item.eventTime,item.eventType,item.logonType,item.filterOrigin,item.filterRuntimeId,item.logonStatus,item.logonSubStatus)
+      const result=run('INSERT OR IGNORE INTO log_events(id,node_id,record_id,event_id,action,protocol,src_ip,src_port,dst_ip,dst_port,direction,program,process_id,account_sid,event_time,event_type,logon_type,filter_origin,filter_runtime_id,logon_status,logon_sub_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',id(),req.agent.node_id,item.recordId,item.eventId,normalizeLogAction(item.eventId,item.action),item.protocol,item.srcIp,item.srcPort,item.dstIp,item.dstPort,item.direction,item.program,item.processId,item.accountSid,item.eventTime,item.eventType,item.logonType,item.filterOrigin,item.filterRuntimeId,item.logonStatus,item.logonSubStatus)
       inserted+=result.changes
       if(result.changes && item.eventType==='firewall')recordNetworkFlow(req.agent.node_id,item)
       if(!result.changes&&item.filterOrigin)run('UPDATE log_events SET filter_origin=COALESCE(filter_origin,?),filter_runtime_id=COALESCE(filter_runtime_id,?) WHERE node_id=? AND record_id=? AND filter_origin IS NULL',item.filterOrigin,item.filterRuntimeId,req.agent.node_id,item.recordId)

@@ -20,6 +20,7 @@ import {pollFleet} from './fleetPoll.js'
 import {refreshDynamicGroups} from './dynamicNodeGroups.js'
 import {dueSnmpTargets,pollSnmpDiscoveryTarget} from './snmpDiscoveryService.js'
 import {processPassiveDiscovery} from './passiveDiscovery.js'
+import {processDueDiscoverySchedules} from './networkDiscovery.js'
 
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..')
 const dist=path.join(root,'web/dist')
@@ -146,6 +147,17 @@ async function sweepPassiveDiscovery(){
 setTimeout(sweepPassiveDiscovery,25_000).unref()
 const passiveDiscoveryTimer=setInterval(sweepPassiveDiscovery,60_000)
 passiveDiscoveryTimer.unref()
+let scheduledDiscoveryRunning=false
+async function sweepScheduledDiscovery(){
+  if(scheduledDiscoveryRunning)return
+  scheduledDiscoveryRunning=true
+  try{await processDueDiscoverySchedules()}
+  catch(error){console.error('Scheduled discovery sweep failed:',error)}
+  finally{scheduledDiscoveryRunning=false}
+}
+setTimeout(sweepScheduledDiscovery,3500).unref()
+const scheduledDiscoveryTimer=setInterval(sweepScheduledDiscovery,60_000)
+scheduledDiscoveryTimer.unref()
 setTimeout(()=>processDueAdAccountHolds().catch(error=>console.error('AD account hold sweep failed:',error)),10_000).unref()
 const adHoldTimer=setInterval(()=>processDueAdAccountHolds().catch(error=>console.error('AD account hold sweep failed:',error)),60_000)
 adHoldTimer.unref()
