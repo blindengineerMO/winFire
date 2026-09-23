@@ -12,7 +12,7 @@ process.env.BOOTSTRAP_PASSWORD='snmp-test-password-123'
 const {app}=await import('../src/app.js')
 const {bootstrap}=await import('../src/security.js')
 const {db}=await import('../src/db.js')
-const {normalizeSnmpSecret,normalizeArpTable,normalizeForwardingTable,pollSnmpDevice,filterSnmpCandidates}=await import('../src/snmpDiscovery.js')
+const {normalizeSnmpSecret,normalizeArpTable,normalizeForwardingTable,pollSnmpDevice,filterSnmpCandidates,classifySnmpIdentity}=await import('../src/snmpDiscovery.js')
 const {pollSnmpDiscoveryTarget,dueSnmpTargets}=await import('../src/snmpDiscoveryService.js')
 await bootstrap()
 const request=supertest(app)
@@ -55,4 +55,11 @@ test('SNMP tables normalize ARP and forwarding data and scope candidates',async(
   const result=await pollSnmpDevice({host:'192.0.2.1',credential:{type:'snmp-v2c',secret:{community:'monitoring'}},sessionFactory:()=>fakeSession})
   assert.equal(result.arp.length,1)
   assert.equal(result.macPorts[0].port,12)
+})
+
+test('SNMP identity fingerprints cover infrastructure vendors and hypervisors',()=>{
+  assert.deepEqual(classifySnmpIdentity({sysDescr:'Cisco IOS-XE Software'}),{vendor:'Cisco IOS/NX-OS',deviceType:'switch',manageability:'snmp'})
+  assert.deepEqual(classifySnmpIdentity({sysDescr:'Juniper Networks Junos'}),{vendor:'Juniper Junos',deviceType:'router',manageability:'snmp'})
+  assert.deepEqual(classifySnmpIdentity({sysDescr:'VMware ESXi 8.0'}),{vendor:'VMware ESXi',deviceType:'hypervisor',manageability:'unmanaged',hypervisor:'VMware ESXi'})
+  assert.deepEqual(classifySnmpIdentity({sysDescr:'Fortinet FortiOS'}),{vendor:'Fortinet FortiOS',deviceType:'firewall',manageability:'snmp'})
 })

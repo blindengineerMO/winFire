@@ -11,6 +11,7 @@ import {jitAccessFunctions} from './jitAccessScript.js'
 import {mfaPromptFunctions} from './mfaPromptScript.js'
 import {assertManagementAccess} from './managementGuard.js'
 import {emitNotification} from './notifications.js'
+import {classifyOperatingSystem,classifyInfrastructureFacts} from './infrastructureDiscovery.js'
 
 const timeoutMs = 40000
 const lsaRightsFunctions=fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../sidecar/lsa_rights.ps1'),'utf8')
@@ -537,7 +538,8 @@ export async function probeNode(node,{verifyWinrm=true,probePort=tcpProbe,authen
 export async function collectFacts(node,{credentialId,suppliedFacts}={}) {
   const facts=suppliedFacts||await remote(node,'facts',{}, {credentialId})
   run('INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET snapshot_json=excluded.snapshot_json,collected_at=excluded.collected_at',node.id,JSON.stringify(facts),now())
-  run('UPDATE nodes SET os_version=?,os_build=?,last_seen_at=?,status=? WHERE id=?',facts?.os?.Version||null,facts?.os?.BuildNumber||null,now(),'reachable',node.id)
+  const osName=classifyOperatingSystem({caption:facts?.os?.Caption,version:facts?.os?.Version,build:facts?.os?.BuildNumber}),infrastructure=classifyInfrastructureFacts(facts),rawMac=String(facts?.network?.find(adapter=>adapter?.macAddress)?.macAddress||'').trim().toLowerCase().replaceAll('-',':'),macAddress=/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(rawMac)&&rawMac!=='00:00:00:00:00:00'?rawMac:null,managedAt=now()
+  run('UPDATE nodes SET mac_address=COALESCE(?,mac_address),os_version=?,os_build=?,os_name=COALESCE(?,os_name),hypervisor=COALESCE(?,hypervisor),manageability=COALESCE(?,manageability),snmp_capable=CASE WHEN ? IS NULL THEN snmp_capable ELSE ? END,last_seen_at=?,last_managed_at=?,status=? WHERE id=?',macAddress,facts?.os?.Version||null,facts?.os?.BuildNumber||null,osName,infrastructure?.hypervisorName||infrastructure?.hypervisor||null,infrastructure?.manageability||null,infrastructure?.snmpCapable===undefined?null:infrastructure.snmpCapable,infrastructure?.snmpCapable===undefined?null:infrastructure.snmpCapable,managedAt,managedAt,'reachable',node.id)
   if(node.connection_mode==='agentless'&&['winrm','winrms'].includes(node.transport)){
     try{const {collectAccountInventory}=await import('./localAccounts.js');await collectAccountInventory(node)}
     catch(error){audit(null,'local-accounts.collect.failed','node',node.id,null,{error:error.message})}

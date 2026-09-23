@@ -6,9 +6,9 @@ const VIM_NS='urn:vim25'
 
 const escapeXml=value=>String(value??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&apos;')
 
-function request(host,{method='GET',body='',headers={},timeoutMs=DEFAULT_TIMEOUT_MS}={}){
+export function hypervisorRequest(host,{port=443,path='/',method='GET',body='',headers={},timeoutMs=DEFAULT_TIMEOUT_MS}={}){
   return new Promise((resolve,reject)=>{
-    const req=https.request({hostname:host,port:443,path:'/sdk',method,headers:{'User-Agent':'WinFire discovery','Accept':'text/xml, */*',...(body?{'Content-Type':'text/xml; charset=utf-8','Content-Length':Buffer.byteLength(body)}:{}),...headers},rejectUnauthorized:false,timeout:timeoutMs},res=>{
+    const req=https.request({hostname:host,port,path,method,headers:{'User-Agent':'WinFire discovery','Accept':'text/xml, */*',...(body?{'Content-Type':'text/xml; charset=utf-8','Content-Length':Buffer.byteLength(body)}:{}),...headers},rejectUnauthorized:false,timeout:timeoutMs},res=>{
       const chunks=[]
       res.on('data',chunk=>chunks.push(chunk))
       res.on('end',()=>resolve({status:res.statusCode||0,headers:res.headers,body:Buffer.concat(chunks).toString('utf8')}))
@@ -19,6 +19,8 @@ function request(host,{method='GET',body='',headers={},timeoutMs=DEFAULT_TIMEOUT
     req.end()
   })
 }
+
+const request=(host,options={})=>hypervisorRequest(host,{path:'/sdk',...options})
 
 const soapEnvelope=body=>`<?xml version="1.0" encoding="UTF-8"?><soapenv:Envelope xmlns:soapenv="${SOAP_NS}" xmlns:vim="${VIM_NS}"><soapenv:Body>${body}</soapenv:Body></soapenv:Envelope>`
 const soapFault=xml=>/<(?:[\w-]+:)?Fault\b/i.test(String(xml||'' ) )
@@ -75,4 +77,27 @@ export async function identifyEsxi(host,{credentials=[],timeoutMs=DEFAULT_TIMEOU
   return detected
 }
 
-export const __private={escapeXml,firstTag,hasVmwareMarker}
+/**
+ * Identify common infrastructure hypervisors with bounded, unauthenticated
+ * HTTPS probes. This runs after liveness and is intentionally independent of
+ * WinRM, WMI, SMB, and SNMP so appliance hosts still get a useful identity.
+ */
+export async function identifyHypervisor(host,{credentials=[],timeoutMs=DEFAULT_TIMEOUT_MS}={}){
+  const esxi=await identifyEsxi(host,{credentials,timeoutMs})
+  if(esxi.detected)return esxi
+  const base={detected:false,authenticated:false,host,deviceType:'hypervisor',manageability:'unmanaged',snmpEligible:true}
+  const probes=[
+    {kind:'proxmox',port:8006,path:'/api2/json/version',markers:/proxmox|pve-manager|pveversion/i,osName:'Proxmox VE',hypervisor:'Proxmox VE',api:'proxmox-api'},
+    {kind:'xenserver',port:443,path:'/',markers:/xenserver|xcp-ng|citrix hypervisor|xen orchestra/i,osName:'Citrix Hypervisor / XenServer',hypervisor:'XenServer',api:'xen-api'},
+    {kind:'azure-local',port:443,path:'/',markers:/azure local|azure stack hci|azurestack/i,osName:'Azure Local',hypervisor:'Azure Local',api:'azure-local'}
+  ]
+  for(const probe of probes){
+    try{
+      const response=await hypervisorRequest(host,probe)
+      if((probe.kind==='proxmox'&&response.status===401)||probe.markers.test(response.body||''))return {...base,...probe,detected:true,probeStatus:response.status}
+    }catch{}
+  }
+  return base
+}
+
+export const __private={escapeXml,firstTag,hasVmwareMarker,hypervisorRequest}

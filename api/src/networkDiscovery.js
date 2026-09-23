@@ -6,13 +6,18 @@ import {isIP} from 'node:net'
 import {db,all,one,run,id,now,json,parse,audit} from './db.js'
 import {lookupDns,probeNode,collectFacts} from './connector.js'
 import {openSealed} from './security.js'
-import {identifyEsxi} from './esxiDiscovery.js'
+import {identifyHypervisor} from './esxiDiscovery.js'
+import {detectInfrastructureHost} from './infrastructureDiscovery.js'
 
 const MAX_HOSTS=4096
 const ARP_TIMEOUT_MS=1500
 const TCP_TIMEOUT_MS=1200
 export const DISCOVERY_TCP_PORTS=[445,3389,5985,5986]
-export const DISCOVERY_ESXI_TCP_PORTS=[443,902]
+// These are bounded management ports used for hypervisor fingerprints. They
+// are liveness evidence, not a general port scan.
+export const DISCOVERY_HYPERVISOR_TCP_PORTS=[443,8006,902]
+// Keep the old export for callers that used the ESXi-specific name.
+export const DISCOVERY_ESXI_TCP_PORTS=DISCOVERY_HYPERVISOR_TCP_PORTS
 export const DISCOVERY_MIN_INTERVAL_MINUTES=5
 export const DISCOVERY_MAX_INTERVAL_MINUTES=10080
 const execFileAsync=promisify(execFile)
@@ -196,37 +201,42 @@ function existingNode(ip,hostname,mac=null){
   const lower=String(hostname||'').toLowerCase()
   return one('SELECT * FROM nodes WHERE ip=? OR lower(hostname)=? OR lower(fqdn)=? ORDER BY CASE WHEN inventory_source=\'ad\' THEN 0 ELSE 1 END LIMIT 1',ip,lower,lower)
 }
+function persistHypervisor(nodeId,hypervisor){
+  if(!hypervisor?.detected)return
+  const esxi=hypervisor.kind==='esxi'||hypervisor.hypervisor==='VMware ESXi'||hypervisor.api==='soap'
+  const name=hypervisor.osName||hypervisor.hypervisor||'Hypervisor'
+  const version=hypervisor.osVersion||hypervisor.fullName||hypervisor.version||hypervisor.build||null
+  const transport=esxi?'esxi-soap':'hypervisor'
+  run("UPDATE nodes SET os_name=?,os_version=COALESCE(?,os_version),platform=?,hypervisor=?,device_type='hypervisor',management_type='manual',manageability='unmanaged',transport=?,connection_mode='agentless',agent_required=0,status='reachable',firewall_state='unmanaged',snmp_capable=1,probe_status=?,last_probe_at=? WHERE id=?",name,version,name,hypervisor.hypervisor||name,transport,hypervisor.authenticated?'hypervisor-authenticated':'hypervisor-detected',now(),nodeId)
+  run("INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET snapshot_json=excluded.snapshot_json,collected_at=excluded.collected_at",nodeId,json({source:transport,hypervisor}),now())
+}
 export async function registerHost(ip,scanId,livenessMethod='icmp',livenessMeta={}){
   let hostname=ip,fqdn=null
   try{const names=await dns.reverse(ip);if(names[0]){fqdn=names[0];hostname=fqdn.split('.')[0]}}catch{}
   const candidateMac=normalizeMac(livenessMeta?.mac),found=existingNode(ip,hostname,candidateMac)
-  const esxi=livenessMeta?.esxi?.detected?livenessMeta.esxi:null
+  const hypervisor=livenessMeta?.hypervisor?.detected?livenessMeta.hypervisor:null
   if(found){
     run('UPDATE nodes SET last_discovered_at=?,discovery_source=?,status=CASE WHEN status=\'unknown\' THEN \'reachable\' ELSE status END,mac_address=COALESCE(?,mac_address),discovery_ttl=COALESCE(?,discovery_ttl),discovery_os_family=COALESCE(?,discovery_os_family) WHERE id=?',now(),`${livenessMethod}:${scanId}`,candidateMac,livenessMeta.ttl||null,livenessMeta.ttlFingerprint?.family||null,found.id)
     if(livenessMeta?.osHint)run("UPDATE nodes SET os_name=CASE WHEN os_name IS NULL OR lower(os_name) IN ('','unknown','unidentified') THEN ? ELSE os_name END,platform=CASE WHEN platform IS NULL OR lower(platform) IN ('','unknown','unidentified') THEN ? ELSE platform END WHERE id=?",livenessMeta.osHint,livenessMeta.osHint,found.id)
-    if(esxi){
-      run("UPDATE nodes SET os_name='VMware ESXi',os_version=COALESCE(?,os_version),platform='VMware ESXi',hypervisor='VMware ESXi',device_type='hypervisor',management_type='manual',manageability='unmanaged',transport='esxi-soap',connection_mode='agentless',agent_required=0,status='reachable',firewall_state='unmanaged',snmp_capable=CASE WHEN snmp_capable IS NULL THEN 0 ELSE snmp_capable END,probe_status=?,last_probe_at=? WHERE id=?",esxi.osVersion||null,esxi.authenticated?'esxi-authenticated':'esxi-detected',now(),found.id)
-      run("INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET snapshot_json=excluded.snapshot_json,collected_at=excluded.collected_at",found.id,json({source:'esxi-soap',esxi}),now())
-    }
+    persistHypervisor(found.id,hypervisor)
     const current=one('SELECT * FROM nodes WHERE id=?',found.id)
     return {ip,nodeId:found.id,existing:true,hostname:current.hostname,fqdn:current.fqdn||null,mac:candidateMac||current.mac_address||null,osName:current.os_name||current.platform||null,osVersion:current.os_version||null,hypervisor:current.hypervisor||null,transport:current.transport||null,managed:current.agent_required===0,livenessMethod,ttl:livenessMeta.ttl||null,ttlFingerprint:livenessMeta.ttlFingerprint||null}
   }
   const nodeId=id(),credentialId=defaultCredential()
   db.transaction(()=>{
-    run("INSERT INTO nodes(id,hostname,fqdn,ip,connection_mode,status,inventory_source,discovery_source,last_discovered_at,agent_required,mac_address,os_name) VALUES(?,?,?,?,?,?,?,?,?,1,?,?)",nodeId,hostname,fqdn,ip,'agentless','reachable','discovery',`${livenessMethod}:${scanId}`,now(),candidateMac,esxi?'VMware ESXi':(livenessMeta.osHint||null))
+    run("INSERT INTO nodes(id,hostname,fqdn,ip,connection_mode,status,inventory_source,discovery_source,last_discovered_at,agent_required,mac_address,os_name) VALUES(?,?,?,?,?,?,?,?,?,1,?,?)",nodeId,hostname,fqdn,ip,'agentless','reachable','discovery',`${livenessMethod}:${scanId}`,now(),candidateMac,hypervisor?.osName||livenessMeta.osHint||null)
     if(credentialId)run('INSERT OR IGNORE INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,NULL)',credentialId,nodeId)
     audit(null,'node.discovery.register','node',nodeId,null,{ip,hostname,fqdn,credentialId,scanId})
   })()
   const node=one('SELECT * FROM nodes WHERE id=?',nodeId)
   if(livenessMeta?.ttl||livenessMeta?.ttlFingerprint?.family)run('UPDATE nodes SET discovery_ttl=?,discovery_os_family=? WHERE id=?',livenessMeta.ttl||null,livenessMeta.ttlFingerprint?.family||null,nodeId)
   if(livenessMeta?.ttl||livenessMeta?.osHint)run("INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET snapshot_json=excluded.snapshot_json,collected_at=excluded.collected_at",nodeId,json({source:'icmp-discovery',ttl:livenessMeta.ttl||null,ttlFingerprint:livenessMeta.ttlFingerprint||null,osHint:livenessMeta.osHint||null}),now())
-  if(esxi){
-    run("UPDATE nodes SET os_name='VMware ESXi',os_version=?,platform='VMware ESXi',hypervisor='VMware ESXi',device_type='hypervisor',management_type='manual',manageability='unmanaged',transport='esxi-soap',connection_mode='agentless',agent_required=0,status='reachable',firewall_state='unmanaged',probe_status=?,last_probe_at=? WHERE id=?",esxi.osVersion||null,esxi.authenticated?'esxi-authenticated':'esxi-detected',now(),nodeId)
-    run("INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET snapshot_json=excluded.snapshot_json,collected_at=excluded.collected_at",nodeId,json({source:'esxi-soap',esxi}),now())
+  if(hypervisor){
+    persistHypervisor(nodeId,hypervisor)
   }
   try{
     await lookupDns(node)
-    const probed=esxi?{transport:'esxi-soap',winrmAuthenticated:false}:await probeNode(one('SELECT * FROM nodes WHERE id=?',nodeId))
+    const probed=hypervisor?{transport:hypervisor.api==='soap'?'esxi-soap':'hypervisor',winrmAuthenticated:false}:await probeNode(one('SELECT * FROM nodes WHERE id=?',nodeId))
     if(probed.winrmAuthenticated){
       await collectFacts(one('SELECT * FROM nodes WHERE id=?',nodeId))
       run('UPDATE nodes SET agent_required=0,platform=COALESCE(platform,\'windows\') WHERE id=?',nodeId)
@@ -234,7 +244,7 @@ export async function registerHost(ip,scanId,livenessMethod='icmp',livenessMeta=
     const current=one('SELECT * FROM nodes WHERE id=?',nodeId)
     return {ip,nodeId,hostname:current?.hostname||hostname,fqdn:current?.fqdn||fqdn,mac:current?.mac_address||null,osName:current?.os_name||current?.platform||null,osVersion:current?.os_version||null,hypervisor:current?.hypervisor||null,transport:probed.transport,managed:!!probed.winrmAuthenticated,livenessMethod,ttl:livenessMeta.ttl||null,ttlFingerprint:livenessMeta.ttlFingerprint||null}
   }catch(error){
-    if(!esxi)run('UPDATE nodes SET agent_required=1,status=CASE WHEN status=\'reachable\' THEN \'degraded\' ELSE status END WHERE id=?',nodeId)
+    if(!hypervisor)run('UPDATE nodes SET agent_required=1,status=CASE WHEN status=\'reachable\' THEN \'degraded\' ELSE status END WHERE id=?',nodeId)
     const current=one('SELECT * FROM nodes WHERE id=?',nodeId)
     return {ip,nodeId,hostname:current?.hostname||hostname,fqdn:current?.fqdn||fqdn,mac:current?.mac_address||null,osName:current?.os_name||current?.platform||null,osVersion:current?.os_version||null,hypervisor:current?.hypervisor||null,agentRequired:true,managed:false,error:error.message,livenessMethod}
   }
@@ -246,7 +256,7 @@ export async function runDiscoveryScan(scanId){
   if(!claimed.changes)return one('SELECT * FROM discovery_scans WHERE id=?',scanId)
   const results=[],concurrency=32,esxiVault=esxiCredentials()
   let cursor=0
-  const worker=async()=>{while(cursor<hosts.length){const ip=hosts[cursor++];run('UPDATE discovery_scans SET probed=probed+1 WHERE id=?',scanId);const liveness=await probeHostLiveness(ip,{tcpPorts:[...DISCOVERY_ESXI_TCP_PORTS,...DISCOVERY_TCP_PORTS]});if(!liveness.alive)continue;run('UPDATE discovery_scans SET alive=alive+1,arp_alive=arp_alive+?,tcp_alive=tcp_alive+? WHERE id=?',liveness.method==='arp'?1:0,liveness.method?.startsWith('tcp:')?1:0,scanId);try{const esxi=await identifyEsxi(ip,{credentials:esxiVault});const result=await registerHost(ip,scanId,liveness.method,{...liveness,esxi});results.push(result);run('UPDATE discovery_scans SET registered=registered+1 WHERE id=?',scanId)}catch(error){results.push({ip,error:error.message,livenessMethod:liveness.method})}}}
+  const worker=async()=>{while(cursor<hosts.length){const ip=hosts[cursor++];run('UPDATE discovery_scans SET probed=probed+1 WHERE id=?',scanId);const liveness=await probeHostLiveness(ip,{tcpPorts:[...DISCOVERY_HYPERVISOR_TCP_PORTS,...DISCOVERY_TCP_PORTS]});if(!liveness.alive)continue;run('UPDATE discovery_scans SET alive=alive+1,arp_alive=arp_alive+?,tcp_alive=tcp_alive+? WHERE id=?',liveness.method==='arp'?1:0,liveness.method?.startsWith('tcp:')?1:0,scanId);try{const detected=await identifyHypervisor(ip,{credentials:esxiVault});const infrastructure=detected.detected?detected:await detectInfrastructureHost(ip).catch(()=>null);const hypervisor=detected.detected?detected:infrastructure?.hypervisor?{...infrastructure,detected:true,osName:infrastructure.osName||infrastructure.hypervisorName,hypervisor:infrastructure.hypervisorName||infrastructure.hypervisor,api:'https'}:detected;const result=await registerHost(ip,scanId,liveness.method,{...liveness,hypervisor});results.push(result);run('UPDATE discovery_scans SET registered=registered+1 WHERE id=?',scanId)}catch(error){results.push({ip,error:error.message,livenessMethod:liveness.method})}}}
   try{
     await Promise.all(Array.from({length:Math.min(concurrency,hosts.length)},worker))
     const limited=results.slice(0,MAX_HOSTS),previousScan=scan.schedule_id?one("SELECT results_json FROM discovery_scans WHERE schedule_id=? AND status='complete' AND id<>? ORDER BY finished_at DESC,rowid DESC LIMIT 1",scan.schedule_id,scan.id):null

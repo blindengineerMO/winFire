@@ -19,7 +19,7 @@ async function processCandidate(candidate,{register=registerHost,actorId=null}={
   if(!claimed.changes)return null
   const attempt=Number(candidate.attempts||0)+1
   try{
-    const result=await register(candidate.ip,`passive:${candidate.id}`,'arp-passive')
+    const result=await register(candidate.ip,`passive:${candidate.id}`,'arp-passive',{mac:candidate.mac,hostname:candidate.hostname})
     if(result?.nodeId)run("UPDATE passive_discovery_candidates SET status='registered',node_id=?,last_error=NULL,next_attempt_at=NULL,updated_at=? WHERE id=?",result.nodeId,now(),candidate.id)
     else run("UPDATE passive_discovery_candidates SET status='failed',last_error=?,next_attempt_at=?,updated_at=? WHERE id=?",'Discovery registration returned no node',attempt>=RETRY_LIMIT?null:retryAt(attempt),now(),candidate.id)
     audit(actorId,'network-discovery.passive.register','passive-discovery',candidate.id,null,{ip:candidate.ip,nodeId:result?.nodeId||null,sourceNodeId:candidate.source_node_id,livenessMethod:'arp-passive'})

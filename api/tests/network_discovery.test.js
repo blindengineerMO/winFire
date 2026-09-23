@@ -8,6 +8,7 @@ import path from 'node:path'
 const dir=fs.mkdtempSync(path.join(os.tmpdir(),'winfire-discovery-'))
 process.env.DATA_DIR=dir
 const {parseNeighborTable,parsePingTtl,classifyTtl,probeHostLiveness,tcpProbe,DISCOVERY_TCP_PORTS}=await import('../src/networkDiscovery.js')
+const {classifyInfrastructureResponse,classifyOperatingSystem}=await import('../src/infrastructureDiscovery.js')
 
 test.after(()=>fs.rmSync(dir,{recursive:true,force:true}))
 
@@ -36,6 +37,14 @@ test('ICMP TTL fingerprints common operating system families',async()=>{
   assert.deepEqual(classifyTtl(254),{family:'network-device',osName:'Network device',initialTtl:255})
   const result=await probeHostLiveness('10.0.0.5',{icmpProbe:async()=>({alive:true,ttl:127,osHint:'Windows',ttlFingerprint:classifyTtl(127)})})
   assert.deepEqual(result,{alive:true,method:'icmp',ttl:127,osHint:'Windows',ttlFingerprint:{family:'windows',osName:'Windows',initialTtl:128}})
+})
+
+test('bounded infrastructure fingerprints and Windows release labels are conservative',()=>{
+  assert.equal(classifyInfrastructureResponse({port:443,body:'VMware ESXi Host Client'}).hypervisorName,'VMware ESXi')
+  assert.equal(classifyInfrastructureResponse({port:8006,body:'pve-manager Proxmox Virtual Environment'}).hypervisorName,'Proxmox VE')
+  assert.equal(classifyInfrastructureResponse({port:443,body:'Citrix Hypervisor XenServer'}).hypervisorName,'Citrix Hypervisor / XenServer')
+  assert.equal(classifyInfrastructureResponse({port:443,body:'ordinary web server'}),null)
+  assert.equal(classifyOperatingSystem({caption:'Windows 11 IoT Enterprise',version:'10.0.26100',build:'26100'}),'Windows 11 IoT Enterprise · 24H2')
 })
 
 test('TCP liveness treats an established connection and an explicit reset as alive',async()=>{

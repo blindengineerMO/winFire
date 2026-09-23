@@ -58,7 +58,8 @@ import {snmpTargets,pollSnmpDiscoveryTarget} from './snmpDiscoveryService.js'
 import {passiveDiscoveryRows,passiveDiscoverySummary,processPassiveDiscovery} from './passiveDiscovery.js'
 import {asyncHandler} from './middleware/asyncHandler.js'
 import {normalizeDynamicRules,dynamicNodeGroupSettings,publicDynamicGroup,updateDynamicGroup,refreshDynamicGroups} from './dynamicNodeGroups.js'
-import {identifyEsxi} from './esxiDiscovery.js'
+import {identifyHypervisor} from './esxiDiscovery.js'
+import {detectInfrastructureHost} from './infrastructureDiscovery.js'
 
 export const app=express()
 app.disable('x-powered-by')
@@ -122,7 +123,10 @@ function normalizedNodeOs(node){
   if(windowsBuild&&`${windowsBuild[1]}.${windowsBuild[2]}`===version)build=''
   if(build&&(build.toLowerCase()===version.toLowerCase()||build.toLowerCase()===name.toLowerCase()))build=''
   if(name==='pfSense'&&/^\d+(?:\.\d+)+$/.test(build))build=''
-  return {os_name:name||null,os_version:version||null,os_build:build||null}
+  let hypervisor=String(node.hypervisor||'').trim()
+  if(/^vmware$/i.test(hypervisor)&&/esxi/i.test(`${name} ${version}`))hypervisor='VMware ESXi'
+  if(/^xenserver$/i.test(hypervisor))hypervisor='Citrix Hypervisor / XenServer'
+  return {os_name:name||null,os_version:version||null,os_build:build||null,hypervisor:hypervisor||null}
 }
 const publicNode=node=>node && ({...node,...normalizedNodeOs(node),failures:Number(node.failures),facts:parse(node.snapshot_json),ad:parse(node.ad_snapshot_json),training:latestTraining(node.id)||null,verification:latestVerification(node.id),managementVerification:managementVerification(node)})
 const canUseCredential=(user,credential)=>credential&&(user.role==='owner'||user.role==='admin'||credential.owner_user_id===user.id||credential.visibility==='team'&&credential.team_id&&credential.team_id===user.team_id||canWriteResource(user,'credential',credential))
@@ -143,7 +147,13 @@ const savedSetting=key=>String(one('SELECT value FROM app_settings WHERE key=?',
 const normalizeLogAction=(eventId,action)=>Number(eventId)===4624?'logon':Number(eventId)===4634?'logoff':action||null
 const serverFqdn=()=>savedSetting('server_fqdn')
 const serverPublicBaseUrl=()=>savedSetting('server_public_base_url')
-const localAssetCidrs=()=>{const value=parse(savedSetting('local_asset_cidrs'));return Array.isArray(value)?value:[]}
+const localAssetCidrs=()=>{
+  const value=parse(savedSetting('local_asset_cidrs'))
+  const entries=Array.isArray(value)?value:[savedSetting('local_asset_cidrs')]
+  // Older settings could contain literal "\\n" separators. Normalize those
+  // on read so inventory filtering and the administration editor agree.
+  return entries.flatMap(item=>String(item||'').split(/(?:\\n|\r?\n|,)/)).map(item=>item.trim()).filter(Boolean)
+}
 const localAssetCidrSchema=z.string().trim().max(43).refine(value=>{const [address,prefix]=value.split('/');const size=Number(prefix);return isIP(address)===4&&Number.isInteger(size)&&size>=0&&size<=32},{message:'Local asset scopes must be IPv4 CIDRs'})
 const isLocalAssetNode=node=>{const scopes=localAssetCidrs();return !scopes.length||!node?.ip||scopes.some(scope=>ipInCidr(node.ip,scope))}
 const savedWefSecret=()=>{
@@ -1572,13 +1582,16 @@ api.delete('/nodes/:id',requireRole('admin'),(req,res)=>{
 api.post('/nodes/:id/probe',requireRole('editor'),wrap(async(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
   const credentials=all("SELECT c.* FROM credentials c WHERE c.type='esxi' AND (c.owner_user_id=? OR c.visibility='team' OR c.visibility='private' OR EXISTS (SELECT 1 FROM credential_assignments a WHERE a.credential_id=c.id AND (a.node_id=? OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?))))",req.user.id,node.id,node.id).filter(credential=>canUseCredential(req.user,credential)).flatMap(credential=>{try{const secret=openSealed(credential.encrypted_blob);return secret?.password?[{username:credential.username,password:secret.password}]:[]}catch{return []}})
-  const esxi=node.ip?await identifyEsxi(node.ip,{credentials}):{detected:false}
-  if(esxi.detected){
-    run("UPDATE nodes SET os_name='VMware ESXi',os_version=COALESCE(?,os_version),platform='VMware ESXi',hypervisor='VMware ESXi',device_type='hypervisor',management_type='manual',manageability='unmanaged',transport='esxi-soap',connection_mode='agentless',agent_required=0,status='reachable',firewall_state='unmanaged',probe_status=?,last_probe_at=? WHERE id=?",esxi.osVersion||null,esxi.authenticated?'esxi-authenticated':'esxi-detected',now(),node.id)
-    run("INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET snapshot_json=excluded.snapshot_json,collected_at=excluded.collected_at",node.id,json({source:'esxi-soap',esxi}),now())
+  const detected=node.ip?await identifyHypervisor(node.ip,{credentials}):{detected:false}
+  const infrastructure=detected.detected?detected:node.ip?await detectInfrastructureHost(node.ip).catch(()=>null):null
+  const hypervisor=detected.detected?detected:infrastructure?.hypervisor?{...infrastructure,detected:true,osName:infrastructure.osName||infrastructure.hypervisorName,hypervisor:infrastructure.hypervisorName||infrastructure.hypervisor,api:'https'}:detected
+  if(hypervisor.detected){
+    const esxi=hypervisor.api==='soap',name=hypervisor.osName||hypervisor.hypervisor||'Hypervisor',version=hypervisor.osVersion||hypervisor.fullName||hypervisor.version||hypervisor.build||null
+    run("UPDATE nodes SET os_name=?,os_version=COALESCE(?,os_version),platform=?,hypervisor=?,device_type='hypervisor',management_type='manual',manageability='unmanaged',transport=?,connection_mode='agentless',agent_required=0,status='reachable',firewall_state='unmanaged',snmp_capable=1,probe_status=?,last_probe_at=? WHERE id=?",name,version,name,hypervisor.hypervisor||name,esxi?'esxi-soap':'hypervisor',hypervisor.authenticated?'hypervisor-authenticated':'hypervisor-detected',now(),node.id)
+    run("INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET snapshot_json=excluded.snapshot_json,collected_at=excluded.collected_at",node.id,json({source:esxi?'esxi-soap':'hypervisor',hypervisor}),now())
   }
-  const result=esxi.detected?{transport:'esxi-soap',status:'reachable',probeStatus:esxi.authenticated?'esxi-authenticated':'esxi-detected'}:await probeNode(getNode(node.id)).catch(error=>({transport:getNode(node.id)?.transport||'unknown',error:error.message}))
-  res.json({...result,esxi})
+  const result=hypervisor.detected?{transport:hypervisor.api==='soap'?'esxi-soap':'hypervisor',status:'reachable',probeStatus:hypervisor.authenticated?'hypervisor-authenticated':'hypervisor-detected'}:await probeNode(getNode(node.id)).catch(error=>({transport:getNode(node.id)?.transport||'unknown',error:error.message}))
+  res.json({...result,esxi:hypervisor.api==='soap'?hypervisor:{detected:false},hypervisor})
 }))
 api.post('/nodes/:id/activate-agentless',requireRole('admin'),wrap(async(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
