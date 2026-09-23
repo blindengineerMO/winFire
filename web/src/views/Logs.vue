@@ -107,7 +107,7 @@ onUnmounted(()=>{window.removeEventListener('pointerdown',onPointer);window.remo
         <label>Challenge ID<input v-model.trim="filters.challengeId" placeholder="MFA challenge ID"></label>
         <label>From<input v-model="filters.from" type="datetime-local"></label>
         <label>To<input v-model="filters.to" type="datetime-local"></label>
-        <label class="check-label"><input v-model="hideLoopback" type="checkbox" @change="searchEvents"> Hide local loopback</label>
+        <label class="switch-field"><span>Hide local loopback</span><input v-model="hideLoopback" type="checkbox" role="switch" @change="searchEvents"><span class="switch-control" aria-hidden="true"></span></label>
         <button class="button small primary" :disabled="loading">Apply filters</button>
         <button type="button" class="button small secondary" @click="clearFilters">Clear filters</button>
       </form>

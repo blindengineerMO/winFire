@@ -37,7 +37,7 @@ onMounted(load)
         <label>Client certificate <small>{{settings.clientCertificateConfigured?'Stored securely; leave blank to keep it':'PEM certificate registered on the Entra app'}}</small><textarea v-model="certificate" rows="4" spellcheck="false" autocomplete="off" placeholder="-----BEGIN CERTIFICATE-----" :required="settings.enabled&&!settings.clientCertificateConfigured"></textarea></label>
         <label>Private key <small>{{settings.clientCertificateConfigured?'Stored securely; leave blank to keep it':'Unencrypted RSA PEM key; never returned by the API'}}</small><textarea v-model="privateKey" rows="4" spellcheck="false" autocomplete="off" placeholder="-----BEGIN PRIVATE KEY-----" :required="settings.enabled&&!settings.clientCertificateConfigured"></textarea></label>
       </template>
-      <label class="entra-toggle"><input v-model="settings.enabled" type="checkbox"> Enable Microsoft sign-in</label>
+      <label class="switch-field"><span>Enable Microsoft sign-in</span><input v-model="settings.enabled" type="checkbox" role="switch"><span class="switch-control" aria-hidden="true"></span></label>
       <div class="form-actions"><button class="button primary" :disabled="busy">{{busy?'Saving…':'Save integration'}}</button></div>
     </form>
     <div class="entra-callbacks"><h3>Register these Web redirect URIs</h3><code v-for="uri in settings.redirectUris" :key="uri">{{uri}}</code><p v-if="!settings.redirectUris.length" class="muted">Set an HTTPS PUBLIC_BASE_URL on the server to show the redirect URIs.</p></div>
@@ -46,5 +46,5 @@ onMounted(load)
 </template>
 
 <style scoped>
-.entra-settings{padding:0 0 1.25rem;max-width:900px}.entra-settings>p,.entra-callbacks{margin:1rem 1.25rem;line-height:1.5}.entra-settings .form-grid{padding:0 1.25rem}.entra-settings label small{display:block;color:var(--muted);font-weight:400}.entra-settings .entra-toggle{display:flex;align-items:center;gap:.6rem}.entra-toggle input{width:17px;height:17px;flex:none}.entra-callbacks{padding:1rem;border:1px solid var(--border);border-radius:8px;overflow-wrap:anywhere}.entra-callbacks h3{margin:0 0 .65rem}.entra-callbacks code{display:block;margin:.35rem 0;font-size:.78rem;overflow-wrap:anywhere}.entra-settings .error-msg,.entra-settings .success-msg{margin:1rem 1.25rem}
+.entra-settings{padding:0 0 1.25rem;max-width:900px}.entra-settings>p,.entra-callbacks{margin:1rem 1.25rem;line-height:1.5}.entra-settings .form-grid{padding:0 1.25rem}.entra-settings label small{display:block;color:var(--muted);font-weight:400}.entra-callbacks{padding:1rem;border:1px solid var(--border);border-radius:8px;overflow-wrap:anywhere}.entra-callbacks h3{margin:0 0 .65rem}.entra-callbacks code{display:block;margin:.35rem 0;font-size:.78rem;overflow-wrap:anywhere}.entra-settings .error-msg,.entra-settings .success-msg{margin:1rem 1.25rem}
 </style>

@@ -31,7 +31,7 @@ onMounted(load)
       <label>Cooldown minutes<input v-model.number="form.cooldownMinutes" type="number" min="1" max="10080" required></label>
       <label>Action<select v-model="form.actionType"><option value="alert">Notify operators</option><option value="disable_ad">Temporarily disable verified AD user and notify</option><option v-if="form.triggerType==='destination'" value="disable_ad_logoff">Disable AD user, log off client, and notify</option></select></label>
       <label v-if="form.actionType!=='alert'">Disable for minutes<input v-model.number="form.disableMinutes" type="number" min="5" max="10080" required></label>
-      <label class="automation-check"><input v-model="form.enabled" type="checkbox"> Enable after saving</label>
+      <label class="switch-field"><span>Enable after saving</span><input v-model="form.enabled" type="checkbox" role="switch"><span class="switch-control" aria-hidden="true"></span></label>
       <div class="automation-actions"><button type="button" class="button small secondary" :disabled="busy" @click="runPreview">Preview recent matches</button><button class="button small primary" :disabled="busy">{{editing?'Update policy':'Create policy'}}</button><button v-if="editing" type="button" class="button small secondary" @click="clear">Cancel edit</button></div>
     </form>
     <div v-if="preview" class="automation-preview"><p class="muted">{{preview.count}} recent matches shown. Preview does not run actions.</p><div v-if="preview.items.length" class="table-wrap"><table><thead><tr><th>TIME</th><th>SUBJECT</th><th>EVIDENCE</th></tr></thead><tbody><tr v-for="item in preview.items.slice(0,20)" :key="item.id||item.user_upn"><td>{{new Date(item.event_time||item.latest||item.received_at).toLocaleString()}}</td><td>{{item.user_upn||item.hostname||'—'}}</td><td>{{item.failures?`${item.failures} failures`:item.dst_ip||'—'}}</td></tr></tbody></table></div></div>
@@ -41,5 +41,5 @@ onMounted(load)
 </template>
 
 <style scoped>
-.security-automation{padding:1.2rem;border-top:1px solid var(--border)}.security-automation>p{max-width:850px;font-size:.8rem}.automation-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(205px,1fr));gap:.7rem;margin:1rem 0}.automation-form label{display:grid;gap:.3rem;font-size:.75rem}.automation-form input,.automation-form select{width:100%;box-sizing:border-box}.automation-form .automation-check{display:flex;align-items:center;gap:.5rem}.automation-check input{width:auto}.automation-actions{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:.5rem}.security-automation h3{margin-top:1.4rem}
+.security-automation{padding:1.2rem;border-top:1px solid var(--border)}.security-automation>p{max-width:850px;font-size:.8rem}.automation-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(205px,1fr));gap:.7rem;margin:1rem 0}.automation-form label{display:grid;gap:.3rem;font-size:.75rem}.automation-form input,.automation-form select{width:100%;box-sizing:border-box}.automation-actions{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:.5rem}.security-automation h3{margin-top:1.4rem}
 </style>
