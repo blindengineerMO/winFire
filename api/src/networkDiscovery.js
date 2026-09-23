@@ -207,7 +207,7 @@ export function persistHypervisor(nodeId,hypervisor){
   const name=hypervisor.osName||hypervisor.hypervisor||'Hypervisor'
   const version=hypervisor.osVersion||hypervisor.fullName||hypervisor.version||hypervisor.build||null
   const transport=esxi?'esxi-soap':'hypervisor'
-  run("UPDATE nodes SET os_name=?,os_version=COALESCE(?,os_version),platform=?,hypervisor=?,device_type=?,management_type='manual',manageability='unmanaged',transport=?,connection_mode='agentless',agent_required=0,status='reachable',firewall_state='unmanaged',snmp_capable=1,probe_status=?,last_probe_at=? WHERE id=?",name,version,name,hypervisor.hypervisor||name,esxi?'esxi':'hypervisor',transport,hypervisor.authenticated?'hypervisor-authenticated':'hypervisor-detected',now(),nodeId)
+  run("UPDATE nodes SET os_name=?,os_version=COALESCE(?,os_version),platform=?,hypervisor=?,device_type=?,management_type=?,manageability='unmanaged',transport=?,connection_mode='agentless',agent_required=0,status='reachable',firewall_state='unmanaged',snmp_capable=1,probe_status=?,last_probe_at=? WHERE id=?",name,version,name,hypervisor.hypervisor||name,esxi?'esxi':'hypervisor',esxi?'api':'manual',transport,hypervisor.authenticated?'hypervisor-authenticated':'hypervisor-detected',now(),nodeId)
   run("INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET snapshot_json=excluded.snapshot_json,collected_at=excluded.collected_at",nodeId,json({source:transport,hypervisor,virtualMachines:Array.isArray(hypervisor.virtualMachines)?hypervisor.virtualMachines:[]}),now())
   if(Array.isArray(hypervisor.virtualMachines))correlateVirtualMachines(nodeId,hypervisor.virtualMachines)
 }
