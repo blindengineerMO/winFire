@@ -7,7 +7,7 @@ import path from 'node:path'
 
 const dir=fs.mkdtempSync(path.join(os.tmpdir(),'winfire-discovery-'))
 process.env.DATA_DIR=dir
-const {parseNeighborTable,probeHostLiveness,tcpProbe,DISCOVERY_TCP_PORTS}=await import('../src/networkDiscovery.js')
+const {parseNeighborTable,parsePingTtl,classifyTtl,probeHostLiveness,tcpProbe,DISCOVERY_TCP_PORTS}=await import('../src/networkDiscovery.js')
 
 test.after(()=>fs.rmSync(dir,{recursive:true,force:true}))
 
@@ -27,6 +27,15 @@ test('liveness falls back from ICMP to ARP and then bounded management ports',as
   const dead=await probeHostLiveness('10.20.0.8',{icmpProbe:async()=>false,arpLivenessProbe:async()=>false,tcpLivenessProbe:async()=>false})
   assert.deepEqual(dead,{alive:false,method:null})
   assert.deepEqual(DISCOVERY_TCP_PORTS,[445,3389,5985,5986])
+})
+
+test('ICMP TTL fingerprints common operating system families',async()=>{
+  assert.equal(parsePingTtl('64 bytes from 10.0.0.4: icmp_seq=1 ttl=64 time=1.2 ms'),64)
+  assert.deepEqual(classifyTtl(63),{family:'linux-unix',osName:'Linux / Unix',initialTtl:64})
+  assert.deepEqual(classifyTtl(127),{family:'windows',osName:'Windows',initialTtl:128})
+  assert.deepEqual(classifyTtl(254),{family:'network-device',osName:'Network device',initialTtl:255})
+  const result=await probeHostLiveness('10.0.0.5',{icmpProbe:async()=>({alive:true,ttl:127,osHint:'Windows',ttlFingerprint:classifyTtl(127)})})
+  assert.deepEqual(result,{alive:true,method:'icmp',ttl:127,osHint:'Windows',ttlFingerprint:{family:'windows',osName:'Windows',initialTtl:128}})
 })
 
 test('TCP liveness treats an established connection and an explicit reset as alive',async()=>{

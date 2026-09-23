@@ -188,3 +188,9 @@ Firewall event collection depends on host audit policy. Filtering Platform Conne
 
 ## Browser Extension for Enterprise Deployment allows URL monitoring / policy blocking
 ![ScreenShot10](assets/browserwatch.png)
+
+## Customizable Traffic Classifier
+![ScreenShot11](assets/classify.png)
+
+## Robust Network Discovery Options
+![ScreenShot12](assets/discovery.png)

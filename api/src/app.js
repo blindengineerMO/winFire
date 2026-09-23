@@ -58,6 +58,7 @@ import {snmpTargets,pollSnmpDiscoveryTarget} from './snmpDiscoveryService.js'
 import {passiveDiscoveryRows,passiveDiscoverySummary,processPassiveDiscovery} from './passiveDiscovery.js'
 import {asyncHandler} from './middleware/asyncHandler.js'
 import {normalizeDynamicRules,dynamicNodeGroupSettings,publicDynamicGroup,updateDynamicGroup,refreshDynamicGroups} from './dynamicNodeGroups.js'
+import {identifyEsxi} from './esxiDiscovery.js'
 
 export const app=express()
 app.disable('x-powered-by')
@@ -106,7 +107,24 @@ function policyVerification(policyId){
   const checks=all('SELECT status FROM verifier_results WHERE policy_id=? AND run_id=?',policyId,latest.run_id)
   return checks.some(check=>check.status==='fail')?'fail':checks.some(check=>check.status==='inconclusive')?'inconclusive':checks.length?'pass':null
 }
-const publicNode=node=>node && ({...node,failures:Number(node.failures),facts:parse(node.snapshot_json),ad:parse(node.ad_snapshot_json),training:latestTraining(node.id)||null,verification:latestVerification(node.id),managementVerification:managementVerification(node)})
+function normalizedNodeOs(node){
+  if(!node)return {}
+  let name=String(node.os_name||node.platform||'').trim(),version=String(node.os_version||'').trim(),build=String(node.os_build||'').trim()
+  if(/^pfsense(?:\/freebsd)?$/i.test(name)){
+    name='pfSense'
+    version=version.replace(/^pfSense\s*/i,'').replace(new RegExp(`^${String(node.hostname||'').replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}\s*`,'i'),'').trim()
+  }
+  if(name&&version&&name.toLowerCase()===version.toLowerCase())version=build&&build.toLowerCase()!==name.toLowerCase()?build:''
+  if(name&&version&&version.toLowerCase().startsWith(`${name.toLowerCase()} `))version=version.slice(name.length).trim()
+  const windowsVersion=version.match(/^(\d+\.\d+)\s*\((\d+)\)$/)
+  if(windowsVersion)version=`${windowsVersion[1]}.${windowsVersion[2]}`
+  const windowsBuild=build.match(/^(\d+\.\d+)\s*\((\d+)\)$/)
+  if(windowsBuild&&`${windowsBuild[1]}.${windowsBuild[2]}`===version)build=''
+  if(build&&(build.toLowerCase()===version.toLowerCase()||build.toLowerCase()===name.toLowerCase()))build=''
+  if(name==='pfSense'&&/^\d+(?:\.\d+)+$/.test(build))build=''
+  return {os_name:name||null,os_version:version||null,os_build:build||null}
+}
+const publicNode=node=>node && ({...node,...normalizedNodeOs(node),failures:Number(node.failures),facts:parse(node.snapshot_json),ad:parse(node.ad_snapshot_json),training:latestTraining(node.id)||null,verification:latestVerification(node.id),managementVerification:managementVerification(node)})
 const canUseCredential=(user,credential)=>credential&&(user.role==='owner'||user.role==='admin'||credential.owner_user_id===user.id||credential.visibility==='team'&&credential.team_id&&credential.team_id===user.team_id||canWriteResource(user,'credential',credential))
 function getNode(idValue) {return one('SELECT * FROM nodes WHERE id=?',idValue)}
 function getPolicy(idValue) {return one('SELECT * FROM policies WHERE id=?',idValue)}
@@ -1393,8 +1411,8 @@ api.post('/directory/users/:id/import-operator',requireRole('admin'),wrap(async(
 
 const visibleCredentials=user=>(user.role==='owner'||user.role==='admin' ? all('SELECT id,name,type,username,owner_user_id,visibility,team_id,priority,created_at FROM credentials ORDER BY priority,name') : all(`SELECT id,name,type,username,owner_user_id,visibility,team_id,priority,created_at FROM credentials WHERE owner_user_id=? OR (visibility='team' AND team_id=?) OR EXISTS (SELECT 1 FROM resource_grants g WHERE g.resource_type='credential' AND g.resource_id=credentials.id AND g.grantee_user_id=?) ORDER BY priority,name`,user.id,user.team_id,user.id)).map(credential=>({...credential,canWrite:canWriteResource(user,'credential',credential)}))
 api.get('/credentials',(req,res)=>res.json(visibleCredentials(req.user)))
-const credentialInputSchema=z.object({name:z.string().trim().min(1).max(120),type:z.enum(['local','domain','snmp-v2c','snmp-v3']),username:z.string().trim().max(255).default(''),password:z.string().max(4096).optional(),community:z.string().max(255).optional(),securityLevel:z.enum(['noAuthNoPriv','authNoPriv','authPriv']).optional(),authProtocol:z.enum(['md5','sha','sha224','sha256','sha384','sha512']).optional(),authKey:z.string().max(4096).optional(),privProtocol:z.enum(['des','aes','aes256b','aes256r']).optional(),privKey:z.string().max(4096).optional(),visibility:z.enum(['private','team']).default('private'),teamId:z.string().optional(),priority:z.number().int().min(-100000).max(100000).default(100)}).superRefine((value,ctx)=>{
-  if(['local','domain'].includes(value.type)&&(!value.username||!value.password))ctx.addIssue({code:'custom',path:['password'],message:'Username and password are required for Windows credentials'})
+const credentialInputSchema=z.object({name:z.string().trim().min(1).max(120),type:z.enum(['local','domain','esxi','snmp-v2c','snmp-v3']),username:z.string().trim().max(255).default(''),password:z.string().max(4096).optional(),community:z.string().max(255).optional(),securityLevel:z.enum(['noAuthNoPriv','authNoPriv','authPriv']).optional(),authProtocol:z.enum(['md5','sha','sha224','sha256','sha384','sha512']).optional(),authKey:z.string().max(4096).optional(),privProtocol:z.enum(['des','aes','aes256b','aes256r']).optional(),privKey:z.string().max(4096).optional(),visibility:z.enum(['private','team']).default('private'),teamId:z.string().optional(),priority:z.number().int().min(-100000).max(100000).default(100)}).superRefine((value,ctx)=>{
+  if(['local','domain','esxi'].includes(value.type)&&(!value.username||!value.password))ctx.addIssue({code:'custom',path:['password'],message:'Username and password are required for this credential'})
   if(value.type==='snmp-v2c'&&!value.community&&!value.password)ctx.addIssue({code:'custom',path:['community'],message:'SNMP v2c requires a community string'})
   if(value.type==='snmp-v3')try{normalizeSnmpSecret(value.type,value)}catch(error){ctx.addIssue({code:'custom',path:['username'],message:error.message})}
 })
@@ -1450,7 +1468,34 @@ api.post('/credentials/:id/test',requireRole('editor'),wrap(async(req,res)=>{
   try {res.json(await testNodeCredential(node,credential.id))}catch(error){res.json({success:false,transport:node.transport||'winrm',error:error.message})}
 }))
 
-api.get('/nodes',(_req,res)=>res.json(all('SELECT n.*,f.snapshot_json FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id ORDER BY n.created_at DESC').filter(isLocalAssetNode).map(publicNode)))
+const serverNodeManaged=node=>{
+  if(!node||node.manageability==='unmanaged')return false
+  if(node.transport==='snmp'||node.connection_mode==='snmp'||node.connection_mode==='agent'||node.agent_id)return true
+  if(node.probe_status==='winrm-authenticated'||node.probe_status==='winrms-authenticated'||node.probe_status==='wmi-authenticated'||node.probe_status==='netsh-authenticated')return true
+  if(node.firewall_state==='enforcing'&&!(node.agent_required&&!node.agent_id))return true
+  return false
+}
+api.get('/nodes',(req,res)=>{
+  const rows=all('SELECT n.*,f.snapshot_json FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id').filter(isLocalAssetNode)
+  // The unparameterized form remains an array for API compatibility. Inventory
+  // uses the parameterized form below so searching, filtering, sorting and
+  // pagination happen here rather than in the browser.
+  if(!Object.keys(req.query||{}).length)return res.json(rows.sort((a,b)=>String(b.created_at||'').localeCompare(String(a.created_at||''))).map(publicNode))
+  const page=Math.max(1,Number.parseInt(req.query.page||'1',10)||1),pageSize=Math.min(500,Math.max(1,Number.parseInt(req.query.pageSize||'25',10)||25)),term=String(req.query.search||'').trim().toLowerCase(),filter=String(req.query.filter||'all'),sort=String(req.query.sort||'priority'),direction=String(req.query.direction||'asc').toLowerCase()==='desc'?-1:1
+  let filtered=rows.filter(node=>{
+    if(term&&!([node.hostname,node.fqdn,node.ip,node.os_name,node.os_version,node.platform,node.device_type,node.transport,node.hypervisor].map(value=>String(value||'').toLowerCase()).join(' ').includes(term)))return false
+    const managed=serverNodeManaged(node)
+    if(filter==='managed'&& !managed)return false
+    if(filter==='unmanaged'&& managed)return false
+    if(filter==='reachable'&&node.status!=='reachable')return false
+    if(filter==='unreachable'&&node.status!=='unreachable')return false
+    return true
+  })
+  const value=(node,key)=>key==='priority'?(serverNodeManaged(node)?0:1):key==='hostname'?String(node.hostname||'').toLowerCase():key==='address'?String(node.ip||node.fqdn||'').toLowerCase():key==='status'?String(node.status||'').toLowerCase():key==='mode'?String(node.transport==='snmp'||node.connection_mode==='snmp'?'snmp':node.connection_mode||'').toLowerCase():String(node.created_at||'')
+  filtered.sort((a,b)=>{if(sort!=='priority'){const ap=value(a,'priority'),bp=value(b,'priority');if(ap!==bp)return ap<bp?-1:1}const av=value(a,sort),bv=value(b,sort);return av===bv?String(a.hostname||'').localeCompare(String(b.hostname||''))*direction:(av<bv?-1:1)*direction})
+  const total=filtered.length,start=(page-1)*pageSize
+  res.json({items:filtered.slice(start,start+pageSize).map(publicNode),total,page,pageSize,totalPages:Math.max(1,Math.ceil(total/pageSize)),sort,direction:direction===-1?'desc':'asc'})
+})
 api.post('/nodes',requireRole('editor'),wrap(async(req,res)=>{
   const data=body(z.object({hostname:z.string().min(1),fqdn:z.string().optional(),ip:z.string().optional(),connectionMode:z.enum(['agentless','agent']).default('agentless'),credentialIds:z.array(z.string()).default([])}),req)
   if(data.credentialIds.some(credentialId=>!canUseCredential(req.user,one('SELECT * FROM credentials WHERE id=?',credentialId))))return res.status(403).json({error:'Credential unavailable'})
@@ -1524,7 +1569,17 @@ api.delete('/nodes/:id',requireRole('admin'),(req,res)=>{
   })()
   res.status(204).end()
 })
-api.post('/nodes/:id/probe',requireRole('editor'),wrap(async(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json(await probeNode(node))}))
+api.post('/nodes/:id/probe',requireRole('editor'),wrap(async(req,res)=>{
+  const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
+  const credentials=all("SELECT c.* FROM credentials c WHERE c.type='esxi' AND (c.owner_user_id=? OR c.visibility='team' OR c.visibility='private' OR EXISTS (SELECT 1 FROM credential_assignments a WHERE a.credential_id=c.id AND (a.node_id=? OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?))))",req.user.id,node.id,node.id).filter(credential=>canUseCredential(req.user,credential)).flatMap(credential=>{try{const secret=openSealed(credential.encrypted_blob);return secret?.password?[{username:credential.username,password:secret.password}]:[]}catch{return []}})
+  const esxi=node.ip?await identifyEsxi(node.ip,{credentials}):{detected:false}
+  if(esxi.detected){
+    run("UPDATE nodes SET os_name='VMware ESXi',os_version=COALESCE(?,os_version),platform='VMware ESXi',hypervisor='VMware ESXi',device_type='hypervisor',management_type='manual',manageability='unmanaged',transport='esxi-soap',connection_mode='agentless',agent_required=0,status='reachable',firewall_state='unmanaged',probe_status=?,last_probe_at=? WHERE id=?",esxi.osVersion||null,esxi.authenticated?'esxi-authenticated':'esxi-detected',now(),node.id)
+    run("INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET snapshot_json=excluded.snapshot_json,collected_at=excluded.collected_at",node.id,json({source:'esxi-soap',esxi}),now())
+  }
+  const result=esxi.detected?{transport:'esxi-soap',status:'reachable',probeStatus:esxi.authenticated?'esxi-authenticated':'esxi-detected'}:await probeNode(getNode(node.id)).catch(error=>({transport:getNode(node.id)?.transport||'unknown',error:error.message}))
+  res.json({...result,esxi})
+}))
 api.post('/nodes/:id/activate-agentless',requireRole('admin'),wrap(async(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
   if(!node.ad_guid||node.ad_missing||!node.ad_enabled||node.connection_mode!=='agentless')return res.status(409).json({error:'This action requires an enabled AD-discovered agentless computer'})
@@ -2108,10 +2163,10 @@ function driftSummaryByNode() {
   return new Map([...byNode].map(([nodeId,statuses])=>[nodeId,statuses.includes('drift')?'drift':statuses.includes('unknown')?'unknown':statuses.includes('pending')?'pending':statuses.includes('unchecked')?'unchecked':'in-sync']))
 }
 function report(name,user=null) {
-  if(name==='inventory')return all(`SELECT n.id,n.hostname,n.fqdn,n.ip,n.os_version,n.os_build,n.status,n.last_seen_at,n.connection_mode,n.inventory_source,n.ad_enabled,n.ad_missing,n.firewall_state,f.snapshot_json,f.collected_at,(SELECT status FROM policy_apply_runs WHERE node_id=n.id AND policy_id IS NOT NULL ORDER BY started_at DESC,rowid DESC LIMIT 1) last_apply_status,(SELECT finished_at FROM policy_apply_runs WHERE node_id=n.id AND policy_id IS NOT NULL ORDER BY started_at DESC,rowid DESC LIMIT 1) last_apply_at,(SELECT status FROM verifier_results WHERE node_id=n.id ORDER BY run_at DESC,rowid DESC LIMIT 1) last_verify_status FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id ORDER BY n.hostname`).map(({snapshot_json,...row})=>{
+  if(name==='inventory')return all(`SELECT n.id,n.hostname,n.fqdn,n.ip,n.os_name,n.os_version,n.os_build,n.status,n.last_seen_at,n.connection_mode,n.inventory_source,n.ad_enabled,n.ad_missing,n.firewall_state,f.snapshot_json,f.collected_at,(SELECT status FROM policy_apply_runs WHERE node_id=n.id AND policy_id IS NOT NULL ORDER BY started_at DESC,rowid DESC LIMIT 1) last_apply_status,(SELECT finished_at FROM policy_apply_runs WHERE node_id=n.id AND policy_id IS NOT NULL ORDER BY started_at DESC,rowid DESC LIMIT 1) last_apply_at,(SELECT status FROM verifier_results WHERE node_id=n.id ORDER BY run_at DESC,rowid DESC LIMIT 1) last_verify_status FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id ORDER BY n.hostname`).filter(isLocalAssetNode).map(({snapshot_json,...row})=>{
     const facts=parse(snapshot_json)||{}
     const profiles=Array.isArray(facts.firewall)?facts.firewall:facts.firewall?[facts.firewall]:[]
-    return {...row,model:facts.computer?.Model||null,manufacturer:facts.computer?.Manufacturer||null,bios_serial:facts.bios?.SerialNumber||null,firewall_service:facts.service?.Status||null,firewall_profiles:profiles.map(profile=>`${profile.Name}: ${profile.Enabled?'on':'off'}`).join(', ')||null}
+    return {...row,...normalizedNodeOs(row),model:facts.computer?.Model||null,manufacturer:facts.computer?.Manufacturer||null,bios_serial:facts.bios?.SerialNumber||null,firewall_service:facts.service?.Status||null,firewall_profiles:profiles.map(profile=>`${profile.Name}: ${profile.Enabled?'on':'off'}`).join(', ')||null}
   })
   if(name==='dns')return all(`SELECT n.id,n.hostname,n.fqdn,n.ip,d.forward_result,d.reverse_result,d.mismatch,d.checked_at FROM nodes n LEFT JOIN dns_lookups d ON d.node_id=n.id ORDER BY n.hostname`).map(row=>{
     const forward=parse(row.forward_result)||[],reverse=parse(row.reverse_result)||[]
@@ -2123,7 +2178,7 @@ function report(name,user=null) {
   })
   if(name==='coverage'){
     const drift=driftSummaryByNode()
-    return all(`SELECT n.id,n.hostname,n.status,COUNT(DISTINCT a.policy_id) AS policy_count,(SELECT status FROM policy_apply_runs WHERE node_id=n.id AND policy_id IS NOT NULL ORDER BY started_at DESC LIMIT 1) AS last_apply_status,(SELECT passed FROM verifier_results WHERE node_id=n.id ORDER BY run_at DESC LIMIT 1) AS last_verify_passed FROM nodes n LEFT JOIN policy_assignments a ON a.node_id=n.id OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=n.id) GROUP BY n.id ORDER BY n.hostname`).map(row=>({...row,drift_status:drift.get(row.id)||null}))
+    return all(`SELECT n.id,n.hostname,n.ip,n.status,COUNT(DISTINCT a.policy_id) AS policy_count,(SELECT status FROM policy_apply_runs WHERE node_id=n.id AND policy_id IS NOT NULL ORDER BY started_at DESC LIMIT 1) AS last_apply_status,(SELECT passed FROM verifier_results WHERE node_id=n.id ORDER BY run_at DESC LIMIT 1) AS last_verify_passed FROM nodes n LEFT JOIN policy_assignments a ON a.node_id=n.id OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=n.id) GROUP BY n.id ORDER BY n.hostname`).filter(isLocalAssetNode).map(row=>({...row,drift_status:drift.get(row.id)||null}))
   }
   if(name==='verification'){
     const visible=user?readablePolicyIds(user):null
@@ -2147,15 +2202,15 @@ function exportReport(req,res,name,data) {
 }
 for(const name of ['inventory','dns','coverage','compliance','verification'])api.get(`/reports/${name}`,(req,res)=>exportReport(req,res,name,report(name,req.user)))
 api.get('/reports/dashboard',(_req,res)=>{
-  const total=one('SELECT COUNT(*) n FROM nodes').n, reachable=one("SELECT COUNT(*) n FROM nodes WHERE status='reachable'").n
+  const localNodes=all('SELECT id,ip,status FROM nodes').filter(isLocalAssetNode),localIds=new Set(localNodes.map(node=>node.id)),total=localNodes.length,reachable=localNodes.filter(node=>node.status==='reachable').length
   const policies=one('SELECT COUNT(*) n FROM policies').n, failed=one("SELECT COUNT(*) n FROM policy_apply_runs WHERE status='failed' AND policy_id IS NOT NULL").n
   const checks=one('SELECT COUNT(passed) n,COALESCE(SUM(passed),0) passed,COUNT(*)-COUNT(passed) inconclusive FROM verifier_results')
   const agentCutoff=new Date(Date.now()-120_000).toISOString()
-  const agents=one('SELECT COUNT(*) total,COALESCE(SUM(CASE WHEN revoked_at IS NULL AND last_checkin_at>=? THEN 1 ELSE 0 END),0) online FROM agents',agentCutoff)
+  const agents=localIds.size?one('SELECT COUNT(*) total,COALESCE(SUM(CASE WHEN a.revoked_at IS NULL AND a.last_checkin_at>=? THEN 1 ELSE 0 END),0) online FROM agents a JOIN nodes n ON n.id=a.node_id WHERE n.id IN ('+Array.from(localIds).map(()=>'?').join(',')+')',agentCutoff,...Array.from(localIds)):{total:0,online:0}
   const denied=all(`SELECT COALESCE(e.dst_port,p.dst_port) dst_port,COUNT(*) count FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE e.action='block' AND ${visibleFirewallEventSql()} GROUP BY COALESCE(e.dst_port,p.dst_port) ORDER BY count DESC LIMIT 6`)
   const verifierTrend=all("SELECT date(run_at) day,COUNT(passed) decisive,SUM(CASE WHEN passed=1 THEN 1 ELSE 0 END) passed FROM verifier_results WHERE datetime(run_at)>=datetime('now','-14 days') GROUP BY date(run_at) ORDER BY day").map(row=>({day:row.day,decisive:row.decisive,passRate:row.decisive?Math.round(row.passed/row.decisive*100):null}))
   const mfaTrend=all("SELECT date(resolved_at) day,SUM(CASE WHEN status='approved' THEN 1 ELSE 0 END) approved,SUM(CASE WHEN status='denied' THEN 1 ELSE 0 END) denied FROM mfa_challenges WHERE datetime(resolved_at)>=datetime('now','-14 days') GROUP BY date(resolved_at) ORDER BY day")
-  const coverage=report('coverage')
+  const coverage=report('coverage').filter(row=>localIds.has(row.id))
   const compliant=coverage.filter(row=>row.policy_count>0&&row.drift_status==='in-sync'&&row.last_apply_status==='success'&&row.last_verify_passed===1).length
   res.json({totalNodes:total,reachableNodes:reachable,agentsOnline:agents.online,agentsOffline:agents.total-agents.online,policies,failedApplies:failed,verifierPassRate:checks.n?Math.round(checks.passed/checks.n*100):null,verifierInconclusive:checks.inconclusive,deniedPorts:denied,compliantNodes:compliant,fleetCompliancePct:total?Math.round(compliant/total*100):null,verifierTrend,mfaTrend})
 })

@@ -5,11 +5,14 @@ import dns from 'node:dns/promises'
 import {isIP} from 'node:net'
 import {db,all,one,run,id,now,json,parse,audit} from './db.js'
 import {lookupDns,probeNode,collectFacts} from './connector.js'
+import {openSealed} from './security.js'
+import {identifyEsxi} from './esxiDiscovery.js'
 
 const MAX_HOSTS=4096
 const ARP_TIMEOUT_MS=1500
 const TCP_TIMEOUT_MS=1200
 export const DISCOVERY_TCP_PORTS=[445,3389,5985,5986]
+export const DISCOVERY_ESXI_TCP_PORTS=[443,902]
 export const DISCOVERY_MIN_INTERVAL_MINUTES=5
 export const DISCOVERY_MAX_INTERVAL_MINUTES=10080
 const execFileAsync=promisify(execFile)
@@ -27,10 +30,31 @@ export function expandCidrs(cidrs){
   }
   return [...new Set(output)]
 }
-export function ping(host){
-  const args=process.platform==='win32'?['-n','1','-w','1000',host]:process.platform==='darwin'?['-c','1','-W','1000',host]:['-c','1','-W','1',host]
-  return new Promise(resolve=>{const child=spawn(process.platform==='win32'?'ping':'ping',args,{stdio:'ignore'});const timer=setTimeout(()=>{child.kill('SIGKILL');resolve(false)},2500);child.once('error',()=>{clearTimeout(timer);resolve(false)});child.once('close',code=>{clearTimeout(timer);resolve(code===0)})})
+export function parsePingTtl(output){
+  const match=String(output||'').match(/(?:ttl|hop limit)[=:\s]+(\d+)/i)
+  const ttl=match?Number(match[1]):null
+  return Number.isInteger(ttl)&&ttl>0&&ttl<=255?ttl:null
 }
+export function classifyTtl(ttl){
+  const value=Number(ttl)
+  if(!Number.isInteger(value)||value<1||value>255)return null
+  // Replies carry the remaining TTL. The closest standard initial value at
+  // or above the reply gives a useful family hint even across a few hops.
+  if(value<=64)return {family:'linux-unix',osName:'Linux / Unix',initialTtl:64}
+  if(value<=128)return {family:'windows',osName:'Windows',initialTtl:128}
+  return {family:'network-device',osName:'Network device',initialTtl:255}
+}
+export function pingWithTtl(host){
+  const args=process.platform==='win32'?['-n','1','-w','1000',host]:process.platform==='darwin'?['-c','1','-W','1000',host]:['-c','1','-W','1',host]
+  return new Promise(resolve=>{
+    const child=spawn(process.platform==='win32'?'ping':'ping',args,{stdio:['ignore','pipe','pipe']});let output=''
+    child.stdout?.on('data',chunk=>{output+=chunk.toString()});child.stderr?.on('data',chunk=>{output+=chunk.toString()})
+    const timer=setTimeout(()=>{child.kill('SIGKILL');resolve({alive:false,ttl:null})},2500)
+    child.once('error',()=>{clearTimeout(timer);resolve({alive:false,ttl:null})})
+    child.once('close',code=>{clearTimeout(timer);const ttl=parsePingTtl(output);resolve({alive:code===0,ttl,osHint:classifyTtl(ttl)?.osName||null,ttlFingerprint:classifyTtl(ttl)||null})})
+  })
+}
+export function ping(host){return pingWithTtl(host).then(result=>result.alive)}
 const ipv4Mac=/\b(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}\b/i
 const zeroMac=/^(?:00[:-]){5}00$/i
 export function normalizeMac(value){const raw=String(value||'').trim().toLowerCase().replaceAll('-',':');return /^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(raw)&&!zeroMac.test(raw)?raw:null}
@@ -88,16 +112,19 @@ export function tcpProbe(host,port,timeoutMs=TCP_TIMEOUT_MS,connect=net.createCo
     socket.once('close',()=>{clearTimeout(timer)})
   })
 }
-export async function probeHostLiveness(host,{icmpProbe=ping,arpLivenessProbe=arpProbe,tcpLivenessProbe=tcpProbe,tcpPorts=DISCOVERY_TCP_PORTS}={}){
-  try{if(await icmpProbe(host))return {alive:true,method:'icmp'}}catch{}
+export async function probeHostLiveness(host,{icmpProbe=pingWithTtl,arpLivenessProbe=arpProbe,tcpLivenessProbe=tcpProbe,tcpPorts=DISCOVERY_TCP_PORTS}={}){
+  try{
+    const icmp=await icmpProbe(host),details=typeof icmp==='object'&&icmp!==null?icmp:{alive:Boolean(icmp)}
+    if(details.alive!==false&&details.alive!==undefined)return {alive:true,method:'icmp',...(details.ttl?{ttl:details.ttl}:{}) ,...(details.osHint?{osHint:details.osHint}:{}) ,...(details.ttlFingerprint?{ttlFingerprint:details.ttlFingerprint}:{})}
+  }catch{}
   try{const arp=await arpLivenessProbe(host),details=typeof arp==='object'&&arp!==null?arp:{alive:Boolean(arp)};if(details.alive!==false&&details.alive!==undefined)return {alive:true,method:'arp',...(details.mac?{mac:details.mac}:{})}}catch{}
   for(const port of tcpPorts){try{if(await tcpLivenessProbe(host,port))return {alive:true,method:`tcp:${port}`}}catch{}}
   return {alive:false,method:null}
 }
 const discoveryIdentity=result=>String(result?.ip||result?.fqdn||result?.hostname||'').trim().toLowerCase()
-const discoveryComparableFields=['hostname','fqdn','mac','hypervisor','osName','osVersion','livenessMethod','transport','managed']
+const discoveryComparableFields=['hostname','fqdn','mac','hypervisor','osName','osVersion','ttl','livenessMethod','transport','managed']
 function discoverySnapshot(result){
-  const snapshot={ip:result?.ip||null,hostname:result?.hostname||null,fqdn:result?.fqdn||null,mac:result?.mac||result?.macAddress||null,hypervisor:result?.hypervisor||null,osName:result?.osName||result?.platform||null,osVersion:result?.osVersion||null,livenessMethod:result?.livenessMethod||null,transport:result?.transport||null,managed:result?.managed===true||result?.managed===1}
+  const snapshot={ip:result?.ip||null,hostname:result?.hostname||null,fqdn:result?.fqdn||null,mac:result?.mac||result?.macAddress||null,hypervisor:result?.hypervisor||null,osName:result?.osName||result?.platform||null,osVersion:result?.osVersion||null,ttl:result?.ttl||null,livenessMethod:result?.livenessMethod||null,transport:result?.transport||null,managed:result?.managed===true||result?.managed===1}
   return snapshot
 }
 export function diffDiscoveryResults(previousResults=[],currentResults=[]){
@@ -158,6 +185,11 @@ export async function runDiscoveryScheduleNow(scheduleId,{actorId=null}={}){
   }catch(error){finishDiscoverySchedule(scheduleId,'failed',error.message);throw error}
 }
 const defaultCredential=()=>one("SELECT node_credential_id FROM directory_connections WHERE id='default' AND enabled=1")?.node_credential_id||null
+function esxiCredentials(){
+  return all("SELECT id,username,encrypted_blob FROM credentials WHERE type='esxi' ORDER BY priority,name").flatMap(row=>{
+    try{const secret=openSealed(row.encrypted_blob);return secret?.password?[{id:row.id,username:row.username,password:secret.password}]:[]}catch{return []}
+  })
+}
 function existingNode(ip,hostname,mac=null){
   const normalizedMac=normalizeMac(mac)
   if(normalizedMac){const byMac=one("SELECT * FROM nodes WHERE lower(mac_address)=? ORDER BY CASE WHEN inventory_source='ad' THEN 0 ELSE 1 END,created_at LIMIT 1",normalizedMac);if(byMac)return byMac}
@@ -168,25 +200,41 @@ export async function registerHost(ip,scanId,livenessMethod='icmp',livenessMeta=
   let hostname=ip,fqdn=null
   try{const names=await dns.reverse(ip);if(names[0]){fqdn=names[0];hostname=fqdn.split('.')[0]}}catch{}
   const candidateMac=normalizeMac(livenessMeta?.mac),found=existingNode(ip,hostname,candidateMac)
-  if(found){run('UPDATE nodes SET last_discovered_at=?,discovery_source=?,status=CASE WHEN status=\'unknown\' THEN \'reachable\' ELSE status END,mac_address=COALESCE(?,mac_address) WHERE id=?',now(),`${livenessMethod}:${scanId}`,candidateMac,found.id);return {ip,nodeId:found.id,existing:true,hostname:found.hostname,fqdn:found.fqdn||null,mac:candidateMac||found.mac_address||null,osName:found.os_name||found.platform||null,osVersion:found.os_version||null,hypervisor:found.hypervisor||null,managed:found.agent_required===0,livenessMethod}}
+  const esxi=livenessMeta?.esxi?.detected?livenessMeta.esxi:null
+  if(found){
+    run('UPDATE nodes SET last_discovered_at=?,discovery_source=?,status=CASE WHEN status=\'unknown\' THEN \'reachable\' ELSE status END,mac_address=COALESCE(?,mac_address),discovery_ttl=COALESCE(?,discovery_ttl),discovery_os_family=COALESCE(?,discovery_os_family) WHERE id=?',now(),`${livenessMethod}:${scanId}`,candidateMac,livenessMeta.ttl||null,livenessMeta.ttlFingerprint?.family||null,found.id)
+    if(livenessMeta?.osHint)run("UPDATE nodes SET os_name=CASE WHEN os_name IS NULL OR lower(os_name) IN ('','unknown','unidentified') THEN ? ELSE os_name END,platform=CASE WHEN platform IS NULL OR lower(platform) IN ('','unknown','unidentified') THEN ? ELSE platform END WHERE id=?",livenessMeta.osHint,livenessMeta.osHint,found.id)
+    if(esxi){
+      run("UPDATE nodes SET os_name='VMware ESXi',os_version=COALESCE(?,os_version),platform='VMware ESXi',hypervisor='VMware ESXi',device_type='hypervisor',management_type='manual',manageability='unmanaged',transport='esxi-soap',connection_mode='agentless',agent_required=0,status='reachable',firewall_state='unmanaged',snmp_capable=CASE WHEN snmp_capable IS NULL THEN 0 ELSE snmp_capable END,probe_status=?,last_probe_at=? WHERE id=?",esxi.osVersion||null,esxi.authenticated?'esxi-authenticated':'esxi-detected',now(),found.id)
+      run("INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET snapshot_json=excluded.snapshot_json,collected_at=excluded.collected_at",found.id,json({source:'esxi-soap',esxi}),now())
+    }
+    const current=one('SELECT * FROM nodes WHERE id=?',found.id)
+    return {ip,nodeId:found.id,existing:true,hostname:current.hostname,fqdn:current.fqdn||null,mac:candidateMac||current.mac_address||null,osName:current.os_name||current.platform||null,osVersion:current.os_version||null,hypervisor:current.hypervisor||null,transport:current.transport||null,managed:current.agent_required===0,livenessMethod,ttl:livenessMeta.ttl||null,ttlFingerprint:livenessMeta.ttlFingerprint||null}
+  }
   const nodeId=id(),credentialId=defaultCredential()
   db.transaction(()=>{
-    run("INSERT INTO nodes(id,hostname,fqdn,ip,connection_mode,status,inventory_source,discovery_source,last_discovered_at,agent_required,mac_address,os_name) VALUES(?,?,?,?,?,?,?,?,?,1,?,?)",nodeId,hostname,fqdn,ip,'agentless','reachable','discovery',`${livenessMethod}:${scanId}`,now(),candidateMac,livenessMeta.osHint||null)
+    run("INSERT INTO nodes(id,hostname,fqdn,ip,connection_mode,status,inventory_source,discovery_source,last_discovered_at,agent_required,mac_address,os_name) VALUES(?,?,?,?,?,?,?,?,?,1,?,?)",nodeId,hostname,fqdn,ip,'agentless','reachable','discovery',`${livenessMethod}:${scanId}`,now(),candidateMac,esxi?'VMware ESXi':(livenessMeta.osHint||null))
     if(credentialId)run('INSERT OR IGNORE INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,NULL)',credentialId,nodeId)
     audit(null,'node.discovery.register','node',nodeId,null,{ip,hostname,fqdn,credentialId,scanId})
   })()
   const node=one('SELECT * FROM nodes WHERE id=?',nodeId)
+  if(livenessMeta?.ttl||livenessMeta?.ttlFingerprint?.family)run('UPDATE nodes SET discovery_ttl=?,discovery_os_family=? WHERE id=?',livenessMeta.ttl||null,livenessMeta.ttlFingerprint?.family||null,nodeId)
+  if(livenessMeta?.ttl||livenessMeta?.osHint)run("INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET snapshot_json=excluded.snapshot_json,collected_at=excluded.collected_at",nodeId,json({source:'icmp-discovery',ttl:livenessMeta.ttl||null,ttlFingerprint:livenessMeta.ttlFingerprint||null,osHint:livenessMeta.osHint||null}),now())
+  if(esxi){
+    run("UPDATE nodes SET os_name='VMware ESXi',os_version=?,platform='VMware ESXi',hypervisor='VMware ESXi',device_type='hypervisor',management_type='manual',manageability='unmanaged',transport='esxi-soap',connection_mode='agentless',agent_required=0,status='reachable',firewall_state='unmanaged',probe_status=?,last_probe_at=? WHERE id=?",esxi.osVersion||null,esxi.authenticated?'esxi-authenticated':'esxi-detected',now(),nodeId)
+    run("INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET snapshot_json=excluded.snapshot_json,collected_at=excluded.collected_at",nodeId,json({source:'esxi-soap',esxi}),now())
+  }
   try{
     await lookupDns(node)
-    const probed=await probeNode(one('SELECT * FROM nodes WHERE id=?',nodeId))
+    const probed=esxi?{transport:'esxi-soap',winrmAuthenticated:false}:await probeNode(one('SELECT * FROM nodes WHERE id=?',nodeId))
     if(probed.winrmAuthenticated){
       await collectFacts(one('SELECT * FROM nodes WHERE id=?',nodeId))
       run('UPDATE nodes SET agent_required=0,platform=COALESCE(platform,\'windows\') WHERE id=?',nodeId)
     }
     const current=one('SELECT * FROM nodes WHERE id=?',nodeId)
-    return {ip,nodeId,hostname:current?.hostname||hostname,fqdn:current?.fqdn||fqdn,mac:current?.mac_address||null,osName:current?.os_name||current?.platform||null,osVersion:current?.os_version||null,hypervisor:current?.hypervisor||null,transport:probed.transport,managed:!!probed.winrmAuthenticated,livenessMethod}
+    return {ip,nodeId,hostname:current?.hostname||hostname,fqdn:current?.fqdn||fqdn,mac:current?.mac_address||null,osName:current?.os_name||current?.platform||null,osVersion:current?.os_version||null,hypervisor:current?.hypervisor||null,transport:probed.transport,managed:!!probed.winrmAuthenticated,livenessMethod,ttl:livenessMeta.ttl||null,ttlFingerprint:livenessMeta.ttlFingerprint||null}
   }catch(error){
-    run('UPDATE nodes SET agent_required=1,status=CASE WHEN status=\'reachable\' THEN \'degraded\' ELSE status END WHERE id=?',nodeId)
+    if(!esxi)run('UPDATE nodes SET agent_required=1,status=CASE WHEN status=\'reachable\' THEN \'degraded\' ELSE status END WHERE id=?',nodeId)
     const current=one('SELECT * FROM nodes WHERE id=?',nodeId)
     return {ip,nodeId,hostname:current?.hostname||hostname,fqdn:current?.fqdn||fqdn,mac:current?.mac_address||null,osName:current?.os_name||current?.platform||null,osVersion:current?.os_version||null,hypervisor:current?.hypervisor||null,agentRequired:true,managed:false,error:error.message,livenessMethod}
   }
@@ -196,9 +244,9 @@ export async function runDiscoveryScan(scanId){
   const cidrs=JSON.parse(scan.cidrs_json),hosts=expandCidrs(cidrs)
   const claimed=run("UPDATE discovery_scans SET status='running',started_at=? WHERE id=? AND status='queued'",now(),scanId)
   if(!claimed.changes)return one('SELECT * FROM discovery_scans WHERE id=?',scanId)
-  const results=[],concurrency=32
+  const results=[],concurrency=32,esxiVault=esxiCredentials()
   let cursor=0
-  const worker=async()=>{while(cursor<hosts.length){const ip=hosts[cursor++];run('UPDATE discovery_scans SET probed=probed+1 WHERE id=?',scanId);const liveness=await probeHostLiveness(ip);if(!liveness.alive)continue;run('UPDATE discovery_scans SET alive=alive+1,arp_alive=arp_alive+?,tcp_alive=tcp_alive+? WHERE id=?',liveness.method==='arp'?1:0,liveness.method?.startsWith('tcp:')?1:0,scanId);try{const result=await registerHost(ip,scanId,liveness.method,liveness);results.push(result);run('UPDATE discovery_scans SET registered=registered+1 WHERE id=?',scanId)}catch(error){results.push({ip,error:error.message,livenessMethod:liveness.method})}}}
+  const worker=async()=>{while(cursor<hosts.length){const ip=hosts[cursor++];run('UPDATE discovery_scans SET probed=probed+1 WHERE id=?',scanId);const liveness=await probeHostLiveness(ip,{tcpPorts:[...DISCOVERY_ESXI_TCP_PORTS,...DISCOVERY_TCP_PORTS]});if(!liveness.alive)continue;run('UPDATE discovery_scans SET alive=alive+1,arp_alive=arp_alive+?,tcp_alive=tcp_alive+? WHERE id=?',liveness.method==='arp'?1:0,liveness.method?.startsWith('tcp:')?1:0,scanId);try{const esxi=await identifyEsxi(ip,{credentials:esxiVault});const result=await registerHost(ip,scanId,liveness.method,{...liveness,esxi});results.push(result);run('UPDATE discovery_scans SET registered=registered+1 WHERE id=?',scanId)}catch(error){results.push({ip,error:error.message,livenessMethod:liveness.method})}}}
   try{
     await Promise.all(Array.from({length:Math.min(concurrency,hosts.length)},worker))
     const limited=results.slice(0,MAX_HOSTS),previousScan=scan.schedule_id?one("SELECT results_json FROM discovery_scans WHERE schedule_id=? AND status='complete' AND id<>? ORDER BY finished_at DESC,rowid DESC LIMIT 1",scan.schedule_id,scan.id):null
