@@ -115,7 +115,8 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
     openapi:'3.1.0',info:{title:'WinFire Secure API',version:'0.1.0',description:'Control-plane operations use bearer tokens. Enrolled agent operations use client certificates.'},
     servers:[{url:'/api/v1'}],paths,
     components:{securitySchemes:{bearerAuth:{type:'http',scheme:'bearer',bearerFormat:'JWT'},internetDeviceBearer:{type:'http',scheme:'bearer',bearerFormat:'Internet device token'},mutualTLS:{type:'mutualTLS'},wefHmac:{type:'apiKey',in:'header',name:'X-WinFire-WEF-Token',description:'Node-scoped HMAC token derived from WEF_SHARED_SECRET. The receiver also accepts the token query parameter for Windows Subscription Manager compatibility.'}},schemas:{
-      Error:{type:'object',required:['error'],properties:{error:{type:'string'}}},
+      OnboardingError:{type:'object',required:['code','title','summary','remediation'],properties:{code:{type:'string',enum:['port_closed','auth_rejected','kerberos_spn_double_hop','winrm_listener_disabled','wmi_dcom_blocked','unknown']},title:{type:'string'},summary:{type:'string'},remediation:{type:'string'},transport:{type:['string','null']},operation:{type:['string','null']},observedOpenPort:{type:'boolean'}}},
+      Error:{type:'object',required:['error'],properties:{error:{type:'string'},onboardingError:{$ref:'#/components/schemas/OnboardingError'}}},
       LoginRequest:{type:'object',required:['email','password'],properties:{email:{type:'string',format:'email'},password:{type:'string',format:'password'},totp:{type:'string'}}},
       RefreshRequest:{type:'object',required:['refreshToken'],properties:{refreshToken:{type:'string'}}},
       EmptyRequest:{type:'object',additionalProperties:false},

@@ -12,6 +12,8 @@ import {mfaPromptFunctions} from './mfaPromptScript.js'
 import {assertManagementAccess} from './managementGuard.js'
 import {emitNotification} from './notifications.js'
 import {classifyOperatingSystem,classifyInfrastructureFacts} from './infrastructureDiscovery.js'
+import {classifyOnboardingError,attachOnboardingError} from './onboardingErrors.js'
+import {collectLinuxFacts,collectLinuxRules,applyLinuxFirewall,testSshCredential,launchLinuxPortal} from './sshConnector.js'
 
 const timeoutMs = 40000
 const lsaRightsFunctions=fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../sidecar/lsa_rights.ps1'),'utf8')
@@ -22,8 +24,15 @@ const securityProcessOwnerFunctions=fs.readFileSync(path.resolve(path.dirname(fi
 const pause=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds))
 const transientError=error=>/timed?\s*out|timeout|ECONNRESET|ECONNREFUSED|Max retries exceeded|unreachable/i.test(error?.message||'')
 export function recordNodeSuccess(nodeId,probeStatus=null) {
-  if(probeStatus)run("UPDATE nodes SET failures=0,status='reachable',next_retry_at=NULL,last_seen_at=?,probe_status=?,last_probe_at=? WHERE id=?",now(),probeStatus,now(),nodeId)
-  else run("UPDATE nodes SET failures=0,status='reachable',next_retry_at=NULL,last_seen_at=? WHERE id=?",now(),nodeId)
+  const managedAt=now()
+  if(probeStatus)run("UPDATE nodes SET failures=0,status='reachable',next_retry_at=NULL,last_seen_at=?,last_managed_at=?,probe_status=?,last_probe_at=?,onboarding_error_code=NULL,onboarding_error_updated_at=NULL WHERE id=?",managedAt,managedAt,probeStatus,managedAt,nodeId)
+  else run("UPDATE nodes SET failures=0,status='reachable',next_retry_at=NULL,last_seen_at=?,last_managed_at=?,onboarding_error_code=NULL,onboarding_error_updated_at=NULL WHERE id=?",managedAt,managedAt,nodeId)
+}
+export function recordOnboardingFailure(nodeId,error,context={}) {
+  const onboardingError=error?.onboardingError||classifyOnboardingError(error,context)
+  if(nodeId)run('UPDATE nodes SET onboarding_error_code=?,onboarding_error_updated_at=? WHERE id=?',onboardingError.code,now(),nodeId)
+  if(error&&typeof error==='object')error.onboardingError=onboardingError
+  return onboardingError
 }
 export function recordNodeTransportFailure(nodeId) {
   const node=one('SELECT failures,hostname,status FROM nodes WHERE id=?',nodeId)
@@ -318,6 +327,12 @@ function nodeCredential(nodeId,credentialId) {
   return rows.map(row=>({...row,secret:openSealed(row.encrypted_blob)}))
 }
 export async function testNodeCredential(node,credentialId){
+  if(node.transport==='ssh'){
+    const credential=nodeCredential(node.id,credentialId)[0],secret=credential?.secret||{}
+    const result=await testSshCredential({host:node.fqdn||node.ip||node.hostname,port:secret.port||22,credential:{...credential,secret}})
+    recordNodeSuccess(node.id,'ssh-authenticated')
+    return result
+  }
   if(node.transport!=='wmi'){
     const account=await remote(node,'auth',{}, {credentialId})
     return {success:true,transport:node.transport||'winrm',account}
@@ -367,6 +382,7 @@ export async function preflightCredential({host,credential,expectedName=null,wmi
   const portSummary=Object.entries(ports).map(([name,result])=>`${name} ${result?.status||'unknown'}`).join(', ')
   const failure=new Error(`Credential preflight failed for ${target}. ${errors.join('; ')||'No WMI or WinRM endpoint accepted the credential'}. Ports: ${portSummary}`)
   failure.status=502;failure.ports=ports
+  attachOnboardingError(failure,{ports,operation:'credential_preflight',message:errors.join('; ')})
   throw failure
 }
 export async function activateWinrmViaWmi(node,{wmi=process.platform==='win32'?wmiProbePowerShell:wmiProbePython,probePort=tcpProbe,invoke=remote,collect=collectFacts,wait=pause}={}){
@@ -389,7 +405,11 @@ export async function activateWinrmViaWmi(node,{wmi=process.platform==='win32'?w
       break
     }catch(error){lastProbeError=error;error.message=String(error.message).replaceAll(check.password,'[redacted]')}
   }
-  if(!selected)throw lastProbeError||new Error('No assigned credential authenticated over WMI')
+  if(!selected){
+    const failure=attachOnboardingError(lastProbeError||new Error('No assigned credential authenticated over WMI'),{operation:'activate_winrm',transport:'wmi'})
+    recordOnboardingFailure(node.id,failure,{operation:'activate_winrm',transport:'wmi'})
+    throw failure
+  }
   const credentialId=selected.id
   const input={host,username:selected.username,password:selected.secret.password,mode:'enable_winrm',expectedName}
   const applyRunId=id()
@@ -412,7 +432,7 @@ export async function activateWinrmViaWmi(node,{wmi=process.platform==='win32'?w
       await invoke(managed,'auth',{}, {credentialId})
       const facts=await invoke(managed,'facts',{}, {credentialId})
       if(String(facts?.computer?.Name||'').toLowerCase()!==String(node.hostname).toLowerCase())throw new Error('WinRM host identity does not match the directory computer')
-      run("UPDATE nodes SET transport='winrm',probe_status='winrm-authenticated',status='reachable',last_probe_at=?,last_seen_at=?,next_retry_at=NULL WHERE id=?",now(),now(),node.id)
+      run("UPDATE nodes SET transport='winrm',probe_status='winrm-authenticated',status='reachable',last_probe_at=?,last_seen_at=?,next_retry_at=NULL,onboarding_error_code=NULL,onboarding_error_updated_at=NULL WHERE id=?",now(),now(),node.id)
       await collect(managed,{suppliedFacts:facts})
       run('UPDATE policy_apply_runs SET status=?,diff_json=?,finished_at=? WHERE id=?','success',JSON.stringify({operation:'enable_winrm_via_wmi',transport:'winrm',computerName:facts.computer.Name}),now(),applyRunId)
       audit(null,'node.agentless.activate','node',node.id,{transport:node.transport,probeStatus:node.probe_status},{transport:'winrm',credentialId,computerName:facts.computer.Name,runId:applyRunId})
@@ -424,14 +444,38 @@ export async function activateWinrmViaWmi(node,{wmi=process.platform==='win32'?w
     const diagnostic=process.platform==='win32'?null:await wmi({...input,mode:'diagnose_winrm'})
     if(diagnostic?.winrmService?.State==='Running'&&String(diagnostic.commandOutput||'').includes('ListeningOn ='))detail=' The WinRM service and listener are running; check network ACLs or an effective host firewall block between the control plane and this node.'
   }catch{}
-  throw new Error(`WMI started WinRM activation, but TCP 5985 remains ${lastPort?.status||'unreachable'} from the control plane.${detail}`)
+  throw attachOnboardingError(new Error(`WMI started WinRM activation, but TCP 5985 remains ${lastPort?.status||'unreachable'} from the control plane.${detail}`),{operation:'activate_winrm',transport:'winrm',ports:{winrm:lastPort}})
   }catch(error){
+    recordOnboardingFailure(node.id,error,{operation:'activate_winrm',transport:'wmi'})
     run('UPDATE policy_apply_runs SET status=?,error=?,finished_at=? WHERE id=?','unknown',error.message,now(),applyRunId)
     audit(null,'node.agentless.activate.failed','node',node.id,null,{runId:applyRunId,error:error.message})
     throw error
   }
 }
 export async function remote(node,operation,args={},options={}) {
+  if(node.transport==='ssh'){
+    if(['jit_preflight','jit_start','jit_end','prompt_session','security_session_logoff','rights','rights_change','wef_configure'].includes(operation))throw new Error('This operation requires an enrolled Windows agent')
+    if(!['auth','facts','all_rules','rules','apply','prompt_browser'].includes(operation))throw new Error('SSH transport supports Linux facts, firewall rules, and desktop MFA prompts only')
+    if(operation==='apply')assertManagementAccess(args.add||[])
+    let lastError
+    for(const credential of nodeCredential(node.id,options.credentialId)){
+      const secret=credential.secret||{},connection={host:node.fqdn||node.ip||node.hostname,port:secret.port||22,username:credential.username,password:secret.password,privateKey:secret.privateKey,passphrase:secret.passphrase,hostKeyFingerprint:secret.hostKeyFingerprint||secret.hostKey}
+      try{
+        if(operation==='auth'){const result=await testSshCredential({host:connection.host,port:connection.port,credential:{...credential,secret},probeOnly:true});recordNodeSuccess(node.id,'ssh-authenticated');return result}
+        if(operation==='prompt_browser'){
+          const result=await launchLinuxPortal(connection,{portalUrl:args.url,preferredUser:args.targetUser||args.username||args.user,browser:args.browser||'xdg-open'})
+          run("UPDATE nodes SET connection_mode='agentless',management_type='ssh',transport='ssh',agent_required=0,firewall_state=CASE WHEN firewall_state='enforcing' THEN firewall_state ELSE 'learning' END WHERE id=?",node.id)
+          recordNodeSuccess(node.id,'ssh-authenticated');return result
+        }
+        const result=operation==='facts'?await collectLinuxFacts(connection):operation==='apply'?await applyLinuxFirewall(connection,args):await collectLinuxRules(connection)
+        if(operation==='facts'&&!result?.computer?.Name)throw new Error('SSH facts did not return the Linux host identity')
+        if(!Array.isArray(result?.rules)&&['rules','all_rules'].includes(operation))throw new Error('SSH firewall inventory returned an invalid result')
+        recordNodeSuccess(node.id,'ssh-authenticated');return result
+      }catch(error){lastError=error;const secretValues=[secret.password,secret.privateKey,secret.passphrase].filter(Boolean);error.message=secretValues.reduce((text,value)=>text.replaceAll(value,'[redacted]'),String(error.message||error))}
+    }
+    if(transientError(lastError))recordNodeTransportFailure(node.id)
+    throw attachOnboardingError(lastError||new Error('No credential authenticated over SSH'),{operation,transport:'ssh'})
+  }
   if(node.transport==='netsh'){
     const eventOperation=['events','events_recent','events_probe','event_cursor'].includes(operation)
     const supported=['auth','facts','audit_policy','audit_policy_enable','all_rules','rules','apply','events','events_recent','events_probe','event_cursor','rpc_filters','rpc_filter_apply','rpc_filter_remove']
@@ -457,7 +501,7 @@ export async function remote(node,operation,args={},options={}) {
       }catch(error){lastError=error;error.message=String(error.message).replaceAll(credential.secret.password,'[redacted]')}
     }
     if(transientError(lastError))recordNodeTransportFailure(node.id)
-    throw lastError||new Error('No credential authenticated over SMB netsh fallback')
+    throw attachOnboardingError(lastError||new Error('No credential authenticated over SMB netsh fallback'),{operation,transport:node.transport})
   }
   if(node.transport==='wmi'){
     const eventOperation=['events','events_recent','events_probe','event_cursor'].includes(operation)
@@ -479,7 +523,7 @@ export async function remote(node,operation,args={},options={}) {
           break
         }catch(error){lastError=error;error.message=String(error.message).replaceAll(check.password,'[redacted]')}
       }
-      if(!selected){if(transientError(lastError))recordNodeTransportFailure(node.id);throw lastError||new Error('No credential authenticated over WMI')}
+      if(!selected){if(transientError(lastError))recordNodeTransportFailure(node.id);throw attachOnboardingError(lastError||new Error('No credential authenticated over WMI'),{operation,transport:node.transport})}
       const input={host,username:selected.username,password:selected.secret.password,mode:operation,args,expectedName}
       try{
         const result=await wmiProbePython(input)
@@ -489,7 +533,7 @@ export async function remote(node,operation,args={},options={}) {
       }catch(error){
         error.message=String(error.message).replaceAll(input.password,'[redacted]')
         if(transientError(error))recordNodeTransportFailure(node.id)
-        throw error // The host may have applied the change; the caller must read back before retrying.
+        throw attachOnboardingError(error,{operation,transport:node.transport}) // The host may have applied the change; the caller must read back before retrying.
       }
     }
     for(const credential of credentials){
@@ -510,7 +554,7 @@ export async function remote(node,operation,args={},options={}) {
       }catch(error){lastError=error;error.message=String(error.message).replaceAll(input.password,'[redacted]')}
     }
     if(transientError(lastError))recordNodeTransportFailure(node.id)
-    throw lastError||new Error('No credential authenticated over WMI')
+    throw attachOnboardingError(lastError||new Error('No credential authenticated over WMI'),{operation,transport:node.transport})
   }
   const host=node.fqdn || node.ip || node.hostname
   let lastError
@@ -531,29 +575,30 @@ export async function remote(node,operation,args={},options={}) {
         if(!transientError(error))break
         if(mutating){
           recordNodeTransportFailure(node.id)
-          throw error // Outcome may be ambiguous; re-read state before retrying.
+          throw attachOnboardingError(error,{operation,transport:input.transport}) // Outcome may be ambiguous; re-read state before retrying.
         }
         if(attempt+1<attempts)await pause(300*(attempt+1))
       }
     }
   }
   if(transientError(lastError))recordNodeTransportFailure(node.id)
-  throw lastError
+  throw attachOnboardingError(lastError||new Error('No credential authenticated over WinRM'),{operation,transport:node.transport})
 }
-export function classifyProbe(transport,rpc,winrmAuthenticated=false,netshAuthenticated=false) {
+export function classifyProbe(transport,rpc,winrmAuthenticated=false,netshAuthenticated=false,sshAuthenticated=false) {
+  if(sshAuthenticated&&transport==='ssh')return {status:'reachable',probeStatus:'ssh-authenticated'}
   if(transport==='wmi')return typeof rpc==='string'?{status:'reachable',probeStatus:'rpc-authenticated'}:{status:'unverified',probeStatus:'rpc-unverified'}
   if(transport==='netsh'&&netshAuthenticated)return {status:'reachable',probeStatus:'netsh-authenticated'}
   if(winrmAuthenticated&&['winrm','winrms'].includes(transport))return {status:'reachable',probeStatus:`${transport}-authenticated`}
   if(transport)return {status:'port-open',probeStatus:'port-open'}
   return {status:'unreachable',probeStatus:'unreachable'}
 }
-export async function probeNode(node,{verifyWinrm=true,probePort=tcpProbe,authenticate=remote,authenticateRpc=rpcProbe,authenticateNetsh=netshProbe}={}) {
+export async function probeNode(node,{verifyWinrm=true,probePort=tcpProbe,authenticate=remote,authenticateRpc=rpcProbe,authenticateNetsh=netshProbe,authenticateSsh=remote}={}) {
   const host=node.fqdn || node.ip || node.hostname
-  const [winrm,winrms,wmi,smb]=await Promise.all([probePort(host,5985),probePort(host,5986),probePort(host,135),probePort(host,445)])
+  const [winrm,winrms,wmi,smb,ssh]=await Promise.all([probePort(host,5985),probePort(host,5986),probePort(host,135),probePort(host,445),probePort(host,22)])
   const candidates=[['winrms',winrms],['winrm',winrm]].filter(([,port])=>port.status==='open')
   let transport=candidates[0]?.[0]||null
   let rpc=null
-  let winrmAuthenticated=false,winrmError=null,netshAuthenticated=false,netshError=null
+  let winrmAuthenticated=false,winrmError=null,netshAuthenticated=false,netshError=null,sshAuthenticated=false,sshError=null
   if(verifyWinrm){
     for(const [candidate] of candidates){
       try{await authenticate({...node,transport:candidate},'auth');transport=candidate;winrmAuthenticated=true;break}
@@ -568,16 +613,23 @@ export async function probeNode(node,{verifyWinrm=true,probePort=tcpProbe,authen
     try{await authenticateNetsh(host,node.id);transport='netsh';netshAuthenticated=true}
     catch(error){netshError=error.message}
   }
-  const {status,probeStatus}=classifyProbe(transport,rpc,winrmAuthenticated,netshAuthenticated),probedAt=now()
-  run('UPDATE nodes SET transport=?,status=?,probe_status=?,last_probe_at=?,last_seen_at=?,failures=?,next_retry_at=NULL WHERE id=?',transport,status,probeStatus,probedAt,transport?probedAt:node.last_seen_at,transport?0:(node.failures||0)+1,node.id)
+  const linuxHint=['linux','unix','macos','freebsd'].some(value=>String(node.os_name||node.platform||node.discovery_os_family||'').toLowerCase().includes(value))||node.management_type==='ssh'||node.transport==='ssh'
+  if(!winrmAuthenticated&&!netshAuthenticated&&ssh.status==='open'&&(linuxHint||node.transport==='ssh'||node.device_type==='linux')){
+    try{await authenticateSsh({...node,transport:'ssh'},'auth');transport='ssh';sshAuthenticated=true}catch(error){sshError=error.message}
+  }
+  const {status,probeStatus}=classifyProbe(transport,rpc,winrmAuthenticated,netshAuthenticated,sshAuthenticated),probedAt=now()
+  const ports={winrm,winrms,wmi,smb,ssh},diagnostic=[winrmError,netshError,sshError,rpc?.error].filter(Boolean).join('; ')
+  const onboardingError=status==='reachable'?null:classifyOnboardingError(new Error(diagnostic||'No supported management port responded'),{operation:'probe',transport,ports})
+  run('UPDATE nodes SET transport=?,status=?,probe_status=?,last_probe_at=?,last_seen_at=?,failures=?,next_retry_at=NULL,onboarding_error_code=?,onboarding_error_updated_at=? WHERE id=?',transport,status,probeStatus,probedAt,transport?probedAt:node.last_seen_at,transport?0:(node.failures||0)+1,onboardingError?.code||null,onboardingError?probedAt:null,node.id)
   audit(null,'node.probe','node',node.id,null,{transport,status,probeStatus})
-  return {transport,status,probeStatus,ports:{winrm,winrms,wmi,smb},rpc,winrmAuthenticated,winrmError,netshAuthenticated,netshError,note:transport==='wmi'?'RPC authentication checked; WMI firewall and Security log access need a credentialed query.':netshAuthenticated?'SMB service execution authenticated; netsh is being used as the legacy fallback.':winrmAuthenticated?'WinRM authentication confirmed.':transport?'A management port responded, but authentication was not confirmed.':'No supported management port responded.'}
+  return {transport,status,probeStatus,ports,rpc,winrmAuthenticated,winrmError,netshAuthenticated,netshError,sshAuthenticated,sshError,onboardingError,note:transport==='wmi'?'RPC authentication checked; WMI firewall and Security log access need a credentialed query.':netshAuthenticated?'SMB service execution authenticated; netsh is being used as the legacy fallback.':sshAuthenticated?'SSH authentication confirmed and Linux management is available.':winrmAuthenticated?'WinRM authentication confirmed.':transport?'A management port responded, but authentication was not confirmed.':'No supported management port responded.'}
 }
 export async function collectFacts(node,{credentialId,suppliedFacts}={}) {
   const facts=suppliedFacts||await remote(node,'facts',{}, {credentialId})
   run('INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET snapshot_json=excluded.snapshot_json,collected_at=excluded.collected_at',node.id,JSON.stringify(facts),now())
   const osName=classifyOperatingSystem({caption:facts?.os?.Caption,version:facts?.os?.Version,build:facts?.os?.BuildNumber}),infrastructure=classifyInfrastructureFacts(facts),rawMac=String(facts?.network?.find(adapter=>adapter?.macAddress)?.macAddress||'').trim().toLowerCase().replaceAll('-',':'),macAddress=/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(rawMac)&&rawMac!=='00:00:00:00:00:00'?rawMac:null,managedAt=now()
-  run('UPDATE nodes SET mac_address=COALESCE(?,mac_address),os_version=?,os_build=?,os_name=COALESCE(?,os_name),hypervisor=COALESCE(?,hypervisor),manageability=COALESCE(?,manageability),snmp_capable=CASE WHEN ? IS NULL THEN snmp_capable ELSE ? END,last_seen_at=?,last_managed_at=?,status=? WHERE id=?',macAddress,facts?.os?.Version||null,facts?.os?.BuildNumber||null,osName,infrastructure?.hypervisorName||infrastructure?.hypervisor||null,infrastructure?.manageability||null,infrastructure?.snmpCapable===undefined?null:infrastructure.snmpCapable,infrastructure?.snmpCapable===undefined?null:infrastructure.snmpCapable,managedAt,managedAt,'reachable',node.id)
+  run('UPDATE nodes SET mac_address=COALESCE(?,mac_address),os_version=?,os_build=?,os_name=COALESCE(?,os_name),hypervisor=COALESCE(?,hypervisor),manageability=COALESCE(?,manageability),snmp_capable=CASE WHEN ? IS NULL THEN snmp_capable ELSE ? END,last_seen_at=?,last_managed_at=?,status=?,onboarding_error_code=NULL,onboarding_error_updated_at=NULL WHERE id=?',macAddress,facts?.os?.Version||null,facts?.os?.BuildNumber||null,osName,infrastructure?.hypervisorName||infrastructure?.hypervisor||null,infrastructure?.manageability||null,infrastructure?.snmpCapable===undefined?null:infrastructure.snmpCapable,infrastructure?.snmpCapable===undefined?null:infrastructure.snmpCapable,managedAt,managedAt,'reachable',node.id)
+  if(node.connection_mode==='agentless'&&node.transport==='ssh')run("UPDATE nodes SET connection_mode='agentless',management_type='ssh',device_type=CASE WHEN device_type IS NULL OR device_type='auto' THEN 'linux' ELSE device_type END,agent_required=0,firewall_state='learning',firewall_backend=COALESCE(?,firewall_backend),collect_network_tables=1,manageability='managed' WHERE id=?",facts?.firewall?.backend||null,node.id)
   if(node.connection_mode==='agentless'&&['winrm','winrms'].includes(node.transport)){
     try{const {collectAccountInventory}=await import('./localAccounts.js');await collectAccountInventory(node)}
     catch(error){audit(null,'local-accounts.collect.failed','node',node.id,null,{error:error.message})}
@@ -616,6 +668,8 @@ export async function enrichNode(node,{probeNodeFn=probeNode,activate=activateWi
       } catch(fallbackError) {
         const activationMessage=String(error.message),fallbackMessage=String(fallbackError.message)
         fallbackError.message=activationMessage===fallbackMessage?fallbackMessage:`${activationMessage}; credentialed WMI facts failed: ${fallbackMessage}`
+        if(error.onboardingError) fallbackError.onboardingError=error.onboardingError
+        else attachOnboardingError(fallbackError,{operation:'activate_winrm',transport:'wmi'})
         throw fallbackError
       }
     }

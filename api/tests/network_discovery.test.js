@@ -8,7 +8,8 @@ import path from 'node:path'
 const dir=fs.mkdtempSync(path.join(os.tmpdir(),'winfire-discovery-'))
 process.env.DATA_DIR=dir
 const {parseNeighborTable,parsePingTtl,classifyTtl,probeHostLiveness,tcpProbe,DISCOVERY_TCP_PORTS,persistHypervisor}=await import('../src/networkDiscovery.js')
-const {run,one,id}=await import('../src/db.js')
+const {ensureSnmpNode}=await import('../src/snmpDiscoveryService.js')
+const {run,one,id,now}=await import('../src/db.js')
 const {classifyInfrastructureResponse,classifyOperatingSystem}=await import('../src/infrastructureDiscovery.js')
 
 test.after(()=>fs.rmSync(dir,{recursive:true,force:true}))
@@ -75,4 +76,16 @@ test('authenticated ESXi guest inventory marks matching assets as virtual machin
   assert.equal(hypervisor.device_type,'esxi')
   assert.equal(hypervisor.management_type,'api')
   assert.equal(facts.virtualMachines[0].guestOs,'Ubuntu Linux (64-bit)')
+})
+
+test('SNMP enrichment preserves an authenticated ESXi SOAP/API transport and VM facts',()=>{
+  const hostId=id()
+  run("INSERT INTO nodes(id,hostname,ip,connection_mode,status,device_type,transport,management_type,probe_status,os_name,os_version) VALUES(?,?,?,?,?,?,?,?,?,?,?)",hostId,'esxi-02','192.168.88.4','agentless','reachable','esxi','esxi-soap','api','hypervisor-authenticated','VMware ESXi','VMware ESXi 8.0.3 build-24677879')
+  run("INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?)",hostId,JSON.stringify({source:'esxi-soap',virtualMachines:[{name:'guest-01'}]}),now())
+  ensureSnmpNode({host:'192.168.88.4',source:'snmp:test'},{identity:{sysName:'esxi-02',sysDescr:'VMware ESXi 8.0.3'},classification:{vendor:'VMware ESXi',hypervisor:'VMware ESXi',deviceType:'hypervisor',manageability:'unmanaged'},arp:[{ip:'192.168.88.42'}],macPorts:[],routes:{},tcpStates:{}},now())
+  const node=one('SELECT connection_mode,transport,management_type,probe_status,os_name,os_version FROM nodes WHERE id=?',hostId)
+  assert.deepEqual(node,{connection_mode:'agentless',transport:'esxi-soap',management_type:'api',probe_status:'hypervisor-authenticated',os_name:'VMware ESXi',os_version:'VMware ESXi 8.0.3 build-24677879'})
+  const facts=JSON.parse(one('SELECT snapshot_json FROM node_facts WHERE node_id=?',hostId).snapshot_json)
+  assert.equal(facts.virtualMachines[0].name,'guest-01')
+  assert.equal(facts.arp[0].ip,'192.168.88.42')
 })

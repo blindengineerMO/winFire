@@ -65,7 +65,7 @@ agentRoutes.post('/:id/heartbeat',requireAgent,(req,res)=>{
   const channelMode=effectiveAgentChannelMode(req.agent.node_id)
   const previous=one('SELECT status FROM nodes WHERE id=?',req.agent.node_id)?.status
   run('UPDATE agents SET version=?,mode=?,last_checkin_at=? WHERE id=?',version,channelMode,now(),req.agent.id)
-  run("UPDATE nodes SET status='reachable',last_seen_at=?,failures=0,platform=COALESCE(?,platform),os_version=COALESCE(?,os_version),firewall_backend=COALESCE(?,firewall_backend),agent_required=0 WHERE id=?",now(),platform||null,osVersion||null,firewallBackend||null,req.agent.node_id)
+  run("UPDATE nodes SET status='reachable',last_seen_at=?,last_managed_at=?,failures=0,platform=COALESCE(?,platform),os_version=COALESCE(?,os_version),firewall_backend=COALESCE(?,firewall_backend),agent_required=0 WHERE id=?",now(),now(),platform||null,osVersion||null,firewallBackend||null,req.agent.node_id)
   if(platform||osVersion||firewallBackend||capabilities)run('UPDATE agents SET capabilities_json=? WHERE id=?',json({platform:platform||null,osVersion:osVersion||null,firewallBackend:firewallBackend||null,capabilities:capabilities||[]}),req.agent.id)
   if(previous==='unreachable')audit(null,'agent.online','node',req.agent.node_id,null,{agentId:req.agent.id})
   let update={available:false}

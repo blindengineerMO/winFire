@@ -13,6 +13,7 @@ const MAX_HOSTS=4096
 const ARP_TIMEOUT_MS=1500
 const TCP_TIMEOUT_MS=1200
 export const DISCOVERY_TCP_PORTS=[445,3389,5985,5986]
+export const DISCOVERY_LINUX_TCP_PORTS=[22]
 // These are bounded management ports used for hypervisor fingerprints. They
 // are liveness evidence, not a general port scan.
 export const DISCOVERY_HYPERVISOR_TCP_PORTS=[443,8006,902]
@@ -190,6 +191,19 @@ export async function runDiscoveryScheduleNow(scheduleId,{actorId=null}={}){
   }catch(error){finishDiscoverySchedule(scheduleId,'failed',error.message);throw error}
 }
 const defaultCredential=()=>one("SELECT node_credential_id FROM directory_connections WHERE id='default' AND enabled=1")?.node_credential_id||null
+function linuxDiscoveryCredential(){
+  const credentialId=one("SELECT value FROM app_settings WHERE key='linux_discovery_credential_id'")?.value
+  const row=credentialId?one("SELECT id,username,encrypted_blob,type FROM credentials WHERE id=? AND type='ssh'",credentialId):null
+  if(!row)return null
+  try{const secret=openSealed(row.encrypted_blob);if(savedSetting('linux_discovery_host_key_policy')==='fingerprint'&&!secret?.hostKeyFingerprint&&!secret?.hostKey)return null;return secret?.password||secret?.privateKey?{...row,secret}:null}catch{return null}
+}
+const savedSetting=key=>String(one('SELECT value FROM app_settings WHERE key=?',key)?.value||'').trim()
+function assignLinuxCredential(nodeId,credential){
+  if(!credential)return false
+  const assigned=one("SELECT 1 FROM credential_assignments WHERE credential_id=? AND node_id=?",credential.id,nodeId)
+  if(!assigned)run('INSERT OR IGNORE INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,NULL)',credential.id,nodeId)
+  return true
+}
 function esxiCredentials(){
   return all("SELECT id,username,encrypted_blob FROM credentials WHERE type='esxi' ORDER BY priority,name").flatMap(row=>{
     try{const secret=openSealed(row.encrypted_blob);return secret?.password?[{id:row.id,username:row.username,password:secret.password}]:[]}catch{return []}
@@ -233,16 +247,20 @@ export async function registerHost(ip,scanId,livenessMethod='icmp',livenessMeta=
   const candidateMac=normalizeMac(livenessMeta?.mac),found=existingNode(ip,hostname,candidateMac)
   const hypervisor=livenessMeta?.hypervisor?.detected?livenessMeta.hypervisor:null
   if(found){
-    run('UPDATE nodes SET last_discovered_at=?,discovery_source=?,status=CASE WHEN status=\'unknown\' THEN \'reachable\' ELSE status END,mac_address=COALESCE(?,mac_address),discovery_ttl=COALESCE(?,discovery_ttl),discovery_os_family=COALESCE(?,discovery_os_family) WHERE id=?',now(),`${livenessMethod}:${scanId}`,candidateMac,livenessMeta.ttl||null,livenessMeta.ttlFingerprint?.family||null,found.id)
+    run('UPDATE nodes SET first_discovered_at=COALESCE(first_discovered_at,?),last_discovered_at=?,discovery_source=?,status=CASE WHEN status=\'unknown\' THEN \'reachable\' ELSE status END,mac_address=COALESCE(?,mac_address),discovery_ttl=COALESCE(?,discovery_ttl),discovery_os_family=COALESCE(?,discovery_os_family) WHERE id=?',now(),now(),`${livenessMethod}:${scanId}`,candidateMac,livenessMeta.ttl||null,livenessMeta.ttlFingerprint?.family||null,found.id)
     if(livenessMeta?.osHint)run("UPDATE nodes SET os_name=CASE WHEN os_name IS NULL OR lower(os_name) IN ('','unknown','unidentified','unknown os') THEN ? ELSE os_name END,platform=CASE WHEN platform IS NULL OR lower(platform) IN ('','unknown','unidentified','unknown os') THEN ? ELSE platform END WHERE id=?",livenessMeta.osHint,livenessMeta.osHint,found.id)
     persistHypervisor(found.id,hypervisor)
-    const current=one('SELECT * FROM nodes WHERE id=?',found.id)
-    return {ip,nodeId:found.id,existing:true,hostname:current.hostname,fqdn:current.fqdn||null,mac:candidateMac||current.mac_address||null,osName:current.os_name||current.platform||null,osVersion:current.os_version||null,hypervisor:current.hypervisor||null,transport:current.transport||null,managed:current.agent_required===0,livenessMethod,ttl:livenessMeta.ttl||null,ttlFingerprint:livenessMeta.ttlFingerprint||null}
+    let current=one('SELECT * FROM nodes WHERE id=?',found.id),probed=null
+    const linuxHint=String(current.os_name||current.platform||livenessMeta.osHint||'').toLowerCase().match(/linux|unix|freebsd|ubuntu|debian|red hat|centos|rocky|alma|fedora|suse|macos/)||livenessMethod==='tcp:22'
+    if(!hypervisor&&linuxHint&&current.agent_required!==0){assignLinuxCredential(found.id,linuxDiscoveryCredential());current=one('SELECT * FROM nodes WHERE id=?',found.id);try{probed=await probeNode(current);if(probed.sshAuthenticated)await collectFacts(one('SELECT * FROM nodes WHERE id=?',found.id))}catch(error){probed={transport:current.transport,error:error.message}}}
+    current=one('SELECT * FROM nodes WHERE id=?',found.id)
+    return {ip,nodeId:found.id,existing:true,hostname:current.hostname,fqdn:current.fqdn||null,mac:candidateMac||current.mac_address||null,osName:current.os_name||current.platform||null,osVersion:current.os_version||null,hypervisor:current.hypervisor||null,transport:current.transport||probed?.transport||null,managed:current.agent_required===0,livenessMethod,ttl:livenessMeta.ttl||null,ttlFingerprint:livenessMeta.ttlFingerprint||null}
   }
-  const nodeId=id(),credentialId=defaultCredential()
+  const nodeId=id(),credentialId=defaultCredential(),linuxCredential=linuxDiscoveryCredential(),isLinux=!hypervisor&&(/linux|unix|freebsd|ubuntu|debian|red hat|centos|rocky|alma|fedora|suse|macos/i.test(String(livenessMeta.osHint||''))||livenessMethod==='tcp:22')
   db.transaction(()=>{
-    run("INSERT INTO nodes(id,hostname,fqdn,ip,connection_mode,status,inventory_source,discovery_source,last_discovered_at,agent_required,mac_address,os_name) VALUES(?,?,?,?,?,?,?,?,?,1,?,?)",nodeId,hostname,fqdn,ip,'agentless','reachable','discovery',`${livenessMethod}:${scanId}`,now(),candidateMac,hypervisor?.osName||livenessMeta.osHint||null)
+    run("INSERT INTO nodes(id,hostname,fqdn,ip,connection_mode,status,inventory_source,discovery_source,first_discovered_at,last_discovered_at,agent_required,mac_address,os_name) VALUES(?,?,?,?,?,?,?,?,?,?,1,?,?)",nodeId,hostname,fqdn,ip,'agentless','reachable','discovery',`${livenessMethod}:${scanId}`,now(),now(),candidateMac,hypervisor?.osName||livenessMeta.osHint||null)
     if(credentialId)run('INSERT OR IGNORE INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,NULL)',credentialId,nodeId)
+    if(isLinux&&linuxCredential)run('INSERT OR IGNORE INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,NULL)',linuxCredential.id,nodeId)
     audit(null,'node.discovery.register','node',nodeId,null,{ip,hostname,fqdn,credentialId,scanId})
   })()
   const node=one('SELECT * FROM nodes WHERE id=?',nodeId)
@@ -254,12 +272,12 @@ export async function registerHost(ip,scanId,livenessMethod='icmp',livenessMeta=
   try{
     await lookupDns(node)
     const probed=hypervisor?{transport:hypervisor.api==='soap'?'esxi-soap':'hypervisor',winrmAuthenticated:false}:await probeNode(one('SELECT * FROM nodes WHERE id=?',nodeId))
-    if(probed.winrmAuthenticated){
+    if(probed.winrmAuthenticated||probed.sshAuthenticated){
       await collectFacts(one('SELECT * FROM nodes WHERE id=?',nodeId))
-      run('UPDATE nodes SET agent_required=0,platform=COALESCE(platform,\'windows\') WHERE id=?',nodeId)
+      run('UPDATE nodes SET agent_required=0,platform=COALESCE(platform,?) WHERE id=?',probed.sshAuthenticated?'linux / unix':'windows',nodeId)
     }
     const current=one('SELECT * FROM nodes WHERE id=?',nodeId)
-    return {ip,nodeId,hostname:current?.hostname||hostname,fqdn:current?.fqdn||fqdn,mac:current?.mac_address||null,osName:current?.os_name||current?.platform||null,osVersion:current?.os_version||null,hypervisor:current?.hypervisor||null,transport:probed.transport,managed:!!probed.winrmAuthenticated,livenessMethod,ttl:livenessMeta.ttl||null,ttlFingerprint:livenessMeta.ttlFingerprint||null}
+    return {ip,nodeId,hostname:current?.hostname||hostname,fqdn:current?.fqdn||fqdn,mac:current?.mac_address||null,osName:current?.os_name||current?.platform||null,osVersion:current?.os_version||null,hypervisor:current?.hypervisor||null,transport:probed.transport,managed:!!(probed.winrmAuthenticated||probed.sshAuthenticated),livenessMethod,ttl:livenessMeta.ttl||null,ttlFingerprint:livenessMeta.ttlFingerprint||null}
   }catch(error){
     if(!hypervisor)run('UPDATE nodes SET agent_required=1,status=CASE WHEN status=\'reachable\' THEN \'degraded\' ELSE status END WHERE id=?',nodeId)
     const current=one('SELECT * FROM nodes WHERE id=?',nodeId)
@@ -273,7 +291,7 @@ export async function runDiscoveryScan(scanId){
   if(!claimed.changes)return one('SELECT * FROM discovery_scans WHERE id=?',scanId)
   const results=[],concurrency=32,esxiVault=esxiCredentials()
   let cursor=0
-  const worker=async()=>{while(cursor<hosts.length){const ip=hosts[cursor++];run('UPDATE discovery_scans SET probed=probed+1 WHERE id=?',scanId);const liveness=await probeHostLiveness(ip,{tcpPorts:[...DISCOVERY_HYPERVISOR_TCP_PORTS,...DISCOVERY_TCP_PORTS]});if(!liveness.alive)continue;run('UPDATE discovery_scans SET alive=alive+1,arp_alive=arp_alive+?,tcp_alive=tcp_alive+? WHERE id=?',liveness.method==='arp'?1:0,liveness.method?.startsWith('tcp:')?1:0,scanId);try{const detected=await identifyHypervisor(ip,{credentials:esxiVault});const infrastructure=detected.detected?detected:await detectInfrastructureHost(ip).catch(()=>null);const hypervisor=detected.detected?detected:infrastructure?.hypervisor?{...infrastructure,detected:true,osName:infrastructure.osName||infrastructure.hypervisorName,hypervisor:infrastructure.hypervisorName||infrastructure.hypervisor,api:'https'}:detected;const result=await registerHost(ip,scanId,liveness.method,{...liveness,hypervisor});results.push(result);run('UPDATE discovery_scans SET registered=registered+1 WHERE id=?',scanId)}catch(error){results.push({ip,error:error.message,livenessMethod:liveness.method})}}}
+  const worker=async()=>{while(cursor<hosts.length){const ip=hosts[cursor++];run('UPDATE discovery_scans SET probed=probed+1 WHERE id=?',scanId);const liveness=await probeHostLiveness(ip,{tcpPorts:[...DISCOVERY_HYPERVISOR_TCP_PORTS,...DISCOVERY_TCP_PORTS,...DISCOVERY_LINUX_TCP_PORTS]});if(!liveness.alive)continue;run('UPDATE discovery_scans SET alive=alive+1,arp_alive=arp_alive+?,tcp_alive=tcp_alive+? WHERE id=?',liveness.method==='arp'?1:0,liveness.method?.startsWith('tcp:')?1:0,scanId);try{const detected=await identifyHypervisor(ip,{credentials:esxiVault});const infrastructure=detected.detected?detected:await detectInfrastructureHost(ip).catch(()=>null);const hypervisor=detected.detected?detected:infrastructure?.hypervisor?{...infrastructure,detected:true,osName:infrastructure.osName||infrastructure.hypervisorName,hypervisor:infrastructure.hypervisorName||infrastructure.hypervisor,api:'https'}:detected;const result=await registerHost(ip,scanId,liveness.method,{...liveness,hypervisor});results.push(result);run('UPDATE discovery_scans SET registered=registered+1 WHERE id=?',scanId)}catch(error){results.push({ip,error:error.message,livenessMethod:liveness.method})}}}
   try{
     await Promise.all(Array.from({length:Math.min(concurrency,hosts.length)},worker))
     const limited=results.slice(0,MAX_HOSTS),previousScan=scan.schedule_id?one("SELECT results_json FROM discovery_scans WHERE schedule_id=? AND status='complete' AND id<>? ORDER BY finished_at DESC,rowid DESC LIMIT 1",scan.schedule_id,scan.id):null

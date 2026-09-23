@@ -56,6 +56,10 @@ async function sourceNodeForIp(ip,targetId){
   return matched.length===1?{node:matched[0]}:{unknown:true}
 }
 async function sourceTransport(node){
+  if(node.transport==='ssh'){
+    await remote(node,'auth',{})
+    return node
+  }
   if(['winrm','winrms'].includes(node.transport))return node
   const host=node.fqdn||node.ip||node.hostname
   const [secure,plain]=await Promise.all([tcpProbe(host,5986,2000),tcpProbe(host,5985,2000)])
@@ -198,7 +202,7 @@ export async function sweepMfaPrompts(limit=25){
       JOIN nodes n ON n.id=e.node_id
       JOIN identity_segments s ON (s.node_id=e.node_id OR s.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=e.node_id))
       WHERE ${visibleFirewallEventSql()} AND datetime(e.received_at)>=datetime(?) AND datetime(COALESCE(e.event_time,e.received_at))>=datetime(?) AND s.portal_enabled=1 AND s.auto_prompt_enabled=1 AND s.mode='agentless'
-        AND n.connection_mode='agentless' AND n.transport IN ('winrm','winrms') AND n.firewall_state<>'learning'
+        AND n.connection_mode='agentless' AND n.transport IN ('winrm','winrms','ssh') AND n.firewall_state<>'learning'
         AND ((e.event_id=5157 AND e.action='block' AND COALESCE(e.dst_port,p.dst_port)=s.port)
           OR (e.event_id=4625 AND lower(COALESCE(e.logon_status,e.logon_sub_status,'')) IN ('0xc000015b','c000015b') AND e.account_sid=s.account_sid
             AND ((e.logon_type='10' AND s.port=3389) OR (e.logon_type='3' AND s.port=22))

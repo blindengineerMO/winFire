@@ -13,6 +13,7 @@ import {compilePolicy, graphSchema, findRuleConflicts,validateAddressExpression,
 import {db, all, one, run, id, now, audit, json, parse} from './db.js'
 import {auth, requireRole, publicUser, issueAccess, issueRefresh, rotateRefresh, hashToken, seal, openSealed} from './security.js'
 import {probeNode, collectFacts, enrichNode, lookupDns, remote, diffRules, tcpProbe,testNodeCredential,preflightCredential} from './connector.js'
+import {testSshCredential} from './sshConnector.js'
 import {firewallConnectorFor,applyManagedRules} from './firewallConnectors.js'
 import {classifyVerification,findMatchingDenyEvent,hasManagedRule} from './verifier.js'
 import {makeTotpSecret,verifyTotp,matchingTotpCounter} from './totp.js'
@@ -60,6 +61,7 @@ import {asyncHandler} from './middleware/asyncHandler.js'
 import {normalizeDynamicRules,dynamicNodeGroupSettings,publicDynamicGroup,updateDynamicGroup,refreshDynamicGroups} from './dynamicNodeGroups.js'
 import {identifyHypervisor} from './esxiDiscovery.js'
 import {detectInfrastructureHost} from './infrastructureDiscovery.js'
+import {classifyOnboardingError,onboardingErrorForCode} from './onboardingErrors.js'
 
 export const app=express()
 app.disable('x-powered-by')
@@ -93,7 +95,10 @@ const latestVerification=nodeId=>one('SELECT status,reason,run_at FROM verifier_
 const managementVerification=node=>{
   const probe=String(node?.probe_status||'').toLowerCase()
   const hasFacts=!!node?.snapshot_json
+  if((node?.transport==='esxi-soap'||node?.device_type==='esxi'||String(node?.hypervisor||'').toLowerCase()==='vmware esxi')&&probe==='hypervisor-authenticated')return {status:'reachable',label:'Verified',reason:'VMware ESXi SOAP/API credentials authenticated and host facts collected',transport:'api',checkedAt:node.last_probe_at||node.last_seen_at||null}
+  if((node?.transport==='esxi-soap'||node?.device_type==='esxi'||String(node?.hypervisor||'').toLowerCase()==='vmware esxi')&&(probe==='hypervisor-detected'||node?.status==='reachable'))return {status:'pending',label:'ESXi detected',reason:'VMware ESXi SOAP/API responded; assign or verify an ESXi credential to collect host inventory',transport:'api',checkedAt:node.last_probe_at||node.last_seen_at||null}
   if((node?.transport==='snmp'||node?.connection_mode==='snmp')&&node?.status==='reachable')return {status:'reachable',label:'Verified',reason:'SNMP poll completed successfully',transport:'snmp',checkedAt:node.last_probe_at||node.last_seen_at||null}
+  if(node?.transport==='ssh'&&node?.status==='reachable'&&(probe==='ssh-authenticated'||hasFacts))return {status:'reachable',label:'Verified',reason:'SSH credentials authenticated and Linux host facts collected',transport:'ssh',checkedAt:node.last_probe_at||node.last_seen_at||null}
   if((probe==='winrm-authenticated'||probe==='winrms-authenticated')&&hasFacts)return {status:'reachable',label:'Verified',reason:'WinRM credentials authenticated and host facts collected',transport:node.transport,checkedAt:node.last_probe_at||node.last_seen_at||null}
   if(probe==='wmi-authenticated')return {status:'reachable',label:'WMI authenticated',reason:'Credentialed WMI facts collected; WinRM is not active',transport:node.transport,checkedAt:node.last_probe_at||node.last_seen_at||null}
   if(probe==='rpc-authenticated')return {status:'pending',label:'RPC authenticated',reason:'RPC sign-in passed; credentialed host verification is still required',transport:node.transport,checkedAt:node.last_probe_at||node.last_seen_at||null}
@@ -129,7 +134,7 @@ function normalizedNodeOs(node){
   return {os_name:name||null,os_version:version||null,os_build:build||null,hypervisor:hypervisor||null}
 }
 const safeJson=value=>{try{return parse(value)}catch{return null}}
-const publicNode=node=>node && ({...node,...normalizedNodeOs(node),failures:Number(node.failures),virtualMachine:!!Number(node.virtual_machine),virtualMachineHostId:node.virtual_machine_host_id||null,virtualMachineDetails:safeJson(node.virtual_machine_details_json),facts:safeJson(node.snapshot_json),ad:safeJson(node.ad_snapshot_json),training:latestTraining(node.id)||null,verification:latestVerification(node.id),managementVerification:managementVerification(node)})
+const publicNode=node=>node && ({...node,...normalizedNodeOs(node),failures:Number(node.failures),firstDiscoveredAt:node.first_discovered_at||null,lastManagedAt:node.last_managed_at||null,triageStatus:node.triage_status||'none',triageNote:node.triage_note||null,triageUpdatedAt:node.triage_updated_at||null,onboardingError:node.onboarding_error_code?onboardingErrorForCode(node.onboarding_error_code):null,virtualMachine:!!Number(node.virtual_machine),virtualMachineHostId:node.virtual_machine_host_id||null,virtualMachineDetails:safeJson(node.virtual_machine_details_json),facts:safeJson(node.snapshot_json),ad:safeJson(node.ad_snapshot_json),training:latestTraining(node.id)||null,verification:latestVerification(node.id),managementVerification:managementVerification(node)})
 const canUseCredential=(user,credential)=>credential&&(user.role==='owner'||user.role==='admin'||credential.owner_user_id===user.id||credential.visibility==='team'&&credential.team_id&&credential.team_id===user.team_id||canWriteResource(user,'credential',credential))
 const assignedNodeCredentials=nodeId=>all(`SELECT DISTINCT c.* FROM credentials c JOIN credential_assignments a ON a.credential_id=c.id WHERE a.node_id=? OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?) ORDER BY c.priority`,nodeId,nodeId)
 const assignedSnmpCredential=(nodeId,user)=>assignedNodeCredentials(nodeId).filter(credential=>['snmp-v2c','snmp-v3'].includes(credential.type)&&canUseCredential(user,credential))[0]||null
@@ -166,6 +171,10 @@ const localAssetCidrs=()=>{
 }
 const localAssetCidrSchema=z.string().trim().max(43).refine(value=>{const [address,prefix]=value.split('/');const size=Number(prefix);return isIP(address)===4&&Number.isInteger(size)&&size>=0&&size<=32},{message:'Local asset scopes must be IPv4 CIDRs'})
 const isLocalAssetNode=node=>{const scopes=localAssetCidrs();return !scopes.length||!node?.ip||scopes.some(scope=>ipInCidr(node.ip,scope))}
+const triageWindowDays=()=>Math.max(1,Math.min(3650,Number.parseInt(savedSetting('unmanaged_asset_window_days')||'7',10)||7))
+const triageCutoff=()=>new Date(Date.now()-triageWindowDays()*86400000)
+const triageDateBefore=(value,cutoff)=>Boolean(value)&&Number.isFinite(Date.parse(value))&&Date.parse(value)<=cutoff.getTime()
+const unmanagedTriageEligible=(node,cutoff=triageCutoff())=>Number(node?.agent_required)===1&&!node?.agent_id&&triageDateBefore(node?.first_discovered_at,cutoff)&&(!node?.last_managed_at||triageDateBefore(node.last_managed_at,cutoff))&&isLocalAssetNode(node)
 const savedWefSecret=()=>{
   const value=savedSetting('wef_shared_secret_sealed')
   if(!value)return ''
@@ -987,6 +996,30 @@ api.patch('/settings/training',requireRole('admin'),(req,res)=>{
   })()
   res.json(publicTrainingSettings())
 })
+api.get('/settings/discovery-triage',requireRole('admin'),(_req,res)=>res.json({unmanagedAssetWindowDays:triageWindowDays()}))
+api.patch('/settings/discovery-triage',requireRole('admin'),(req,res)=>{
+  const data=body(z.object({unmanagedAssetWindowDays:z.number().int().min(1).max(3650)}),req)
+  const before={unmanagedAssetWindowDays:triageWindowDays()}
+  run("INSERT INTO app_settings(key,value) VALUES('unmanaged_asset_window_days',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",String(data.unmanagedAssetWindowDays))
+  audit(req.user.id,'discovery.triage.settings.update','app-settings','discovery-triage',before,data)
+  res.json({unmanagedAssetWindowDays:triageWindowDays()})
+})
+api.get('/settings/discovery-linux',requireRole('admin'),(_req,res)=>{
+  const credentialId=savedSetting('linux_discovery_credential_id')||null
+  const credential=credentialId?one("SELECT id,name,type,username FROM credentials WHERE id=? AND type='ssh'",credentialId):null
+  res.json({credentialId:credential?.id||null,credential:credential||null,hostKeyPolicy:savedSetting('linux_discovery_host_key_policy')||'accept-any'})
+})
+api.patch('/settings/discovery-linux',requireRole('admin'),(req,res)=>{
+  const data=body(z.object({credentialId:z.string().nullable().optional(),hostKeyPolicy:z.enum(['accept-any','fingerprint']).default('accept-any')}),req)
+  const credential=data.credentialId?one("SELECT id,name,type,username FROM credentials WHERE id=?",data.credentialId):null
+  if(data.credentialId&&(!credential||credential.type!=='ssh'))return res.status(400).json({error:'Select an SSH credential from the vault'})
+  if(data.hostKeyPolicy==='fingerprint'&&credential){const secret=openSealed(credential.encrypted_blob);if(!secret?.hostKeyFingerprint&&!secret?.hostKey)return res.status(400).json({error:'The selected SSH credential must include a host key SHA256 fingerprint'})}
+  const before={credentialId:savedSetting('linux_discovery_credential_id')||null,hostKeyPolicy:savedSetting('linux_discovery_host_key_policy')||'accept-any'}
+  run("INSERT INTO app_settings(key,value) VALUES('linux_discovery_credential_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",data.credentialId||'')
+  run("INSERT INTO app_settings(key,value) VALUES('linux_discovery_host_key_policy',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",data.hostKeyPolicy)
+  audit(req.user.id,'discovery.linux.settings.update','app-settings','discovery-linux',before,data)
+  res.json({credentialId:credential?.id||null,credential:credential||null,hostKeyPolicy:data.hostKeyPolicy})
+})
 api.get('/settings/observability',requireRole('admin'),(_req,res)=>res.json(observabilitySettings()))
 const serverFqdnSchema=z.string().trim().max(253).refine(value=>!value||/^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(value),{message:'FQDN may contain letters, numbers, dots, and hyphens'})
 const serverPublicUrlSchema=z.string().trim().max(2048).refine(value=>{
@@ -1431,12 +1464,13 @@ api.post('/directory/users/:id/import-operator',requireRole('admin'),wrap(async(
 
 const visibleCredentials=user=>(user.role==='owner'||user.role==='admin' ? all('SELECT id,name,type,username,owner_user_id,visibility,team_id,priority,created_at FROM credentials ORDER BY priority,name') : all(`SELECT id,name,type,username,owner_user_id,visibility,team_id,priority,created_at FROM credentials WHERE owner_user_id=? OR (visibility='team' AND team_id=?) OR EXISTS (SELECT 1 FROM resource_grants g WHERE g.resource_type='credential' AND g.resource_id=credentials.id AND g.grantee_user_id=?) ORDER BY priority,name`,user.id,user.team_id,user.id)).map(credential=>({...credential,canWrite:canWriteResource(user,'credential',credential)}))
 api.get('/credentials',(req,res)=>res.json(visibleCredentials(req.user)))
-const credentialInputSchema=z.object({name:z.string().trim().min(1).max(120),type:z.enum(['local','domain','esxi','snmp-v2c','snmp-v3']),username:z.string().trim().max(255).default(''),password:z.string().max(4096).optional(),community:z.string().max(255).optional(),securityLevel:z.enum(['noAuthNoPriv','authNoPriv','authPriv']).optional(),authProtocol:z.enum(['md5','sha','sha224','sha256','sha384','sha512']).optional(),authKey:z.string().max(4096).optional(),privProtocol:z.enum(['des','aes','aes256b','aes256r']).optional(),privKey:z.string().max(4096).optional(),visibility:z.enum(['private','team']).default('private'),teamId:z.string().optional(),priority:z.number().int().min(-100000).max(100000).default(100)}).superRefine((value,ctx)=>{
+const credentialInputSchema=z.object({name:z.string().trim().min(1).max(120),type:z.enum(['local','domain','esxi','ssh','snmp-v2c','snmp-v3']),username:z.string().trim().max(255).default(''),password:z.string().max(4096).optional(),privateKey:z.string().max(32768).optional(),passphrase:z.string().max(4096).optional(),hostKeyFingerprint:z.string().trim().max(255).optional(),port:z.number().int().min(1).max(65535).optional(),community:z.string().max(255).optional(),securityLevel:z.enum(['noAuthNoPriv','authNoPriv','authPriv']).optional(),authProtocol:z.enum(['md5','sha','sha224','sha256','sha384','sha512']).optional(),authKey:z.string().max(4096).optional(),privProtocol:z.enum(['des','aes','aes256b','aes256r']).optional(),privKey:z.string().max(4096).optional(),visibility:z.enum(['private','team']).default('private'),teamId:z.string().optional(),priority:z.number().int().min(-100000).max(100000).default(100)}).superRefine((value,ctx)=>{
   if(['local','domain','esxi'].includes(value.type)&&(!value.username||!value.password))ctx.addIssue({code:'custom',path:['password'],message:'Username and password are required for this credential'})
+  if(value.type==='ssh'&&(!value.username||(!value.password&&!value.privateKey)))ctx.addIssue({code:'custom',path:['password'],message:'SSH requires a username and password or private key'})
   if(value.type==='snmp-v2c'&&!value.community&&!value.password)ctx.addIssue({code:'custom',path:['community'],message:'SNMP v2c requires a community string'})
   if(value.type==='snmp-v3')try{normalizeSnmpSecret(value.type,value)}catch(error){ctx.addIssue({code:'custom',path:['username'],message:error.message})}
 })
-const sealedCredentialSecret=data=>['snmp-v2c','snmp-v3'].includes(data.type)?normalizeSnmpSecret(data.type,data):{password:data.password}
+const sealedCredentialSecret=data=>['snmp-v2c','snmp-v3'].includes(data.type)?normalizeSnmpSecret(data.type,data):data.type==='ssh'?{password:data.password||null,privateKey:data.privateKey||null,passphrase:data.passphrase||null,hostKeyFingerprint:data.hostKeyFingerprint||null,port:data.port||22}:{password:data.password}
 api.post('/credentials',requireRole('editor'),(req,res)=>{
   const data=body(credentialInputSchema,req),credentialId=id(),username=data.type==='snmp-v2c'?(data.username||'community') : data.username
   run('INSERT INTO credentials(id,name,type,username,encrypted_blob,owner_user_id,visibility,team_id,priority) VALUES(?,?,?,?,?,?,?,?,?)',credentialId,data.name,data.type,username,seal(sealedCredentialSecret(data)),req.user.id,data.visibility,data.teamId||req.user.team_id||null,data.priority)
@@ -1445,11 +1479,12 @@ api.post('/credentials',requireRole('editor'),(req,res)=>{
 api.patch('/credentials/:id',requireRole('editor'),(req,res)=>{
   const credential=one('SELECT * FROM credentials WHERE id=?',reqId(req));if(!credential)return notFound(res)
   if(!canWriteResource(req.user,'credential',credential))return res.status(403).json({error:'Insufficient permission'})
-  const data=body(z.object({name:z.string().trim().min(1).max(120).optional(),username:z.string().trim().max(255).optional(),password:z.string().max(4096).optional(),community:z.string().max(255).optional(),securityLevel:z.enum(['noAuthNoPriv','authNoPriv','authPriv']).optional(),authProtocol:z.enum(['md5','sha','sha224','sha256','sha384','sha512']).optional(),authKey:z.string().max(4096).optional(),privProtocol:z.enum(['des','aes','aes256b','aes256r']).optional(),privKey:z.string().max(4096).optional(),priority:z.number().int().min(-100000).max(100000).optional()}),req)
+  const data=body(z.object({name:z.string().trim().min(1).max(120).optional(),username:z.string().trim().max(255).optional(),password:z.string().max(4096).optional(),privateKey:z.string().max(32768).optional(),passphrase:z.string().max(4096).optional(),hostKeyFingerprint:z.string().trim().max(255).optional(),port:z.number().int().min(1).max(65535).optional(),community:z.string().max(255).optional(),securityLevel:z.enum(['noAuthNoPriv','authNoPriv','authPriv']).optional(),authProtocol:z.enum(['md5','sha','sha224','sha256','sha384','sha512']).optional(),authKey:z.string().max(4096).optional(),privProtocol:z.enum(['des','aes','aes256b','aes256r']).optional(),privKey:z.string().max(4096).optional(),priority:z.number().int().min(-100000).max(100000).optional()}),req)
   let encrypted=credential.encrypted_blob
   if(['snmp-v2c','snmp-v3'].includes(credential.type)&&(data.password||data.community||data.securityLevel||data.authProtocol||data.authKey||data.privProtocol||data.privKey||data.username)){
     const current=openSealed(credential.encrypted_blob),next={...current,...data,username:data.username||credential.username}
     encrypted=seal(normalizeSnmpSecret(credential.type,next))
+  }else if(credential.type==='ssh'&&(data.password||data.privateKey||data.passphrase||data.hostKeyFingerprint||data.port)){const current=openSealed(credential.encrypted_blob);encrypted=seal({...current,...data,port:data.port||current.port||22})
   }else if(data.password)encrypted=seal({password:data.password})
   db.transaction(()=>{
     run('UPDATE credentials SET name=?,username=?,encrypted_blob=?,priority=? WHERE id=?',data.name||credential.name,data.username||credential.username,encrypted,data.priority??credential.priority,credential.id)
@@ -1485,13 +1520,18 @@ api.post('/credentials/:id/test',requireRole('editor'),wrap(async(req,res)=>{
   if(!canUseCredential(req.user,credential))return res.status(403).json({error:'Insufficient permission'})
   const assigned=one('SELECT 1 FROM credential_assignments WHERE credential_id=? AND (node_id=? OR node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?))',credential.id,node.id,node.id)
   if(!assigned)return res.status(400).json({error:'Assign credential to node first'})
-  try {res.json(await testNodeCredential(node,credential.id))}catch(error){res.json({success:false,transport:node.transport||'winrm',error:error.message})}
+  try {res.json(await testNodeCredential(node,credential.id))}catch(error){const onboardingError=error.onboardingError||classifyOnboardingError(error,{operation:'credential_test',transport:node.transport||'winrm'});res.json({success:false,transport:node.transport||'winrm',error:error.message,onboardingError})}
 }))
 api.post('/credentials/:id/preflight',requireRole('editor'),wrap(async(req,res)=>{
   const data=body(z.object({host:z.string().trim().min(1).max(253),expectedName:z.string().trim().max(253).optional()}),req)
   const credential=one('SELECT * FROM credentials WHERE id=?',reqId(req));if(!credential)return notFound(res,'Credential')
   if(!canUseCredential(req.user,credential))return res.status(403).json({error:'Insufficient permission'})
-  if(!['local','domain'].includes(credential.type))return res.status(400).json({error:'Only Windows local or domain credentials support WMI/WinRM preflight'})
+  if(credential.type==='ssh'){
+    let secret
+    try{secret=openSealed(credential.encrypted_blob)}catch{return res.status(500).json({error:'Credential secret could not be opened'})}
+    try{const result=await testSshCredential({host:data.host,credential:{username:credential.username,secret}});audit(req.user.id,'credential.preflight.success','credential',credential.id,null,{host:data.host,transport:'ssh'});return res.json(result)}catch(error){audit(req.user.id,'credential.preflight.failure','credential',credential.id,null,{host:data.host,error:String(error.message||error).slice(0,500)});return res.json({success:false,error:String(error.message||error).replaceAll(secret?.password||'','[redacted]')})}
+  }
+  if(!['local','domain'].includes(credential.type))return res.status(400).json({error:'Only Windows local/domain or SSH credentials support preflight'})
   let secret
   try{secret=openSealed(credential.encrypted_blob)}catch{return res.status(500).json({error:'Credential secret could not be opened'})}
   try{
@@ -1501,17 +1541,32 @@ api.post('/credentials/:id/preflight',requireRole('editor'),wrap(async(req,res)=
   }catch(error){
     audit(req.user.id,'credential.preflight.failure','credential',credential.id,null,{host:data.host,error:String(error.message||error).slice(0,500)})
     const message=String(error.message||error),redacted=secret?.password?message.replaceAll(secret.password,'[redacted]'):message
-    res.json({success:false,error:redacted,ports:error.ports})
+    const onboardingError=error.onboardingError||classifyOnboardingError(error,{operation:'credential_preflight',ports:error.ports,message:redacted})
+    res.json({success:false,error:redacted,onboardingError,ports:error.ports})
   }
 }))
 
 const serverNodeManaged=node=>{
   if(!node||node.manageability==='unmanaged')return false
   if(node.transport==='snmp'||node.connection_mode==='snmp'||node.connection_mode==='agent'||node.agent_id)return true
+  if(node.transport==='ssh'&&node.agent_required===0)return true
   if(node.probe_status==='winrm-authenticated'||node.probe_status==='winrms-authenticated'||node.probe_status==='wmi-authenticated'||node.probe_status==='netsh-authenticated')return true
   if(node.firewall_state==='enforcing'&&!(node.agent_required&&!node.agent_id))return true
   return false
 }
+api.get('/nodes/triage',(req,res)=>{
+  const query=z.object({search:z.string().max(200).default(''),status:z.enum(['open','flagged','excluded','all']).default('open'),page:z.coerce.number().int().min(1).default(1),pageSize:z.coerce.number().int().min(1).max(200).default(25),sort:z.enum(['priority','hostname','address','status','firstDiscovered','lastManaged']).default('priority'),direction:z.enum(['asc','desc']).default('asc')}).parse(req.query)
+  const cutoff=triageCutoff(),rows=all('SELECT n.*,f.snapshot_json FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id').filter(node=>unmanagedTriageEligible(node,cutoff))
+  const term=query.search.trim().toLowerCase()
+  const statusMatches=node=>query.status==='all'||(query.status==='open'?(node.triage_status||'none')!=='excluded':(node.triage_status||'none')===query.status)
+  const filtered=rows.filter(node=>statusMatches(node)&&(!term||[node.hostname,node.fqdn,node.ip,node.os_name,node.os_version,node.platform,node.status,node.triage_status,node.triage_note].map(value=>String(value||'').toLowerCase()).join(' ').includes(term)))
+  const value=(node,key)=>key==='priority'?(node.triage_status==='flagged'?0:1):key==='hostname'?String(node.hostname||'').toLowerCase():key==='address'?String(node.ip||node.fqdn||'').toLowerCase():key==='status'?String(node.status||'').toLowerCase():key==='firstDiscovered'?String(node.first_discovered_at||''):String(node.last_managed_at||'')
+  const direction=query.direction==='desc'?-1:1
+  filtered.sort((a,b)=>{const av=value(a,query.sort),bv=value(b,query.sort);return av===bv?String(a.hostname||'').localeCompare(String(b.hostname||''))*direction:(av<bv?-1:1)*direction})
+  const summary={open:rows.filter(node=>(node.triage_status||'none')!=='excluded').length,flagged:rows.filter(node=>node.triage_status==='flagged').length,excluded:rows.filter(node=>node.triage_status==='excluded').length,total:rows.length}
+  const total=filtered.length,start=(query.page-1)*query.pageSize
+  res.json({items:filtered.slice(start,start+query.pageSize).map(publicNode),total,page:query.page,pageSize:query.pageSize,totalPages:Math.max(1,Math.ceil(total/query.pageSize)),windowDays:triageWindowDays(),cutoffAt:cutoff.toISOString(),summary,sort:query.sort,direction:query.direction})
+})
 api.get('/nodes',(req,res)=>{
   const rows=all('SELECT n.*,f.snapshot_json FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id').filter(isLocalAssetNode)
   // The unparameterized form remains an array for API compatibility. Inventory
@@ -1538,7 +1593,7 @@ api.post('/nodes',requireRole('editor'),wrap(async(req,res)=>{
   if(data.credentialIds.some(credentialId=>!canUseCredential(req.user,one('SELECT * FROM credentials WHERE id=?',credentialId))))return res.status(403).json({error:'Credential unavailable'})
   const nodeId=id(),days=trainingDays()
   const training=db.transaction(()=>{
-    run('INSERT INTO nodes(id,hostname,fqdn,ip,connection_mode) VALUES(?,?,?,?,?)',nodeId,data.hostname,data.fqdn||null,data.ip||null,data.connectionMode)
+    run('INSERT INTO nodes(id,hostname,fqdn,ip,connection_mode,first_discovered_at) VALUES(?,?,?,?,?,?)',nodeId,data.hostname,data.fqdn||null,data.ip||null,data.connectionMode,now())
     for(const credentialId of data.credentialIds)run('INSERT OR IGNORE INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,NULL)',credentialId,nodeId)
     audit(req.user.id,'node.create','node',nodeId,null,data)
     return startTraining(getNode(nodeId),days,'auto',req.user.id)
@@ -1554,7 +1609,7 @@ api.post('/nodes/:id/training',requireRole('editor'),(req,res)=>{
 })
 api.patch('/nodes/:id',requireRole('editor'),wrap(async(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
-  const data=body(z.object({hostname:z.string().trim().min(1).optional(),fqdn:z.string().trim().nullable().optional(),ip:z.string().refine(value=>isIP(value)!==0,'Invalid IP address').nullable().optional(),connectionMode:z.enum(['agentless','agent','snmp']).optional(),deviceType:z.enum(['auto','switch','firewall','router','printer','hypervisor','esxi','other']).optional(),managementType:z.enum(['auto','snmp','agentless','agent','api','manual']).optional(),credentialIds:z.array(z.string()).max(20).optional()}),req)
+  const data=body(z.object({hostname:z.string().trim().min(1).optional(),fqdn:z.string().trim().nullable().optional(),ip:z.string().refine(value=>isIP(value)!==0,'Invalid IP address').nullable().optional(),connectionMode:z.enum(['agentless','agent','snmp']).optional(),deviceType:z.enum(['auto','linux','switch','firewall','router','printer','hypervisor','esxi','other']).optional(),managementType:z.enum(['auto','ssh','snmp','agentless','agent','api','manual']).optional(),credentialIds:z.array(z.string()).max(20).optional()}),req)
   const hostname=data.hostname??node.hostname,fqdn=data.fqdn===undefined?node.fqdn:data.fqdn,ip=data.ip===undefined?node.ip:data.ip,mode=data.connectionMode||node.connection_mode
   if(node.ad_guid&&(hostname!==node.hostname||fqdn!==node.fqdn))return res.status(409).json({error:'Active Directory manages this computer name and FQDN; edit them in the directory'})
   if(mode==='agent'&&!node.agent_id)return res.status(409).json({error:'Enroll an agent before switching to agent mode'})
@@ -1563,12 +1618,13 @@ api.patch('/nodes/:id',requireRole('editor'),wrap(async(req,res)=>{
   if(targetChanged&&one('SELECT id FROM policy_assignments WHERE node_id=? OR node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?)',node.id,node.id))return res.status(409).json({error:'Remove assigned policies before changing the management address; existing firewall rules may still be present on the old host'})
   const identityChanged=hostname!==node.hostname||fqdn!==node.fqdn||ip!==node.ip
   const managementType=data.managementType??node.management_type??'auto',requestedDeviceType=data.deviceType??node.device_type??'auto',deviceType=requestedDeviceType==='auto'?(node.device_type||null):requestedDeviceType,isEsxi=deviceType==='esxi'
-  const effectiveManagementType=isEsxi?'api':managementType,nextMode=isEsxi?'agentless':effectiveManagementType==='snmp'?'snmp':mode,nextTransport=isEsxi?(node.transport==='esxi-soap'?node.transport:null):effectiveManagementType==='snmp'?'snmp':targetChanged?null:node.transport,nextStatus=isEsxi&&node.transport==='esxi-soap'&&node.status==='reachable'?'reachable':effectiveManagementType==='snmp'&&node.status==='reachable'?'reachable':targetChanged?'unknown':node.status
+  const effectiveManagementType=isEsxi?'api':managementType,nextMode=isEsxi||effectiveManagementType==='ssh'?'agentless':effectiveManagementType==='snmp'?'snmp':mode,nextTransport=isEsxi?(node.transport==='esxi-soap'?node.transport:null):effectiveManagementType==='snmp'?'snmp':effectiveManagementType==='ssh'?'ssh':targetChanged?null:node.transport,nextStatus=isEsxi&&node.transport==='esxi-soap'&&node.status==='reachable'?'reachable':['snmp','ssh'].includes(effectiveManagementType)&&node.status==='reachable'?'reachable':targetChanged?'unknown':node.status
   const assignedIds=data.credentialIds===undefined?all('SELECT credential_id FROM credential_assignments WHERE node_id=?',node.id).map(item=>item.credential_id):data.credentialIds
   const assignedCredentials=assignedIds.map(credentialId=>one('SELECT * FROM credentials WHERE id=?',credentialId))
   if(assignedCredentials.some(credential=>!credential||!canUseCredential(req.user,credential)))return res.status(403).json({error:'One or more credentials are unavailable'})
   if(isEsxi&&!assignedCredentials.some(credential=>credential.type==='esxi')&&!assignedNodeCredentials(node.id).some(credential=>credential.type==='esxi'&&canUseCredential(req.user,credential)))return res.status(400).json({error:'VMware ESXi nodes require an ESXi credential from the vault'})
-  const nextManageability=isEsxi?'unmanaged':node.manageability,nextSnmpCapable=isEsxi?1:node.snmp_capable,nextFirewallState=isEsxi?'unmanaged':node.firewall_state,nextHypervisor=isEsxi?'VMware ESXi':node.device_type==='esxi'?null:node.hypervisor,nextAgentRequired=isEsxi?0:node.agent_required
+  if(effectiveManagementType==='ssh'&&!assignedCredentials.some(credential=>credential.type==='ssh'))return res.status(400).json({error:'Linux SSH management requires an SSH credential from the vault'})
+  const nextManageability=isEsxi?'unmanaged':node.manageability,nextSnmpCapable=isEsxi?1:node.snmp_capable,nextFirewallState=isEsxi?'unmanaged':effectiveManagementType==='ssh'?'learning':node.firewall_state,nextHypervisor=isEsxi?'VMware ESXi':node.device_type==='esxi'?null:node.hypervisor,nextAgentRequired=isEsxi||effectiveManagementType==='ssh'?0:node.agent_required
   db.transaction(()=>{
     run('UPDATE nodes SET hostname=?,fqdn=?,ip=?,connection_mode=?,transport=?,device_type=?,management_type=?,manageability=?,snmp_capable=?,hypervisor=?,firewall_state=?,agent_required=?,status=?,failures=?,next_retry_at=? WHERE id=?',hostname,fqdn,ip,nextMode,nextTransport,deviceType,effectiveManagementType,nextManageability,nextSnmpCapable,nextHypervisor,nextFirewallState,nextAgentRequired,nextStatus,targetChanged?0:node.failures,targetChanged?null:node.next_retry_at,node.id)
     if(data.credentialIds!==undefined){
@@ -1581,6 +1637,15 @@ api.patch('/nodes/:id',requireRole('editor'),wrap(async(req,res)=>{
   if(identityChanged)await lookupDns(getNode(node.id))
   res.json(getNode(node.id))
 }))
+api.patch('/nodes/:id/triage',requireRole('editor'),(req,res)=>{
+  const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
+  const data=body(z.object({status:z.enum(['none','flagged','excluded']),note:z.string().trim().max(500).nullable().optional()}),req)
+  const before={status:node.triage_status||'none',note:node.triage_note||null,updatedAt:node.triage_updated_at||null}
+  const note=data.note===undefined?node.triage_note:data.note||null
+  run('UPDATE nodes SET triage_status=?,triage_note=?,triage_updated_at=?,triage_updated_by=? WHERE id=?',data.status,note,now(),req.user.id,node.id)
+  audit(req.user.id,'node.triage.update','node',node.id,before,{status:data.status,note})
+  res.json(publicNode(getNode(node.id)))
+})
 api.put('/nodes/:id/credentials',requireRole('editor'),wrap(async(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
   const data=body(z.object({credentialIds:z.array(z.string()).max(20)}),req)
@@ -1594,7 +1659,7 @@ api.put('/nodes/:id/credentials',requireRole('editor'),wrap(async(req,res)=>{
   })()
   let snmpPoll=null
   const snmpCredential=credentials.find(credential=>['snmp-v2c','snmp-v3'].includes(credential.type))
-  if(snmpCredential&&node.device_type!=='esxi'){
+  if(snmpCredential){
     try{snmpPoll=await pollSnmpNode(getNode(node.id),{credential:openedCredential(snmpCredential),actorId:req.user.id})}
     catch(error){audit(req.user.id,'snmp-node.poll.failed','node',node.id,null,{error:String(error.message||error).slice(0,500)})}
   }
@@ -1632,7 +1697,7 @@ api.post('/nodes/:id/probe',requireRole('editor'),wrap(async(req,res)=>{
       // SNMP fingerprints ESXi reliably, but the SOAP inventory still needs
       // the separate ESXi vault credential. Run it after the SNMP facts pass
       // so a hypervisor keeps both its infrastructure identity and VM list.
-      if(result.classification?.deviceType==='hypervisor'&&refreshed?.ip){
+      if((result.classification?.deviceType==='hypervisor'||node.device_type==='esxi'||node.transport==='esxi-soap')&&refreshed?.ip){
         const esxiCredentials=accessibleEsxiCredentials(refreshed,req.user).flatMap(credential=>{try{const secret=openSealed(credential.encrypted_blob);return secret?.password?[{username:credential.username,password:secret.password}]:[]}catch{return []}})
         const detected=await identifyHypervisor(refreshed.ip,{credentials:esxiCredentials}).catch(()=>({detected:false}))
         if(detected.detected){persistHypervisor(node.id,detected);return res.json({transport:detected.api==='soap'?'esxi-soap':'hypervisor',status:'reachable',probeStatus:detected.authenticated?'hypervisor-authenticated':'hypervisor-detected',snmp:result,esxi:detected,hypervisor:detected})}
@@ -1647,7 +1712,7 @@ api.post('/nodes/:id/probe',requireRole('editor'),wrap(async(req,res)=>{
   const infrastructure=detected.detected?detected:node.ip?await detectInfrastructureHost(node.ip).catch(()=>null):null
   const hypervisor=detected.detected?detected:infrastructure?.hypervisor?{...infrastructure,detected:true,osName:infrastructure.osName||infrastructure.hypervisorName,hypervisor:infrastructure.hypervisorName||infrastructure.hypervisor,api:'https'}:detected
   if(hypervisor.detected)persistHypervisor(node.id,hypervisor)
-  const result=hypervisor.detected?{transport:hypervisor.api==='soap'?'esxi-soap':'hypervisor',status:'reachable',probeStatus:hypervisor.authenticated?'hypervisor-authenticated':'hypervisor-detected'}:await probeNode(getNode(node.id)).catch(error=>({transport:getNode(node.id)?.transport||'unknown',error:error.message}))
+  const result=hypervisor.detected?{transport:hypervisor.api==='soap'?'esxi-soap':'hypervisor',status:'reachable',probeStatus:hypervisor.authenticated?'hypervisor-authenticated':'hypervisor-detected'}:await probeNode(getNode(node.id)).catch(error=>({transport:getNode(node.id)?.transport||'unknown',error:error.message,onboardingError:classifyOnboardingError(error,{operation:'probe',transport:getNode(node.id)?.transport||null})}))
   res.json({...result,esxi:hypervisor.api==='soap'?hypervisor:{detected:false},hypervisor})
 }))
 api.post('/nodes/:id/activate-agentless',requireRole('admin'),wrap(async(req,res)=>{
@@ -1659,8 +1724,8 @@ api.post('/nodes/:id/activate-agentless',requireRole('admin'),wrap(async(req,res
     // response actionable instead of collapsing it into the generic 500 page;
     // the connector message does not contain credentials and is safe to show
     // to the administrator who initiated the check.
-    const detail=String(error?.message||'The remote host did not complete verification').slice(0,500)
-    throw Object.assign(new Error(`Agentless verification failed: ${detail}`),{status:502,cause:error})
+    const onboardingError=error.onboardingError||classifyOnboardingError(error,{operation:'activate_winrm',transport:node.transport||'wmi'})
+    throw Object.assign(new Error(onboardingError.summary),{status:502,cause:error,onboardingError})
   }
   audit(req.user.id,'node.agentless.verify','node',node.id,null,{transport:one('SELECT transport FROM nodes WHERE id=?',node.id)?.transport,computerName:facts?.computer?.Name})
   res.json({managed:true,transport:one('SELECT transport FROM nodes WHERE id=?',node.id)?.transport,computerName:facts?.computer?.Name})
@@ -3285,7 +3350,10 @@ api.get('/agents/:id',(req,res)=>{const agent=one('SELECT * FROM agents WHERE id
 app.use((error,req,res,_next)=>{
   if(error instanceof z.ZodError)return res.status(400).json({error:'Validation failed',issues:error.issues})
   if(error?.code==='SQLITE_CONSTRAINT_UNIQUE'||error?.code==='SQLITE_CONSTRAINT_PRIMARYKEY')return res.status(409).json({error:'Record already exists'})
-  if([400,401,403,404,409,413,429,502,503].includes(error.status))return res.status(error.status).json({error:error.message,...(error.conflicts?{conflicts:error.conflicts}:{})})
+  if([400,401,403,404,409,413,429,502,503].includes(error.status)){
+    const onboardingError=error.onboardingError
+    return res.status(error.status).json({error:onboardingError?.summary||error.message,onboardingError,...(error.conflicts?{conflicts:error.conflicts}:{})})
+  }
   console.error(error)
   res.status(500).json({error:'Internal server error'})
 })

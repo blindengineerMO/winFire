@@ -16,7 +16,10 @@ export async function api(path,options={},retry=true){
   if(!response.ok){
     const data=await response.json().catch(()=>({error:response.statusText}))
     const detail=data.conflicts?.slice(0,3).map(c=>`${c.hostname}: ${c.rule} conflicts with ${c.otherPolicy} / ${c.otherRule}`).join('; ')
-    throw new Error([data.error||'Request failed',detail].filter(Boolean).join(' — '))
+    const failure=new Error([data.error||'Request failed',detail].filter(Boolean).join(' — '))
+    failure.status=response.status
+    failure.onboardingError=data.onboardingError||null
+    throw failure
   }
   if(response.status===204)return null
   return response.json()
