@@ -62,34 +62,61 @@ function scalarRequest(session,oid){
   return new Promise((resolve,reject)=>{if(typeof session.get!=='function')return resolve(null);session.get([oid],(error,varbinds)=>error?reject(error):resolve(varbinds?.[0]?.value??null))})
 }
 const scalarText=value=>Buffer.isBuffer(value)?value.toString('utf8'):String(value??'').trim()
-export function classifySnmpIdentity(identity={}){
+const boundedIdentity=value=>clean(value).slice(0,256)||null
+function snmpClassificationEvidence(identity,hit,matched,confidence=null){
+  const oid=boundedIdentity(identity.sysObjectId),descr=boundedIdentity(identity.sysDescr),name=boundedIdentity(identity.sysName)
+  return {
+    source:'snmp',
+    method:hit?.method||'identity',
+    matched,
+    matchedOid:hit?.method==='sysObjectID'?oid:null,
+    signal:hit?.method==='sysObjectID'&&hit.marker?`sysObjectID contains ${hit.marker}`:hit?.method==='sysDescr'?'sysDescr/sysName':'sysDescr/sysName/sysObjectID',
+    observed:{sysName:name,sysDescr:descr,sysObjectId:oid},
+    confidence:confidence|| (hit?.method==='sysObjectID'?'high':hit?.method==='sysDescr'?'medium':'low')
+  }
+}
+
+/**
+ * Match a device identity while optionally retaining the exact signal that
+ * caused the match. The default keeps the compact legacy shape for callers
+ * that only need the device type; polling requests the evidence-rich form.
+ */
+export function classifySnmpIdentity(identity={}, {includeEvidence=false}={}){
   const text=`${identity.sysDescr||''} ${identity.sysName||''} ${identity.sysObjectId||''}`.toLowerCase(),oid=String(identity.sysObjectId||'')
-  const match=(pattern,marker)=>pattern.test(text)||marker.some(prefix=>oid.includes(prefix))
-  if(match(/vmware|esxi/,['.6876.']))return {vendor:'VMware ESXi',deviceType:'hypervisor',manageability:'unmanaged',hypervisor:'VMware ESXi'}
-  if(match(/proxmox|pve-manager/,[]))return {vendor:'Proxmox VE',deviceType:'hypervisor',manageability:'unmanaged',hypervisor:'Proxmox VE'}
-  if(match(/xenserver|xcp-ng|citrix hypervisor/,['.6876.']))return {vendor:'Citrix Hypervisor / XenServer',deviceType:'hypervisor',manageability:'unmanaged',hypervisor:'XenServer'}
-  if(match(/azure local|azure stack hci|azurestack/,[]))return {vendor:'Azure Local',deviceType:'hypervisor',manageability:'unmanaged',hypervisor:'Azure Local'}
-  if(match(/cisco ios|cisco nexus|cisco catalyst|cisco/,['.9.']))return {vendor:'Cisco IOS/NX-OS',deviceType:'switch',manageability:'snmp'}
-  if(match(/juniper|junos/,['.2636.']))return {vendor:'Juniper Junos',deviceType:'router',manageability:'snmp'}
-  if(match(/arubaos|aruba/,['.14823.']))return {vendor:'ArubaOS',deviceType:'switch',manageability:'snmp'}
-  if(match(/procurve|hpe|hewlett.packard/,['.11.']))return {vendor:'HPE/ProCurve',deviceType:'switch',manageability:'snmp'}
-  if(match(/fortios|fortinet/,['.12356.']))return {vendor:'Fortinet FortiOS',deviceType:'firewall',manageability:'snmp'}
-  if(match(/pan.?os|palo alto/,['.25461.']))return {vendor:'Palo Alto PAN-OS',deviceType:'firewall',manageability:'snmp'}
-  if(match(/sonicwall|sonicos/,['.8741.']))return {vendor:'SonicWall SonicOS',deviceType:'firewall',manageability:'snmp'}
-  if(match(/check point|gaia/,['.2620.']))return {vendor:'Check Point Gaia',deviceType:'firewall',manageability:'snmp'}
-  if(match(/big.?ip|f5 networks/,['.3375.']))return {vendor:'F5 BIG-IP',deviceType:'firewall',manageability:'snmp'}
-  if(match(/huawei|vrp/,['.2011.']))return {vendor:'Huawei VRP',deviceType:'switch',manageability:'snmp'}
-  if(match(/arista|eos/,['.30065.']))return {vendor:'Arista EOS',deviceType:'switch',manageability:'snmp'}
-  if(match(/extreme.?xos|extreme networks/,['.1916.']))return {vendor:'ExtremeXOS',deviceType:'switch',manageability:'snmp'}
-  if(match(/ubiquiti|edgeos|unifi/,['.41112.']))return {vendor:'Ubiquiti EdgeOS/UniFi',deviceType:'switch',manageability:'snmp'}
-  if(match(/sonicwall/,['.8741.']))return {vendor:'SonicWall SonicOS',deviceType:'firewall',manageability:'snmp'}
-  if(match(/netscaler|citrix adc/,['.5951.']))return {vendor:'Citrix NetScaler',deviceType:'firewall',manageability:'snmp'}
-  if(match(/mikrotik|routeros/,['.14988.']))return {vendor:'MikroTik RouterOS',deviceType:'router',manageability:'snmp'}
-  if(/pfsense|opnsense/.test(text))return {vendor:/opnsense/.test(text)?'OPNsense':'pfSense',deviceType:'firewall',manageability:'snmp'}
-  if(/freebsd/.test(text))return {vendor:'FreeBSD',deviceType:'firewall',manageability:'snmp'}
-  if(/linux|unix/.test(text))return {vendor:'Linux/Unix',deviceType:'other',manageability:'snmp'}
-  if(/windows/.test(text))return {vendor:'Windows',deviceType:'other',manageability:'snmp'}
-  return {vendor:null,deviceType:'other',manageability:'snmp'}
+  const match=(pattern,markers=[])=>{
+    if(pattern.test(text))return {method:'sysDescr',pattern:pattern.source}
+    const marker=markers.find(prefix=>oid.includes(prefix))
+    return marker?{method:'sysObjectID',marker}:null
+  }
+  const result=(vendor,deviceType,manageability,hypervisor,hit,confidence)=>{
+    const value={vendor,deviceType,manageability,...(hypervisor?{hypervisor}:{})}
+    return includeEvidence?{...value,classificationEvidence:snmpClassificationEvidence(identity,hit,vendor||'No vendor fingerprint',confidence)}:value
+  }
+  let hit
+  if((hit=match(/vmware|esxi/,['.6876.'])))return result('VMware ESXi','hypervisor','unmanaged','VMware ESXi',hit,'high')
+  if((hit=match(/proxmox|pve-manager/,[])))return result('Proxmox VE','hypervisor','unmanaged','Proxmox VE',hit,'high')
+  if((hit=match(/xenserver|xcp-ng|citrix hypervisor/,['.6876.'])))return result('Citrix Hypervisor / XenServer','hypervisor','unmanaged','XenServer',hit,'high')
+  if((hit=match(/azure local|azure stack hci|azurestack/,[])))return result('Azure Local','hypervisor','unmanaged','Azure Local',hit,'high')
+  if((hit=match(/cisco ios|cisco nexus|cisco catalyst|cisco/,['.9.'])))return result('Cisco IOS/NX-OS','switch','snmp',null,hit)
+  if((hit=match(/juniper|junos/,['.2636.'])))return result('Juniper Junos','router','snmp',null,hit)
+  if((hit=match(/arubaos|aruba/,['.14823.'])))return result('ArubaOS','switch','snmp',null,hit)
+  if((hit=match(/procurve|hpe|hewlett.packard/,['.11.'])))return result('HPE/ProCurve','switch','snmp',null,hit)
+  if((hit=match(/fortios|fortinet/,['.12356.'])))return result('Fortinet FortiOS','firewall','snmp',null,hit)
+  if((hit=match(/pan.?os|palo alto/,['.25461.'])))return result('Palo Alto PAN-OS','firewall','snmp',null,hit)
+  if((hit=match(/sonicwall|sonicos/,['.8741.'])))return result('SonicWall SonicOS','firewall','snmp',null,hit)
+  if((hit=match(/check point|gaia/,['.2620.'])))return result('Check Point Gaia','firewall','snmp',null,hit)
+  if((hit=match(/big.?ip|f5 networks/,['.3375.'])))return result('F5 BIG-IP','firewall','snmp',null,hit)
+  if((hit=match(/huawei|vrp/,['.2011.'])))return result('Huawei VRP','switch','snmp',null,hit)
+  if((hit=match(/arista|eos/,['.30065.'])))return result('Arista EOS','switch','snmp',null,hit)
+  if((hit=match(/extreme.?xos|extreme networks/,['.1916.'])))return result('ExtremeXOS','switch','snmp',null,hit)
+  if((hit=match(/ubiquiti|edgeos|unifi/,['.41112.'])))return result('Ubiquiti EdgeOS/UniFi','switch','snmp',null,hit)
+  if((hit=match(/netscaler|citrix adc/,['.5951.'])))return result('Citrix NetScaler','firewall','snmp',null,hit)
+  if((hit=match(/mikrotik|routeros/,['.14988.'])))return result('MikroTik RouterOS','router','snmp',null,hit)
+  if((hit=match(/pfsense|opnsense/,[])))return result(/opnsense/.test(text)?'OPNsense':'pfSense','firewall','snmp',null,hit)
+  if((hit=match(/freebsd/,[])))return result('FreeBSD','firewall','snmp',null,hit)
+  if((hit=match(/linux|unix/,[])))return result('Linux/Unix','other','snmp',null,hit)
+  if((hit=match(/windows/,[])))return result('Windows','other','snmp',null,hit)
+  return result(null,'other','snmp',null,null,'low')
 }
 function indexIp(index){
   const values=clean(index).split('.').map(Number)
@@ -137,7 +164,7 @@ export async function pollSnmpDevice({host,credential,sessionFactory=createSnmpS
     const [arpTable,forwardingTable,routeTable,tcpTable,pfStateTable]=await Promise.all([tableRequest(session,ARP_TABLE_OID,maxRepetitions),tableRequest(session,FDB_TABLE_OID,maxRepetitions),optionalTable(SNMP_TABLE_OIDS.route),optionalTable(SNMP_TABLE_OIDS.tcp),optionalTable(SNMP_TABLE_OIDS.pfState)])
     const identity={}
     for(const [name,oid] of Object.entries(SNMP_IDENTITY_OIDS)){try{identity[name]=scalarText(await scalarRequest(session,oid))||null}catch{identity[name]=null}}
-    const classification=classifySnmpIdentity(identity)
+    const classification=classifySnmpIdentity(identity,{includeEvidence:true})
     return {host:target,arp:normalizeArpTable(arpTable),macPorts:normalizeForwardingTable(forwardingTable),routes:routeTable,tcpStates:tcpTable,pfStates:pfStateTable,firewallStates:pfStateTable,identity,classification}
   }finally{try{session.close()}catch{}}
 }

@@ -5,6 +5,14 @@ const props=defineProps({node:{type:Object,required:true},rulePage:{type:Object,
 const emit=defineEmits(['rulesPage'])
 const facts=computed(()=>props.node.facts||{})
 const identity=computed(()=>facts.value.identity||{})
+const classification=computed(()=>facts.value.classification||{})
+const classificationEvidence=computed(()=>{
+  const raw=props.node.classificationEvidence||classification.value.classificationEvidence||classification.value.evidence||facts.value.hypervisor?.classificationEvidence||facts.value.hypervisor?.evidence
+  return typeof raw==='string'?{source:'legacy discovery',signal:raw}:raw||null
+})
+const observedIdentity=computed(()=>[classificationEvidence.value?.observed?.sysName,classificationEvidence.value?.observed?.sysDescr].filter(Boolean).join(' · '))
+const passiveHint=computed(()=>props.node.passiveDeviceHint||null)
+const passiveHintEvidence=computed(()=>props.node.passiveDeviceHintEvidence||null)
 const adapters=computed(()=>Array.isArray(facts.value.network)?facts.value.network:[])
 const profiles=computed(()=>Array.isArray(facts.value.firewall)?facts.value.firewall:facts.value.firewall?[facts.value.firewall]:[])
 const value=(item)=>Array.isArray(item)?item.filter(Boolean).join(', ')||'—':item===true?'Yes':item===false?'No':item||'—'
@@ -14,6 +22,17 @@ const time=item=>item&&!Number.isNaN(new Date(item).getTime())?new Date(item).to
 <template>
   <div class="node-facts">
     <div v-if="!node.facts" class="info-banner"><i class="mdi mdi-information-outline"></i><span>Host details have not been collected yet. WinRM nodes with a credential are collected automatically after onboarding.</span></div>
+      <section v-if="node.dhcpLease" class="node-facts-section">
+        <h3>DHCP lease evidence</h3>
+        <div class="node-facts-grid">
+          <div><span>DHCP server / source</span><strong>{{node.dhcpLease.source}}</strong></div>
+          <div><span>Lease hostname</span><strong>{{value(node.dhcpLease.hostname)}}</strong></div>
+          <div><span>Lease IP / MAC</span><strong>{{node.dhcpLease.ip}} / {{node.dhcpLease.mac}}</strong></div>
+          <div><span>Observed</span><strong>{{time(node.dhcpLease.observedAt)}}</strong></div>
+          <div><span>Lease expires</span><strong>{{time(node.dhcpLease.leaseExpiry)}}</strong></div>
+        </div>
+        <p class="muted">A DHCP lease is passive identity evidence. Reachability, OS, credentials and firewall state require independent verification.</p>
+      </section>
       <section class="node-facts-section">
         <h3>Identity and domain</h3>
         <div class="node-facts-grid">
@@ -32,6 +51,26 @@ const time=item=>item&&!Number.isNaN(new Date(item).getTime())?new Date(item).to
           <div><span>Current interactive user</span><strong>{{value(identity.currentInteractiveUser)}}</strong></div>
           <div><span>Last logged-on user</span><strong>{{value(identity.lastLoggedOnUser)}}</strong></div>
         </div>
+      </section>
+      <section class="node-facts-section">
+        <h3>Device classification</h3>
+        <div class="node-facts-grid">
+          <div><span>Device type</span><strong>{{value(props.node.device_type)}}</strong></div>
+          <div><span>Vendor</span><strong>{{value(props.node.vendor||classification.vendor)}}</strong></div>
+          <div><span>Evidence source</span><strong>{{value(classificationEvidence?.source)}}</strong></div>
+          <div><span>Detection method</span><strong>{{value(classificationEvidence?.method)}}</strong></div>
+          <div><span>Matched classification</span><strong>{{value(classificationEvidence?.matched)}}</strong></div>
+          <div><span>Confidence</span><strong>{{value(classificationEvidence?.confidence)}}</strong></div>
+          <div><span>Matched OID</span><strong class="mono">{{value(classificationEvidence?.matchedOid)}}</strong></div>
+          <div><span>Observed signal</span><strong>{{value(classificationEvidence?.signal)}}</strong></div>
+          <div><span>Observed identity</span><strong>{{value(observedIdentity)}}</strong></div>
+          <div><span>Passive device hint</span><strong>{{value(passiveHint)}}</strong></div>
+          <div><span>Passive hint confidence</span><strong>{{value(passiveHintEvidence?.confidence)}}</strong></div>
+          <div><span>Passive hint services</span><strong>{{value(passiveHintEvidence?.observedServices)}}</strong></div>
+        </div>
+        <p v-if="!classificationEvidence" class="muted">No classification evidence has been persisted yet. Run discovery or collect identity facts to classify this node.</p>
+        <p v-else class="muted">Classification evidence is retained from the latest successful discovery or identity poll. Change the node type from Edit node if the detected type needs correction.</p>
+        <p v-if="passiveHint" class="muted">Passive hint is based on recent internal traffic and remains advisory until a stronger authenticated or SNMP identity is collected.</p>
       </section>
       <section class="node-facts-section">
         <h3>Operating system and hardware</h3>

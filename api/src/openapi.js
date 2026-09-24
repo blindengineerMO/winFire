@@ -3,7 +3,7 @@ const publicRoutes=new Set([
   'POST /invites/accept','POST /auth/verify-email','POST /auth/ad/login',
   'POST /auth/ad-totp/enroll','POST /auth/ad-totp/confirm','GET /avatars/{id}',
   'GET /portal-branding','GET /portal-branding/image',
-  'GET /settings/training','GET /settings/logs-display',
+  'GET /agent-package/WinFire.Agent.exe','GET /agent-package/WinFire.Agent.msi','GET /agent-package/enroll.ps1',
   'GET /mfa/prompts/{id}','POST /mfa/prompts/{id}/totp','POST /mfa/prompts/{id}/entra/start',
   'POST /mfa/entra/complete','POST /mfa/entra/cancel',
   'POST /agents/enroll'
@@ -22,6 +22,8 @@ const errorResponse={description:'Error response',content:{'application/json':{s
 // complete API, while these explicit schemas prevent management calls from
 // being published as unbounded JSON objects.
 const requestSchemas={
+  'POST /discovery/dhcp/preview':'DhcpImportRequest',
+  'POST /discovery/dhcp/import':'DhcpImportRequest',
   'POST /auth/logout':'LogoutRequest',
   'POST /auth/ad/login':'AdLoginRequest',
   'POST /auth/ad-totp/enroll':'AdAuthenticatorEnrollRequest',
@@ -95,6 +97,22 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
           parameters:pathParameters(path),
           responses:method==='delete'&&routeKey==='DELETE /policies/{id}/assignments/{assignmentId}'?{200:jsonResponse,202:{description:'Agent cleanup queued',content:{'application/json':{schema:{type:'object',properties:{queued:{type:'boolean'},jobId:{type:'string'},nodeId:{type:'string'}}}}}},default:errorResponse}:method==='delete'&&['DELETE /teams/{id}','DELETE /node-groups/{id}/members/{nodeId}'].includes(routeKey)?{200:jsonResponse,default:errorResponse}:method==='delete'?{204:{description:'No content'},default:errorResponse}:{200:jsonResponse,default:errorResponse}
         }
+        const permissions=layer.route.stack.map(entry=>entry.handle.requiredPermission).filter(Boolean)
+        if(permissions.length)operation['x-required-permissions']=[...new Set(permissions)]
+        if(path.startsWith('/discovery/dhcp/')){
+          operation.description=path.endsWith('/preview')?'Read-only DHCP enrichment preview; requires configured local CIDRs.':path.endsWith('/import')?'Passively import eligible local leases; preserve verified state and report conflicts. Exact replays return the original report.':'Read retained DHCP import evidence and row outcomes.'
+          if(routeKey==='POST /discovery/dhcp/import')operation.responses={201:jsonResponse,default:errorResponse}
+          if(path==='/discovery/dhcp/imports')operation.parameters.push(...Object.entries({page:{type:'integer',minimum:1,default:1},pageSize:{type:'integer',minimum:1,maximum:100,default:25}}).map(([name,schema])=>({name,in:'query',schema})))
+        }
+        if (method==='get' && ['/mapping','/mapping/topology','/mapping/arp'].includes(path)) {
+          operation.description='Subnet and switch criteria must match the same endpoint. Connections retain peers outside that scope. Switch membership uses observed ARP and current forwarding MACs, including inventory MAC correlation; it is not proof of direct physical attachment. Neighbor links use node, subnet, switch and date criteria; traffic scope and class apply to flow edges only.'
+          const fields={nodeId:{type:'string'},subnet:{type:'string',description:'IPv4 or IPv6 CIDR; host bits are allowed.'},switchId:{type:'string',description:'Inventory ID of a switch.'},from:{type:'string',format:'date-time'},to:{type:'string',format:'date-time'}}
+          if(path!=='/mapping/arp')Object.assign(fields,{external:{type:'string',enum:['0','1']},trafficClass:{type:'string'}})
+          if(path==='/mapping')Object.assign(fields,{page:{type:'integer',minimum:1,default:1},pageSize:{type:'integer',minimum:10,maximum:500,default:100}})
+          if(path==='/mapping/topology')Object.assign(fields,{maxNodes:{type:'integer',minimum:20,maximum:500,default:300},maxEdges:{type:'integer',minimum:20,maximum:1000,default:700}})
+          if(path==='/mapping/arp')fields.limit={type:'integer',minimum:1,maximum:2000,default:500}
+          operation.parameters.push(...Object.entries(fields).map(([name,schema])=>({name,in:'query',required:false,schema})))
+        }
         if(wefReceiverRoutes.has(routeKey))operation.security=[{wefHmac:[]}]
         else if(internetEnrollmentRoutes.has(routeKey))operation.security=[]
         else if(internetDeviceRoutes.has(routeKey))operation.security=[{internetDeviceBearer:[]}]
@@ -146,10 +164,12 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
       AgentEvent:{type:'object',required:['recordId','id','timeCreated'],properties:{recordId:{type:'integer',minimum:1},id:{type:'integer',minimum:1},timeCreated:{type:'string',format:'date-time'},fields:{type:'object',additionalProperties:{type:'string'}}}},
       AgentJobResultRequest:{type:'object',required:['leaseToken','success'],properties:{leaseToken:{type:'string',minLength:20},success:{type:'boolean'},diff:{},result:{},error:{type:'string',maxLength:2000}}},
       AgentNetworkRequest:{type:'object',properties:{flows:{type:'array',maxItems:2000,items:{type:'object'}},arp:{type:'array',maxItems:5000,items:{type:'object'}}}},
+      DhcpImportRequest:{type:'object',required:['source','observedAt','leases'],additionalProperties:false,properties:{source:{type:'string',minLength:1,maxLength:253},observedAt:{type:'string',format:'date-time'},leases:{type:'array',minItems:1,maxItems:2000,items:{$ref:'#/components/schemas/DhcpLease'}}}},
+      DhcpLease:{type:'object',required:['ip','mac','leaseExpiry'],additionalProperties:false,properties:{ip:{type:'string',format:'ipv4'},mac:{type:'string',maxLength:100,description:'Ethernet MAC or Windows Ethernet client ID (optional 01 prefix)'},hostname:{type:'string',maxLength:253,default:''},leaseExpiry:{type:'string',format:'date-time'},state:{type:'string',maxLength:40,default:'Active'}}},
       DiscoveryScanRequest:{type:'object',required:['cidrs'],properties:{cidrs:{type:'array',minItems:1,maxItems:32,items:{type:'string',maxLength:64}}}},
       CredentialHealthResponse:{type:'object',required:['notices','windowMinutes','threshold'],properties:{windowMinutes:{type:'integer',minimum:5},threshold:{type:'integer',minimum:2},notices:{type:'array',items:{type:'object',required:['code','credentialId','credentialName','affectedNodeCount'],properties:{code:{type:'string',enum:['credential_may_be_stale']},title:{type:'string'},credentialId:{type:'string'},credentialName:{type:'string'},affectedNodeCount:{type:'integer',minimum:0},affectedNodes:{type:'array',items:{type:'object'}},windowMinutes:{type:'integer'},firstFailureAt:{type:'string',format:'date-time'},lastFailureAt:{type:'string',format:'date-time'},summary:{type:'string'},remediation:{type:'string'}}}}}},
       TriageBulkRequest:{type:'object',required:['nodeIds','action'],properties:{nodeIds:{type:'array',minItems:1,maxItems:200,items:{type:'string'}},action:{type:'string',enum:['assign_and_retry','flagged','excluded','none']},credentialId:{type:'string'},note:{type:['string','null'],maxLength:500}},additionalProperties:false},
-      ServerSettingsRequest:{type:'object',required:['fqdn','publicBaseUrl'],properties:{fqdn:{type:'string',maxLength:253},publicBaseUrl:{type:'string',maxLength:2048,format:'uri'}},additionalProperties:false},
+      ServerSettingsRequest:{type:'object',required:['fqdn','publicBaseUrl'],properties:{fqdn:{type:'string',maxLength:253},publicBaseUrl:{type:'string',maxLength:2048},localCidrs:{type:'array',maxItems:256,items:{type:'string'},default:[]}},additionalProperties:false},
       WefSettingsRequest:{type:'object',required:['enabled'],properties:{enabled:{type:'boolean'},sharedSecret:{type:'string',minLength:8,maxLength:512,format:'password'},clearSecret:{type:'boolean'}},additionalProperties:false},
       ClassifierRuleRequest:{type:'object',required:['protocol','service'],properties:{protocol:{type:'string',enum:['ANY','TCP','UDP','SCTP','DCCP','ICMP','ICMPv6','IGMP','IPv6-in-IPv4','GRE','ESP','AH','OSPF']},portStart:{type:['integer','null'],minimum:1,maximum:65535},portEnd:{type:['integer','null'],minimum:1,maximum:65535},service:{type:'string',minLength:1,maxLength:160},description:{type:'string',maxLength:500},priority:{type:'integer',minimum:1,maximum:10000,default:10},enabled:{type:'boolean',default:true}},additionalProperties:false,description:'Provide both port bounds for a port rule or omit both for a protocol rule. ICMP and IGMP rules do not use ports.'},
       ClassifierProcessRuleRequest:{type:'object',required:['executablePattern','service'],properties:{executablePattern:{type:'string',minLength:1,maxLength:512},service:{type:'string',minLength:1,maxLength:160},description:{type:'string',maxLength:500},priority:{type:'integer',minimum:1,maximum:10000,default:10},enabled:{type:'boolean',default:true}},additionalProperties:false,description:'Matches a case-insensitive executable path substring, such as lsass.exe, to identify traffic from a process.'},

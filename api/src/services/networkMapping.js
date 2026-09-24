@@ -1,4 +1,5 @@
 import {isIP} from 'node:net'
+import {mappingScope, mappingFlowWhere} from './mappingScope.js'
 import {all, one, run, id, now} from '../db.js'
 import {resolveClassifierService,resolveProcessService,classifierRuleSuppresses} from './classifierRules.js'
 
@@ -127,6 +128,8 @@ const servicePorts = {
   5061: {TCP: 'SIP over TLS', UDP: 'SIP over TLS'},
   5353: {UDP: 'mDNS service discovery'},
   5355: {UDP: 'LLMNR name resolution'},
+  515: {TCP: 'LPD printer service'},
+  631: {TCP: 'IPP printer service'},
   5432: {TCP: 'PostgreSQL database'},
   5671: {TCP: 'AMQPS messaging'},
   5672: {TCP: 'AMQP messaging'},
@@ -251,6 +254,88 @@ const hasIdentifiedService = value => {
 const localNode = nodeId => one('SELECT n.id,n.ip,n.hostname,f.snapshot_json FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id WHERE n.id=?', nodeId)
 const nodeForIp = address => address ? one('SELECT id,hostname FROM nodes WHERE lower(ip)=lower(?) LIMIT 1', address) : null
 
+const PASSIVE_MANAGEMENT_PORTS = new Set([22, 80, 443, 445, 3389, 5985, 5986, 8006, 902])
+const PASSIVE_PRINTER_PORTS = new Set([515, 631, 9100])
+const PASSIVE_SERVICE_GROUPS = {
+  mdns: /m(?:-?dns|dns).*service|service discovery/i,
+  ssdp: /ssdp|upnp/i,
+  wsDiscovery: /ws-?discovery/i,
+  netbios: /netbios/i,
+  printer: /printer|printing|ipp|jetdirect|lpd|airprint/i,
+  snmp: /snmp/i
+}
+const boundedText = value => String(value || '').trim().slice(0, 160)
+
+/**
+ * Infer a conservative device-type hint from traffic that was already
+ * persisted by the mapping classifier. This is deliberately advisory: it
+ * never claims an authenticated OS or management protocol and returns null
+ * when the observed signals are too weak.
+ */
+export function inferPassiveDeviceType({ip, rows = [], observedAt = now()} = {}) {
+  const address = normalizedIp(ip)
+  if (!address) return null
+  const services = new Set(), ports = new Set(), evidence = [], managementPorts = new Set()
+  const addEvidence = value => { const text = boundedText(value); if (text && !evidence.includes(text) && evidence.length < 12) evidence.push(text) }
+  for (const row of Array.isArray(rows) ? rows.slice(0, 2000) : []) {
+    const source = normalizedIp(row.source_ip || row.sourceIp), destination = normalizedIp(row.destination_ip || row.destinationIp)
+    if (source !== address && destination !== address) continue
+    const protocol = normalizeNetworkProtocol(row.protocol)
+    const sourcePort = normalizePort(row.source_port ?? row.sourcePort), destinationPort = normalizePort(row.destination_port ?? row.destinationPort)
+    const service = boundedText(row.traffic_service || row.trafficService) || serviceFor({source, destination, protocol, sourcePort, destinationPort, program: row.sample_program || row.program})
+    if (service) {
+      services.add(service)
+      addEvidence(`${protocol || 'traffic'} ${sourcePort || '—'}→${destinationPort || '—'} · ${service}`)
+    }
+    for (const portValue of [sourcePort, destinationPort]) {
+      if (!portValue) continue
+      ports.add(portValue)
+      if (PASSIVE_MANAGEMENT_PORTS.has(portValue)) managementPorts.add(portValue)
+    }
+  }
+  const serviceList = [...services].slice(0, 8)
+  const has = group => serviceList.some(service => PASSIVE_SERVICE_GROUPS[group].test(service))
+  const printerPort = [...ports].some(portValue => PASSIVE_PRINTER_PORTS.has(portValue))
+  const printerSignal = has('printer') || printerPort
+  const passiveDiscoverySignal = has('mdns') || has('ssdp') || has('wsDiscovery') || has('netbios')
+  if (!passiveDiscoverySignal && !printerSignal && !has('snmp')) return null
+
+  let type = null, label = null, confidence = 'low'
+  if (printerSignal && managementPorts.size === 0) {
+    type = 'printer'; label = 'Printer'; confidence = 'high'
+  } else if (has('snmp') && managementPorts.size === 0) {
+    type = 'network-device'; label = 'Network device'; confidence = 'medium'
+  } else if ((has('ssdp') || has('wsDiscovery') || has('mdns')) && managementPorts.size === 0) {
+    type = 'iot'; label = 'IoT device'; confidence = has('ssdp') || has('wsDiscovery') ? 'medium' : 'low'
+  } else if (has('netbios') && managementPorts.size === 0) {
+    type = 'other'; label = 'Network endpoint'; confidence = 'low'
+  }
+  if (!type) return null
+  return {
+    type,
+    label,
+    confidence,
+    source: 'passive-traffic',
+    method: 'network-map-classifier',
+    observedServices: serviceList,
+    observedPorts: [...ports].sort((a, b) => a - b).slice(0, 24),
+    managementPorts: [...managementPorts].sort((a, b) => a - b),
+    evidence,
+    observedAt
+  }
+}
+
+export function passiveDeviceHintForIp(ip, {maxRows = 500, windowDays = 7} = {}) {
+  const address = normalizedIp(ip)
+  if (!address) return null
+  const rows = all(`SELECT source_ip,destination_ip,protocol,source_port,destination_port,traffic_service,sample_program,last_seen_at
+    FROM network_map_pairs
+    WHERE external=0 AND (lower(source_ip)=lower(?) OR lower(destination_ip)=lower(?))
+      AND (last_seen_at IS NULL OR datetime(last_seen_at)>=datetime('now',?))
+    ORDER BY last_seen_at DESC LIMIT ?`, address, address, `-${Math.min(30, Math.max(1, Number(windowDays) || 7))} days`, Math.min(2000, Math.max(1, Number(maxRows) || 500)))
+  return inferPassiveDeviceType({ip: address, rows})
+}
+
 export function recordNetworkFlow(nodeId, event, observedAt = null) {
   if (!event || event.eventType && event.eventType !== 'firewall' || !event.srcIp && !event.dstIp) return false
   const node = localNode(nodeId)
@@ -303,17 +388,11 @@ export function recordArpEntries(nodeId, entries, source = 'agent') {
   return saved
 }
 
-export function mappingRows({nodeId = null, external = null, trafficClass = null, from = null, to = null, page = 1, pageSize = 100} = {}) {
-  const filters = [], args = []
-  if (nodeId) { filters.push('(m.source_node_id=? OR m.destination_node_id=?)'); args.push(nodeId, nodeId) }
-  if (external !== null && external !== undefined && external !== '') { filters.push('m.external=?'); args.push(Number(external) ? 1 : 0) }
-  if (trafficClass) { filters.push('m.traffic_class=?'); args.push(trafficClass) }
-  if (from) { filters.push('datetime(m.last_seen_at)>=datetime(?)'); args.push(from) }
-  if (to) { filters.push('datetime(m.first_seen_at)<=datetime(?)'); args.push(to) }
-  const where = filters.length ? `WHERE ${filters.join(' AND ')}` : ''
+export function mappingRows({page = 1, pageSize = 100, ...options} = {}) {
+  const {where, args} = mappingFlowWhere(options)
   const total = one(`SELECT COUNT(*) count FROM network_map_pairs m ${where}`, ...args)?.count || 0
   const safePage = Math.max(1, Number(page) || 1), safeSize = Math.min(500, Math.max(10, Number(pageSize) || 100))
-  const rows = all(`SELECT m.*,sn.hostname source_hostname,dn.hostname destination_hostname FROM network_map_pairs m LEFT JOIN nodes sn ON sn.id=m.source_node_id LEFT JOIN nodes dn ON dn.id=m.destination_node_id ${where} ORDER BY m.connection_count DESC,m.last_seen_at DESC LIMIT ? OFFSET ?`, ...args, safeSize, (safePage - 1) * safeSize).map(row => {
+  const rows = all(`SELECT m.*,sn.hostname source_hostname,dn.hostname destination_hostname FROM network_map_pairs m LEFT JOIN nodes sn ON sn.id=m.source_node_id LEFT JOIN nodes dn ON dn.id=m.destination_node_id ${where} ORDER BY m.connection_count DESC,m.last_seen_at DESC,m.map_key LIMIT ? OFFSET ?`, ...args, safeSize, (safePage - 1) * safeSize).map(row => {
     // Older map rows predate the classification columns. Enrich those rows at
     // read time so the table remains useful before an administrator rebuilds
     // the map, while preserving the stored values for current rows.
@@ -343,7 +422,129 @@ export function mappingRows({nodeId = null, external = null, trafficClass = null
   return {rows, topTalkers, total: Number(total), page: safePage, pageSize: safeSize, pages: Math.ceil(Number(total) / safeSize)}
 }
 
-export function arpRows(nodeId = null, limit = 500) {
-  const rows = nodeId ? all('SELECT a.*,n.hostname FROM arp_entries a JOIN nodes n ON n.id=a.node_id WHERE a.node_id=? ORDER BY a.observed_at DESC LIMIT ?', nodeId, Math.min(2000, limit)) : all('SELECT a.*,n.hostname FROM arp_entries a JOIN nodes n ON n.id=a.node_id ORDER BY a.observed_at DESC LIMIT ?', Math.min(2000, limit))
-  return rows
+/**
+ * Build a bounded topology projection from persisted flow, ARP, and SNMP
+ * observations. The graph intentionally contains no live collection logic;
+ * discovery and agents remain the producers while this endpoint only shapes
+ * data for the Mapping view.
+ */
+export function topologyGraph({nodeId = null, maxNodes = 300, maxEdges = 700, ...options} = {}) {
+  const scope = mappingScope(options)
+  const {where, args} = mappingFlowWhere({nodeId, ...options}, scope)
+  const inventory = all(`SELECT id,hostname,fqdn,ip,mac_address,device_type,transport,connection_mode,status,manageability,hypervisor
+    FROM nodes ORDER BY hostname`)
+  const byId = new Map(inventory.map(node => [node.id, node]))
+  const byIp = new Map(inventory.filter(node => node.ip).map(node => [normalizedIp(node.ip), node]))
+  const graphNodes = new Map()
+  const graphEdges = new Map()
+  const sourceCounts = {flows: 0, arp: 0, forwarding: 0}
+  const roleFor = node => {
+    const type = String(node?.device_type || '').toLowerCase()
+    if (type === 'switch') return 'switch'
+    if (type === 'router') return 'router'
+    if (type === 'firewall') return 'firewall'
+    if (type === 'esxi' || type === 'hypervisor' || /hypervisor/i.test(String(node?.hypervisor || ''))) return 'hypervisor'
+    return 'host'
+  }
+  const addAsset = node => {
+    if (!node) return null
+    const id = `asset:${node.id}`
+    if (!graphNodes.has(id)) graphNodes.set(id, {id,kind:'asset',role:roleFor(node),label:node.hostname || node.ip || node.id,address:node.ip || node.fqdn || null,hostname:node.hostname || null,deviceType:node.device_type || null,transport:node.transport || null,status:node.status || null,manageability:node.manageability || null,hypervisor:node.hypervisor || null})
+    return id
+  }
+  const addPeer = ip => {
+    const address = normalizedIp(ip)
+    if (!address || !isIP(address)) return null
+    const id = `peer:${address}`
+    if (!graphNodes.has(id)) graphNodes.set(id, {id,kind:'peer',role:'host',label:address,address,hostname:null,deviceType:'peer',transport:null,status:'observed',manageability:'unmanaged',hypervisor:null})
+    return id
+  }
+  const addEdge = (left, right, kind, metadata = {}) => {
+    if (!left || !right || left === right) return
+    const [source, target] = [left, right].sort()
+    const key = `${source}|${target}|${kind}`
+    const existing = graphEdges.get(key)
+    if (existing) {
+      existing.observations += Number(metadata.observations || 1)
+      existing.weight += Number(metadata.weight || 1)
+      if (!existing.port && metadata.port) existing.port = metadata.port
+      if (!existing.label && metadata.label) existing.label = metadata.label
+      return
+    }
+    graphEdges.set(key, {id:`edge:${graphEdges.size + 1}`,source,target,kind,observations:Number(metadata.observations || 1),weight:Number(metadata.weight || 1),port:metadata.port || null,label:metadata.label || null})
+  }
+
+  inventory.forEach(addAsset)
+  const flowRows = all(`SELECT m.* FROM network_map_pairs m ${where}
+    ORDER BY m.connection_count DESC,m.map_key LIMIT 3001`, ...args)
+  for (const row of flowRows.slice(0,3000)) {
+    const source = addAsset(byId.get(row.source_node_id) || byIp.get(normalizedIp(row.source_ip))) || addPeer(row.source_ip)
+    const target = addAsset(byId.get(row.destination_node_id) || byIp.get(normalizedIp(row.destination_ip))) || addPeer(row.destination_ip)
+    if (source && target) { addEdge(source,target,'traffic',{weight:Number(row.connection_count)||1,observations:Number(row.connection_count)||1,label:`${Number(row.connection_count)||1} flows`}); sourceCounts.flows++ }
+  }
+
+  // When the operator focuses a host, include the switch/router ARP rows that
+  // point at that host as well as rows reported by the focused infrastructure
+  // node. This keeps the focused graph useful in both directions without
+  // moving relationship filtering into the browser.
+  const arpRowsForGraph = arpRows(nodeId, 5001, {...options, graph: true})
+  const arpByMac = new Map()
+  for (const row of arpRowsForGraph.slice(0,5000)) {
+    const source = addAsset(byId.get(row.node_id)); if (!source) continue
+    const targetNode = byIp.get(normalizedIp(row.ip)), target = targetNode ? addAsset(targetNode) : addPeer(row.ip)
+    if (!target) continue
+    addEdge(source,target,'link',{observations:1,label:'ARP'}); sourceCounts.arp++
+    const mac = String(row.mac || '').replace(/[^0-9a-f]/gi,'').toLowerCase()
+    if (mac) { if (!arpByMac.has(mac)) arpByMac.set(mac, []); arpByMac.get(mac).push({nodeId:row.node_id,target}) }
+  }
+
+  // Forwarding tables belong to the reporting switch. Once ARP has narrowed
+  // the target set above, reading the bounded recent snapshot window lets a
+  // focused host still resolve the switch port that learned its MAC.
+  for (const node of inventory) {
+    const mac = String(node.mac_address || '').replace(/[^0-9a-f]/gi,'').toLowerCase()
+    if (mac && (!nodeId || node.id === nodeId) && (!scope.active || scope.matches(node.ip,node.id))) {
+      if (!arpByMac.has(mac)) arpByMac.set(mac, [])
+      if (!arpByMac.get(mac).some(item => item.target === `asset:${node.id}`)) arpByMac.get(mac).push({target: addAsset(node)})
+    }
+  }
+  const snapshotFilters = [], snapshotArgs = []
+  if (options.from) { snapshotFilters.push('datetime(collected_at)>=datetime(?)'); snapshotArgs.push(options.from) }
+  if (options.to) { snapshotFilters.push('datetime(collected_at)<=datetime(?)'); snapshotArgs.push(options.to) }
+  const snapshots = all(`SELECT node_id,state_json FROM network_table_snapshots ${snapshotFilters.length ? `WHERE ${snapshotFilters.join(' AND ')}` : ''} ORDER BY collected_at DESC`, ...snapshotArgs)
+  for (const snapshot of snapshots) {
+    const source = addAsset(byId.get(snapshot.node_id)); if (!source) continue
+    let state = {}; try { state = JSON.parse(snapshot.state_json || '{}') || {} } catch {}
+    for (const entry of Array.isArray(state.macPorts) ? state.macPorts : []) {
+      const mac = String(entry.mac || '').replace(/[^0-9a-f]/gi,'').toLowerCase()
+      for (const match of arpByMac.get(mac) || []) {
+        const targetNode = graphNodes.get(match.target)
+        if (scope.active && !scope.matches(byId.get(snapshot.node_id)?.ip, snapshot.node_id) && !scope.matches(targetNode?.address, targetNode?.id?.slice(6))) continue
+        const port = entry.port == null ? null : String(entry.port)
+        addEdge(source,match.target,'link',{observations:1,port,label:port ? `port ${port}` : 'SNMP forwarding'}); sourceCounts.forwarding++
+      }
+    }
+  }
+
+  const edges = [...graphEdges.values()].sort((a,b) => b.weight - a.weight || a.id.localeCompare(b.id)).slice(0,maxEdges)
+  const connected = new Set(edges.flatMap(edge => [edge.source,edge.target]))
+  const candidateNodes = [...graphNodes.values()].filter(node => connected.has(node.id) || nodeId && node.id === `asset:${nodeId}` && (!scope.active || scope.matches(node.address,nodeId))).map(node => ({...node, scopeMatch: scope.active && scope.matches(node.address, node.kind === 'asset' ? node.id.slice(6) : null)})).sort((a,b) => Number(b.scopeMatch)-Number(a.scopeMatch) || `${a.role}:${a.label}`.localeCompare(`${b.role}:${b.label}`))
+  const nodes = candidateNodes.slice(0,maxNodes)
+  const allowed = new Set(nodes.map(node => node.id))
+  const boundedEdges = edges.filter(edge => allowed.has(edge.source) && allowed.has(edge.target))
+  return {nodes,edges:boundedEdges,scope:scope.summary,generatedAt:now(),truncated:flowRows.length>3000||arpRowsForGraph.length>5000||candidateNodes.length>nodes.length||graphEdges.size>edges.length,sources:sourceCounts,nodeCount:nodes.length,edgeCount:boundedEdges.length}
+}
+
+export function arpRows(nodeId = null, limit = 500, options = {}) {
+  const scope = mappingScope(options), filters = [], args = []
+  if (nodeId) {
+    if (options.graph) { filters.push('(a.node_id=? OR a.ip=(SELECT ip FROM nodes WHERE id=?))'); args.push(nodeId,nodeId) }
+    else { filters.push('a.node_id=?'); args.push(nodeId) }
+  }
+  if (scope.active) { const match=scope.pairSql('n.ip','a.node_id','a.ip','NULL'); filters.push(match.sql); args.push(...match.args) }
+  if (options.from) { filters.push('datetime(a.observed_at)>=datetime(?)'); args.push(options.from) }
+  if (options.to) { filters.push('datetime(a.observed_at)<=datetime(?)'); args.push(options.to) }
+  return all(`SELECT a.*,n.hostname FROM arp_entries a JOIN nodes n ON n.id=a.node_id
+    ${filters.length ? `WHERE ${filters.join(' AND ')}` : ''} ORDER BY a.observed_at DESC,a.id LIMIT ?`,
+    ...args, Math.min(options.graph ? 5001 : 2000, Math.max(1, Number(limit)||500)))
 }

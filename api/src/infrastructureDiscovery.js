@@ -4,6 +4,8 @@ import net from 'node:net'
 
 const REQUEST_TIMEOUT_MS=700
 const MAX_RESPONSE_BYTES=128*1024
+const bounded=value=>String(value??'').trim().slice(0,256)||null
+const fingerprintEvidence=(matched,signal,method='https-fingerprint',confidence='high')=>({source:'infrastructure-discovery',method,matched,signal:bounded(signal),confidence})
 
 /**
  * Classify a small HTTP/HTTPS response without relying on DNS or credentials.
@@ -13,10 +15,10 @@ const MAX_RESPONSE_BYTES=128*1024
 export function classifyInfrastructureResponse({port,headers={},body=''}={}){
   const headerText=Object.entries(headers||{}).map(([key,value])=>`${key}:${value}`).join(' ')
   const haystack=`${headerText}\n${body}`.toLowerCase()
-  if(/vmware\s*(?:esxi|vsphere)|esxi\s*(?:web|host|server)/i.test(haystack))return {hypervisor:'VMware ESXi',hypervisorName:'VMware ESXi',osName:'VMware ESXi',manageability:'unmanaged',snmpCapable:1,evidence:`https/${port}`}
-  if(/proxmox\s*(?:virtual environment|ve)|pve\s*(?:manager|proxy)/i.test(haystack))return {hypervisor:'Proxmox VE',hypervisorName:'Proxmox VE',osName:'Proxmox VE',manageability:'unmanaged',snmpCapable:1,evidence:`https/${port}`}
-  if(/(?:citrix\s+hypervisor|xenserver|xcp-ng|xcpng)/i.test(haystack))return {hypervisor:'XenServer',hypervisorName:'Citrix Hypervisor / XenServer',osName:'Citrix Hypervisor / XenServer',manageability:'unmanaged',snmpCapable:1,evidence:`https/${port}`}
-  if(/(?:azure\s+local|azure\s+stack\s+hci)/i.test(haystack))return {hypervisor:'Azure Local',hypervisorName:'Azure Local',osName:'Azure Local',manageability:'unmanaged',snmpCapable:1,evidence:`https/${port}`}
+  if(/vmware\s*(?:esxi|vsphere)|esxi\s*(?:web|host|server)/i.test(haystack))return {vendor:'VMware ESXi',hypervisor:'VMware ESXi',hypervisorName:'VMware ESXi',osName:'VMware ESXi',manageability:'unmanaged',snmpCapable:1,evidence:`https/${port}`,classificationEvidence:fingerprintEvidence('VMware ESXi',`https/${port}`)}
+  if(/proxmox\s*(?:virtual environment|ve)|pve\s*(?:manager|proxy)/i.test(haystack))return {vendor:'Proxmox VE',hypervisor:'Proxmox VE',hypervisorName:'Proxmox VE',osName:'Proxmox VE',manageability:'unmanaged',snmpCapable:1,evidence:`https/${port}`,classificationEvidence:fingerprintEvidence('Proxmox VE',`https/${port}`)}
+  if(/(?:citrix\s+hypervisor|xenserver|xcp-ng|xcpng)/i.test(haystack))return {vendor:'Citrix Hypervisor / XenServer',hypervisor:'XenServer',hypervisorName:'Citrix Hypervisor / XenServer',osName:'Citrix Hypervisor / XenServer',manageability:'unmanaged',snmpCapable:1,evidence:`https/${port}`,classificationEvidence:fingerprintEvidence('Citrix Hypervisor / XenServer',`https/${port}`)}
+  if(/(?:azure\s+local|azure\s+stack\s+hci)/i.test(haystack))return {vendor:'Azure Local',hypervisor:'Azure Local',hypervisorName:'Azure Local',osName:'Azure Local',manageability:'unmanaged',snmpCapable:1,evidence:`https/${port}`,classificationEvidence:fingerprintEvidence('Azure Local',`https/${port}`)}
   return null
 }
 
@@ -40,7 +42,7 @@ export function classifyOperatingSystem({caption,version,build}={}){
 export function classifyInfrastructureFacts(facts={}){
   const values=[facts?.os?.Caption,facts?.computer?.Model,facts?.computer?.Manufacturer,facts?.computer?.Domain].filter(Boolean).join(' ')
   const result=classifyInfrastructureResponse({body:values})
-  if(result)return result
+  if(result)return {...result,classificationEvidence:{...result.classificationEvidence,source:'authenticated-facts',method:'host-facts',signal:'OS / computer identity facts'}}
   return null
 }
 
@@ -78,6 +80,6 @@ export async function detectInfrastructureHost(host,{request=httpFingerprint,tcp
   }
   // ESXi can expose its UI only through an appliance gateway while retaining
   // the distinctive vSphere management port.
-  if(await tcp(host,902))return {hypervisor:'VMware ESXi',hypervisorName:'VMware ESXi',osName:'VMware ESXi',manageability:'unmanaged',snmpCapable:1,evidence:'tcp/902'}
+  if(await tcp(host,902))return {vendor:'VMware ESXi',hypervisor:'VMware ESXi',hypervisorName:'VMware ESXi',osName:'VMware ESXi',manageability:'unmanaged',snmpCapable:1,evidence:'tcp/902',classificationEvidence:fingerprintEvidence('VMware ESXi','tcp/902','tcp-probe','medium')}
   return null
 }

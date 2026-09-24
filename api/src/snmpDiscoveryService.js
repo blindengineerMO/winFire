@@ -1,7 +1,7 @@
 import {db,all,one,run,id,now,json,audit} from './db.js'
 import {openSealed} from './security.js'
 import {registerHost} from './networkDiscovery.js'
-import {filterSnmpCandidates,pollSnmpDevice} from './snmpDiscovery.js'
+import {classifySnmpIdentity,filterSnmpCandidates,pollSnmpDevice} from './snmpDiscovery.js'
 import {recordCredentialAuthSuccess,recordCredentialAuthFailure} from './credentialHealth.js'
 
 const MAX_REGISTER=512
@@ -20,7 +20,10 @@ export function targetWithCredential(targetId){
 }
 export function ensureSnmpNode(target,device,stamp){
   const existing=one('SELECT * FROM nodes WHERE ip=? OR lower(hostname)=lower(?) OR lower(fqdn)=lower(?) ORDER BY CASE WHEN inventory_source=\'ad\' THEN 0 ELSE 1 END LIMIT 1',target.host,target.host,target.host)
-  const identity=device.identity||{},classification=device.classification||{}
+  const identity=device.identity||{}
+  const detectedClassification=classifySnmpIdentity(identity,{includeEvidence:true})
+  const classification={...detectedClassification,...(device.classification||{})}
+  const classificationEvidence=classification.classificationEvidence|| (typeof classification.evidence==='string'?{source:'snmp',method:'legacy-fingerprint',signal:classification.evidence,matched:classification.vendor||'Unknown'}:detectedClassification.classificationEvidence)
   const hostname=identity.sysName||target.host,deviceType=classification.deviceType||'other',manageability=classification.manageability||'snmp'
   const esxi=classification.hypervisor==='VMware ESXi'||classification.vendor==='VMware ESXi'
   const persistedDeviceType=esxi?'esxi':deviceType
@@ -42,10 +45,10 @@ export function ensureSnmpNode(target,device,stamp){
   const osVersion=esxiNode?(existing?.os_version||identity.sysDescr||null):identity.sysDescr||null
   let nodeId=existing?.id
   if(existing){
-    run("UPDATE nodes SET hostname=COALESCE(NULLIF(?,''),hostname),ip=COALESCE(ip,?),connection_mode=?,transport=?,status='reachable',agent_required=0,snmp_capable=1,device_type=?,management_type=?,manageability=?,firewall_state=?,hypervisor=CASE WHEN ? IN ('hypervisor','esxi') THEN COALESCE(?,hypervisor) ELSE hypervisor END,os_name=COALESCE(NULLIF(?,''),os_name),os_version=COALESCE(NULLIF(?,''),os_version),first_discovered_at=COALESCE(first_discovered_at,?),last_seen_at=?,last_discovered_at=?,last_probe_at=?,probe_status=?,discovery_source=? WHERE id=?",hostname,target.host,persistedConnectionMode,persistedTransport,persistedDeviceType,persistedManagementType,manageability,firewallState,persistedDeviceType,classification.hypervisor||classification.vendor||null,osName,osVersion,stamp,stamp,stamp,stamp,persistedProbeStatus,target.source||`snmp:${target.id}`,existing.id)
+    run("UPDATE nodes SET hostname=COALESCE(NULLIF(?,''),hostname),ip=COALESCE(ip,?),connection_mode=?,transport=?,status='reachable',agent_required=0,snmp_capable=1,device_type=?,vendor=COALESCE(?,vendor),classification_evidence_json=?,management_type=?,manageability=?,firewall_state=?,hypervisor=CASE WHEN ? IN ('hypervisor','esxi') THEN COALESCE(?,hypervisor) ELSE hypervisor END,os_name=COALESCE(NULLIF(?,''),os_name),os_version=COALESCE(NULLIF(?,''),os_version),first_discovered_at=COALESCE(first_discovered_at,?),last_seen_at=?,last_discovered_at=?,last_probe_at=?,probe_status=?,discovery_source=? WHERE id=?",hostname,target.host,persistedConnectionMode,persistedTransport,persistedDeviceType,classification.vendor||null,JSON.stringify(classificationEvidence),persistedManagementType,manageability,firewallState,persistedDeviceType,classification.hypervisor||classification.vendor||null,osName,osVersion,stamp,stamp,stamp,stamp,persistedProbeStatus,target.source||`snmp:${target.id}`,existing.id)
   }else{
     nodeId=id()
-    run("INSERT INTO nodes(id,hostname,fqdn,ip,connection_mode,transport,status,inventory_source,discovery_source,first_discovered_at,last_seen_at,last_discovered_at,last_probe_at,probe_status,agent_required,firewall_state,snmp_capable,device_type,management_type,manageability,hypervisor,os_name,os_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",nodeId,hostname,null,target.host,persistedConnectionMode,persistedTransport,'reachable','snmp',target.source||`snmp:${target.id}`,stamp,stamp,stamp,stamp,persistedProbeStatus,0,firewallState,1,persistedDeviceType,persistedManagementType,manageability,esxiNode?'VMware ESXi':persistedDeviceType==='hypervisor'?(classification.hypervisor||classification.vendor):null,osName,osVersion)
+    run("INSERT INTO nodes(id,hostname,fqdn,ip,connection_mode,transport,status,inventory_source,discovery_source,first_discovered_at,last_seen_at,last_discovered_at,last_probe_at,probe_status,agent_required,firewall_state,snmp_capable,device_type,vendor,classification_evidence_json,management_type,manageability,hypervisor,os_name,os_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",nodeId,hostname,null,target.host,persistedConnectionMode,persistedTransport,'reachable','snmp',target.source||`snmp:${target.id}`,stamp,stamp,stamp,stamp,persistedProbeStatus,0,firewallState,1,persistedDeviceType,classification.vendor||null,JSON.stringify(classificationEvidence),persistedManagementType,manageability,esxiNode?'VMware ESXi':persistedDeviceType==='hypervisor'?(classification.hypervisor||classification.vendor):null,osName,osVersion)
   }
   const previousFacts=existing?one('SELECT snapshot_json FROM node_facts WHERE node_id=?',nodeId):null
   let previous={};try{previous=previousFacts?.snapshot_json?JSON.parse(previousFacts.snapshot_json)||{}:{}}catch{}

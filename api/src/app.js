@@ -58,6 +58,7 @@ import {expandCidrs,runDiscoveryScan,queueDiscoveryScan,publicDiscoverySchedule,
 import {validSnmpHost,normalizeSnmpSecret,ipInCidr} from './snmpDiscovery.js'
 import {snmpTargets,pollSnmpDiscoveryTarget,pollSnmpNode} from './snmpDiscoveryService.js'
 import {passiveDiscoveryRows,passiveDiscoverySummary,processPassiveDiscovery} from './passiveDiscovery.js'
+import {previewDhcpImport,importDhcpLeases,dhcpImportHistory,dhcpImportById} from './dhcpDiscovery.js'
 import {asyncHandler} from './middleware/asyncHandler.js'
 import {normalizeDynamicRules,dynamicNodeGroupSettings,publicDynamicGroup,updateDynamicGroup,refreshDynamicGroups} from './dynamicNodeGroups.js'
 import {identifyHypervisor} from './esxiDiscovery.js'
@@ -135,7 +136,7 @@ function normalizedNodeOs(node){
   return {os_name:name||null,os_version:version||null,os_build:build||null,hypervisor:hypervisor||null}
 }
 const safeJson=value=>{try{return parse(value)}catch{return null}}
-const publicNode=node=>node && ({...node,...normalizedNodeOs(node),failures:Number(node.failures),firstDiscoveredAt:node.first_discovered_at||null,lastManagedAt:node.last_managed_at||null,triageStatus:node.triage_status||'none',triageNote:node.triage_note||null,triageUpdatedAt:node.triage_updated_at||null,onboardingError:node.onboarding_error_code?onboardingErrorForCode(node.onboarding_error_code):null,virtualMachine:!!Number(node.virtual_machine),virtualMachineHostId:node.virtual_machine_host_id||null,virtualMachineDetails:safeJson(node.virtual_machine_details_json),facts:safeJson(node.snapshot_json),ad:safeJson(node.ad_snapshot_json),training:latestTraining(node.id)||null,verification:latestVerification(node.id),managementVerification:managementVerification(node)})
+const publicNode=node=>node && ({...node,...normalizedNodeOs(node),failures:Number(node.failures),firstDiscoveredAt:node.first_discovered_at||null,lastManagedAt:node.last_managed_at||null,triageStatus:node.triage_status||'none',triageNote:node.triage_note||null,triageUpdatedAt:node.triage_updated_at||null,onboardingError:node.onboarding_error_code?onboardingErrorForCode(node.onboarding_error_code):null,virtualMachine:!!Number(node.virtual_machine),virtualMachineHostId:node.virtual_machine_host_id||null,virtualMachineDetails:safeJson(node.virtual_machine_details_json),classificationEvidence:safeJson(node.classification_evidence_json),dhcpLease:safeJson(node.dhcp_lease_json),passiveDeviceHint:node.passive_device_hint||null,passiveDeviceHintEvidence:safeJson(node.passive_device_hint_json),facts:safeJson(node.snapshot_json),ad:safeJson(node.ad_snapshot_json),training:latestTraining(node.id)||null,verification:latestVerification(node.id),managementVerification:managementVerification(node)})
 const canUseCredential=(user,credential)=>credential&&(user.role==='owner'||user.role==='admin'||credential.owner_user_id===user.id||credential.visibility==='team'&&credential.team_id&&credential.team_id===user.team_id||canWriteResource(user,'credential',credential))
 const assignedNodeCredentials=nodeId=>all(`SELECT DISTINCT c.* FROM credentials c JOIN credential_assignments a ON a.credential_id=c.id WHERE a.node_id=? OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?) ORDER BY c.priority`,nodeId,nodeId)
 const assignedSnmpCredential=(nodeId,user)=>assignedNodeCredentials(nodeId).filter(credential=>['snmp-v2c','snmp-v3'].includes(credential.type)&&canUseCredential(user,credential))[0]||null
@@ -667,6 +668,10 @@ api.post('/discovery/snmp-targets/:id/poll',requireRole('admin'),wrap(async(req,
   const result=await pollSnmpDiscoveryTarget(reqId(req),{actorId:req.user.id})
   res.json(result)
 }))
+api.post('/discovery/dhcp/preview',requireRole('admin'),(req,res)=>res.json(previewDhcpImport(req.body)))
+api.post('/discovery/dhcp/import',requireRole('admin'),(req,res)=>res.status(201).json(importDhcpLeases(req.body,req.user.id)))
+api.get('/discovery/dhcp/imports',requireRole('admin'),(req,res)=>res.json(dhcpImportHistory(req.query)))
+api.get('/discovery/dhcp/imports/:id',requireRole('admin'),(req,res)=>res.json(dhcpImportById(reqId(req))))
 api.get('/discovery/passive-candidates',requireRole('admin'),(req,res)=>res.json({summary:passiveDiscoverySummary(),items:passiveDiscoveryRows({status:req.query.status||null,limit:req.query.limit})}))
 api.post('/discovery/passive-candidates/process',requireRole('admin'),wrap(async(req,res)=>res.json(await processPassiveDiscovery({limit:32,actorId:req.user.id}))))
 api.post('/nodes/:id/arp/collect',requireRole('editor'),(req,res)=>{
@@ -1565,7 +1570,7 @@ api.get('/nodes/triage',(req,res)=>{
   const cutoff=triageCutoff(),rows=all('SELECT n.*,f.snapshot_json FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id').filter(node=>unmanagedTriageEligible(node,cutoff))
   const term=query.search.trim().toLowerCase()
   const statusMatches=node=>query.status==='all'||(query.status==='open'?(node.triage_status||'none')!=='excluded':(node.triage_status||'none')===query.status)
-  const filtered=rows.filter(node=>statusMatches(node)&&(!term||[node.hostname,node.fqdn,node.ip,node.os_name,node.os_version,node.platform,node.status,node.triage_status,node.triage_note].map(value=>String(value||'').toLowerCase()).join(' ').includes(term)))
+  const filtered=rows.filter(node=>statusMatches(node)&&(!term||[node.hostname,node.fqdn,node.ip,node.os_name,node.os_version,node.platform,node.status,node.device_type,node.passive_device_hint,node.triage_status,node.triage_note].map(value=>String(value||'').toLowerCase()).join(' ').includes(term)))
   const value=(node,key)=>key==='priority'?(node.triage_status==='flagged'?0:1):key==='hostname'?String(node.hostname||'').toLowerCase():key==='address'?String(node.ip||node.fqdn||'').toLowerCase():key==='status'?String(node.status||'').toLowerCase():key==='firstDiscovered'?String(node.first_discovered_at||''):String(node.last_managed_at||'')
   const direction=query.direction==='desc'?-1:1
   filtered.sort((a,b)=>{const av=value(a,query.sort),bv=value(b,query.sort);return av===bv?String(a.hostname||'').localeCompare(String(b.hostname||''))*direction:(av<bv?-1:1)*direction})
@@ -1581,7 +1586,7 @@ api.get('/nodes',(req,res)=>{
   if(!Object.keys(req.query||{}).length)return res.json(rows.sort((a,b)=>String(b.created_at||'').localeCompare(String(a.created_at||''))).map(publicNode))
   const page=Math.max(1,Number.parseInt(req.query.page||'1',10)||1),pageSize=Math.min(500,Math.max(1,Number.parseInt(req.query.pageSize||'25',10)||25)),term=String(req.query.search||'').trim().toLowerCase(),filter=String(req.query.filter||'all'),sort=String(req.query.sort||'priority'),direction=String(req.query.direction||'asc').toLowerCase()==='desc'?-1:1
   let filtered=rows.filter(node=>{
-    if(term&&!([node.hostname,node.fqdn,node.ip,node.os_name,node.os_version,node.platform,node.device_type,node.transport,node.hypervisor,node.virtual_machine?'virtual machine':''].map(value=>String(value||'').toLowerCase()).join(' ').includes(term)))return false
+    if(term&&!([node.hostname,node.fqdn,node.ip,node.os_name,node.os_version,node.platform,node.device_type,node.passive_device_hint,node.transport,node.hypervisor,node.virtual_machine?'virtual machine':''].map(value=>String(value||'').toLowerCase()).join(' ').includes(term)))return false
     const managed=serverNodeManaged(node)
     if(filter==='managed'&& !managed)return false
     if(filter==='unmanaged'&& managed)return false

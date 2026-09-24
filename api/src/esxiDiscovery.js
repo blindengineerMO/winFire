@@ -97,7 +97,7 @@ async function retrieveVirtualMachines(host,sessionId,{collector='propertyCollec
 }
 
 export async function identifyEsxi(host,{credentials=[],timeoutMs=DEFAULT_TIMEOUT_MS,requestFn=request}={}){
-  const base={detected:false,authenticated:false,host,osName:'VMware ESXi',hypervisor:'VMware ESXi',deviceType:'hypervisor',manageability:'unmanaged',api:'soap'}
+  const base={detected:false,authenticated:false,host,osName:'VMware ESXi',hypervisor:'VMware ESXi',deviceType:'hypervisor',manageability:'unmanaged',api:'soap',classificationEvidence:{source:'esxi-discovery',method:'vSphere SOAP',matched:'VMware ESXi',signal:'vSphere SOAP /sdk',confidence:'high'}}
   let probe
   try{probe=await requestFn(host,{timeoutMs})}catch(error){return {...base,error:error.message}}
   let marker=probe.status===401||hasVmwareMarker(probe.body)||/text\/xml/i.test(String(probe.headers?.['content-type']||''))
@@ -160,7 +160,7 @@ export async function identifyHypervisor(host,{credentials=[],timeoutMs=DEFAULT_
   for(const probe of probes){
     try{
       const response=await hypervisorRequest(host,probe)
-      if((probe.kind==='proxmox'&&response.status===401)||probe.markers.test(response.body||''))return {...base,...probe,detected:true,probeStatus:response.status}
+      if((probe.kind==='proxmox'&&response.status===401)||probe.markers.test(response.body||''))return {...base,...probe,detected:true,probeStatus:response.status,classificationEvidence:{source:'esxi-discovery',method:'hypervisor-api-fingerprint',matched:probe.osName,signal:`${probe.kind} ${probe.port}${probe.path}`,confidence:'high'}}
     }catch{}
   }
   return base

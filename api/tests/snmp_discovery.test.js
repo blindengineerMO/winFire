@@ -13,7 +13,7 @@ const {app}=await import('../src/app.js')
 const {bootstrap}=await import('../src/security.js')
 const {db}=await import('../src/db.js')
 const {normalizeSnmpSecret,normalizeArpTable,normalizeForwardingTable,pollSnmpDevice,filterSnmpCandidates,classifySnmpIdentity}=await import('../src/snmpDiscovery.js')
-const {pollSnmpDiscoveryTarget,pollSnmpNode,dueSnmpTargets}=await import('../src/snmpDiscoveryService.js')
+const {ensureSnmpNode,pollSnmpDiscoveryTarget,pollSnmpNode,dueSnmpTargets}=await import('../src/snmpDiscoveryService.js')
 await bootstrap()
 const request=supertest(app)
 test.after(()=>{db.close();fs.rmSync(dir,{recursive:true,force:true})})
@@ -69,6 +69,23 @@ test('SNMP identity fingerprints cover infrastructure vendors and hypervisors',(
   assert.deepEqual(classifySnmpIdentity({sysDescr:'Juniper Networks Junos'}),{vendor:'Juniper Junos',deviceType:'router',manageability:'snmp'})
   assert.deepEqual(classifySnmpIdentity({sysDescr:'VMware ESXi 8.0'}),{vendor:'VMware ESXi',deviceType:'hypervisor',manageability:'unmanaged',hypervisor:'VMware ESXi'})
   assert.deepEqual(classifySnmpIdentity({sysDescr:'Fortinet FortiOS'}),{vendor:'Fortinet FortiOS',deviceType:'firewall',manageability:'snmp'})
+  const evidence=classifySnmpIdentity({sysObjectId:'1.3.6.1.4.1.9.1.1'},{includeEvidence:true}).classificationEvidence
+  assert.equal(evidence.method,'sysObjectID')
+  assert.equal(evidence.matched,'Cisco IOS/NX-OS')
+  assert.equal(evidence.observed.sysObjectId,'1.3.6.1.4.1.9.1.1')
+})
+
+test('SNMP identity evidence is persisted on the node record',async()=>{
+  const nodeId='snmp-evidence-node'
+  db.prepare("INSERT INTO nodes(id,hostname,ip,connection_mode,status) VALUES(?,?,?,?,?)").run(nodeId,'core-switch','192.0.2.46','agentless','unknown')
+  ensureSnmpNode({host:'192.0.2.46',source:'snmp:test'},{identity:{sysName:'core-switch',sysDescr:'Cisco IOS-XE Software',sysObjectId:'1.3.6.1.4.1.9.1.1'},arp:[],macPorts:[],routes:{},tcpStates:{},firewallStates:{}},new Date().toISOString())
+  const node=db.prepare('SELECT vendor,device_type,classification_evidence_json FROM nodes WHERE id=?').get(nodeId)
+  assert.equal(node.vendor,'Cisco IOS/NX-OS')
+  assert.equal(node.device_type,'switch')
+  assert.equal(JSON.parse(node.classification_evidence_json).matched,'Cisco IOS/NX-OS')
+  const login=await request.post('/api/v1/auth/login').send({email:'owner@snmp.test',password:'snmp-test-password-123'}).expect(200)
+  const detail=await request.get(`/api/v1/nodes/${nodeId}`).set('Authorization',`Bearer ${login.body.accessToken}`).expect(200)
+  assert.equal(detail.body.classificationEvidence.matched,'Cisco IOS/NX-OS')
 })
 
 test('assigned SNMP polling promotes an existing node to verified ARP learning',async()=>{

@@ -14,5 +14,12 @@ __pycache__/
 *.pyc
 PLAN.md
 IMPLEMENTATION_STATUS.md
-/docs
+/docs/*
+!/docs/API.md
+!/docs/API_ROUTES.md
+!/docs/DHCP_IMPORT.md
+!/docs/INSTALLATION.md
+!/docs/JIT_MFA.md
+!/docs/USAGE.md
+!/docs/INTERNET_ENTERPRISE_DEPLOYMENT.md
 RESEARCH_AGENTLESS_MFA.md

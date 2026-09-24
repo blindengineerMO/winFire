@@ -1,5 +1,6 @@
 import {all,one,run,id,now,audit} from './db.js'
 import {registerHost} from './networkDiscovery.js'
+import {passiveDeviceHintForIp} from './services/networkMapping.js'
 
 const MAX_BATCH=32
 const RETRY_LIMIT=5
@@ -14,12 +15,25 @@ export function passiveDiscoveryRows({status=null,limit=100}={}){
   const where=status? 'WHERE p.status=?':'',args=status?[status]:[]
   return all(`SELECT p.*,s.hostname source_hostname,n.hostname node_hostname FROM passive_discovery_candidates p JOIN nodes s ON s.id=p.source_node_id LEFT JOIN nodes n ON n.id=p.node_id ${where} ORDER BY CASE p.status WHEN 'queued' THEN 0 WHEN 'processing' THEN 1 WHEN 'failed' THEN 2 ELSE 3 END,p.last_seen_at DESC LIMIT ?`,...args,safeLimit)
 }
+function persistHint(candidateId,nodeId,hint){
+  if(!hint)return
+  const serialized=JSON.stringify(hint)
+  run('UPDATE passive_discovery_candidates SET device_type_hint=?,device_type_hint_json=?,updated_at=? WHERE id=?',hint.label,serialized,now(),candidateId)
+  if(!nodeId)return
+  // Keep the hint separate from the authoritative node type. It never
+  // replaces a manually selected type or a stronger authenticated/SNMP
+  // classification, while inventory and node details can still surface it.
+  run('UPDATE nodes SET passive_device_hint=?,passive_device_hint_json=? WHERE id=?',hint.label,serialized,nodeId)
+}
 async function processCandidate(candidate,{register=registerHost,actorId=null}={}){
   const claimed=run("UPDATE passive_discovery_candidates SET status='processing',attempts=attempts+1,updated_at=? WHERE id=? AND status='queued' AND (next_attempt_at IS NULL OR datetime(next_attempt_at)<=datetime(?))",now(),candidate.id,now())
   if(!claimed.changes)return null
   const attempt=Number(candidate.attempts||0)+1
   try{
-    const result=await register(candidate.ip,`passive:${candidate.id}`,'arp-passive',{mac:candidate.mac,hostname:candidate.hostname})
+    const hint=passiveDeviceHintForIp(candidate.ip)
+    persistHint(candidate.id,null,hint)
+    const result=await register(candidate.ip,`passive:${candidate.id}`,'arp-passive',{mac:candidate.mac,hostname:candidate.hostname,passiveHint:hint||null})
+    persistHint(candidate.id,result?.nodeId||null,hint)
     if(result?.nodeId)run("UPDATE passive_discovery_candidates SET status='registered',node_id=?,last_error=NULL,next_attempt_at=NULL,updated_at=? WHERE id=?",result.nodeId,now(),candidate.id)
     else run("UPDATE passive_discovery_candidates SET status='failed',last_error=?,next_attempt_at=?,updated_at=? WHERE id=?",'Discovery registration returned no node',attempt>=RETRY_LIMIT?null:retryAt(attempt),now(),candidate.id)
     audit(actorId,'network-discovery.passive.register','passive-discovery',candidate.id,null,{ip:candidate.ip,nodeId:result?.nodeId||null,sourceNodeId:candidate.source_node_id,livenessMethod:'arp-passive'})

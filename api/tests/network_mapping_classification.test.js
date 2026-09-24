@@ -6,7 +6,7 @@ import path from 'node:path'
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'winfire-mapping-'))
 process.env.DATA_DIR = dir
-const {classifyNetworkFlow,recordArpEntries,recordNetworkFlow,mappingRows} = await import('../src/services/networkMapping.js')
+const {classifyNetworkFlow,recordArpEntries,recordNetworkFlow,mappingRows,inferPassiveDeviceType} = await import('../src/services/networkMapping.js')
 const {db}=await import('../src/db.js')
 
 test.after(() => fs.rmSync(dir, {recursive: true, force: true}))
@@ -137,4 +137,32 @@ test('managed-node ARP observations queue only new passive discovery candidates'
   ]),4)
   const candidate=db.prepare('SELECT ip,mac,source_node_id,status,hostname FROM passive_discovery_candidates').all()
   assert.deepEqual(candidate,[{ip:'192.168.88.30',mac:'00:00:00:00:00:30',source_node_id:'arp-source',status:'queued',hostname:'new-host'}])
+})
+
+test('passive traffic adds a printer hint without requiring management ports', () => {
+  const hint = inferPassiveDeviceType({ip:'192.168.88.55', rows:[
+    {source_ip:'192.168.88.55', destination_ip:'224.0.0.251', protocol:'UDP', source_port:5353, destination_port:5353, traffic_service:'mDNS service discovery'},
+    {source_ip:'192.168.88.55', destination_ip:'192.168.88.10', protocol:'TCP', source_port:50123, destination_port:9100, traffic_service:'JetDirect printing'}
+  ]})
+  assert.equal(hint.type, 'printer')
+  assert.equal(hint.confidence, 'high')
+  assert.deepEqual(hint.managementPorts, [])
+  assert.ok(hint.evidence.length >= 2)
+})
+
+test('passive discovery classifies UPnP-only endpoints as IoT and avoids server labels', () => {
+  const hint = inferPassiveDeviceType({ip:'192.168.88.56', rows:[
+    {source_ip:'192.168.88.56', destination_ip:'239.255.255.250', protocol:'UDP', source_port:42000, destination_port:1900, traffic_service:'SSDP/UPnP discovery'}
+  ]})
+  assert.equal(hint.type, 'iot')
+  assert.equal(hint.label, 'IoT device')
+  assert.equal(hint.managementPorts.length, 0)
+})
+
+test('passive hints stay advisory when a management port is observed', () => {
+  const hint = inferPassiveDeviceType({ip:'192.168.88.57', rows:[
+    {source_ip:'192.168.88.57', destination_ip:'224.0.0.251', protocol:'UDP', source_port:5353, destination_port:5353, traffic_service:'mDNS service discovery'},
+    {source_ip:'192.168.88.57', destination_ip:'192.168.88.10', protocol:'TCP', source_port:50124, destination_port:22, traffic_service:'SSH/SFTP remote access'}
+  ]})
+  assert.equal(hint, null)
 })

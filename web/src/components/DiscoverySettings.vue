@@ -3,6 +3,7 @@ import {onMounted, ref} from 'vue'
 import {api} from '../services/api.js'
 import ConfirmDialog from './ConfirmDialog.vue'
 import SnmpDiscoverySettings from './SnmpDiscoverySettings.vue'
+import DhcpDiscoverySettings from './DhcpDiscoverySettings.vue'
 import LinuxDiscoverySettings from './LinuxDiscoverySettings.vue'
 
 const props = defineProps({credentials: {type: Array, default: () => []}})
@@ -31,6 +32,7 @@ async function load() {
 }
 const cidrValues = value => String(value || '').split(/[\n,]/).map(item => item.trim()).filter(Boolean)
 const preflightLabel = result => { if (!result) return ''; if (!result.success) return result.onboardingError?.title || result.error || 'Credential test failed'; return `Verified ${(result.transport || 'management').toUpperCase()}${result.computerName ? ` · ${result.computerName}` : ''}` }
+const hintConfidence = candidate => { try { return JSON.parse(candidate?.device_type_hint_json || '{}').confidence || 'advisory' } catch { return 'advisory' } }
 const diffText = scan => { const summary = scan?.diff?.summary; if (!summary) return '—'; return `${summary.new ?? summary.newCount ?? 0} new · ${summary.gone ?? summary.goneCount ?? 0} dark · ${summary.changed ?? summary.changedCount ?? 0} changed` }
 async function scan() { busy.value = true; error.value = ''; message.value = ''; try { const result = await api('/discovery/scans', {method: 'POST', body: {cidrs: cidrValues(cidrs.value)}}); message.value = `Scan queued for ${result.addresses} address${result.addresses === 1 ? '' : 'es'}.`; cidrs.value = ''; await load() } catch (cause) { error.value = cause.message } finally { busy.value = false } }
 async function preflightDiscoveryCredential() {
@@ -58,6 +60,7 @@ onMounted(load)
       <button type="button" role="tab" :aria-selected="activeTab === 'snmp'" :class="{active: activeTab === 'snmp'}" @click="activeTab = 'snmp'">SNMP polling</button>
       <button type="button" role="tab" :aria-selected="activeTab === 'arp'" :class="{active: activeTab === 'arp'}" @click="activeTab = 'arp'">ARP / Other</button>
       <button type="button" role="tab" :aria-selected="activeTab === 'linux'" :class="{active: activeTab === 'linux'}" @click="activeTab = 'linux'">Linux</button>
+      <button type="button" role="tab" :aria-selected="activeTab === 'dhcp'" :class="{active: activeTab === 'dhcp'}" @click="activeTab = 'dhcp'">DHCP leases</button>
     </div>
 
     <template v-if="activeTab === 'cidr'">
@@ -77,8 +80,10 @@ onMounted(load)
 
     <LinuxDiscoverySettings v-else-if="activeTab === 'linux'" :credentials="props.credentials" />
 
+    <DhcpDiscoverySettings v-else-if="activeTab === 'dhcp'" />
+
     <template v-else>
-      <section v-if="passiveAvailable" class="passive-discovery"><div class="panel-title"><div><span class="eyebrow">PASSIVE DISCOVERY</span><h2>Managed-node ARP candidates</h2></div><div class="inline-actions"><span class="count-chip">{{passive.summary.queued || 0}} queued</span><button class="button small secondary" :disabled="busy" @click="processPassive">Process now</button></div></div><p class="muted">ARP entries collected from enrolled agents are queued here without interrupting telemetry. Processing sends candidates through DNS and the normal management verification path.</p><div class="table-wrap"><table><thead><tr><th>IP</th><th>MAC</th><th>SOURCE NODE</th><th>LAST SEEN</th><th>STATUS</th><th>ERROR</th></tr></thead><tbody><tr v-for="candidate in passive.items" :key="candidate.id"><td class="mono">{{candidate.ip}}</td><td class="mono">{{candidate.mac || '—'}}</td><td>{{candidate.source_hostname}}</td><td>{{new Date(candidate.last_seen_at).toLocaleString()}}</td><td><span class="status" :class="candidate.status === 'registered' ? 'reachable' : candidate.status === 'failed' ? 'unreachable' : 'pending'">{{candidate.status}}</span></td><td class="danger-text">{{candidate.last_error || '—'}}</td></tr><tr v-if="!passive.items.length"><td colspan="6" class="empty-table">No passive ARP candidates are waiting.</td></tr></tbody></table></div></section>
+      <section v-if="passiveAvailable" class="passive-discovery"><div class="panel-title"><div><span class="eyebrow">PASSIVE DISCOVERY</span><h2>Managed-node ARP candidates</h2></div><div class="inline-actions"><span class="count-chip">{{passive.summary.queued || 0}} queued</span><button class="button small secondary" :disabled="busy" @click="processPassive">Process now</button></div></div><p class="muted">ARP entries collected from enrolled agents are queued here without interrupting telemetry. Recent internal traffic can add an advisory device-type hint before management verification.</p><div class="table-wrap"><table><thead><tr><th>IP</th><th>MAC</th><th>SOURCE NODE</th><th>PASSIVE HINT</th><th>LAST SEEN</th><th>STATUS</th><th>ERROR</th></tr></thead><tbody><tr v-for="candidate in passive.items" :key="candidate.id"><td class="mono">{{candidate.ip}}</td><td class="mono">{{candidate.mac || '—'}}</td><td>{{candidate.source_hostname}}</td><td><span v-if="candidate.device_type_hint" class="status pending">{{candidate.device_type_hint}}</span><small v-if="candidate.device_type_hint_json" class="muted">{{hintConfidence(candidate)}} confidence</small><span v-if="!candidate.device_type_hint">—</span></td><td>{{new Date(candidate.last_seen_at).toLocaleString()}}</td><td><span class="status" :class="candidate.status === 'registered' ? 'reachable' : candidate.status === 'failed' ? 'unreachable' : 'pending'">{{candidate.status}}</span></td><td class="danger-text">{{candidate.last_error || '—'}}</td></tr><tr v-if="!passive.items.length"><td colspan="7" class="empty-table">No passive ARP candidates are waiting.</td></tr></tbody></table></div></section>
       <section class="other-discovery"><div class="panel-title"><div><span class="eyebrow">OTHER SOURCES</span><h2>ARP and passive discovery</h2></div></div><p class="muted">Use this tab to review ARP candidates gathered from managed nodes and process them through DNS, deduplication, and management verification. Additional passive discovery sources appear here as they are enabled.</p></section>
     </template>
 

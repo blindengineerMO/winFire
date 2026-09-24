@@ -85,8 +85,8 @@ test('OpenAPI lists registered control-plane and agent routes with their auth sc
   assert.equal(spec.paths['/auth/ad/login'].post.security,undefined)
   assert.equal(spec.paths['/auth/ad-totp/enroll'].post.security,undefined)
   assert.deepEqual(spec.paths['/wef/wsman'].post.security,[{wefHmac:[]}])
-  assert.equal(spec.paths['/settings/training'].get.security,undefined)
-  assert.equal(spec.paths['/settings/logs-display'].get.security,undefined)
+  assert.deepEqual(spec.paths['/settings/training'].get.security,[{bearerAuth:[]}])
+  assert.deepEqual(spec.paths['/settings/logs-display'].get.security,[{bearerAuth:[]}])
   assert.equal(spec.paths['/mfa/prompts/{id}/totp'].post.requestBody.content['application/json'].schema.$ref,'#/components/schemas/MfaPromptTotpRequest')
   assert.equal(spec.paths['/mfa/entra/complete'].post.requestBody.content['application/json'].schema.$ref,'#/components/schemas/MfaEntraCompleteRequest')
   assert.equal(spec.paths['/auth/totp/setup'].post.requestBody.required,false)
@@ -100,12 +100,14 @@ test('OpenAPI lists registered control-plane and agent routes with their auth sc
 })
 
 test('OpenAPI authorization audit protects every non-public route',async()=>{
+  await request.get('/api/v1/settings/training').expect(401)
+  await request.get('/api/v1/settings/logs-display').expect(401)
   const spec=(await request.get('/api/v1/openapi.json').expect(200)).body
   const publicRoutes=new Set([
     'GET /health','GET /openapi.json','POST /auth/login','POST /auth/refresh','POST /auth/ad/login',
     'POST /auth/ad-totp/enroll','POST /auth/ad-totp/confirm','POST /invites/accept','POST /auth/verify-email',
-    'GET /avatars/{id}','GET /portal-branding','GET /portal-branding/image','GET /settings/training',
-    'GET /settings/logs-display','GET /mfa/prompts/{id}','POST /mfa/prompts/{id}/totp',
+    'GET /avatars/{id}','GET /portal-branding','GET /portal-branding/image','GET /agent-package/WinFire.Agent.exe',
+    'GET /agent-package/WinFire.Agent.msi','GET /agent-package/enroll.ps1','GET /mfa/prompts/{id}','POST /mfa/prompts/{id}/totp',
     'POST /mfa/prompts/{id}/entra/start','POST /mfa/entra/complete','POST /mfa/entra/cancel','POST /agents/enroll',
     'POST /internet/enroll'
   ])

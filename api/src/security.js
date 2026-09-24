@@ -124,4 +124,9 @@ export function auth(req,res,next) {
   } catch { res.status(401).json({error:'Invalid or expired token'}) }
 }
 const rolePermission={auditor:'portal.read',editor:'portal.edit',admin:'portal.admin',owner:'portal.owner'}
-export const requireRole = role => (req,res,next) => one('SELECT 1 FROM role_permissions WHERE role_id=? AND permission_id=?',req.user?.role||'',rolePermission[role]||'') ? next() : res.status(403).json({error:'Insufficient permission'})
+export const requireRole = role => {
+  const permission=rolePermission[role]||''
+  const middleware=(req,res,next)=>one('SELECT 1 FROM role_permissions WHERE role_id=? AND permission_id=?',req.user?.role||'',permission)?next():res.status(403).json({error:'Insufficient permission'})
+  middleware.requiredPermission=permission
+  return middleware
+}

@@ -24,7 +24,8 @@
     "test:winrm:live": "node api/tests/live_winrm_smoke.mjs",
     "test:winrm:rights": "node api/tests/live_rights_read.mjs",
     "test:winrm:rights:write": "node api/tests/live_rights_write.mjs",
-    "audit:deps": "npm audit --omit=dev --audit-level=high"
+    "audit:deps": "npm audit --omit=dev --audit-level=high",
+    "docs:api": "node scripts/generate-api-docs.mjs"
   },
   "dependencies": {
     "argon2": "^0.44.0",

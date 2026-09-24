@@ -2,160 +2,108 @@
 
 # WinFire Secure
 
-WinFire Secure is a control plane for firewall visibility, policy design, host inventory, identity controls, and agentless MFA. It serves the operator interface and API from one port so a deployment can be tested locally and published behind one HTTPS origin.
+WinFire Secure is an API-first control plane for host inventory, firewall visibility and policy, network mapping, and identity-based access. The Vue operator interface and Express API can be served from one origin. The current persistent store is SQLite.
 
-## What it provides
+## Documentation
 
-- **Secure operator access:** owner, administrator, policy editor, and auditor roles; resource grants; invitations; password changes; session revocation; optional authenticator login; rate limiting; account lockout; and an auditable change history.
-- **Credential vault:** encrypted credentials with write-only secrets, local and domain accounts, SNMP v2c community and SNMP v3 user/authentication/privacy credentials, node and group assignments, authentication tests, rotation, and priority ordering.
-- **Directory and identity:** LDAPS computer and user discovery, explicit LDAP 389 fallback approval, AD and local account inventory, account detail windows, MFA enrollment status, logon and logoff history, operator import, account status controls, logon-rights baseline, and identity segments.
-- **Monitored assets:** DNS forward and reverse lookups, OS and hardware facts, domain status, SIDs and GUIDs, users, network interfaces, firewall profiles, paged firewall rules, training status, manual and dynamic group membership, management credentials, and agent status. Dynamic groups can match hostnames, FQDNs, IP addresses, or CIDRs and refresh on an administrator-selected interval.
-- **Policy studio:** visual flow editor, classic rule editor, version history, comparisons, deduplication, compatible rule merging, conflict checks, assignments to nodes, groups, or all nodes, verification, staged deployment, and a top-bar **Sync policies** action.
-- **Learning:** automatic new-host training, progressive learning, live policy previews, evidence for learned flows, review and approval, personal learned policies, and group/global policy composition.
-- **Firewall events:** server-side paging (100 rows by default), filters, sorting, search, loopback controls, event exports, event-to-rule actions, account and process ignore rules, retroactive cleanup, WEF ingestion, and WinRM/WMI collection.
-- **Network visibility:** internal and external connection mapping, node pairs, top talkers, ARP snapshots, passive discovery from managed-node ARP caches, ARP and TCP fallback liveness for CIDR discovery scans, credentialed SNMP switch/router ARP and MAC-port polling, agent telemetry, and separate Internet visibility for browser navigation metadata. Mapping and Firewall Events explain local broadcast, multicast, loopback, link-local, private, shared CGNAT, special-purpose, and public traffic, and identify well-known services by protocol and port such as HTTP/HTTPS/HTTP3, DNS, LDAP/LDAPS, Active Directory Global Catalog, DHCP, SMB, RDP, WinRM, mail, VPN, databases, messaging, monitoring, and container APIs.
-- **Agentless MFA:** portal-based RDP/SSH access requests with TOTP or Entra authentication, optional browser prompting through a managed WinRM workstation, temporary firewall grants, expiry, and fail-open or fail-closed controls.
-- **Optional universal agent:** Windows, Linux, and macOS builds with native firewall backends where supported; policy jobs, event shipment, heartbeats, ARP collection, certificate enrollment, and optional deployment from Inventory.
-- **Administration:** training, observability, process and traffic exclusions, WEF, discovery, directory, Entra, portal branding, event export destinations, security automation, RPC filters, agent delivery, and TLS certificate uploads.
-
-## Requirements
-
-- Node.js 20 or newer.
-- A writable data directory.
-- A browser that supports modern HTML, CSS, and JavaScript.
-- For Windows management: reachable WinRM, WMI/DCOM, or the documented SMB fallback, plus a vault credential with the required host rights.
-- For agent enrollment and automatic MFA prompts: an HTTPS public origin and a server certificate trusted by clients.
-
-## Install and start
-
-```bash
-npm install
-npm start
-```
-
-`npm start` builds the operator interface and starts the API and interface on the same port. The default is `http://localhost:3000`; set `PORT` and `HOST` to change the listener. Use `DATA_DIR` to place the database, encrypted secrets, uploaded branding, and administration-managed TLS material in another directory.
-
-For local development, `npm run dev:api` starts the API watcher and `npm run dev:web` starts the interface development server. Run `npm test` for the API test suite and `npm run build` for a production interface build.
-
-### Deploy to Dokploy
-
-The checked-in `deploy/dokploy/docker-compose.yml` defines separate `api`, `ui`,
-and PostgreSQL services. Run the interactive deployment wizard from a machine
-that can reach the Dokploy API:
-
-```bash
-npm run deploy:dokploy
-```
-
-The wizard asks for the Dokploy URL/IP and API key, lists the projects and
-environments returned by Dokploy, and asks for a service name, base DNS domain,
-GitHub repository/branch, and bootstrap administrator values. It generates a
-random hostname below the base domain, creates the compose application, saves
-the generated environment, attaches the hostname to the `ui` service, deploys,
-and prints the deployment status and URLs. The API key is read interactively and
-is never written to disk. Point internal DNS at the printed hostname with a
-CNAME. The wizard attaches two Dokploy domains for the same hostname: an HTTP
-route and an HTTPS route using Let's Encrypt. Dokploy serves the HTTPS route on
-public port 443 and forwards it to the UI container's port 80; the domain
-`port` value is the container port, not a second public listener. The generated
-hostname must resolve publicly to the Dokploy server and allow ports 80/443 for
-the Let's Encrypt challenge. Set `WINFIRE_HTTPS=false` when deploying an
-internal-only test domain that cannot satisfy ACME validation.
-
-For automation, `DOKPLOY_URL`, `DOKPLOY_API_KEY`, `DOKPLOY_PROJECT_ID`,
-`DOKPLOY_ENVIRONMENT_ID`, `WINFIRE_SERVICE_NAME`, `WINFIRE_BASE_DOMAIN`,
-`WINFIRE_BOOTSTRAP_EMAIL`, `WINFIRE_BOOTSTRAP_PASSWORD`,
-`WINFIRE_GITHUB_REPOSITORY`, `WINFIRE_GITHUB_BRANCH`, and `WINFIRE_HTTPS` can
-provide wizard values through a secret manager or CI job; they remain
-process-only values.
-
-When an internal DNS record is not yet visible from the machine running the
-wizard, `DOKPLOY_REACHABILITY_IP` can be set to the Dokploy address for a test
-request. The generated hostname is still sent as the HTTP Host/SNI value, so
-the domain routing is tested without changing normal DNS behavior.
-
-The initial stack sets one replica for every service and includes health checks,
-persistent API/PostgreSQL volumes, and an Nginx UI proxy. WinFire's current
-database migration engine remains SQLite backed by the API data volume; the
-PostgreSQL service and `POSTGRES_URL` are provisioned for the database adapter
-migration and are ready for a later PostgreSQL cutover.
-
-### Bootstrap administrator
-
-On a new data directory the server creates one owner account when bootstrap is enabled. Configure these variables before the first start:
-
-```text
-BOOTSTRAP_ADMIN_ENABLED=true
-BOOTSTRAP_ADMIN_EMAIL=admin@example.invalid
-BOOTSTRAP_ADMIN_PASSWORD=replace-with-a-long-secret
-```
-
-The password must contain at least 12 characters. The account is created once and remains unchanged on later starts unless it is edited in Administration. Set `BOOTSTRAP_ADMIN_ENABLED=false` after provisioning in a production deployment.
-
-## HTTPS, certificates, and administration configuration
-
-Administration → **TLS** accepts PEM encoded server and agent CA certificates and private keys. Files are stored with restricted permissions and take effect after a restart. Environment paths take precedence over uploaded files:
-
-- `TLS_CERT`, `TLS_KEY`: control plane server certificate and key.
-- `AGENT_CA_CERT`, `AGENT_CA_KEY`: client certificate authority used by enrolled agents.
-- `AGENT_CA_PASSPHRASE`, `TLS_KEY_PASSPHRASE`: private-key passphrases; production agent CA and server keys must be encrypted.
-
-Administration exposes the operational settings that can be changed without editing environment files: server FQDN and public URL, directory connections and fallback approval, training, event retention and compaction, loopback handling, WEF (including its encrypted shared secret), process and traffic ignores, the IANA-backed classifier catalog and custom service rules, portal branding, Entra, MFA prompt behavior, discovery CIDRs, agent polling, event exports, security automation, RPC filters, users, teams, credentials, and audit retention. `PUBLIC_BASE_URL` and `SERVER_FQDN` take precedence over values saved in Administration. Set `CORS_ORIGIN` to a comma-separated allow list when the interface is served from another origin.
-
-## Operator workflow
-
-1. Sign in with the bootstrap administrator and change the password.
-2. Open Administration → Credentials and store the directory bind account and management credentials. Set the Dynamic node group refresh interval in Administration → Observability.
-3. Open Administration → Directory, configure the controller URL and search base, select credentials, and test the connection. LDAPS is the default. LDAP 389 requires an explicit administrator approval checkbox and is used only as a transport fallback when LDAPS is unavailable.
-4. Run a computer sync. AD computers are matched by directory GUID, resolved with forward and reverse DNS, assigned the directory management credential, and placed into automatic training. Manual nodes follow the same fact, audit, and event collection workflow.
-5. Use Entities → Directory to search AD and local accounts. Click an account for its AD-style detail view, groups, SID, status, MFA enrollment, operator mapping, associated nodes, and recent logon or MFA events. Use the account controls only with an approved reason and confirmation.
-6. Use Monitored assets to inspect a node. The Assets and Node groups tabs provide searchable tables; selecting a group opens its member list and removal confirmation. The node action menu can verify management, deploy the optional agent, enroll an agent, or open a time-limited break-glass window.
-7. Use Policy Studio to build or review a visual or classic policy. Save a version, verify it, assign it, and use **Sync policies** when the change should be sent to enforced nodes.
-8. Use Visibility → Firewall events to search and sort traffic. The Events and Learning sessions tabs keep policy discovery separate from event search. Right-click an event to stage an allow/reject rule or ignore matching traffic. Use Administration → Observability for retroactive cleanup.
-9. Use Identity to create node or node-group MFA segments, choose TOTP or Entra, configure the access portal, and review pending requests and grants.
-10. Use Visibility → Mapping and Administration → Discovery for connection maps, ARP snapshots, CIDR probes, passive managed-node ARP candidates, and optional credentialed SNMP switch/router polling. Passive candidates and SNMP results automatically pass through the normal node onboarding workflow.
-
-## Interface routes
-
-| Route | Purpose |
+| Guide | Contents |
 |---|---|
-| `/login` | Operator sign-in and authenticator enrollment link |
-| `/enroll-authenticator` | AD sign-in and QR-code TOTP enrollment |
-| `/dashboard` | Health, policy, event, and inventory summary |
-| `/inventory` | Monitored asset table and node details |
-| `/directory` | AD and local account inventory and detail views |
-| `/identity` | Identity segments, MFA requests, grants, and logon baseline |
-| `/policies` | Visual and classic policy studio |
-| `/logs` | Firewall events and learning sessions tabs |
-| `/mapping` | Internal/external traffic map, top talkers, and ARP |
-| `/internet` | Browser Internet visibility and URL policy |
-| `/activities` | Unified activity stream |
-| `/reports` | Inventory, DNS, policy, verification, and compliance reports |
-| `/tools` | Browser extension downloads and enrollment tools |
-| `/admin` | Credentials, operators, directory, branding, security, TLS, agents, and system settings |
-| `/mfa/:id` | MFA portal challenge page |
+| [Installation and configuration](docs/INSTALLATION.md) | Native/systemd, Docker, Dokploy, environment settings, TLS/mTLS, bootstrap accounts, backups, upgrades and troubleshooting. |
+| [Operator guide](docs/USAGE.md) | Discovery, inventory, triage, groups, policy learning, events, mapping, administration and every interface route. |
+| [API usage and curl examples](docs/API.md) | Authentication, inventory queries, credentials, discovery, DHCP, groups, events, topology and JIT access. |
+| [Complete API route reference](docs/API_ROUTES.md) | Every registered API operation, authentication/permission gates, source handler links and published request schemas. |
+| [DHCP lease import](docs/DHCP_IMPORT.md) | Windows export script, preview/import, MAC/IP correlation, retained evidence, conflict handling and API contract. |
+| [JIT MFA: how it works](docs/JIT_MFA.md) | Setup, supported platforms, prompting, identity checks, firewall gates, temporary grants, expiry, fallback and verification. |
+| [Enterprise Internet deployment](docs/INTERNET_ENTERPRISE_DEPLOYMENT.md) | Browser extension deployment and URL telemetry/policy. |
 
-## API route families
+Live OpenAPI: **`GET /api/v1/openapi.json`**. Regenerate the route reference with `npm run docs:api`; generation uses a disposable database and does not contact inventory hosts.
 
-All API routes are under `/api/v1` and require a bearer access token unless marked public.
+## Feature summary
 
-- `/auth/*`: sign-in, refresh, sign-out, password changes, TOTP, email verification, and authenticator enrollment.
-- `/users`, `/teams`, `/invites`, `/access`, `/audit`: operator administration, resource grants, invitations, and audit search/export.
-- `/credentials`: vault records, assignments, tests, and rotation.
-- `/nodes`, `/node-groups`: inventory, facts, DNS, probes, credentials, firewall rules, training, agentless verification, break glass, manual and dynamic group membership, and scheduled group refresh.
-- `/directory/*`: directory test/sync, AD and local account inventories, account status, operator import, and account-scoped rules.
-- `/policies`, `/learning-sessions`, `/policy-sync`: policy versions, assignments, verification, learned previews, approvals, and deployment queues.
-- `/logs`, `/event-export`, `/settings/process-exclusions`, `/settings/traffic-ignores`: event search, collection, exports, filtering, ignore rules, and cleanup.
-- `/identity`, `/segments`, `/mfa`: identity segments, access requests, challenges, temporary grants, and portal callbacks.
-- `/mapping`, `/discovery`, `/internet`: network maps, ARP, CIDR scans, browser enrollment, Internet events, and URL policy.
-- `/agents`, `/agent-package`, `/settings/agent-poll`, `/settings/tls`: certificate enrollment, jobs, packages, delivery modes, polling, and TLS status/material uploads.
-- `/settings/*`: training, observability, WEF, directory, Entra, portal branding, MFA fallback, classifier catalog and custom rules, RPC filters, discovery, and other administrator settings.
+- **Inventory and correlation:** local-CIDR inventory boundary, server-side search/filter/sort/pagination, managed-first ordering, MAC correlation, TTL family hints, authenticated OS/hardware facts, hypervisor identity, ESXi VM inventory/correlation, and retained device-classification evidence. External peers remain in events and mapping.
+- **Discovery:** CIDR scans with ICMP/ARP/TCP fallback; recurring scans with new/dark/changed diffs; Windows directory sync; SNMP identity/ARP/routes/TCP/forwarding tables; Linux SSH defaults; passive ARP candidates; optional Windows DHCP lease import with preview and conflict reports.
+- **Management:** Windows agentless transports, Linux SSH facts and supported firewall actions, SNMP visibility, VMware ESXi API inventory, and optional enrolled agents. Unknown/discovery-only assets remain unmanaged until independent management verification succeeds.
+- **Triage and groups:** unmanaged/rogue asset queue, bulk credential retry/flag/exclude/restore, static groups and server-evaluated dynamic membership rules.
+- **Vault and access:** encrypted write-only credentials, resource grants, credential preflight and rotation-failure notices, owner/admin/editor/auditor permissions, custom roles, teams, invitations, TOTP and audit history.
+- **Policies and learning:** visual/classic editors, versions/diffs, conflict checks, assignments, verification, scheduled sync, training proposals, progressive learning and rollback workflows.
+- **Events and mapping:** separate Firewall events and Accounts tables, transaction details and quick rule actions, classifier catalog/custom rules, exports/ignores, WEF/agent collection, topology graph, neighbors, top talkers and node/subnet/switch/time filters.
+- **Identity and JIT MFA:** TOTP or Entra portal requests, optional source-desktop browser prompts, scoped temporary Windows firewall grants, host-local expiry plus server cleanup, optional account-right baselines and audited fallback behavior.
+- **Operations:** administration settings, TLS/agent PKI, branding, notifications, security automation, Internet extension visibility, retention/compaction, reporting and health endpoints.
 
-## Security and operational guidance
+Capabilities depend on the transport, permissions and remote platform. SNMP tables vary by device/MIB. TTL hints are advisory. SSH source-desktop prompting is implemented, while the current agentless **portal grant target still requires WinRM/WinRMS**. See the supported-path table in the JIT MFA guide.
 
-Use a dedicated least-privilege directory account and separate management credentials. Protect the data directory and its backups. Review policy diffs and verification evidence before deployment. Keep LDAP 389 fallback disabled unless the network is trusted. Use short MFA grant lifetimes. Break glass disables host firewall profiles temporarily and always records an audited rollback session. Uploaded private keys are never returned to the interface.
+## Quick start
 
-Firewall event collection depends on host audit policy. Filtering Platform Connection auditing must be enabled for Windows firewall events; high-volume hosts should use process exclusions, traffic ignores, loopback discard, retention, and compaction settings. Browser visibility records navigation metadata only; it does not collect page contents, credentials, cookies, or private browsing activity.
+Use Node.js 24 (matching the Docker image), npm, Python 3/venv and a writable data directory. From a checkout:
+
+```bash
+npm ci
+npm run setup:winrm
+cp .env.example .env
+chmod 600 .env
+# Edit .env: replace JWT/vault placeholders, choose owner credentials,
+# disable the demo admin in production and set your public origin.
+npm run build
+node --env-file=.env api/src/server.js
+```
+
+The application does not automatically load `.env`; the explicit Node option above does. If your service manager already exports the environment, `npm start` builds and starts the app. Default listener: `http://localhost:3000`. Native TLS or a configured HTTPS proxy is required for production browser access; enrolled agents require native mTLS connectivity.
+
+`BOOTSTRAP_EMAIL` / `BOOTSTRAP_PASSWORD` provision an owner on an empty database. **`BOOTSTRAP_ADMIN_*` controls a separate demo account that is reconciled on every restart**, not a one-time owner setup. Set `BOOTSTRAP_ADMIN_ENABLED=false` in production. Read the installation guide before configuring persistent secrets and TLS.
+
+```bash
+curl --fail http://localhost:3000/api/v1/health
+curl --fail http://localhost:3000/api/v1/openapi.json -o openapi.json
+```
+
+For Docker/systemd/Dokploy, full environment reference and backup/recovery procedures, see [Installation](docs/INSTALLATION.md).
+
+## First operator session
+
+1. Sign in with the owner and configure **Server config → Local asset CIDRs** and the public HTTPS URL.
+2. Add vault credentials, test a representative Windows/SSH host, and configure the appropriate discovery source.
+3. Review local assets and management verification. Use SNMP for supported network-device visibility and API credentials for ESXi inventory.
+4. To enrich from DHCP without a scan, export with `scripts/Export-DhcpLeases.ps1`, then use **Discovery → DHCP leases → Preview import → Import eligible leases**.
+5. Review unmanaged triage, group membership, training evidence and proposed policy changes before enforcement.
+6. Inspect Firewall events, Accounts and Mapping; use the same server-side scopes across tables and topology.
+7. Configure Identity segments only after their firewall gates are verified. Test MFA, grant expiry and explicit revocation.
+
+## API quick example
+
+All operator calls use `/api/v1` and a bearer access token. Login returns an access token and rotating refresh token; protect both.
+
+```bash
+BASE='https://winfire.example.com/api/v1'
+# login.json contains your email/password (and totp when enabled); restrict its permissions.
+LOGIN=$(curl --fail-with-body "$BASE/auth/login" \
+  -H 'Content-Type: application/json' --data-binary @login.json)
+TOKEN=$(printf '%s' "$LOGIN" | jq -er '.accessToken')
+curl --fail-with-body --get "$BASE/nodes" -H "Authorization: Bearer $TOKEN" \
+  --data-urlencode 'page=1' --data-urlencode 'pageSize=25' \
+  --data-urlencode 'filter=managed' --data-urlencode 'sort=priority'
+```
+
+See [API examples](docs/API.md) for refresh/logout, mutation payloads, discovery, mapping, DHCP import and MFA calls. Some older routes expose generic OpenAPI schemas; the complete route reference links to their exact handler validation.
+
+## How JIT MFA functions
+
+A segment defines the protected host/group, TCP ports, eligible identities and grant lifetime. The user requests access directly or receives a browser prompt after matching blocked-connection evidence. WinFire verifies TOTP or Entra MFA, validates source/target scope and the enforced policy, then remotely checks that the target's firewall gate is closed and free of conflicting rules.
+
+On success, WinFire installs a temporary allow rule for the actual requesting source IP and selected ports, confirms it, and records the grant and audit evidence. The target schedules local cleanup; the server also sweeps expired grants and supports explicit revocation. The application on the target still performs its normal login. Default prompt failure behavior is closed; an optional constrained fallback is separately configured and audited. Browser launch alone never constitutes MFA approval.
+
+The [JIT MFA guide](docs/JIT_MFA.md) explains prerequisites, Windows target enforcement, Linux/Windows source prompting, TOTP/Entra setup, NAT/proxy implications, LSA baselines, expiry, failure handling and verification.
+
+## Development
+
+```bash
+npm run dev:api      # API watcher; export environment first
+npm run dev:web      # Vite in a second terminal; /api proxies to port 3000
+npm test
+npm run build
+npm run docs:api
+```
+
+The frontend route is `/` for Dashboard, `/inventory` for assets/groups/triage, `/logs` for event/account activity, `/mapping` for topology and connections, `/identity` for access workflows, and `/admin` for configuration. See the [full route map](docs/USAGE.md#interface-route-map).
 
 ## Screenshots and visual references
 
@@ -177,10 +125,10 @@ Firewall event collection depends on host audit policy. Filtering Platform Conne
 ## Enterprise Logon
 ![ScreenShot6](assets/login.png)
 
-## Dynamic Rules Engine Auto-Learns from traffic detected at the firewalls.
+## Dynamic Rules Engine Auto-Learns from traffic detected at the client firewalls.
 ![ScreenShot7](assets/autoRules.png)
 
-## Active Directory Integration for Seciroty and MFA Identity.
+## Active Directory Integration for Security and MFA Identity.
 ![ScreenShot8](assets/adUsers.png)
 
 ## Network Mapping Features to identify who is talking to who as well as top talkers.
@@ -194,3 +142,6 @@ Firewall event collection depends on host audit policy. Filtering Platform Conne
 
 ## Robust Network Discovery Options
 ![ScreenShot12](assets/discovery.png)
+
+## Visual Network Topology Mapping
+![ScreenShot13](assets/networkMap.png)
