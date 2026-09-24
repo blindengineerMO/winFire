@@ -1,0 +1,53 @@
+WINFIRE-TEST-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, Integer32 FROM SNMPv2-SMI
+    DisplayString FROM SNMPv2-TC
+    winfireTest FROM WINFIRE-TEST-SMI;
+winfireTestMib MODULE-IDENTITY
+    LAST-UPDATED "202609240000Z"
+    ORGANIZATION "WinFire test fixtures"
+    CONTACT-INFO "Test fixture"
+    DESCRIPTION "A test-only module. Not used by production devices."
+    ::= { winfireTest 1 }
+modelName OBJECT-TYPE
+    SYNTAX DisplayString
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Device model"
+    ::= { winfireTestMib 1 }
+rebootControl OBJECT-TYPE
+    SYNTAX Integer32
+    MAX-ACCESS read-write
+    STATUS current
+    DESCRIPTION "Read/write in the MIB; collector must only GET."
+    ::= { winfireTestMib 2 }
+portTable OBJECT-TYPE
+    SYNTAX SEQUENCE OF PortEntry
+    MAX-ACCESS not-accessible
+    STATUS current
+    DESCRIPTION "Ports"
+    ::= { winfireTestMib 3 }
+portEntry OBJECT-TYPE
+    SYNTAX PortEntry
+    MAX-ACCESS not-accessible
+    STATUS current
+    DESCRIPTION "Port"
+    INDEX { portIndex }
+    ::= { portTable 1 }
+PortEntry ::= SEQUENCE {
+    portIndex Integer32,
+    portName DisplayString
+}
+portIndex OBJECT-TYPE
+    SYNTAX Integer32
+    MAX-ACCESS not-accessible
+    STATUS current
+    DESCRIPTION "Index"
+    ::= { portEntry 1 }
+portName OBJECT-TYPE
+    SYNTAX DisplayString
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Port name"
+    ::= { portEntry 2 }
+END

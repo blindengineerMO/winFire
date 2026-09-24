@@ -57,6 +57,7 @@ import {mappingRoutes} from './routes/mapping.js'
 import {expandCidrs,runDiscoveryScan,queueDiscoveryScan,publicDiscoverySchedule,runDiscoveryScheduleNow,persistHypervisor,DISCOVERY_MIN_INTERVAL_MINUTES,DISCOVERY_MAX_INTERVAL_MINUTES} from './networkDiscovery.js'
 import {validSnmpHost,normalizeSnmpSecret,ipInCidr} from './snmpDiscovery.js'
 import {snmpTargets,pollSnmpDiscoveryTarget,pollSnmpNode} from './snmpDiscoveryService.js'
+import {listMibs,mibDetails,importMibs,updateMib,deleteMib,nodeMibFacts} from './snmpMibLibrary.js'
 import {passiveDiscoveryRows,passiveDiscoverySummary,processPassiveDiscovery} from './passiveDiscovery.js'
 import {previewDhcpImport,importDhcpLeases,dhcpImportHistory,dhcpImportById} from './dhcpDiscovery.js'
 import {asyncHandler} from './middleware/asyncHandler.js'
@@ -632,6 +633,12 @@ const snmpCidr=value=>{
   const prefix=prefixText===undefined?32:Number(prefixText)
   return isIP(address)===4&&Number.isInteger(prefix)&&prefix>=0&&prefix<=32?`${address}/${prefix}`:null
 }
+api.get('/discovery/snmp-library',requireRole('admin'),(req,res)=>res.json(listMibs(req.query)))
+api.post('/discovery/snmp-library/preview',requireRole('admin'),wrap(async(req,res)=>res.json(await importMibs(req.body,req.user.id,{preview:true}))))
+api.post('/discovery/snmp-library/import',requireRole('admin'),wrap(async(req,res)=>res.status(201).json(await importMibs(req.body,req.user.id))))
+api.get('/discovery/snmp-library/:id',requireRole('admin'),(req,res)=>res.json(mibDetails(reqId(req),req.query)))
+api.patch('/discovery/snmp-library/:id',requireRole('admin'),(req,res)=>res.json(updateMib(reqId(req),req.body,req.user.id)))
+api.delete('/discovery/snmp-library/:id',requireRole('admin'),(req,res)=>{deleteMib(reqId(req),req.user.id);res.status(204).end()})
 api.get('/discovery/snmp-targets',requireRole('admin'),(_req,res)=>res.json(snmpTargets()))
 api.post('/discovery/snmp-targets',requireRole('admin'),(req,res)=>{
   const data=body(z.object({name:z.string().trim().min(1).max(120),host:z.string().trim().min(1).max(253),cidr:z.string().trim().max(32).optional(),credentialId:z.string().min(1),enabled:z.boolean().default(true),pollIntervalMinutes:z.number().int().min(5).max(10080).default(60)}),req)
@@ -1961,6 +1968,7 @@ api.post('/nodes/:id/break-glass/end',requireRole('admin'),wrap(async(req,res)=>
   const result=await endBreakGlass(session,req.user.id)
   res.status(result.queued?202:200).json(result)
 }))
+api.get('/nodes/:id/snmp-mibs',(req,res)=>res.json(nodeMibFacts(reqId(req),req.query)))
 api.get('/nodes/:id/facts',(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');res.json(parse(one('SELECT snapshot_json FROM node_facts WHERE node_id=?',node.id)?.snapshot_json)||{})})
 api.get('/nodes/:id/audit-policy',wrap(async(req,res)=>{const node=getNode(reqId(req));if(!node)return notFound(res,'Node');if(node.connection_mode==='agent')return res.status(409).json({error:'Audit policy inspection requires a WinRM node'});res.json(await remote(node,'audit_policy'))}))
 api.post('/nodes/:id/audit-policy/enable',requireRole('admin'),wrap(async(req,res)=>{

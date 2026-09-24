@@ -58,7 +58,12 @@ test('SNMP tables normalize ARP and forwarding data and scope candidates',async(
   const forwarding=normalizeForwardingTable({'0.17.34.51.68.85':{2:12,3:3}})
   assert.deepEqual(forwarding,[{mac:'00:11:22:33:44:55',port:12,status:3}])
   assert.deepEqual(filterSnmpCandidates([...arp,{ip:'198.51.100.5',mac:'aa:bb:cc:dd:ee:ff'}],'192.0.2.0/24').map(row=>row.ip),['192.0.2.10'])
-  const fakeSession={table(oid,_max,callback){callback(null,oid.endsWith('4.22')?{'2.192.0.2.10':{2:Buffer.from([0,17,34,51,68,85])}}:{'0.17.34.51.68.85':{2:12}})},close(){}}
+  const fakeSession={get(oids,cb){cb(null,[{oid:oids[0],type:4,value:'Test SNMP device'}])},subtree(oid,_max,feed,done){
+    if(oid.endsWith('4.22'))feed([{oid:oid+'.1.2.2.192.0.2.10',type:4,value:Buffer.from([0,17,34,51,68,85])}])
+    if(oid.endsWith('17.4.3'))feed([{oid:oid+'.1.2.0.17.34.51.68.85',type:2,value:12}])
+    done()
+  },close(){}}
+
   const result=await pollSnmpDevice({host:'192.0.2.1',credential:{type:'snmp-v2c',secret:{community:'monitoring'}},sessionFactory:()=>fakeSession})
   assert.equal(result.arp.length,1)
   assert.equal(result.macPorts[0].port,12)

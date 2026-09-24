@@ -1,5 +1,11 @@
 # Operator guide
 
+## Appearance
+
+Enterprise light and Enterprise dark use the same navigation, layouts, tables, and forms. The sun/moon button in the top bar switches the color palette for this browser.
+
+Under **Administration → Security → Appearance**, choose an account theme and save it. **Follow system** tracks the operating system's light/dark setting, including changes while the app is open. **This browser → Use account theme** clears the local override; otherwise the browser choice takes precedence over the saved account theme. Browser overrides synchronize across tabs. Older Hacker/Dark preferences now open Enterprise dark.
+
 ## Start with the inventory boundary
 
 Set **Administration → Server config → Local asset CIDRs** to the networks you own. The monitored-asset list and dashboard use that scope; external peers remain visible as traffic endpoints in events and mapping. Saving no CIDRs leaves the older inventory behavior unrestricted. DHCP import deliberately requires a configured boundary.
@@ -34,6 +40,12 @@ The Assets tab uses API-side search/filter/sort and defaults to 25 rows. Managed
 Edit node chooses the device type, management method and credentials in one place. ESXi uses API credentials; Linux uses SSH; network devices can use SNMP. VM correlation adds **Virtual Machine** beneath the hostname and exposes hypervisor/guest details. Correlation depends on reported guest names/addresses and available inventory evidence; absent guest tools or stale addresses can limit it.
 
 The **Unmanaged assets** tab is a local inventory triage queue after a configurable grace period. Search/filter the queue, flag a record, exclude it from triage, restore it, or assign credentials and retry. Bulk triage acts on the selected IDs and returns per-node results; partial failures remain visible. Excluding a triage record does not mean its traffic should disappear from visibility.
+
+## SNMP MIB library
+
+Open **Administration → Discovery → SNMP → MIB library**. Built-in profiles collect additional interface, hardware, host-resource, routing, neighbor, TCP, VLAN-forwarding and LLDP evidence. Import one or more vendor ASN.1 MIBs with their dependencies, preview, then import. Use **Details / Configure** to select readable objects and set sysObjectID prefixes or sysDescr phrases; use switches to disable a source or object.
+
+Each successful identity poll matches enabled profiles and persists links to the node. Later polls recognize those links, recheck identity, and discover newly imported matching sources. The node's details show **SNMP library and collected data**, match evidence, collection status and searchable paginated values. Unsupported MIBs do not make a successfully authenticated device unreachable. [Full workflow, supported MIBs and API examples](SNMP_LIBRARY.md).
 
 ## Static and dynamic node groups
 

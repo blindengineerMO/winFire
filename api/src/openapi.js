@@ -22,6 +22,9 @@ const errorResponse={description:'Error response',content:{'application/json':{s
 // complete API, while these explicit schemas prevent management calls from
 // being published as unbounded JSON objects.
 const requestSchemas={
+  'POST /discovery/snmp-library/preview':'SnmpMibImportRequest',
+  'POST /discovery/snmp-library/import':'SnmpMibImportRequest',
+  'PATCH /discovery/snmp-library/{id}':'SnmpMibUpdateRequest',
   'POST /discovery/dhcp/preview':'DhcpImportRequest',
   'POST /discovery/dhcp/import':'DhcpImportRequest',
   'POST /auth/logout':'LogoutRequest',
@@ -99,6 +102,16 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
         }
         const permissions=layer.route.stack.map(entry=>entry.handle.requiredPermission).filter(Boolean)
         if(permissions.length)operation['x-required-permissions']=[...new Set(permissions)]
+        if(path.startsWith('/discovery/snmp-library')||path==='/nodes/{id}/snmp-mibs'){
+          operation.description=path.endsWith('/preview')?'Validate one or more ASN.1 MIBs and their dependencies without saving.':path.endsWith('/import')?'Atomically import validated MIBs. Replacement requires replace=true; selected readable objects are collected on matching devices at the next SNMP poll.':path==='/nodes/{id}/snmp-mibs'?'Read the last retained SNMP collection, including library matches, unsupported objects and bounded values. No device polling is triggered.':'Manage built-in collection profiles and imported MIB sources. Administrative library changes are audited.'
+          if(routeKey==='POST /discovery/snmp-library/import')operation.responses={201:jsonResponse,default:errorResponse}
+          if(method==='get'){
+            const fields={search:{type:'string',maxLength:200},page:{type:'integer',minimum:1,default:1},limit:{type:'integer',minimum:1,maximum:100,default:25}}
+            if(path==='/discovery/snmp-library')Object.assign(fields,{source:{type:'string',enum:['all','builtin','imported'],default:'all'},sort:{type:'string',enum:['name','source','updated'],default:'name'},direction:{type:'string',enum:['asc','desc'],default:'asc'}})
+            if(path==='/nodes/{id}/snmp-mibs')fields.moduleId={type:'string'}
+            operation.parameters.push(...Object.entries(fields).map(([name,schema])=>({name,in:'query',schema})))
+          }
+        }
         if(path.startsWith('/discovery/dhcp/')){
           operation.description=path.endsWith('/preview')?'Read-only DHCP enrichment preview; requires configured local CIDRs.':path.endsWith('/import')?'Passively import eligible local leases; preserve verified state and report conflicts. Exact replays return the original report.':'Read retained DHCP import evidence and row outcomes.'
           if(routeKey==='POST /discovery/dhcp/import')operation.responses={201:jsonResponse,default:errorResponse}
@@ -164,6 +177,8 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
       AgentEvent:{type:'object',required:['recordId','id','timeCreated'],properties:{recordId:{type:'integer',minimum:1},id:{type:'integer',minimum:1},timeCreated:{type:'string',format:'date-time'},fields:{type:'object',additionalProperties:{type:'string'}}}},
       AgentJobResultRequest:{type:'object',required:['leaseToken','success'],properties:{leaseToken:{type:'string',minLength:20},success:{type:'boolean'},diff:{},result:{},error:{type:'string',maxLength:2000}}},
       AgentNetworkRequest:{type:'object',properties:{flows:{type:'array',maxItems:2000,items:{type:'object'}},arp:{type:'array',maxItems:5000,items:{type:'object'}}}},
+      SnmpMibImportRequest:{type:'object',required:['files'],properties:{replace:{type:'boolean',default:false},files:{type:'array',minItems:1,maxItems:20,description:'Plain text ASN.1 MIBs, at most 1.5 MB combined. Include imported dependencies.',items:{type:'object',required:['filename','content'],properties:{filename:{type:'string',minLength:1,maxLength:200},content:{type:'string',minLength:1,maxLength:1048576}}}}}},
+      SnmpMibUpdateRequest:{type:'object',additionalProperties:false,properties:{enabled:{type:'boolean'},match:{type:'object',properties:{sysObjectIdPrefixes:{type:'array',maxItems:32,items:{type:'string',maxLength:512}},sysDescrContains:{type:'array',maxItems:32,items:{type:'string',minLength:2,maxLength:120}}}},selectedObjects:{type:'array',maxItems:64,items:{type:'string',maxLength:128},description:'Readable object names from this module. Empty disables its object collection.'}}},
       DhcpImportRequest:{type:'object',required:['source','observedAt','leases'],additionalProperties:false,properties:{source:{type:'string',minLength:1,maxLength:253},observedAt:{type:'string',format:'date-time'},leases:{type:'array',minItems:1,maxItems:2000,items:{$ref:'#/components/schemas/DhcpLease'}}}},
       DhcpLease:{type:'object',required:['ip','mac','leaseExpiry'],additionalProperties:false,properties:{ip:{type:'string',format:'ipv4'},mac:{type:'string',maxLength:100,description:'Ethernet MAC or Windows Ethernet client ID (optional 01 prefix)'},hostname:{type:'string',maxLength:253,default:''},leaseExpiry:{type:'string',format:'date-time'},state:{type:'string',maxLength:40,default:'Active'}}},
       DiscoveryScanRequest:{type:'object',required:['cidrs'],properties:{cidrs:{type:'array',minItems:1,maxItems:32,items:{type:'string',maxLength:64}}}},

@@ -1,5 +1,7 @@
 import snmp from 'net-snmp'
 import {isIP} from 'node:net'
+import {collectionPlan} from './snmpMibLibrary.js'
+import {boundedWalk,walkTable,collectMibPlan,collectionObject,collectionTable,normalizedHardware} from './snmpMibCollector.js'
 
 const ARP_TABLE_OID='1.3.6.1.2.1.4.22'
 const FDB_TABLE_OID='1.3.6.1.2.1.17.4.3'
@@ -53,13 +55,7 @@ function valueToMac(value){
   if(Buffer.isBuffer(value))return [...value].map(byte=>byte.toString(16).padStart(2,'0')).join(':')
   if(value instanceof Uint8Array)return [...value].map(byte=>byte.toString(16).padStart(2,'0')).join(':')
   const text=clean(value)
-  return text||null
-}
-function tableRequest(session,oid,maxRepetitions=MAX_REPETITIONS){
-  return new Promise((resolve,reject)=>session.table(oid,maxRepetitions,(error,table)=>error?reject(error):resolve(table||{})))
-}
-function scalarRequest(session,oid){
-  return new Promise((resolve,reject)=>{if(typeof session.get!=='function')return resolve(null);session.get([oid],(error,varbinds)=>error?reject(error):resolve(varbinds?.[0]?.value??null))})
+  return /^[a-f0-9]{12}$/i.test(text)?text.match(/../g).join(':').toLowerCase():text||null
 }
 const scalarText=value=>Buffer.isBuffer(value)?value.toString('utf8'):String(value??'').trim()
 const boundedIdentity=value=>clean(value).slice(0,256)||null
@@ -85,7 +81,7 @@ export function classifySnmpIdentity(identity={}, {includeEvidence=false}={}){
   const text=`${identity.sysDescr||''} ${identity.sysName||''} ${identity.sysObjectId||''}`.toLowerCase(),oid=String(identity.sysObjectId||'')
   const match=(pattern,markers=[])=>{
     if(pattern.test(text))return {method:'sysDescr',pattern:pattern.source}
-    const marker=markers.find(prefix=>oid.includes(prefix))
+    const marker=markers.find(prefix=>{const root='1.3.6.1.4.1'+prefix.replace(/\.$/,'');const normalized=oid.replace(/^\./,'');return normalized===root||normalized.startsWith(root+'.')})
     return marker?{method:'sysObjectID',marker}:null
   }
   const result=(vendor,deviceType,manageability,hypervisor,hit,confidence)=>{
@@ -95,7 +91,7 @@ export function classifySnmpIdentity(identity={}, {includeEvidence=false}={}){
   let hit
   if((hit=match(/vmware|esxi/,['.6876.'])))return result('VMware ESXi','hypervisor','unmanaged','VMware ESXi',hit,'high')
   if((hit=match(/proxmox|pve-manager/,[])))return result('Proxmox VE','hypervisor','unmanaged','Proxmox VE',hit,'high')
-  if((hit=match(/xenserver|xcp-ng|citrix hypervisor/,['.6876.'])))return result('Citrix Hypervisor / XenServer','hypervisor','unmanaged','XenServer',hit,'high')
+  if((hit=match(/xenserver|xcp-ng|citrix hypervisor/,[])))return result('Citrix Hypervisor / XenServer','hypervisor','unmanaged','XenServer',hit,'high')
   if((hit=match(/azure local|azure stack hci|azurestack/,[])))return result('Azure Local','hypervisor','unmanaged','Azure Local',hit,'high')
   if((hit=match(/cisco ios|cisco nexus|cisco catalyst|cisco/,['.9.'])))return result('Cisco IOS/NX-OS','switch','snmp',null,hit)
   if((hit=match(/juniper|junos/,['.2636.'])))return result('Juniper Junos','router','snmp',null,hit)
@@ -149,23 +145,46 @@ export function normalizeForwardingTable(table){
 }
 export function createSnmpSession(host,credential,{timeoutMs=2500,retries=1,port=161}={}){
   const secret=normalizeSnmpSecret(credential.type,credential.secret||credential)
-  const options={port,timeout:timeoutMs,retries,transport:'udp4'}
+  const options={port,timeout:timeoutMs,retries,transport:isIP(host)===6?'udp6':'udp4'}
   if(credential.type==='snmp-v3'){
     return snmp.createV3Session(host,{name:secret.username,level:snmp.SecurityLevel[secret.securityLevel],authProtocol:snmp.AuthProtocols[secret.authProtocol],authKey:secret.authKey,privProtocol:snmp.PrivProtocols[secret.privProtocol],privKey:secret.privKey},options)
   }
   return snmp.createSession(host,secret.community,{...options,version:snmp.Version2c})
 }
-export async function pollSnmpDevice({host,credential,sessionFactory=createSnmpSession,maxRepetitions=MAX_REPETITIONS}={}){
+export async function pollSnmpDevice({host,credential,nodeId=null,sessionFactory=createSnmpSession,maxRepetitions=MAX_REPETITIONS}={}){
   const target=validSnmpHost(host);if(!target)throw new Error('SNMP target host is invalid')
   if(!credential||!['snmp-v2c','snmp-v3'].includes(credential.type))throw new Error('An SNMP v2c or v3 credential is required')
   const session=sessionFactory(target,credential)
   try{
-    const optionalTable=oid=>tableRequest(session,oid,maxRepetitions).catch(()=>({}))
-    const [arpTable,forwardingTable,routeTable,tcpTable,pfStateTable]=await Promise.all([tableRequest(session,ARP_TABLE_OID,maxRepetitions),tableRequest(session,FDB_TABLE_OID,maxRepetitions),optionalTable(SNMP_TABLE_OIDS.route),optionalTable(SNMP_TABLE_OIDS.tcp),optionalTable(SNMP_TABLE_OIDS.pfState)])
-    const identity={}
-    for(const [name,oid] of Object.entries(SNMP_IDENTITY_OIDS)){try{identity[name]=scalarText(await scalarRequest(session,oid))||null}catch{identity[name]=null}}
-    const classification=classifySnmpIdentity(identity,{includeEvidence:true})
-    return {host:target,arp:normalizeArpTable(arpTable),macPorts:normalizeForwardingTable(forwardingTable),routes:routeTable,tcpStates:tcpTable,pfStates:pfStateTable,firewallStates:pfStateTable,identity,classification}
+    // Verification comes from a valid identity response, not optional ARP/FDB support.
+    const identity={};let lastError
+    for(const [name,oid] of Object.entries(SNMP_IDENTITY_OIDS)){
+      try{identity[name]=await new Promise((resolve,reject)=>session.get([oid],(error,values)=>{
+        if(error)return reject(error)
+        const vb=values?.[0];resolve(vb&&!snmp.isVarbindError(vb)?scalarText(vb.value)||null:null)
+      }))}catch(error){lastError=error;identity[name]=null}
+      if(name==='sysObjectId'&&!identity.sysDescr&&!identity.sysObjectId)throw lastError||new Error('SNMP identity is unavailable: check credentials and the system MIB view')
+    }
+    const classification=classifySnmpIdentity(identity,{includeEvidence:true}),diagnostics={}
+    const readTable=async(name,oid)=>{
+      const result=await boundedWalk(session,oid,{maxRepetitions})
+      diagnostics[name]={status:result.status,truncated:result.truncated,error:result.error}
+      return walkTable(result,oid)
+    }
+    const [arpTable,forwardingTable,routeTable,tcpTable]=await Promise.all([readTable('arp',ARP_TABLE_OID),readTable('bridge',FDB_TABLE_OID),readTable('route',SNMP_TABLE_OIDS.route),readTable('tcp',SNMP_TABLE_OIDS.tcp)])
+    const mibCollection=await collectMibPlan(session,collectionPlan(identity,{nodeId,host:target}))
+    const arp=normalizeArpTable(arpTable),seen=new Set(arp.map(r=>r.ip+'|'+r.mac))
+    for(const [index,c] of Object.entries(collectionTable(mibCollection,'ipNetToPhysicalTable'))){
+      // InetAddressType 1 is IPv4; IPv6 observations remain available as raw MIB facts.
+      const parts=index.split('.').map(Number),ip=c[2]===1?indexIp(index):parts[1]===1&&parts[2]===4?indexIp(index):null,mac=valueToMac(c[4])
+      if(ip&&mac&&mac!=='00:00:00:00:00:00'&&!seen.has(ip+'|'+mac)){arp.push({ip,mac,interface:String(c[1]??parts[0]),state:String(c[6]??''),source:'snmp'});seen.add(ip+'|'+mac)}
+    }
+    const macPorts=normalizeForwardingTable(forwardingTable)
+    for(const [index,c] of Object.entries(collectionTable(mibCollection,'dot1qTpFdbTable'))){
+      const mac=indexMac(index),port=Number(c[2]);if(mac&&Number.isInteger(port)&&port>=0)macPorts.push({mac,port,status:c[3]??null,vlanFdbId:Number(index.split('.')[0])})
+    }
+    const pf=Object.fromEntries((collectionObject(mibCollection,'pfStatistics')?.values||[]).map(v=>[v.oid,v.value]))
+    return {host:target,arp:arp.slice(0,MAX_ARP_ROWS),macPorts:macPorts.slice(0,MAX_ARP_ROWS),routes:routeTable,tcpStates:tcpTable,pfStates:pf,firewallStates:pf,identity,classification,mibCollection,hardware:normalizedHardware(mibCollection),interfaces:collectionTable(mibCollection,'ifTable'),interfaceDetails:collectionTable(mibCollection,'ifXTable'),lldp:collectionTable(mibCollection,'lldpRemTable'),collectionDiagnostics:diagnostics}
   }finally{try{session.close()}catch{}}
 }
 

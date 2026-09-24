@@ -12,6 +12,7 @@ WinFire Secure is an API-first control plane for host inventory, firewall visibi
 | [Operator guide](docs/USAGE.md) | Discovery, inventory, triage, groups, policy learning, events, mapping, administration and every interface route. |
 | [API usage and curl examples](docs/API.md) | Authentication, inventory queries, credentials, discovery, DHCP, groups, events, topology and JIT access. |
 | [Complete API route reference](docs/API_ROUTES.md) | Every registered API operation, authentication/permission gates, source handler links and published request schemas. |
+| [SNMP MIB library](docs/SNMP_LIBRARY.md) | Built-in coverage, multi-file imports, matching, device links, collected facts, limits and curl examples. |
 | [DHCP lease import](docs/DHCP_IMPORT.md) | Windows export script, preview/import, MAC/IP correlation, retained evidence, conflict handling and API contract. |
 | [JIT MFA: how it works](docs/JIT_MFA.md) | Setup, supported platforms, prompting, identity checks, firewall gates, temporary grants, expiry, fallback and verification. |
 | [Enterprise Internet deployment](docs/INTERNET_ENTERPRISE_DEPLOYMENT.md) | Browser extension deployment and URL telemetry/policy. |
@@ -21,7 +22,7 @@ Live OpenAPI: **`GET /api/v1/openapi.json`**. Regenerate the route reference wit
 ## Feature summary
 
 - **Inventory and correlation:** local-CIDR inventory boundary, server-side search/filter/sort/pagination, managed-first ordering, MAC correlation, TTL family hints, authenticated OS/hardware facts, hypervisor identity, ESXi VM inventory/correlation, and retained device-classification evidence. External peers remain in events and mapping.
-- **Discovery:** CIDR scans with ICMP/ARP/TCP fallback; recurring scans with new/dark/changed diffs; Windows directory sync; SNMP identity/ARP/routes/TCP/forwarding tables; Linux SSH defaults; passive ARP candidates; optional Windows DHCP lease import with preview and conflict reports.
+- **Discovery:** CIDR scans with ICMP/ARP/TCP fallback; recurring scans with new/dark/changed diffs; Windows directory sync; SNMP identity/ARP/routes/TCP/forwarding tables, hardware/interface/LLDP coverage, and an importable MIB library with automatic device matching; Linux SSH defaults; passive ARP candidates; optional Windows DHCP lease import with preview and conflict reports.
 - **Management:** Windows agentless transports, Linux SSH facts and supported firewall actions, SNMP visibility, VMware ESXi API inventory, and optional enrolled agents. Unknown/discovery-only assets remain unmanaged until independent management verification succeeds.
 - **Triage and groups:** unmanaged/rogue asset queue, bulk credential retry/flag/exclude/restore, static groups and server-evaluated dynamic membership rules.
 - **Vault and access:** encrypted write-only credentials, resource grants, credential preflight and rotation-failure notices, owner/admin/editor/auditor permissions, custom roles, teams, invitations, TOTP and audit history.

@@ -4,6 +4,8 @@ import {registerHost} from './networkDiscovery.js'
 import {classifySnmpIdentity,filterSnmpCandidates,pollSnmpDevice} from './snmpDiscovery.js'
 import {recordCredentialAuthSuccess,recordCredentialAuthFailure} from './credentialHealth.js'
 
+import {persistMibBindings} from './snmpMibLibrary.js'
+
 const MAX_REGISTER=512
 export function publicSnmpTarget(row){
   let result={}
@@ -52,9 +54,10 @@ export function ensureSnmpNode(target,device,stamp){
   }
   const previousFacts=existing?one('SELECT snapshot_json FROM node_facts WHERE node_id=?',nodeId):null
   let previous={};try{previous=previousFacts?.snapshot_json?JSON.parse(previousFacts.snapshot_json)||{}:{}}catch{}
-  const snapshot={...previous,source:esxiNode?(previous.source||'esxi-soap'):'snmp',identity:{...(previous.identity||{}),...identity},classification:{...(previous.classification||{}),...classification},arp:device.arp||[],macPorts:device.macPorts||[],routes:device.routes||{},tcpStates:device.tcpStates||{},pfStates:device.pfStates||device.firewallStates||{},firewallStates:device.firewallStates||device.pfStates||{},collectedAt:stamp}
+  const snapshot={...previous,...(device.mibCollection?{mibCollection:device.mibCollection,hardware:device.hardware||[],interfaces:device.interfaces||{},interfaceDetails:device.interfaceDetails||{},lldp:device.lldp||{},collectionDiagnostics:device.collectionDiagnostics||{}}:{}),source:esxiNode?(previous.source||'esxi-soap'):'snmp',identity:{...(previous.identity||{}),...identity},classification:{...(previous.classification||{}),...classification},arp:device.arp||[],macPorts:device.macPorts||[],routes:device.routes||{},tcpStates:device.tcpStates||{},pfStates:device.pfStates||device.firewallStates||{},firewallStates:device.firewallStates||device.pfStates||{},collectedAt:stamp}
   run("INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET snapshot_json=excluded.snapshot_json,collected_at=excluded.collected_at",nodeId,json(snapshot),stamp)
   run("INSERT INTO network_table_snapshots(node_id,arp_json,state_json,source,collected_at,identity_json,routes_json,tcp_states_json) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET arp_json=excluded.arp_json,state_json=excluded.state_json,source=excluded.source,collected_at=excluded.collected_at,identity_json=excluded.identity_json,routes_json=excluded.routes_json,tcp_states_json=excluded.tcp_states_json",nodeId,json(device.arp||[]),json({macPorts:device.macPorts||[],pfStates:device.pfStates||device.firewallStates||{},firewallStates:device.firewallStates||device.pfStates||{}}),'snmp',stamp,json(identity),json(device.routes||{}),json(device.tcpStates||{}))
+  persistMibBindings(nodeId,device.mibCollection,stamp)
   return nodeId
 }
 /** Poll one already-inventoried node with its assigned SNMP credential.
@@ -66,7 +69,7 @@ export async function pollSnmpNode(node,{credential,credentialId=null,actorId=nu
   if(!credential?.type)throw new Error('An SNMP credential is required')
   const host=node.ip||node.fqdn||node.hostname
   let device
-  try{device=await devicePoll({host,credential})}catch(error){recordCredentialAuthFailure({credentialId,nodeId:node.id,error,transport:'snmp',operation:'poll'});throw error}
+  try{device=await devicePoll({host,credential,nodeId:node.id})}catch(error){recordCredentialAuthFailure({credentialId,nodeId:node.id,error,transport:'snmp',operation:'poll'});throw error}
   recordCredentialAuthSuccess({credentialId,nodeId:node.id,transport:'snmp'})
   const finished=now()
   const nodeId=ensureSnmpNode({id:node.id,host,source:`snmp:node:${node.id}`},device,finished)

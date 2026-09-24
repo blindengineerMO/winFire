@@ -2,6 +2,8 @@
 import {computed,onMounted,ref} from 'vue'
 import {api} from '../services/api.js'
 import ConfirmDialog from './ConfirmDialog.vue'
+import SnmpMibLibrary from './SnmpMibLibrary.vue'
+const tab=ref('targets')
 const props=defineProps({credentials:{type:Array,default:()=>[]}})
 const targets=ref([]),busy=ref(false),error=ref(''),message=ref(''),confirmOpen=ref(false),removeTarget=ref(null)
 const form=ref({name:'',host:'',cidr:'',credentialId:'',pollIntervalMinutes:60,enabled:true})
@@ -14,7 +16,9 @@ async function remove(){const target=removeTarget.value;confirmOpen.value=false;
 onMounted(async()=>{await load();form.value.credentialId=snmpCredentials.value[0]?.id||''})
 </script>
 <template>
-  <section class="snmp-settings">
+  <nav class="admin-subtabs" role="tablist" aria-label="SNMP sections"><button type="button" role="tab" :aria-selected="tab==='targets'" :class="{active:tab==='targets'}" @click="tab='targets'">Polling targets</button><button type="button" role="tab" :aria-selected="tab==='library'" :class="{active:tab==='library'}" @click="tab='library'">MIB library</button></nav>
+  <SnmpMibLibrary v-if="tab==='library'" />
+  <section v-else class="snmp-settings">
     <div class="panel-title"><div><span class="eyebrow">NETWORK DISCOVERY</span><h2>SNMP switch and router polling</h2></div><span class="count-chip">{{targets.length}} targets</span></div>
     <p class="muted">Use a read-only SNMP v2c community or SNMP v3 account to collect switch/router ARP caches and forwarding tables. ARP IPs inside the optional CIDR are registered as discovery candidates and follow the normal DNS and management verification flow.</p>
     <details class="snmp-oid-reference"><summary>Supported identity and vendor OIDs</summary><p><code>sysDescr .1.3.6.1.2.1.1.1.0</code> · <code>sysObjectID .1.3.6.1.2.1.1.2.0</code> · <code>sysName .1.3.6.1.2.1.1.5.0</code> · ARP <code>.1.3.6.1.2.1.4.22</code> · bridge forwarding <code>.1.3.6.1.2.1.17.4.3</code></p><p class="hint">Vendor fingerprints cover Cisco (.9), pfSense/FreeBSD, SonicWall (.8741), Citrix NetScaler (.5951), VMware (.6876), MikroTik (.14988), and Proxmox/Linux. Identity, ARP, forwarding, and hardware facts are retained with the node.</p></details>

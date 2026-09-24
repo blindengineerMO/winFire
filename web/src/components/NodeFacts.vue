@@ -1,5 +1,6 @@
 <script setup>
 import {computed} from 'vue'
+import NodeSnmpFacts from './NodeSnmpFacts.vue'
 
 const props=defineProps({node:{type:Object,required:true},rulePage:{type:Object,default:null},rulesLoading:{type:Boolean,default:false},rulesError:{type:String,default:''}})
 const emit=defineEmits(['rulesPage'])
@@ -33,6 +34,7 @@ const time=item=>item&&!Number.isNaN(new Date(item).getTime())?new Date(item).to
         </div>
         <p class="muted">A DHCP lease is passive identity evidence. Reachability, OS, credentials and firewall state require independent verification.</p>
       </section>
+      <NodeSnmpFacts v-if="facts.mibCollection" :node-id="node.id" :collected-at="facts.collectedAt" />
       <section class="node-facts-section">
         <h3>Identity and domain</h3>
         <div class="node-facts-grid">
