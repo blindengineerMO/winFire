@@ -42,6 +42,7 @@ import {createMfaChallenge,markVerifiedAdChallenge,resolveMfaChallenge} from './
 import {beginAdAuthenticatorEnrollment,confirmAdAuthenticatorEnrollment} from './adAuthenticatorEnrollment.js'
 import {validateExportDestination,exportSelectedEvents} from './eventExport.js'
 import {previewSecurityAutomation} from './securityAutomations.js'
+import {activeCredentialStaleNotices,credentialHealthConfig} from './credentialHealth.js'
 import {collectAccountInventory,accountName} from './localAccounts.js'
 import {normalizeProcessExclusions,refreshProcessExclusions,isExcludedFirewallEvent,visibleFirewallEventSql} from './processExclusions.js'
 import {normalizeTrafficIgnore,trafficIgnoreFingerprint,trafficIgnoreFromEvent,refreshTrafficIgnores,publicTrafficIgnore,isIgnoredFirewallEvent,trafficIgnoreMatchSql} from './trafficIgnores.js'
@@ -1463,6 +1464,11 @@ api.post('/directory/users/:id/import-operator',requireRole('admin'),wrap(async(
 }))
 
 const visibleCredentials=user=>(user.role==='owner'||user.role==='admin' ? all('SELECT id,name,type,username,owner_user_id,visibility,team_id,priority,created_at FROM credentials ORDER BY priority,name') : all(`SELECT id,name,type,username,owner_user_id,visibility,team_id,priority,created_at FROM credentials WHERE owner_user_id=? OR (visibility='team' AND team_id=?) OR EXISTS (SELECT 1 FROM resource_grants g WHERE g.resource_type='credential' AND g.resource_id=credentials.id AND g.grantee_user_id=?) ORDER BY priority,name`,user.id,user.team_id,user.id)).map(credential=>({...credential,canWrite:canWriteResource(user,'credential',credential)}))
+api.get('/credentials/health',requireRole('editor'),(req,res)=>{
+  const visibleIds=new Set(visibleCredentials(req.user).map(credential=>credential.id))
+  const notices=activeCredentialStaleNotices().filter(notice=>visibleIds.has(notice.credentialId))
+  res.json({notices,...credentialHealthConfig()})
+})
 api.get('/credentials',(req,res)=>res.json(visibleCredentials(req.user)))
 const credentialInputSchema=z.object({name:z.string().trim().min(1).max(120),type:z.enum(['local','domain','esxi','ssh','snmp-v2c','snmp-v3']),username:z.string().trim().max(255).default(''),password:z.string().max(4096).optional(),privateKey:z.string().max(32768).optional(),passphrase:z.string().max(4096).optional(),hostKeyFingerprint:z.string().trim().max(255).optional(),port:z.number().int().min(1).max(65535).optional(),community:z.string().max(255).optional(),securityLevel:z.enum(['noAuthNoPriv','authNoPriv','authPriv']).optional(),authProtocol:z.enum(['md5','sha','sha224','sha256','sha384','sha512']).optional(),authKey:z.string().max(4096).optional(),privProtocol:z.enum(['des','aes','aes256b','aes256r']).optional(),privKey:z.string().max(4096).optional(),visibility:z.enum(['private','team']).default('private'),teamId:z.string().optional(),priority:z.number().int().min(-100000).max(100000).default(100)}).superRefine((value,ctx)=>{
   if(['local','domain','esxi'].includes(value.type)&&(!value.username||!value.password))ctx.addIssue({code:'custom',path:['password'],message:'Username and password are required for this credential'})
@@ -1646,6 +1652,55 @@ api.patch('/nodes/:id/triage',requireRole('editor'),(req,res)=>{
   audit(req.user.id,'node.triage.update','node',node.id,before,{status:data.status,note})
   res.json(publicNode(getNode(node.id)))
 })
+api.post('/nodes/triage/bulk',requireRole('editor'),wrap(async(req,res)=>{
+  const data=body(z.object({
+    nodeIds:z.array(z.string().min(1).max(200)).min(1).max(200),
+    action:z.enum(['assign_and_retry','flagged','excluded','none']),
+    credentialId:z.string().min(1).max(200).optional(),
+    note:z.string().trim().max(500).nullable().optional()
+  }),req)
+  const nodeIds=[...new Set(data.nodeIds)]
+  if(data.action==='assign_and_retry'&&!data.credentialId)return res.status(400).json({error:'A credential is required for assign and retry'})
+  const credential=data.credentialId?one('SELECT * FROM credentials WHERE id=?',data.credentialId):null
+  if(data.credentialId&&!credential)return notFound(res,'Credential')
+  if(credential&&!canUseCredential(req.user,credential))return res.status(403).json({error:'Credential unavailable'})
+  const cutoff=triageCutoff()
+  const nodes=nodeIds.map(nodeId=>getNode(nodeId))
+  const missing=nodeIds.filter((_nodeId,index)=>!nodes[index])
+  if(missing.length)return res.status(404).json({error:`Node not found: ${missing.join(', ')}`})
+  const inQueue=nodes.filter(node=>unmanagedTriageEligible(node,cutoff))
+  if(inQueue.length!==nodes.length)return res.status(409).json({error:'One or more selected nodes are no longer eligible for the unmanaged triage queue'})
+  const nextStatus=data.action==='flagged'?'flagged':data.action==='excluded'?'excluded':'none'
+  db.transaction(()=>{
+    for(const node of nodes){
+      const before={status:node.triage_status||'none',note:node.triage_note||null,credentialIds:all('SELECT credential_id FROM credential_assignments WHERE node_id=?',node.id).map(row=>row.credential_id)}
+      const note=data.action==='assign_and_retry'?null:data.note===undefined?node.triage_note:data.note||null
+      if(credential)run('INSERT OR IGNORE INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,NULL)',credential.id,node.id)
+      run('UPDATE nodes SET triage_status=?,triage_note=?,triage_updated_at=?,triage_updated_by=? WHERE id=?',nextStatus,note,now(),req.user.id,node.id)
+      audit(req.user.id,'node.triage.bulk.update','node',node.id,before,{action:data.action,status:nextStatus,credentialId:credential?.id||null,note})
+    }
+  })()
+  const results=[]
+  if(data.action==='assign_and_retry'){
+    for(const node of nodes){
+      const current=getNode(node.id)
+      try{
+        const probe=await probeNode(current)
+        let factsCollected=false
+        if(['winrm-authenticated','winrms-authenticated','wmi-authenticated','netsh-authenticated','ssh-authenticated'].includes(probe.probeStatus)){
+          try{await collectFacts(getNode(node.id));factsCollected=true}catch(error){results.push({id:node.id,hostname:node.hostname,success:false,probe,factsCollected,error:`Probe succeeded but facts collection failed: ${String(error.message||error).slice(0,300)}`});continue}
+        }
+        results.push({id:node.id,hostname:node.hostname,success:probe.status==='reachable',probe,factsCollected})
+      }catch(error){
+        results.push({id:node.id,hostname:node.hostname,success:false,error:String(error.message||error).slice(0,500),onboardingError:error.onboardingError||null})
+      }
+    }
+  }else{
+    for(const node of nodes)results.push({id:node.id,hostname:node.hostname,success:true,status:nextStatus})
+  }
+  audit(req.user.id,'node.triage.bulk.complete','nodes',nodeIds.join(','),null,{action:data.action,credentialId:credential?.id||null,requested:nodeIds.length,succeeded:results.filter(result=>result.success).length})
+  res.json({action:data.action,credentialId:credential?.id||null,requested:nodeIds.length,results,items:nodeIds.map(nodeId=>publicNode(getNode(nodeId)))})
+}))
 api.put('/nodes/:id/credentials',requireRole('editor'),wrap(async(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
   const data=body(z.object({credentialIds:z.array(z.string()).max(20)}),req)
@@ -1660,7 +1715,7 @@ api.put('/nodes/:id/credentials',requireRole('editor'),wrap(async(req,res)=>{
   let snmpPoll=null
   const snmpCredential=credentials.find(credential=>['snmp-v2c','snmp-v3'].includes(credential.type))
   if(snmpCredential){
-    try{snmpPoll=await pollSnmpNode(getNode(node.id),{credential:openedCredential(snmpCredential),actorId:req.user.id})}
+    try{snmpPoll=await pollSnmpNode(getNode(node.id),{credential:openedCredential(snmpCredential),credentialId:snmpCredential.id,actorId:req.user.id})}
     catch(error){audit(req.user.id,'snmp-node.poll.failed','node',node.id,null,{error:String(error.message||error).slice(0,500)})}
   }
   res.json({credentialIds:data.credentialIds,snmpPoll})
@@ -1692,7 +1747,7 @@ api.post('/nodes/:id/probe',requireRole('editor'),wrap(async(req,res)=>{
   const snmpCredential=assignedSnmpCredential(node.id,req.user)
   if(snmpCredential&&node.device_type!=='esxi'){
     try{
-      const result=await pollSnmpNode(node,{credential:openedCredential(snmpCredential),actorId:req.user.id})
+      const result=await pollSnmpNode(node,{credential:openedCredential(snmpCredential),credentialId:snmpCredential.id,actorId:req.user.id})
       const refreshed=getNode(node.id)
       // SNMP fingerprints ESXi reliably, but the SOAP inventory still needs
       // the separate ESXi vault credential. Run it after the SNMP facts pass
@@ -1940,7 +1995,7 @@ api.post('/nodes/:id/facts/refresh',requireRole('editor'),wrap(async(req,res)=>{
   }
   const snmpCredential=assignedSnmpCredential(node.id,req.user)
   if(snmpCredential){
-    const result=await pollSnmpNode(node,{credential:openedCredential(snmpCredential),actorId:req.user.id})
+    const result=await pollSnmpNode(node,{credential:openedCredential(snmpCredential),credentialId:snmpCredential.id,actorId:req.user.id})
     return res.json({...result,source:'snmp'})
   }
   const facts=await collectFacts(node);audit(req.user.id,'node.facts.refresh','node',node.id,null,facts);res.json(facts)

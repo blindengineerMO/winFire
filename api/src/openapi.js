@@ -61,6 +61,7 @@ const requestSchemas={
   'POST /segments/{id}/lsa-baselines':'LsaBaselineRequest',
   'POST /logon-rights/baseline':'LogsPullRequest',
   'POST /discovery/scans':'DiscoveryScanRequest',
+  'POST /nodes/triage/bulk':'TriageBulkRequest',
   'POST /settings/classifier/rules':'ClassifierRuleRequest',
   'PATCH /settings/classifier/rules/{id}':'ClassifierRuleRequest',
   'POST /settings/classifier/process-rules':'ClassifierProcessRuleRequest',
@@ -68,6 +69,7 @@ const requestSchemas={
 }
 
 const responseSchemas={
+  'GET /credentials/health':'CredentialHealthResponse',
   'POST /segments/{id}/entra-group/sync':'EntraGroupSyncResponse',
   'GET /segments/{id}/entra-group/members':'EntraGroupMembersResponse',
   'GET /settings/entra':'EntraSettingsResponse',
@@ -145,6 +147,8 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
       AgentJobResultRequest:{type:'object',required:['leaseToken','success'],properties:{leaseToken:{type:'string',minLength:20},success:{type:'boolean'},diff:{},result:{},error:{type:'string',maxLength:2000}}},
       AgentNetworkRequest:{type:'object',properties:{flows:{type:'array',maxItems:2000,items:{type:'object'}},arp:{type:'array',maxItems:5000,items:{type:'object'}}}},
       DiscoveryScanRequest:{type:'object',required:['cidrs'],properties:{cidrs:{type:'array',minItems:1,maxItems:32,items:{type:'string',maxLength:64}}}},
+      CredentialHealthResponse:{type:'object',required:['notices','windowMinutes','threshold'],properties:{windowMinutes:{type:'integer',minimum:5},threshold:{type:'integer',minimum:2},notices:{type:'array',items:{type:'object',required:['code','credentialId','credentialName','affectedNodeCount'],properties:{code:{type:'string',enum:['credential_may_be_stale']},title:{type:'string'},credentialId:{type:'string'},credentialName:{type:'string'},affectedNodeCount:{type:'integer',minimum:0},affectedNodes:{type:'array',items:{type:'object'}},windowMinutes:{type:'integer'},firstFailureAt:{type:'string',format:'date-time'},lastFailureAt:{type:'string',format:'date-time'},summary:{type:'string'},remediation:{type:'string'}}}}}},
+      TriageBulkRequest:{type:'object',required:['nodeIds','action'],properties:{nodeIds:{type:'array',minItems:1,maxItems:200,items:{type:'string'}},action:{type:'string',enum:['assign_and_retry','flagged','excluded','none']},credentialId:{type:'string'},note:{type:['string','null'],maxLength:500}},additionalProperties:false},
       ServerSettingsRequest:{type:'object',required:['fqdn','publicBaseUrl'],properties:{fqdn:{type:'string',maxLength:253},publicBaseUrl:{type:'string',maxLength:2048,format:'uri'}},additionalProperties:false},
       WefSettingsRequest:{type:'object',required:['enabled'],properties:{enabled:{type:'boolean'},sharedSecret:{type:'string',minLength:8,maxLength:512,format:'password'},clearSecret:{type:'boolean'}},additionalProperties:false},
       ClassifierRuleRequest:{type:'object',required:['protocol','service'],properties:{protocol:{type:'string',enum:['ANY','TCP','UDP','SCTP','DCCP','ICMP','ICMPv6','IGMP','IPv6-in-IPv4','GRE','ESP','AH','OSPF']},portStart:{type:['integer','null'],minimum:1,maximum:65535},portEnd:{type:['integer','null'],minimum:1,maximum:65535},service:{type:'string',minLength:1,maxLength:160},description:{type:'string',maxLength:500},priority:{type:'integer',minimum:1,maximum:10000,default:10},enabled:{type:'boolean',default:true}},additionalProperties:false,description:'Provide both port bounds for a port rule or omit both for a protocol rule. ICMP and IGMP rules do not use ports.'},

@@ -13,6 +13,7 @@ import {assertManagementAccess} from './managementGuard.js'
 import {emitNotification} from './notifications.js'
 import {classifyOperatingSystem,classifyInfrastructureFacts} from './infrastructureDiscovery.js'
 import {classifyOnboardingError,attachOnboardingError} from './onboardingErrors.js'
+import {recordCredentialAuthSuccess,recordCredentialAuthFailure} from './credentialHealth.js'
 import {collectLinuxFacts,collectLinuxRules,applyLinuxFirewall,testSshCredential,launchLinuxPortal} from './sshConnector.js'
 
 const timeoutMs = 40000
@@ -56,21 +57,22 @@ async function rpcProbe(host,nodeId) {
   let lastError
   for(const credential of nodeCredential(nodeId)) {
     try {
-      return await new Promise((resolve,reject)=>{
+      const result=await new Promise((resolve,reject)=>{
         const child=spawn('rpcclient',['-U',credential.username,'-c','srvinfo',host],{env:{...process.env,PASSWD:credential.secret.password},stdio:['ignore','pipe','pipe']})
         let stdout='',stderr='';const timer=setTimeout(()=>child.kill('SIGKILL'),8000)
         child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk)
         child.once('error',reject);child.once('close',code=>{clearTimeout(timer);code?reject(new Error(stderr.trim()||`rpcclient exited ${code}`)):resolve(stdout.trim())})
       })
-    } catch(error) {lastError=error}
+      recordCredentialAuthSuccess({credentialId:credential.id,nodeId,transport:'rpc'});return result
+    } catch(error) {lastError=error;recordCredentialAuthFailure({credentialId:credential.id,nodeId,error,transport:'rpc',operation:'probe'})}
   }
   throw lastError||new Error('No credential assigned')
 }
 async function netshProbe(host,nodeId){
   let lastError
   for(const credential of nodeCredential(nodeId)){
-    try{return await netshExecPython({host,username:credential.username,password:credential.secret.password,mode:'probe'})}
-    catch(error){lastError=error;error.message=String(error.message).replaceAll(credential.secret.password,'[redacted]')}
+    try{const result=await netshExecPython({host,username:credential.username,password:credential.secret.password,mode:'probe'});recordCredentialAuthSuccess({credentialId:credential.id,nodeId,transport:'netsh'});return result}
+    catch(error){lastError=error;recordCredentialAuthFailure({credentialId:credential.id,nodeId,error,transport:'netsh',operation:'probe'});error.message=String(error.message).replaceAll(credential.secret.password,'[redacted]')}
   }
   throw lastError||new Error('No credential assigned')
 }
@@ -329,8 +331,10 @@ function nodeCredential(nodeId,credentialId) {
 export async function testNodeCredential(node,credentialId){
   if(node.transport==='ssh'){
     const credential=nodeCredential(node.id,credentialId)[0],secret=credential?.secret||{}
-    const result=await testSshCredential({host:node.fqdn||node.ip||node.hostname,port:secret.port||22,credential:{...credential,secret}})
-    recordNodeSuccess(node.id,'ssh-authenticated')
+    let result
+    try{result=await testSshCredential({host:node.fqdn||node.ip||node.hostname,port:secret.port||22,credential:{...credential,secret}})}
+    catch(error){recordCredentialAuthFailure({credentialId:credential.id,nodeId:node.id,error,transport:'ssh',operation:'credential_test'});throw error}
+    recordCredentialAuthSuccess({credentialId:credential.id,nodeId:node.id,transport:'ssh'});recordNodeSuccess(node.id,'ssh-authenticated')
     return result
   }
   if(node.transport!=='wmi'){
@@ -341,9 +345,9 @@ export async function testNodeCredential(node,credentialId){
   const input={host:node.fqdn||node.ip||node.hostname,username:credential.username,password:credential.secret.password}
   let result
   try{result=process.platform==='win32'?await wmiProbePowerShell(input):await wmiProbePython(input)}
-  catch(error){error.message=String(error.message).replaceAll(input.password,'[redacted]');throw error}
+  catch(error){recordCredentialAuthFailure({credentialId:credential.id,nodeId:node.id,error,transport:'wmi',operation:'credential_test'});error.message=String(error.message).replaceAll(input.password,'[redacted]');throw error}
   if(result?.success!==true||result.transport!=='wmi'||!result.computerName)throw new Error('WMI did not confirm access to Win32_ComputerSystem')
-  recordNodeSuccess(node.id,'wmi-authenticated')
+  recordCredentialAuthSuccess({credentialId:credential.id,nodeId:node.id,transport:'wmi'});recordNodeSuccess(node.id,'wmi-authenticated')
   return {success:true,transport:'wmi',account:credential.username,computerName:result.computerName}
 }
 /**
@@ -461,17 +465,17 @@ export async function remote(node,operation,args={},options={}) {
     for(const credential of nodeCredential(node.id,options.credentialId)){
       const secret=credential.secret||{},connection={host:node.fqdn||node.ip||node.hostname,port:secret.port||22,username:credential.username,password:secret.password,privateKey:secret.privateKey,passphrase:secret.passphrase,hostKeyFingerprint:secret.hostKeyFingerprint||secret.hostKey}
       try{
-        if(operation==='auth'){const result=await testSshCredential({host:connection.host,port:connection.port,credential:{...credential,secret},probeOnly:true});recordNodeSuccess(node.id,'ssh-authenticated');return result}
+        if(operation==='auth'){const result=await testSshCredential({host:connection.host,port:connection.port,credential:{...credential,secret},probeOnly:true});recordCredentialAuthSuccess({credentialId:credential.id,nodeId:node.id,transport:'ssh'});recordNodeSuccess(node.id,'ssh-authenticated');return result}
         if(operation==='prompt_browser'){
           const result=await launchLinuxPortal(connection,{portalUrl:args.url,preferredUser:args.targetUser||args.username||args.user,browser:args.browser||'xdg-open'})
           run("UPDATE nodes SET connection_mode='agentless',management_type='ssh',transport='ssh',agent_required=0,firewall_state=CASE WHEN firewall_state='enforcing' THEN firewall_state ELSE 'learning' END WHERE id=?",node.id)
-          recordNodeSuccess(node.id,'ssh-authenticated');return result
+          recordCredentialAuthSuccess({credentialId:credential.id,nodeId:node.id,transport:'ssh'});recordNodeSuccess(node.id,'ssh-authenticated');return result
         }
         const result=operation==='facts'?await collectLinuxFacts(connection):operation==='apply'?await applyLinuxFirewall(connection,args):await collectLinuxRules(connection)
         if(operation==='facts'&&!result?.computer?.Name)throw new Error('SSH facts did not return the Linux host identity')
         if(!Array.isArray(result?.rules)&&['rules','all_rules'].includes(operation))throw new Error('SSH firewall inventory returned an invalid result')
-        recordNodeSuccess(node.id,'ssh-authenticated');return result
-      }catch(error){lastError=error;const secretValues=[secret.password,secret.privateKey,secret.passphrase].filter(Boolean);error.message=secretValues.reduce((text,value)=>text.replaceAll(value,'[redacted]'),String(error.message||error))}
+        recordCredentialAuthSuccess({credentialId:credential.id,nodeId:node.id,transport:'ssh'});recordNodeSuccess(node.id,'ssh-authenticated');return result
+      }catch(error){lastError=error;recordCredentialAuthFailure({credentialId:credential.id,nodeId:node.id,error,transport:'ssh',operation});const secretValues=[secret.password,secret.privateKey,secret.passphrase].filter(Boolean);error.message=secretValues.reduce((text,value)=>text.replaceAll(value,'[redacted]'),String(error.message||error))}
     }
     if(transientError(lastError))recordNodeTransportFailure(node.id)
     throw attachOnboardingError(lastError||new Error('No credential authenticated over SSH'),{operation,transport:'ssh'})
@@ -488,7 +492,7 @@ export async function remote(node,operation,args={},options={}) {
         const result=await netshExecPython(input)
         if(operation==='event_cursor'){
           if(!Number.isSafeInteger(result)||result<0)throw new Error('Netsh Security event cursor was invalid')
-          recordNodeSuccess(node.id,'netsh-authenticated');return result
+          recordCredentialAuthSuccess({credentialId:credential.id,nodeId:node.id,transport:'netsh'});recordNodeSuccess(node.id,'netsh-authenticated');return result
         }
         if(result?.success!==true||result.transport!=='netsh'||!result.computerName)throw new Error('Netsh fallback did not confirm the computer identity')
         if(eventOperation&&!Array.isArray(result.eventResult))throw new Error('Netsh Security event query returned an invalid result')
@@ -496,9 +500,9 @@ export async function remote(node,operation,args={},options={}) {
         if(['rules','all_rules'].includes(operation)&&!result.ruleResult)throw new Error('Netsh firewall inventory returned an invalid result')
         if(operation==='apply'&&result.applyResult?.applied!==true)throw new Error('Netsh firewall apply was not confirmed')
         if(['rpc_filters','rpc_filter_apply','rpc_filter_remove'].includes(operation)&&!result.rpcFilterResult)throw new Error('Netsh RPC filter operation returned no result')
-        recordNodeSuccess(node.id,'netsh-authenticated')
+        recordCredentialAuthSuccess({credentialId:credential.id,nodeId:node.id,transport:'netsh'});recordNodeSuccess(node.id,'netsh-authenticated')
         return operation==='auth'?{success:true,transport:'netsh',account:credential.username,computerName:result.computerName}:operation==='facts'?result.factsResult:operation==='audit_policy'||operation==='audit_policy_enable'?result.auditResult:operation==='apply'?result.applyResult:eventOperation?result.eventResult:['rpc_filters','rpc_filter_apply','rpc_filter_remove'].includes(operation)?result.rpcFilterResult:result.ruleResult
-      }catch(error){lastError=error;error.message=String(error.message).replaceAll(credential.secret.password,'[redacted]')}
+      }catch(error){lastError=error;recordCredentialAuthFailure({credentialId:credential.id,nodeId:node.id,error,transport:'netsh',operation});error.message=String(error.message).replaceAll(credential.secret.password,'[redacted]')}
     }
     if(transientError(lastError))recordNodeTransportFailure(node.id)
     throw attachOnboardingError(lastError||new Error('No credential authenticated over SMB netsh fallback'),{operation,transport:node.transport})
@@ -519,16 +523,16 @@ export async function remote(node,operation,args={},options={}) {
         try{
           const result=await wmiProbePython(check)
           if(result?.success!==true||result.transport!=='wmi'||!result.computerName||expectedName&&String(result.computerName).toLowerCase()!==expectedName.split('.')[0].toLowerCase())throw new Error('WMI computer identity was not confirmed before policy apply')
-          selected=credential
+          recordCredentialAuthSuccess({credentialId:credential.id,nodeId:node.id,transport:'wmi'});selected=credential
           break
-        }catch(error){lastError=error;error.message=String(error.message).replaceAll(check.password,'[redacted]')}
+        }catch(error){lastError=error;recordCredentialAuthFailure({credentialId:credential.id,nodeId:node.id,error,transport:'wmi',operation});error.message=String(error.message).replaceAll(check.password,'[redacted]')}
       }
       if(!selected){if(transientError(lastError))recordNodeTransportFailure(node.id);throw attachOnboardingError(lastError||new Error('No credential authenticated over WMI'),{operation,transport:node.transport})}
       const input={host,username:selected.username,password:selected.secret.password,mode:operation,args,expectedName}
       try{
         const result=await wmiProbePython(input)
         if(result?.success!==true||result.transport!=='wmi'||(operation==='apply'?result.applyResult?.applied!==true:result.auditResult?.successEnabled!==true||result.auditResult?.failureEnabled!==true)||expectedName&&String(result.computerName).toLowerCase()!==expectedName.split('.')[0].toLowerCase())throw new Error('WMI write returned no confirmed host readback; inspect host state before retrying')
-        recordNodeSuccess(node.id,'wmi-authenticated')
+        recordCredentialAuthSuccess({credentialId:selected.id,nodeId:node.id,transport:'wmi'});recordNodeSuccess(node.id,'wmi-authenticated')
         return operation==='apply'?result.applyResult:result.auditResult
       }catch(error){
         error.message=String(error.message).replaceAll(input.password,'[redacted]')
@@ -549,9 +553,9 @@ export async function remote(node,operation,args={},options={}) {
         }else if(operation==='audit_policy'){
           if(!Number.isInteger(result.auditResult?.settingValue)||typeof result.auditResult?.successEnabled!=='boolean'||typeof result.auditResult?.failureEnabled!=='boolean')throw new Error('WMI audit policy returned an invalid result')
         }else if(operation==='rules'?!Array.isArray(result.ruleResult):!Array.isArray(result.ruleResult?.rules)||!Number.isInteger(result.ruleResult?.total))throw new Error('WMI firewall inventory returned an invalid rule page')
-        recordNodeSuccess(node.id,'wmi-authenticated')
+        recordCredentialAuthSuccess({credentialId:credential.id,nodeId:node.id,transport:'wmi'});recordNodeSuccess(node.id,'wmi-authenticated')
         return eventOperation?result.eventResult:operation==='facts'?result.factsResult:operation==='audit_policy'?result.auditResult:result.ruleResult
-      }catch(error){lastError=error;error.message=String(error.message).replaceAll(input.password,'[redacted]')}
+      }catch(error){lastError=error;recordCredentialAuthFailure({credentialId:credential.id,nodeId:node.id,error,transport:'wmi',operation});error.message=String(error.message).replaceAll(input.password,'[redacted]')}
     }
     if(transientError(lastError))recordNodeTransportFailure(node.id)
     throw attachOnboardingError(lastError||new Error('No credential authenticated over WMI'),{operation,transport:node.transport})
@@ -567,11 +571,12 @@ export async function remote(node,operation,args={},options={}) {
         const script=remoteScript.replace('__WINFIRE_PROMPT_FUNCTIONS__',operation.startsWith('prompt_')||operation==='security_session_logoff'?mfaPromptFunctions:'').replace('__WINFIRE_AGENT_DEPLOY__',operation==='agent_deploy'?agentDeployFunctions:'').replace('__WINFIRE_SECURITY_PROCESS_OWNER__',operation.startsWith('security_')?securityProcessOwnerFunctions:'').replace('# __WINFIRE_LSA_RIGHTS__',operation.startsWith('rights')||operation.startsWith('jit_')?lsaRightsFunctions:'').replace('# __WINFIRE_ACCOUNT_INVENTORY__',()=>operation==='account_inventory'?accountInventoryFunctions:'').replace('# __WINFIRE_FIREWALL_USER__',()=>['rules','apply'].includes(operation)?firewallUserFunctions:'')
         const legacy=/^(?:5\.[12]\.|6\.[01]\.|windows (?:xp|vista|7\b|server 2003|server 2008))/i.test(String(input.osVersion||''))
         const result=process.platform==='win32'&&!legacy&&operation!=='auth' ? await pwsh(script,input) : await pywinrm(input)
-        recordNodeSuccess(node.id,input.transport==='winrms'?'winrms-authenticated':'winrm-authenticated')
+        recordCredentialAuthSuccess({credentialId:credential.id,nodeId:node.id,transport:input.transport||'winrm'});recordNodeSuccess(node.id,input.transport==='winrms'?'winrms-authenticated':'winrm-authenticated')
         return result
       }
       catch(error) {
         lastError=error
+        recordCredentialAuthFailure({credentialId:credential.id,nodeId:node.id,error,transport:input.transport||'winrm',operation})
         if(!transientError(error))break
         if(mutating){
           recordNodeTransportFailure(node.id)

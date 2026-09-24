@@ -2,6 +2,7 @@ import {db,all,one,run,id,now,json,audit} from './db.js'
 import {openSealed} from './security.js'
 import {registerHost} from './networkDiscovery.js'
 import {filterSnmpCandidates,pollSnmpDevice} from './snmpDiscovery.js'
+import {recordCredentialAuthSuccess,recordCredentialAuthFailure} from './credentialHealth.js'
 
 const MAX_REGISTER=512
 export function publicSnmpTarget(row){
@@ -57,11 +58,13 @@ export function ensureSnmpNode(target,device,stamp){
  * This is intentionally separate from discovery targets: assigning a vault
  * credential to a node must be enough to collect facts and begin ARP learning.
  */
-export async function pollSnmpNode(node,{credential,actorId=null,devicePoll=pollSnmpDevice}={}){
+export async function pollSnmpNode(node,{credential,credentialId=null,actorId=null,devicePoll=pollSnmpDevice}={}){
   if(!node?.id)throw new Error('SNMP node is required')
   if(!credential?.type)throw new Error('An SNMP credential is required')
   const host=node.ip||node.fqdn||node.hostname
-  const device=await devicePoll({host,credential})
+  let device
+  try{device=await devicePoll({host,credential})}catch(error){recordCredentialAuthFailure({credentialId,nodeId:node.id,error,transport:'snmp',operation:'poll'});throw error}
+  recordCredentialAuthSuccess({credentialId,nodeId:node.id,transport:'snmp'})
   const finished=now()
   const nodeId=ensureSnmpNode({id:node.id,host,source:`snmp:node:${node.id}`},device,finished)
   audit(actorId,'snmp-node.poll.complete','node',nodeId,null,{host,arpCount:device.arp?.length||0,macPortCount:device.macPorts?.length||0})
@@ -80,7 +83,7 @@ export async function pollAssignedSnmpNode(nodeId,{actorId=null,devicePoll=pollS
   const credential=one(`SELECT c.* FROM credentials c JOIN credential_assignments a ON a.credential_id=c.id
     WHERE c.type IN ('snmp-v2c','snmp-v3') AND (a.node_id=? OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?)) ORDER BY c.priority,c.name LIMIT 1`,node.id,node.id)
   if(!credential)throw new Error('No SNMP credential assigned to node')
-  return pollSnmpNode(node,{credential:{type:credential.type,secret:openSealed(credential.encrypted_blob)},actorId,devicePoll})
+  return pollSnmpNode(node,{credential:{type:credential.type,secret:openSealed(credential.encrypted_blob)},credentialId:credential.id,actorId,devicePoll})
 }
 export async function pollSnmpDiscoveryTarget(targetId,{actorId=null,devicePoll=pollSnmpDevice,register=registerHost}={}){
   const target=targetWithCredential(targetId)
@@ -88,8 +91,10 @@ export async function pollSnmpDiscoveryTarget(targetId,{actorId=null,devicePoll=
   const started=now(),pollId=id()
   run('INSERT INTO snmp_discovery_polls(id,target_id,status,started_at,requested_by) VALUES(?,?,?,?,?)',pollId,target.id,'running',started,actorId)
   try{
-    const device=await devicePoll({host:target.host,credential:{type:target.credential_type,secret:target.secret}})
+    let device
+    try{device=await devicePoll({host:target.host,credential:{type:target.credential_type,secret:target.secret}})}catch(error){const existingNode=one('SELECT id FROM nodes WHERE ip=? OR lower(hostname)=lower(?) OR lower(fqdn)=lower(?) LIMIT 1',target.host,target.host,target.host);if(existingNode)recordCredentialAuthFailure({credentialId:target.credential_id,nodeId:existingNode.id,error,transport:'snmp',operation:'discovery_poll'});throw error}
     const targetNodeId=ensureSnmpNode(target,device,now())
+    recordCredentialAuthSuccess({credentialId:target.credential_id,nodeId:targetNodeId,transport:'snmp'})
     const candidates=filterSnmpCandidates(device.arp,target.cidr)
     const registrations=[]
     for(const candidate of candidates.slice(0,MAX_REGISTER)){
