@@ -1,4 +1,6 @@
 <script setup>
+import {useRoute} from 'vue-router'
+const route=useRoute()
 import {computed, onMounted, ref} from 'vue'
 import PageHeader from '../../components/PageHeader.vue'
 import MappingFilters from '../../components/mapping/MappingFilters.vue'
@@ -14,7 +16,7 @@ import {mappingService} from '../../services/mapping.js'
 const activeTab=ref('pairs')
 const rows=ref([]),topTalkers=ref([]),arp=ref([]),topology=ref({nodes:[],edges:[],nodeCount:0,edgeCount:0}),nodes=ref([]),policies=ref([])
 const emptyFilters=()=>({nodeId:'',external:'',trafficClass:'',subnet:'',switchId:'',from:'',to:''})
-const draft=ref(emptyFilters()),applied=ref(emptyFilters()),filterOptions=ref({switches:[],subnets:[]})
+const draft=ref({...emptyFilters(),nodeId:String(route.query.nodeId||'')}),applied=ref({...emptyFilters(),nodeId:String(route.query.nodeId||'')}),filterOptions=ref({switches:[],subnets:[]})
 const nodeId=computed(()=>applied.value.nodeId)
 const page=ref(1),pageSize=ref(100),pages=ref(1),total=ref(0)
 const loading=ref(false),error=ref(''),message=ref(''),topologySelectedId=ref('')

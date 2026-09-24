@@ -7,6 +7,7 @@ import {rateLimit} from 'express-rate-limit'
 import argon2 from 'argon2'
 import crypto from 'node:crypto'
 import {isIP} from 'node:net'
+import {configuredCidrs as localAssetCidrs,isLocalAssetNode,subnetMatcher,normalizeCidrs,boundaryState} from './services/networkBoundary.js'
 import PDFDocument from 'pdfkit'
 import {z} from 'zod'
 import {compilePolicy, graphSchema, findRuleConflicts,validateAddressExpression,validatePortExpression,validateProgramPath,activePolicyRules,scheduleStateKey,extractMfaGates} from '@winfire/shared'
@@ -55,7 +56,7 @@ import {classifyNetworkFlow,normalizeNetworkProtocol,recordNetworkFlow} from './
 import {classifierRuleRows,classifierRuleById,createClassifierRule,updateClassifierRule,deleteClassifierRule,processRuleRows,processRuleById,createProcessRule,updateProcessRule,deleteProcessRule} from './services/classifierRules.js'
 import {mappingRoutes} from './routes/mapping.js'
 import {expandCidrs,runDiscoveryScan,queueDiscoveryScan,publicDiscoverySchedule,runDiscoveryScheduleNow,persistHypervisor,DISCOVERY_MIN_INTERVAL_MINUTES,DISCOVERY_MAX_INTERVAL_MINUTES} from './networkDiscovery.js'
-import {validSnmpHost,normalizeSnmpSecret,ipInCidr} from './snmpDiscovery.js'
+import {validSnmpHost,normalizeSnmpSecret} from './snmpDiscovery.js'
 import {snmpTargets,pollSnmpDiscoveryTarget,pollSnmpNode} from './snmpDiscoveryService.js'
 import {listMibs,mibDetails,mibRecord,importMibs,updateMib,deleteMib,nodeMibFacts} from './snmpMibLibrary.js'
 import {mibUpload,mibUploadInput,cleanupMibUploads,listMibFiles,sourcePath} from './snmpMibStorage.js'
@@ -166,15 +167,7 @@ const savedSetting=key=>String(one('SELECT value FROM app_settings WHERE key=?',
 const normalizeLogAction=(eventId,action)=>Number(eventId)===4624?'logon':Number(eventId)===4634?'logoff':action||null
 const serverFqdn=()=>savedSetting('server_fqdn')
 const serverPublicBaseUrl=()=>savedSetting('server_public_base_url')
-const localAssetCidrs=()=>{
-  const value=parse(savedSetting('local_asset_cidrs'))
-  const entries=Array.isArray(value)?value:[savedSetting('local_asset_cidrs')]
-  // Older settings could contain literal "\\n" separators. Normalize those
-  // on read so inventory filtering and the administration editor agree.
-  return entries.flatMap(item=>String(item||'').split(/(?:\\n|\r?\n|,)/)).map(item=>item.trim()).filter(Boolean)
-}
-const localAssetCidrSchema=z.string().trim().max(43).refine(value=>{const [address,prefix]=value.split('/');const size=Number(prefix);return isIP(address)===4&&Number.isInteger(size)&&size>=0&&size<=32},{message:'Local asset scopes must be IPv4 CIDRs'})
-const isLocalAssetNode=node=>{const scopes=localAssetCidrs();return !scopes.length||!node?.ip||scopes.some(scope=>ipInCidr(node.ip,scope))}
+const localAssetCidrSchema=z.string().trim().max(64).refine(value=>{try{subnetMatcher(value);return true}catch{return false}},{message:'Local asset scopes must be IPv4 or IPv6 CIDRs'})
 const triageWindowDays=()=>Math.max(1,Math.min(3650,Number.parseInt(savedSetting('unmanaged_asset_window_days')||'7',10)||7))
 const triageCutoff=()=>new Date(Date.now()-triageWindowDays()*86400000)
 const triageDateBefore=(value,cutoff)=>Boolean(value)&&Number.isFinite(Date.parse(value))&&Date.parse(value)<=cutoff.getTime()
@@ -1059,13 +1052,14 @@ api.patch('/settings/server',requireRole('admin'),(req,res)=>{
   if(process.env.SERVER_FQDN&&data.fqdn&&data.fqdn!==process.env.SERVER_FQDN.trim())return res.status(409).json({error:'SERVER_FQDN is configured by the deployment environment; change that value instead'})
   if(process.env.PUBLIC_BASE_URL&&data.publicBaseUrl&&data.publicBaseUrl!==process.env.PUBLIC_BASE_URL.trim())return res.status(409).json({error:'PUBLIC_BASE_URL is configured by the deployment environment; change that value instead'})
   const before={fqdn:serverFqdn()||null,publicBaseUrl:serverPublicBaseUrl()||null,localCidrs:localAssetCidrs()}
-  const next={fqdn:data.fqdn||'',publicBaseUrl:data.publicBaseUrl||'',localCidrs:data.localCidrs}
+  const next={fqdn:data.fqdn||'',publicBaseUrl:data.publicBaseUrl||'',localCidrs:normalizeCidrs(data.localCidrs)}
   db.transaction(()=>{
     if(!process.env.SERVER_FQDN)run("INSERT INTO app_settings(key,value) VALUES('server_fqdn',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",next.fqdn)
     if(!process.env.PUBLIC_BASE_URL)run("INSERT INTO app_settings(key,value) VALUES('server_public_base_url',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",next.publicBaseUrl)
     run("INSERT INTO app_settings(key,value) VALUES('local_asset_cidrs',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",json(next.localCidrs))
     audit(req.user.id,'server.settings.update','app-settings','server',before,next)
   })()
+  boundaryState()
   res.json({fqdn:process.env.SERVER_FQDN||next.fqdn||null,configuredFqdn:next.fqdn||null,fqdnSource:process.env.SERVER_FQDN?'environment':next.fqdn?'administration':'unset',publicBaseUrl:effectivePublicBaseUrl(req),configuredPublicBaseUrl:next.publicBaseUrl||null,publicBaseUrlConfigured:!!(process.env.PUBLIC_BASE_URL||next.publicBaseUrl),publicBaseUrlSource:process.env.PUBLIC_BASE_URL?'environment':next.publicBaseUrl?'administration':'request',localCidrs:next.localCidrs,environmentOverrides:{fqdn:!!process.env.SERVER_FQDN,publicBaseUrl:!!process.env.PUBLIC_BASE_URL}})
 })
 api.get('/settings/wef',requireRole('admin'),(req,res)=>res.json(publicWef(req)))
@@ -2119,7 +2113,7 @@ api.delete('/node-groups/:id/members/:nodeId',requireRole('editor'),wrap(async(r
   res.json({removed:true,cleanedPolicies:completed.map(item=>item.policy.id),retainedByOtherAssignment:policies.length-completed.length})
 }))
 
-api.get('/policies',(req,res)=>res.json(all('SELECT p.*,v.version_no FROM policies p LEFT JOIN policy_versions v ON v.id=p.current_version_id ORDER BY p.created_at DESC').filter(policy=>canReadResource(req.user,'policy',policy)).map(policy=>({...policy,scopes:all('SELECT node_id,node_group_id FROM policy_assignments WHERE policy_id=?',policy.id),verificationStatus:policyVerification(policy.id),learning:policy.origin==='learned'?one('SELECT id,status,ends_at,progressive_enabled,next_progressive_at,last_progressive_at FROM learning_sessions WHERE generated_policy_id=? ORDER BY started_at DESC,rowid DESC LIMIT 1',policy.id):null}))))
+api.get('/policies',(req,res)=>res.json(all('SELECT p.*,v.version_no FROM policies p LEFT JOIN policy_versions v ON v.id=p.current_version_id ORDER BY p.created_at DESC').filter(policy=>canReadResource(req.user,'policy',policy)).map(policy=>({...policy,canWrite:canWriteResource(req.user,'policy',policy),scopes:all('SELECT node_id,node_group_id FROM policy_assignments WHERE policy_id=?',policy.id),verificationStatus:policyVerification(policy.id),learning:policy.origin==='learned'?one('SELECT id,status,ends_at,progressive_enabled,next_progressive_at,last_progressive_at FROM learning_sessions WHERE generated_policy_id=? ORDER BY started_at DESC,rowid DESC LIMIT 1',policy.id):null}))))
 api.get('/policies/sync',requireRole('admin'),(_req,res)=>res.json({pending:pendingPolicySync(),schedules:all("SELECT id,execute_at,status,created_at,finished_at,result_json FROM policy_sync_schedules WHERE status IN ('scheduled','running') ORDER BY execute_at") }))
 api.post('/policies/sync',requireRole('admin'),wrap(async(req,res)=>{
   const data=body(z.object({executeAt:z.iso.datetime({offset:true}).optional()}),req)
@@ -2149,12 +2143,28 @@ api.get('/policies/:id/learning-preview',(req,res)=>{
   if(!session)return res.status(409).json({error:'This policy has no active learning session'})
   res.json(learningPreview(session))
 })
+api.post('/policies/:id/preview',(req,res)=>{
+  const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy')
+  if(!canReadResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'})
+  const data=body(z.object({graph:graphSchema}),req)
+  let rules,mfaGates
+  try{rules=compilePolicy(data.graph,policy.id);mfaGates=extractMfaGates(data.graph)}catch(error){return res.status(400).json({error:error.message})}
+  const warnings=[]
+  for(const node of data.graph.nodes)if(['portGroup','addressGroup','profile','schedule'].includes(node.type)&&!data.graph.edges.some(edge=>edge.source===node.id))warnings.push(`${node.data.name||node.type} has no outgoing connection and does not affect any rule.`)
+  if(mfaGates.length)warnings.push('MFA gates are metadata; deployment requires the Windows challenge broker.')
+  let managementIssue=null;try{assertManagementAccess(rules)}catch(error){managementIssue=error.message}
+  const conflicts=assignmentConflicts(policy.id,rules,assignedNodes(policy.id))
+  res.json({rules,mfaGates,warnings,conflicts,managementIssue,canSave:canWriteResource(req.user,'policy',policy)&&!hasActiveLearning(policy.id)&&!managementIssue&&!conflicts.length})
+})
 api.post('/policies/:id/versions',requireRole('editor'),(req,res)=>{
   const policy=getPolicy(reqId(req));if(!policy)return notFound(res,'Policy')
   if(!canWriteResource(req.user,'policy',policy))return res.status(403).json({error:'Insufficient permission for policy'})
   if(hasActiveLearning(policy.id))return res.status(409).json({error:'Automatic learning owns this policy until training ends'})
   if(one('SELECT id FROM policy_assignments WHERE policy_id=? AND removal_job_id IS NOT NULL',policy.id))return res.status(409).json({error:'Wait for pending agent firewall cleanup before changing this policy'})
-  const data=body(z.object({graph:graphSchema,comment:z.string().default('')}),req),rules=compilePolicy(data.graph,policy.id),versionId=id()
+  const data=body(z.object({graph:graphSchema,comment:z.string().default(''),baseVersionId:z.string().nullable().optional()}),req)
+  if(data.baseVersionId!==undefined&&data.baseVersionId!==(policy.current_version_id||null))return res.status(409).json({error:'This policy changed since the draft was opened. Review the latest version before saving.'})
+  let rules;try{rules=compilePolicy(data.graph,policy.id)}catch(error){return res.status(400).json({error:error.message})}
+  const versionId=id()
   assertManagementAccess(rules)
   const conflicts=assignmentConflicts(policy.id,rules,assignedNodes(policy.id))
   if(conflicts.length)return rejectConflicts(res,conflicts)
@@ -2865,7 +2875,7 @@ api.post('/logon-rights/change',requireRole('admin'),wrap(async(req,res)=>{
 }))
 
 api.get('/logs/search',(req,res)=>{
-  const query=z.object({
+  const query=z.object({id:z.string().max(200).optional(),
     nodeId:z.string().optional(),action:z.enum(['allow','block','success','failure','logon','logoff']).optional(),direction:z.enum(['in','out']).optional(),
     program:z.string().max(1024).optional(),challengeId:z.string().max(128).optional(),
     eventId:z.coerce.number().int().min(0).optional(),protocol:z.string().max(32).optional(),srcIp:z.string().max(128).optional(),dstIp:z.string().max(128).optional(),
@@ -2875,6 +2885,7 @@ api.get('/logs/search',(req,res)=>{
   }).parse(req.query)
   if(query.from&&query.to&&new Date(query.from)>new Date(query.to))return res.status(400).json({error:'From must be earlier than To'})
   const filters=[visibleFirewallEventSql()],args=[]
+  if(query.id){filters.push('e.id=?');args.push(query.id)}
   if(query.eventType==='logon')filters.push("(COALESCE(e.event_type,p.event_type)='logon' OR e.event_id IN (4624,4634))")
   if(query.eventType==='firewall')filters.push("COALESCE(e.event_type,p.event_type,'firewall')<>'logon' AND e.event_id NOT IN (4624,4634)")
   for(const [key,column] of [['nodeId','e.node_id'],['direction','COALESCE(e.direction,p.direction)'],['challengeId','e.challenge_id'],['eventId','e.event_id'],['port','COALESCE(e.dst_port,p.dst_port)']])if(query[key]!==undefined){filters.push(`${column}=?`);args.push(query[key])}

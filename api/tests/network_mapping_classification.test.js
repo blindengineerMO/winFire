@@ -8,6 +8,7 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'winfire-mapping-'))
 process.env.DATA_DIR = dir
 const {classifyNetworkFlow,recordArpEntries,recordNetworkFlow,mappingRows,inferPassiveDeviceType} = await import('../src/services/networkMapping.js')
 const {db}=await import('../src/db.js')
+db.prepare("INSERT OR REPLACE INTO app_settings(key,value) VALUES('local_asset_cidrs',?)").run(JSON.stringify(['10.0.0.0/8','192.168.0.0/16','fc00::/7']))
 
 test.after(() => fs.rmSync(dir, {recursive: true, force: true}))
 
@@ -39,7 +40,7 @@ test('private node pairs and public peers are separated by scope', () => {
   assert.equal(internal.scope, 'internal')
   assert.equal(internal.service, 'SMB file or management traffic')
   const external = classifyNetworkFlow({sourceIp: '192.168.88.10', destinationIp: '203.0.113.5', protocol: 'TCP', destinationPort: 443})
-  assert.equal(external.scope, 'unknown')
+  assert.equal(external.scope, 'external')
   assert.equal(external.trafficClass, 'special-purpose')
   const publicInternet = classifyNetworkFlow({sourceIp: '192.168.88.10', destinationIp: '8.8.8.8', protocol: 'UDP', destinationPort: 53})
   assert.equal(publicInternet.scope, 'external')

@@ -1,4 +1,6 @@
 <script setup>
+import {useRoute} from 'vue-router'
+const route=useRoute()
 import {onMounted,onUnmounted,ref,computed,nextTick} from 'vue'
 import PageHeader from '../components/PageHeader.vue'
 import GlassWindow from '../components/GlassWindow.vue'
@@ -29,7 +31,7 @@ const serviceLabel=value=>String(value||'Unidentified').split(/\r?\n/,1)[0].trim
 const serviceDetails=event=>[event.traffic_service,event.traffic_reason].filter(Boolean).join(' — ')||'Service could not be identified from the observed traffic'
 const columns=[{key:'time',label:'Time'},{key:'node',label:'Node'},{key:'eventId',label:'Event'},{key:'action',label:'Action'},{key:'direction',label:'Direction'},{key:'srcIp',label:'Source'},{key:'dstIp',label:'Destination'},{key:'port',label:'Port'},{key:'service',label:'Service',sortable:false},{key:'program',label:'Program'},{key:'account',label:'Account'}]
 function queryString(){
-  const query={eventType:eventType.value,page:page.value,pageSize:pageSize.value,sortBy:sortBy.value,sortDir:sortDir.value,hideLoopback:hideLoopback.value,...filters.value}
+  const query={...(route.query.event?{id:String(route.query.event)}:{}),eventType:eventType.value,page:page.value,pageSize:pageSize.value,sortBy:sortBy.value,sortDir:sortDir.value,hideLoopback:hideLoopback.value,...filters.value}
   for(const key of ['from','to'])if(query[key])query[key]=new Date(query[key]).toISOString()
   return new URLSearchParams(Object.entries(query).filter(([,value])=>value!==''&&value!==null)).toString()
 }

@@ -1,3 +1,4 @@
+import {configuredCidrs,inLocalCidrs} from './services/networkBoundary.js'
 import {BlockList, isIPv4} from 'node:net'
 import {createHash} from 'node:crypto'
 import {z} from 'zod'
@@ -22,18 +23,9 @@ function normalizeMac(value) {
   return raw.match(/../g).join(':')
 }
 function localScope() {
-  const raw=one("SELECT value FROM app_settings WHERE key='local_asset_cidrs'")?.value||''
-  let values
-  try { values=JSON.parse(raw) } catch { values=raw }
-  const entries=(Array.isArray(values)?values:[values]).flatMap(value=>String(value||'').replace(/\\n/g,'\n').split(/[\n,]/)).map(value=>value.trim()).filter(Boolean)
+  const entries=configuredCidrs()
   if(!entries.length)throw error('Configure Local asset CIDRs in Administration → Server config before importing DHCP leases.',409)
-  const scope=new BlockList()
-  for(const entry of entries){
-    const [address,prefix,...rest]=entry.split('/')
-    if(!isIPv4(address)||!/^\d+$/.test(prefix||'')||+prefix>32||rest.length)throw error('Local asset CIDRs contain an invalid IPv4 subnet.',409)
-    scope.addSubnet(address,+prefix,'ipv4')
-  }
-  return scope
+  return {check:ip=>inLocalCidrs(ip,entries)}
 }
 const hostKey = value => String(value||'').toLowerCase().replace(/\.$/,'').split('.')[0]
 const placeholderName = node => !node.hostname||node.hostname===node.ip||/^unknown$/i.test(node.hostname)

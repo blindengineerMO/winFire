@@ -59,9 +59,32 @@ Groups can scope policies and credentials. Inspect group membership before deplo
 
 1. Review new-host training and its duration/progressive schedule in Administration.
 2. Collect representative traffic; inspect the generated learning proposal and evidence rather than assuming every observed flow is wanted.
-3. Build/edit policies in visual Policy Studio or the classic editor. Resolve overlaps/conflicts and review compiled rules/version differences.
+3. Build/edit policies using the **Visual editor** and **Form editor** tabs in Policy Studio. Resolve overlaps/conflicts and review compiled rules/version differences.
 4. Verify, assign to the intended node or group, and use **Sync policies**. Learning sessions own their generated policies until the workflow permits review/apply.
 5. Inspect apply runs and verification results per host. A queued deployment is not a confirmed applied policy. Use versions/recall and the normal sync workflow for rollback.
+
+### Policy Studio authoring
+
+Select a policy in the library. Both editor tabs use the same graph and remain visible for learning/read-only policies. The rule palette includes Allow, Reject, Program, Port group, Address group, Profile scope, Schedule and MFA gate nodes. Click a graph node or a Form editor row to inspect/edit its fields, connected scopes and last compiled rule. **Apply to draft** accepts the dialog changes; **Cancel** leaves the graph unchanged.
+
+Connect a scope's right handle to a rule's left handle, or use **Connect nodes** with the source/target selectors. Scope chains are supported. Explicit rule fields take precedence over inherited values. Port groups supply local ports for inbound rules and remote ports for outbound rules. Address/profile scopes supply remote addresses/profiles; a rule can inherit one schedule. Cycles, duplicate connections and invalid fields are rejected. MFA gates remain standalone metadata and do not turn an ordinary connection into MFA enforcement.
+
+Use **Zoom in/out**, **Fit view**, **Arrange nodes**, **Undo/Redo**, and the expandable Connections list. Click an edge for connection details/removal. Deleting a node removes its incident connections; Undo restores them. Rule details support duplication and deletion. Browser drafts are scoped to the operator and policy; a restored draft is labeled. **Discard draft** returns to the latest saved version. Saving a stale version is rejected instead of overwriting another operator's changes.
+
+The API validates and compiles draft changes before saving. The compiled output shows the draft's effective rules, inherited scope, conflicts and warnings. **Save version** stores a version without deploying it. **Assign** controls node/group/global targets; **Apply** applies the saved version to assigned nodes after confirmation, while the top navigation's **Sync policies** remains available for staged changes. **History** compares or recalls saved versions. Active learning policies remain read-only in both tabs, with clickable rule/evidence details.
+
+API clients can preview and save the same graph:
+
+```bash
+curl --fail-with-body -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' --data-binary @draft.json \
+  "$BASE/api/v1/policies/$POLICY_ID/preview"
+curl --fail-with-body -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' --data-binary @version.json \
+  "$BASE/api/v1/policies/$POLICY_ID/versions"
+```
+
+`draft.json` contains `{ "graph": { "nodes": [...], "edges": [...] } }`. `version.json` adds `comment` and `baseVersionId` (the version originally loaded, or `null` for the first save). Preview returns `rules`, `mfaGates`, `warnings`, `conflicts`, `managementIssue` and `canSave`; it creates no version and changes no firewall. The API enforces policy permissions and learning ownership independently of the UI.
 
 Break glass temporarily changes host firewall profile state and has an audited rollback session; use the dedicated workflow with a reason and bounded duration. It is separate from an MFA grant for a particular source/port.
 
@@ -110,3 +133,7 @@ Browser Internet telemetry is a separate feature with extension enrollment, coll
 | `/mfa/:promptId`, `/mfa/callback` | Public prompt and MFA callback views. |
 
 UI routes are client-side views; API calls use `/api/v1`. A reverse proxy must route non-API navigation to the SPA while preserving `/api` errors/responses. There is no standalone `/activities` Vue route in the current application.
+
+## Internet connections outside LAN
+
+**Internet** has separate **Browser activity**, **Internet connections**, **Browser devices**, and **Internet Policy Studio** tabs. The connections table uses configured IPv4/IPv6 local CIDRs, server-side filters/sorting and 25-row pagination. Private peers outside those CIDRs are included; special non-unicast peers are excluded. CIDR edits rebuild retained classifications in the background and expose pending status. Reverse-DNS names are PTR evidence, not confirmed website addresses. No external peer is added to inventory. See the [complete workflow, DNS configuration and curl examples](INTERNET_CONNECTIONS.md).

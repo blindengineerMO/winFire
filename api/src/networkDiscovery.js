@@ -1,3 +1,4 @@
+import {inventoryEligibleIp} from './services/networkBoundary.js'
 import {spawn,execFile} from 'node:child_process'
 import {promisify} from 'node:util'
 import net from 'node:net'
@@ -243,6 +244,7 @@ function correlateVirtualMachines(hostNodeId,virtualMachines){
   }
 }
 export async function registerHost(ip,scanId,livenessMethod='icmp',livenessMeta={}){
+  if(!inventoryEligibleIp(ip))return {ip,nodeId:null,skipped:true,reason:'Outside configured local asset CIDRs or not a unicast address'}
   let hostname=ip,fqdn=null
   try{const names=await dns.reverse(ip);if(names[0]){fqdn=names[0];hostname=fqdn.split('.')[0]}}catch{}
   const candidateMac=normalizeMac(livenessMeta?.mac),found=existingNode(ip,hostname,candidateMac)

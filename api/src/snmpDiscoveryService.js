@@ -1,3 +1,5 @@
+import {isIP} from 'node:net'
+import {inventoryEligibleIp} from './services/networkBoundary.js'
 import {db,all,one,run,id,now,json,audit} from './db.js'
 import {openSealed} from './security.js'
 import {registerHost} from './networkDiscovery.js'
@@ -22,6 +24,7 @@ export function targetWithCredential(targetId){
 }
 export function ensureSnmpNode(target,device,stamp){
   const existing=one('SELECT * FROM nodes WHERE ip=? OR lower(hostname)=lower(?) OR lower(fqdn)=lower(?) ORDER BY CASE WHEN inventory_source=\'ad\' THEN 0 ELSE 1 END LIMIT 1',target.host,target.host,target.host)
+  if(!existing&&isIP(target.host)&&!inventoryEligibleIp(target.host))return null
   const identity=device.identity||{}
   const detectedClassification=classifySnmpIdentity(identity,{includeEvidence:true})
   const classification={...detectedClassification,...(device.classification||{})}

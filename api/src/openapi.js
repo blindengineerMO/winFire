@@ -1,3 +1,4 @@
+import {internetConnectionSchemas} from './services/internetConnectionSchemas.js'
 const publicRoutes=new Set([
   'GET /health','GET /openapi.json','POST /auth/login','POST /auth/refresh',
   'POST /invites/accept','POST /auth/verify-email','POST /auth/ad/login',
@@ -22,6 +23,9 @@ const errorResponse={description:'Error response',content:{'application/json':{s
 // complete API, while these explicit schemas prevent management calls from
 // being published as unbounded JSON objects.
 const requestSchemas={
+  'POST /policies/{id}/preview':'PolicyDraftRequest',
+  'POST /policies/{id}/versions':'PolicyVersionRequest',
+  'POST /internet/peers/{id}/resolve':'EmptyRequest',
   'POST /discovery/snmp-library/preview':'SnmpMibImportRequest',
   'POST /discovery/snmp-library/import':'SnmpMibImportRequest',
   'PATCH /discovery/snmp-library/{id}':'SnmpMibUpdateRequest',
@@ -74,6 +78,12 @@ const requestSchemas={
 }
 
 const responseSchemas={
+  'POST /policies/{id}/preview':'PolicyDraftPreview',
+  'GET /internet/connections':'InternetConnectionPage',
+  'GET /internet/connections/summary':'InternetConnectionSummary',
+  'GET /internet/connections/export':'InternetConnectionExport',
+  'GET /internet/connections/{id}':'InternetConnectionDetails',
+  'GET /internet/peers/{id}':'InternetPeer',
   'GET /credentials/health':'CredentialHealthResponse',
   'POST /segments/{id}/entra-group/sync':'EntraGroupSyncResponse',
   'GET /segments/{id}/entra-group/members':'EntraGroupMembersResponse',
@@ -113,6 +123,16 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
             operation.parameters.push(...Object.entries(fields).map(([name,schema])=>({name,in:'query',schema})))
           }
         }
+        if(routeKey==='POST /policies/{id}/preview')operation.description='Read-only draft compilation with inherited scopes, assignment conflicts, management-access protection and warnings. Creates no version and changes no host.'
+        if(routeKey==='POST /policies/{id}/versions'){operation.description='Save an immutable policy graph version. Supply baseVersionId (null for the initial version) to reject stale drafts with 409. Saving does not deploy.';operation.responses={201:jsonResponse,409:errorResponse,default:errorResponse}}
+        if(path.startsWith('/internet/connections')||path.startsWith('/internet/peers/')){
+          operation.description=path.startsWith('/internet/connections')?'Retained firewall observations outside the completed local-CIDR boundary revision. PTR is reverse-DNS evidence, not a requested website. Default direction is outbound. Counts and exports use identical filters. Pending reclassification retains the previous complete revision.':'Read reverse-DNS evidence/history or enqueue a coalesced refresh. No inventory asset is created; resolve requires editor permission and is rate limited.'
+          if(method==='get'&&['/internet/connections','/internet/connections/summary','/internet/connections/export'].includes(path)){
+            const fields={q:{type:'string',maxLength:200},nodeId:{type:'string'},groupId:{type:'string'},ip:{type:'string',description:'Canonical peer IP or IPv4/IPv6 CIDR'},hostname:{type:'string',description:'PTR hostname search'},program:{type:'string'},protocol:{type:'string'},port:{type:'integer',minimum:1,maximum:65535},direction:{type:'string',enum:['out','in','unknown','all'],default:'out'},action:{type:'string',enum:['allow','block']},dnsState:{type:'string',enum:['pending','resolved','not-found','error','stale']},from:{type:'string',format:'date-time'},to:{type:'string',format:'date-time'},page:{type:'integer',minimum:1,default:1},limit:{type:'integer',minimum:1,maximum:100,default:25},sort:{type:'string',enum:['time','node','peer','hostname','program','protocol','port','action','direction'],default:'time'},order:{type:'string',enum:['asc','desc'],default:'desc'}}
+            operation.parameters.push(...Object.entries(fields).map(([name,schema])=>({name,in:'query',schema})))
+          }
+          if(path.endsWith('/resolve'))operation.responses={202:{description:'Refresh queued or coalesced',content:{'application/json':{schema:{$ref:'#/components/schemas/InternetDnsEnqueue'}}}},429:errorResponse,default:errorResponse}
+        }
         if(path.startsWith('/discovery/dhcp/')){
           operation.description=path.endsWith('/preview')?'Read-only DHCP enrichment preview; requires configured local CIDRs.':path.endsWith('/import')?'Passively import eligible local leases; preserve verified state and report conflicts. Exact replays return the original report.':'Read retained DHCP import evidence and row outcomes.'
           if(routeKey==='POST /discovery/dhcp/import')operation.responses={201:jsonResponse,default:errorResponse}
@@ -151,6 +171,11 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
     openapi:'3.1.0',info:{title:'WinFire Secure API',version:'0.1.0',description:'Control-plane operations use bearer tokens. Enrolled agent operations use client certificates.'},
     servers:[{url:'/api/v1'}],paths,
     components:{securitySchemes:{bearerAuth:{type:'http',scheme:'bearer',bearerFormat:'JWT'},internetDeviceBearer:{type:'http',scheme:'bearer',bearerFormat:'Internet device token'},mutualTLS:{type:'mutualTLS'},wefHmac:{type:'apiKey',in:'header',name:'X-WinFire-WEF-Token',description:'Node-scoped HMAC token derived from WEF_SHARED_SECRET. The receiver also accepts the token query parameter for Windows Subscription Manager compatibility.'}},schemas:{
+      ...internetConnectionSchemas,
+      PolicyGraph:{type:'object',required:['nodes'],properties:{nodes:{type:'array',items:{type:'object',required:['id','type'],properties:{id:{type:'string'},type:{type:'string',enum:['allow','deny','program','portGroup','addressGroup','profile','schedule','mfaGate']},position:{type:'object',properties:{x:{type:'number'},y:{type:'number'}}},data:{type:'object',additionalProperties:true}}}},edges:{type:'array',items:{type:'object',required:['id','source','target'],properties:{id:{type:'string'},source:{type:'string'},target:{type:'string'}}}}}},
+      PolicyDraftRequest:{type:'object',required:['graph'],properties:{graph:{$ref:'#/components/schemas/PolicyGraph'}}},
+      PolicyVersionRequest:{type:'object',required:['graph'],properties:{graph:{$ref:'#/components/schemas/PolicyGraph'},comment:{type:'string'},baseVersionId:{type:['string','null'],description:'The saved version on which the draft is based; null for a policy with no saved version.'}}},
+      PolicyDraftPreview:{type:'object',required:['rules','mfaGates','warnings','conflicts','managementIssue','canSave'],properties:{rules:{type:'array',items:{type:'object',additionalProperties:true}},mfaGates:{type:'array',items:{type:'object',additionalProperties:true}},warnings:{type:'array',items:{type:'string'}},conflicts:{type:'array',items:{type:'object',additionalProperties:true}},managementIssue:{type:['string','null']},canSave:{type:'boolean'}}},
       OnboardingError:{type:'object',required:['code','title','summary','remediation'],properties:{code:{type:'string',enum:['port_closed','auth_rejected','kerberos_spn_double_hop','winrm_listener_disabled','wmi_dcom_blocked','unknown']},title:{type:'string'},summary:{type:'string'},remediation:{type:'string'},transport:{type:['string','null']},operation:{type:['string','null']},observedOpenPort:{type:'boolean'}}},
       Error:{type:'object',required:['error'],properties:{error:{type:'string'},onboardingError:{$ref:'#/components/schemas/OnboardingError'}}},
       LoginRequest:{type:'object',required:['email','password'],properties:{email:{type:'string',format:'email'},password:{type:'string',format:'password'},totp:{type:'string'}}},

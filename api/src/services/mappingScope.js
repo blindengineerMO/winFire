@@ -1,30 +1,14 @@
-import {BlockList, isIP} from 'node:net'
+import {subnetMatcher,configuredCidrs,effectiveCidrs} from './networkBoundary.js'
+export {subnetMatcher} from './networkBoundary.js'
 import {db, all, one} from '../db.js'
 
 const address = value => String(value || '').trim().split('%')[0].toLowerCase()
 const mac = value => String(value || '').replace(/[^a-f0-9]/gi, '').toLowerCase()
-const cidrCache = new Map()
-export function subnetMatcher(cidr) {
-  if (cidrCache.has(cidr)) return cidrCache.get(cidr)
-  const parts = String(cidr || '').split('/'), family = isIP(parts[0]), prefix = Number(parts[1])
-  if (parts.length !== 2 || !family || !/^\d+$/.test(parts[1]) || prefix < 0 || prefix > (family === 4 ? 32 : 128)) {
-    throw Object.assign(new Error('Subnet must be a valid IPv4 or IPv6 CIDR'), {status: 400})
-  }
-  const block = new BlockList()
-  block.addSubnet(parts[0], prefix, family === 4 ? 'ipv4' : 'ipv6')
-  const matches = value => isIP(address(value)) === family && block.check(address(value), family === 4 ? 'ipv4' : 'ipv6')
-  if (cidrCache.size >= 128) cidrCache.clear()
-  cidrCache.set(cidr, matches)
-  return matches
-}
 db.function('winfire_mapping_subnet', {deterministic: true}, (ip, cidr) => Number(subnetMatcher(cidr)(ip)))
 db.function('winfire_mapping_mac', {deterministic: true}, mac)
 
 export function mappingFilterOptions() {
-  let cidrs = []
-  const raw = one("SELECT value FROM app_settings WHERE key='local_asset_cidrs'")?.value || ''
-  try { cidrs = JSON.parse(raw) } catch { cidrs = raw.split(/\\n|[\n,]/) }
-  if (!Array.isArray(cidrs)) cidrs = []
+  const cidrs=configuredCidrs()
   return {
     subnets: [...new Set(cidrs.map(value => String(value).trim()).filter(value => { try { subnetMatcher(value); return true } catch { return false } }))],
     switches: all("SELECT id,hostname,ip FROM nodes WHERE device_type='switch' ORDER BY hostname,id")
@@ -75,7 +59,7 @@ export function mappingScope({subnet = null, switchId = null} = {}) {
 export function mappingFlowWhere({nodeId = null, external = null, trafficClass = null, from = null, to = null, ...scopeOptions} = {}, scope = mappingScope(scopeOptions)) {
   const filters = [], args = []
   if (nodeId) { filters.push('(m.source_node_id=? OR m.destination_node_id=?)'); args.push(nodeId, nodeId) }
-  if (external !== null && external !== undefined && external !== '') { filters.push('m.external=?'); args.push(Number(external) ? 1 : 0) }
+  if (external !== null && external !== undefined && external !== '') { filters.push('(winfire_outside(m.source_ip,?) OR winfire_outside(m.destination_ip,?))=?'); const cidrs=JSON.stringify(effectiveCidrs());args.push(cidrs,cidrs,Number(external)?1:0) }
   if (trafficClass) { filters.push('m.traffic_class=?'); args.push(trafficClass) }
   if (from) { filters.push('datetime(m.last_seen_at)>=datetime(?)'); args.push(from) }
   if (to) { filters.push('datetime(m.first_seen_at)<=datetime(?)'); args.push(to) }

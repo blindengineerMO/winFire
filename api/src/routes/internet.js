@@ -5,11 +5,22 @@ import {z} from 'zod'
 import {db,all,one,run,id,now,audit,json,parse} from '../db.js'
 import {auth,hashToken,requireRole} from '../security.js'
 import {asyncHandler} from '../middleware/asyncHandler.js'
+import {listConnections,connectionSummary,connectionDetails,exportConnections} from '../services/internetConnections.js'
+import {peerDetails,enqueuePeer} from '../services/internetPeers.js'
 
 export const internetRoutes=express.Router()
 const wrap=asyncHandler
 const internetEnrollLimit=rateLimit({windowMs:15*60*1000,limit:20,standardHeaders:'draft-8',legacyHeaders:false})
 const internetIngestLimit=rateLimit({windowMs:60*1000,limit:120,standardHeaders:'draft-8',legacyHeaders:false})
+const peerResolveLimit=rateLimit({windowMs:60*1000,limit:20,standardHeaders:'draft-8',legacyHeaders:false})
+internetRoutes.get('/connections',auth,requireRole('auditor'),(req,res)=>res.json(listConnections(req.query)))
+internetRoutes.get('/connections/summary',auth,requireRole('auditor'),(req,res)=>res.json(connectionSummary(req.query)))
+internetRoutes.get('/connections/export',auth,requireRole('auditor'),(req,res)=>{
+  res.set('Content-Disposition','attachment; filename="internet-connections.json"').json(exportConnections(req.query))
+})
+internetRoutes.get('/connections/:id',auth,requireRole('auditor'),(req,res)=>res.json(connectionDetails(req.params.id)))
+internetRoutes.get('/peers/:id',auth,requireRole('auditor'),(req,res)=>res.json(peerDetails(req.params.id)))
+internetRoutes.post('/peers/:id/resolve',auth,requireRole('editor'),peerResolveLimit,(req,res)=>{const result=enqueuePeer(req.params.id);audit(req.user.id,'internet.peer.resolve','internet-peer',req.params.id,null,result);res.status(202).json(result)})
 const browserSchema=z.enum(['chrome','edge','firefox'])
 const collectionSchema=z.enum(['host','path']).default('host')
 const internetRuleSchema=z.object({pattern:z.string().trim().min(1).max(500),match:z.enum(['hostname','domain','prefix']).default('hostname'),action:z.enum(['allow','block']),nodeIds:z.array(z.string().min(1)).max(500).default([]),nodeGroupIds:z.array(z.string().min(1)).max(500).default([]),resourceTypes:z.array(z.enum(['main_frame','sub_frame','script','image','stylesheet','font','object','xmlhttprequest','other'])).min(1).max(20).default(['main_frame'])})

@@ -1,3 +1,4 @@
+import {effectiveCidrs,outsideLocal,inLocalCidrs,inventoryEligibleIp,boundaryState} from './networkBoundary.js'
 import {isIP} from 'node:net'
 import {mappingScope, mappingFlowWhere} from './mappingScope.js'
 import {all, one, run, id, now} from '../db.js'
@@ -230,7 +231,9 @@ export function classifyNetworkFlow({node, sourceIp, destinationIp, sourceNode, 
 
   const localCategories = new Set(['broadcast', 'multicast', 'loopback', 'link-local', 'private', 'unspecified'])
   const hasPublic = sourceCategory === 'public' || destinationCategory === 'public'
-  const scope = trafficClass === 'loopback' ? 'host-local' : (localCategories.has(sourceCategory) && localCategories.has(destinationCategory) && !hasPublic) || sourceNode && destinationNode ? 'internal' : hasPublic ? 'external' : 'unknown'
+  let scope = trafficClass === 'loopback' ? 'host-local' : (localCategories.has(sourceCategory) && localCategories.has(destinationCategory) && !hasPublic) || sourceNode && destinationNode ? 'internal' : hasPublic ? 'external' : 'unknown'
+  const boundary=effectiveCidrs()
+  if(!['loopback','broadcast','multicast','link-local','unspecified'].includes(trafficClass))scope=boundary.length?(outsideLocal(source,boundary)||outsideLocal(destination,boundary)?'external':inLocalCidrs(source,boundary)&&inLocalCidrs(destination,boundary)?'internal':'unknown'):'unknown'
   let reason
   if (trafficClass === 'multicast') reason = `${destination || source} is a multicast group; multicast is link or site scoped and is treated as internal traffic`
   else if (trafficClass === 'broadcast') reason = `${destination || source} is an IPv4 broadcast address; broadcast is local to the attached network`
@@ -242,6 +245,7 @@ export function classifyNetworkFlow({node, sourceIp, destinationIp, sourceNode, 
   else if (trafficClass === 'shared-address') reason = '100.64.0.0/10 is shared carrier-grade NAT space, not a public Internet destination'
   else if (trafficClass === 'public-unicast') reason = 'At least one endpoint is globally routable and no local-scope exception matched'
   else reason = 'Address scope could not be determined from the observed tuple'
+  if(boundary.length&&scope==='external')reason='A unicast endpoint is outside configured local CIDRs; its address category does not imply public routability'
   if (service) reason += `; identified as ${service}`
   return {trafficClass, scope, service, reason, sourceCategory, destinationCategory, external: scope === 'external' ? 1 : 0}
 }
@@ -344,8 +348,8 @@ export function recordNetworkFlow(nodeId, event, observedAt = null) {
   const sourceIp = clean(event.srcIp || (direction === 'out' ? node.ip : null))
   const destinationIp = clean(event.dstIp || (direction === 'in' ? node.ip : null))
   if (!sourceIp || !destinationIp || isIP(ipv4(sourceIp)) === 0 || isIP(ipv4(destinationIp)) === 0) return false
-  const sourceNode = direction === 'out' ? node : nodeForIp(sourceIp)
-  const destinationNode = direction === 'in' ? node : nodeForIp(destinationIp)
+  const sourceNode = sourceIp === node.ip ? node : nodeForIp(sourceIp)
+  const destinationNode = destinationIp === node.ip ? node : nodeForIp(destinationIp)
   const protocol = normalizeNetworkProtocol(event.protocol || 'UNKNOWN')
   const sourcePort = port(event.srcPort)
   const destinationPort = port(event.dstPort)
@@ -378,7 +382,7 @@ export function recordArpEntries(nodeId, entries, source = 'agent') {
     // reporting node's own address. The queue keeps ingestion synchronous and
     // lets the normal DNS/WinRM onboarding worker handle network operations.
     const inventoryNode = one('SELECT id FROM nodes WHERE lower(ip)=lower(?) LIMIT 1', ip)
-    if (sourceNode && ip !== sourceNode.ip && !inventoryNode) run(`INSERT INTO passive_discovery_candidates(id,ip,mac,source_node_id,hostname,first_seen_at,last_seen_at,status,attempts,next_attempt_at,node_id,last_error,updated_at)
+    if (sourceNode && ip !== sourceNode.ip && !inventoryNode && inventoryEligibleIp(ip)) run(`INSERT INTO passive_discovery_candidates(id,ip,mac,source_node_id,hostname,first_seen_at,last_seen_at,status,attempts,next_attempt_at,node_id,last_error,updated_at)
       VALUES(?,?,?,?,?,?,?,'queued',0,NULL,NULL,NULL,?)
       ON CONFLICT(ip) DO UPDATE SET mac=COALESCE(excluded.mac,passive_discovery_candidates.mac),source_node_id=excluded.source_node_id,hostname=COALESCE(excluded.hostname,passive_discovery_candidates.hostname),last_seen_at=excluded.last_seen_at,updated_at=excluded.updated_at,
         status=CASE WHEN passive_discovery_candidates.status='registered' THEN passive_discovery_candidates.status ELSE 'queued' END,
@@ -410,16 +414,17 @@ export function mappingRows({page = 1, pageSize = 100, ...options} = {}) {
       ...row,
       protocol: normalizeNetworkProtocol(row.protocol),
       traffic_class: row.traffic_class || classification.trafficClass,
-      traffic_scope: row.traffic_scope || classification.scope,
+      traffic_scope: classification.scope,
+      external:classification.external,
       // Reclassify legacy rows whose old analyzer stored a placeholder. This
       // makes existing mappings immediately show a known service after the
       // catalog or port normalization is updated.
       traffic_service: hasIdentifiedService(row.traffic_service) ? row.traffic_service : classification.service,
-      classification_reason: row.classification_reason || classification.reason,
+      classification_reason: classification.reason,
     }
   })
   const topTalkers = all(`SELECT node_id,hostname,SUM(connections) connections FROM (SELECT source_node_id node_id,COALESCE(sn.hostname,source_ip) hostname,connection_count connections FROM network_map_pairs m LEFT JOIN nodes sn ON sn.id=m.source_node_id ${where} UNION ALL SELECT destination_node_id,COALESCE(dn.hostname,destination_ip),connection_count FROM network_map_pairs m LEFT JOIN nodes dn ON dn.id=m.destination_node_id ${where}) GROUP BY node_id,hostname ORDER BY connections DESC LIMIT 20`, ...args, ...args)
-  return {rows, topTalkers, total: Number(total), page: safePage, pageSize: safeSize, pages: Math.ceil(Number(total) / safeSize)}
+  return {scopeBoundary:boundaryState(),rows, topTalkers, total: Number(total), page: safePage, pageSize: safeSize, pages: Math.ceil(Number(total) / safeSize)}
 }
 
 /**

@@ -1,33 +1,34 @@
 <script setup>
 import {onMounted,onUnmounted,ref,computed,watch,nextTick} from 'vue'
-import {VueFlow,useVueFlow} from '@vue-flow/core'
-import '@vue-flow/core/dist/style.css'
-import '@vue-flow/core/dist/theme-default.css'
+import PolicyEditor from '../components/policies/PolicyEditor.vue'
+import {nodeLabel,nodeIssue,graphDocument} from '../components/policies/model.js'
 import PageHeader from '../components/PageHeader.vue'
 import GlassWindow from '../components/GlassWindow.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import LearnedRuleEvidence from '../components/LearnedRuleEvidence.vue'
 import {api,session} from '../services/api.js'
-import {validateAddressExpression,validatePortExpression,validateProgramPath} from '@winfire/shared/validation.js'
-import {normalizeSchedule,normalizeMfaGate,extractMfaGates} from '@winfire/shared'
-import {useRoute} from 'vue-router'
-const route=useRoute()
-const policies=ref([]),nodes=ref([]),groups=ref([]),selected=ref(null),versions=ref([]),assignments=ref([]),graphNodes=ref([]),edges=ref([]),editor=ref(null),formOpen=ref(false),assignOpen=ref(false),historyOpen=ref(false),error=ref(''),message=ref(''),newName=ref(''),newDescription=ref(''),comment=ref(''),assignKind=ref('node'),assignTarget=ref(''),busy=ref(false)
+import {useRoute,useRouter} from 'vue-router'
+const route=useRoute(),router=useRouter()
+const policies=ref([]),nodes=ref([]),groups=ref([]),selected=ref(null),versions=ref([]),assignments=ref([]),graphNodes=ref([]),edges=ref([]),formOpen=ref(false),assignOpen=ref(false),historyOpen=ref(false),error=ref(''),message=ref(''),newName=ref(''),newDescription=ref(''),comment=ref(''),assignKind=ref('node'),assignTarget=ref(''),busy=ref(false)
 const learningPreview=ref(null),previewBusy=ref(false)
 const confirmDialogOpen=ref(false),confirmDialogMessage=ref(''),confirmDialogAction=ref(null),confirmDialogBusy=ref(false)
 const targetDropActive=ref(false)
 const verifyOpen=ref(false),verifyVantageId=ref(''),verifyBusy=ref(false)
 const verifierPeers=computed(()=>nodes.value.filter(node=>['winrm','winrms'].includes(node.transport)))
-const editorMode=ref('visual')
-const classicRules=computed(()=>graphNodes.value.filter(node=>['allow','deny','program'].includes(node.type)))
+const policyEditor=ref(null),loadedPolicyId=ref(null),loadingPolicy=ref(false),draftPreview=ref(null),validating=ref(false),draftError=ref(''),draftNotice=ref(''),baseVersionId=ref(null),savedSignature=ref('')
+let selectionSequence=0,validationSequence=0,validationTimer
+const currentGraph=()=>graphDocument(graphNodes.value,edges.value)
+const graphSignature=computed(()=>JSON.stringify(currentGraph()))
+const dirty=computed(()=>!isLearningPreview.value&&graphSignature.value!==savedSignature.value)
+const policyLoaded=computed(()=>!!selected.value&&loadedPolicyId.value===selected.value.id)
+const editable=computed(()=>policyLoaded.value&&canEdit.value&&selected.value?.canWrite!==false&&!isLearningPreview.value&&!loadingPolicy.value)
+const staleDraft=computed(()=>baseVersionId.value!==(selected.value?.current_version_id||null))
 const compareFrom=ref(''),compareTo=ref(''),comparison=ref(null),compareBusy=ref(false)
-const types=[['allow','check-circle-outline','Allow rule'],['deny','cancel','Deny rule'],['program','application-outline','Program rule'],['portGroup','numeric','Port group'],['addressGroup','ip-network','Address group'],['profile','shield-outline','Profile scope'],['schedule','clock-outline','Schedule'],['mfaGate','shield-account','MFA gate']]
-const {fitView}=useVueFlow()
 let resizeTimer,previewTimer
-function fit(){clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>fitView({padding:.22,duration:150}),100)}
+function fit(){clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>policyEditor.value?.fit(),100)}
 const isLearningPreview=computed(()=>selected.value?.origin==='learned'&&selected.value?.learning?.status==='active')
-const activeRules=computed(()=>isLearningPreview.value?learningPreview.value?.rules||[]:versions.value.find(v=>v.id===selected.value?.current_version_id)?.rules||[])
-const activeMfaGates=computed(()=>isLearningPreview.value?[]:versions.value.find(v=>v.id===selected.value?.current_version_id)?.mfaGates||extractMfaGates({nodes:graphNodes.value,edges:edges.value}))
+const activeRules=computed(()=>isLearningPreview.value?learningPreview.value?.rules||[]:(dirty.value?(validating.value?[]:draftPreview.value?.rules||[]):versions.value.find(v=>v.id===selected.value?.current_version_id)?.rules||[]))
+const activeMfaGates=computed(()=>isLearningPreview.value?[]:draftPreview.value?.mfaGates||[])
 const evidenceByNode=computed(()=>{
   const graph=isLearningPreview.value?learningPreview.value?.graph:versions.value.find(v=>v.id===selected.value?.current_version_id)?.graph
   return new Map((graph?.nodes||[]).map(node=>[node.id,node.data?.evidence]))
@@ -36,42 +37,70 @@ function ruleEvidence(rule){return evidenceByNode.value.get(rule.sourceNodeId)}
 const canEdit=computed(()=>['owner','admin','editor'].includes(session.user?.role))
 function assignmentLabel(assignment){return assignment.node_id?nodes.value.find(node=>node.id===assignment.node_id)?.hostname||assignment.node_id:groups.value.find(group=>group.id===assignment.node_group_id)?.name||assignment.node_group_id}
 async function refreshAssignments(){if(selected.value)assignments.value=(await api(`/policies/${selected.value.id}`)).assignments||[]}
-function nodeIssue(node){
-  const data=node.data||{}
-  if(node.type==='portGroup'&&!validatePortExpression(data.ports))return 'Enter ports from 1 to 65535, separated by commas.'
-  if(node.type==='addressGroup'&&!validateAddressExpression(data.addresses))return 'Enter valid IP addresses, CIDRs, or ranges.'
-  if(['allow','deny','program'].includes(node.type)){
-    if(!validatePortExpression(data.localPort||'Any')||!validatePortExpression(data.remotePort||'Any'))return 'Use valid local and remote ports from 1 to 65535.'
-    if(data.protocol==='Any'&&((data.localPort||'Any')!=='Any'||(data.remotePort||'Any')!=='Any'))return 'Specific ports require TCP or UDP.'
-    if(!validateAddressExpression(data.remoteAddress||'Any'))return 'Enter a valid remote IP address or CIDR.'
-    if(node.type==='program'&&!validateProgramPath(data.program))return 'Enter an absolute Windows program path.'
-    if(data.localUserSid&&(!/^S-1-\d+-\d+(?:-\d+)+$/.test(data.localUserSid)||node.type!=='deny'||data.direction!=='out'))return 'Account SID restrictions require an outbound reject rule and a valid SID.'
-  }
-  if(node.type==='schedule'){try{normalizeSchedule(data)}catch(error){return error.message}}
-  if(node.type==='mfaGate'){try{normalizeMfaGate(data)}catch(error){return error.message}}
-  return ''
-}
-const editorIssue=computed(()=>editor.value?nodeIssue(editor.value):'')
 const validationIssue=computed(()=>{
   if(!selected.value)return ''
   for(const node of graphNodes.value){const issue=nodeIssue(node);if(issue)return `${nodeLabel(node)}: ${issue}`}
   return ''
 })
-function nodeLabel(n){return n.data?.name||types.find(t=>t[0]===n.type)?.[2]||n.type}
-function storageKey(){return `winfire_draft_${selected.value?.id}`}
+function storageKey(policy=selected.value){return `winfire_draft_${session.user?.id||'operator'}_${policy?.id}`}
 async function load(){try{[policies.value,nodes.value,groups.value]=await Promise.all([api('/policies'),api('/nodes'),api('/node-groups')]);if(selected.value){selected.value=policies.value.find(p=>p.id===selected.value.id)||null}}catch(e){error.value=e.message}}
 async function refreshLearningPreview(policy=selected.value){if(!policy||policy.learning?.status!=='active')return;previewBusy.value=true;try{const preview=await api(`/policies/${policy.id}/learning-preview`);if(selected.value?.id!==policy.id)return;learningPreview.value=preview;graphNodes.value=preview.graph.nodes.map(n=>({...n,data:{...n.data,label:nodeLabel(n)}}));edges.value=preview.graph.edges;error.value='';await nextTick();fit()}catch(e){error.value=e.message}finally{previewBusy.value=false}}
-async function choose(policy){selected.value=policy;learningPreview.value=null;[versions.value]=await Promise.all([api(`/policies/${policy.id}/versions`),refreshAssignments()]);compareFrom.value=versions.value[1]?.id||versions.value[0]?.id||'';compareTo.value=policy.current_version_id||versions.value[0]?.id||'';comparison.value=null;if(isLearningPreview.value){await refreshLearningPreview(policy);return}const draft=localStorage.getItem(storageKey());const current=versions.value.find(v=>v.id===policy.current_version_id);const graph=draft?JSON.parse(draft):current?.graph||{nodes:[],edges:[]};graphNodes.value=graph.nodes.map(n=>({...n,data:{direction:'in',protocol:'TCP',localPort:'Any',remotePort:'Any',remoteAddress:'Any',profile:'Any',program:'Any',...n.data,label:nodeLabel(n)}}));edges.value=graph.edges;error.value='';message.value='';await nextTick();fit()}
-watch([graphNodes,edges],()=>{if(selected.value&&!isLearningPreview.value)localStorage.setItem(storageKey(),JSON.stringify({nodes:graphNodes.value,edges:edges.value}))},{deep:true})
-onMounted(async()=>{await load();const requested=policies.value.find(policy=>policy.id===route.query.policyId);if(requested)await choose(requested);window.addEventListener('resize',fit);previewTimer=setInterval(async()=>{if(!isLearningPreview.value)return;const policyId=selected.value.id;await load();if(selected.value?.id!==policyId)return;if(isLearningPreview.value)await refreshLearningPreview();else await choose(selected.value)},60_000)})
-onUnmounted(()=>{window.removeEventListener('resize',fit);clearTimeout(resizeTimer);clearInterval(previewTimer)})
-async function create(){try{const policy=await api('/policies',{method:'POST',body:{name:newName.value,description:newDescription.value}});formOpen.value=false;newName.value='';newDescription.value='';await load();await choose(policy)}catch(e){error.value=e.message}}
-function addNode(type){const index=graphNodes.value.length;const data={name:types.find(t=>t[0]===type)?.[2],label:types.find(t=>t[0]===type)?.[2],direction:'in',protocol:'TCP',localPort:'Any',remotePort:'Any',remoteAddress:'Any',profile:'Any',program:'Any'};if(type==='schedule')Object.assign(data,{days:'1,2,3,4,5',startTime:'09:00',endTime:'17:00',timezone:'UTC'});if(type==='mfaGate')Object.assign(data,{localPort:'3389',program:'Any',sourceAssetScope:'Any',destinationAssetScope:'Any',sourceProcess:'Any',extraPorts:'',fallbackToLoggedOnUser:false,failMode:'closed',sessionTtlMinutes:480,reactiveTtlMinutes:240,entraGroupId:''});graphNodes.value.push({id:crypto.randomUUID(),type,position:{x:80+(index%3)*230,y:80+Math.floor(index/3)*140},data})}
-function removeClassicRule(node){graphNodes.value=graphNodes.value.filter(item=>item.id!==node.id);edges.value=edges.value.filter(edge=>edge.source!==node.id&&edge.target!==node.id)}
-function connect(connection){edges.value=[...edges.value,{...connection,id:crypto.randomUUID()}]}
-async function save(){busy.value=true;error.value='';try{const graph={nodes:graphNodes.value.map(n=>({id:n.id,type:n.type,position:n.position,data:Object.fromEntries(Object.entries(n.data||{}).filter(([k])=>k!=='label'))})),edges:edges.value.map(e=>({id:e.id,source:e.source,target:e.target}))};await api(`/policies/${selected.value.id}/versions`,{method:'POST',body:{graph,comment:comment.value}});localStorage.removeItem(storageKey());comment.value='';message.value='Version saved. An administrator can sync it from the top bar.';await load();await choose(selected.value)}catch(e){error.value=e.message}finally{busy.value=false}}
+async function validateDraft(){
+  if(!policyLoaded.value||loadingPolicy.value||isLearningPreview.value)return
+  const sequence=++validationSequence,policyId=selected.value.id,signature=graphSignature.value
+  validating.value=true;draftError.value=''
+  try{const preview=await api(`/policies/${policyId}/preview`,{method:'POST',body:{graph:currentGraph()}});if(sequence===validationSequence&&selected.value?.id===policyId&&signature===graphSignature.value){draftPreview.value=preview;draftError.value=preview.managementIssue||preview.conflicts.map(c=>`${c.rule} conflicts with ${c.otherPolicy} / ${c.otherRule}`).join('; ')}}
+  catch(e){if(sequence===validationSequence&&selected.value?.id===policyId&&signature===graphSignature.value){draftError.value=e.message;draftPreview.value=null}}
+  finally{if(sequence===validationSequence)validating.value=false}
+}
+async function choose(policy,{discard=false}={}){
+  const sequence=++selectionSequence;++validationSequence;clearTimeout(validationTimer);loadingPolicy.value=true;loadedPolicyId.value=null;graphNodes.value=[];edges.value=[];versions.value=[];assignments.value=[];validating.value=false;selected.value=policy;learningPreview.value=null;draftPreview.value=null;draftError.value='';draftNotice.value='';error.value=''
+  try{
+    const [history,details]=await Promise.all([api(`/policies/${policy.id}/versions`),api(`/policies/${policy.id}`)])
+    if(sequence!==selectionSequence)return
+    versions.value=history;assignments.value=details.assignments||[];selected.value={...policy,...details}
+    if(route.query.policyId!==policy.id)router.replace({query:{...route.query,policyId:policy.id}})
+    compareFrom.value=history[1]?.id||history[0]?.id||'';compareTo.value=details.current_version_id||history[0]?.id||'';comparison.value=null
+    baseVersionId.value=details.current_version_id||null
+    if(isLearningPreview.value){await refreshLearningPreview(selected.value);if(sequence===selectionSequence&&learningPreview.value)loadedPolicyId.value=policy.id;return}
+    const current=history.find(v=>v.id===details.current_version_id)?.graph||{nodes:[],edges:[]}
+    savedSignature.value=JSON.stringify(graphDocument(current.nodes,current.edges||[]))
+    let graph=current
+    if(discard){localStorage.removeItem(storageKey());localStorage.removeItem(`winfire_draft_${policy.id}`)}
+    else if(canEdit.value&&selected.value.canWrite!==false){
+      try{
+        const cached=localStorage.getItem(storageKey())||localStorage.getItem(`winfire_draft_${policy.id}`)
+        if(cached){const draft=JSON.parse(cached),candidate=draft.graph||draft;if(!Array.isArray(candidate.nodes)||!Array.isArray(candidate.edges))throw Error('Invalid stored draft');graphDocument(candidate.nodes,candidate.edges);graph=candidate;if('baseVersionId' in draft)baseVersionId.value=draft.baseVersionId;draftNotice.value='Restored your local draft. Review it before saving.'}
+      }catch{draftNotice.value='The stored draft could not be read. The saved policy is shown; the stored copy has been retained.'}
+    }
+    graphNodes.value=graph.nodes.map((n,i)=>({...n,position:n.position||{x:60+(i%3)*310,y:60+Math.floor(i/3)*180},data:{...n.data}}));edges.value=graph.edges;loadedPolicyId.value=policy.id
+    await nextTick();policyEditor.value?.resetHistory();fit()
+  }catch(e){if(sequence===selectionSequence)error.value=e.message}
+  finally{if(sequence===selectionSequence){loadingPolicy.value=false;if(!isLearningPreview.value)validateDraft()}}
+}
+watch(graphSignature,()=>{
+  if(!policyLoaded.value||loadingPolicy.value||isLearningPreview.value)return
+  if(editable.value&&dirty.value){try{localStorage.setItem(storageKey(),JSON.stringify({graph:currentGraph(),baseVersionId:baseVersionId.value}))}catch{draftNotice.value='Browser storage is unavailable. Save a version to retain your changes.'}}
+  if(editable.value&&!dirty.value){try{localStorage.removeItem(storageKey());localStorage.removeItem(`winfire_draft_${selected.value.id}`)}catch{}}
+  clearTimeout(validationTimer);++validationSequence;validating.value=true;validationTimer=setTimeout(validateDraft,450)
+})
+watch(()=>route.query.policyId,id=>{const policy=policies.value.find(p=>p.id===id);if(policy&&selected.value?.id!==id)choose(policy)})
+onMounted(async()=>{await load();const requested=policies.value.find(policy=>policy.id===route.query.policyId)||policies.value[0];if(requested)await choose(requested);window.addEventListener('resize',fit);previewTimer=setInterval(async()=>{if(!isLearningPreview.value)return;const policyId=selected.value.id;await load();if(selected.value?.id!==policyId)return;if(isLearningPreview.value)await refreshLearningPreview();else await choose(selected.value)},60_000)})
+onUnmounted(()=>{window.removeEventListener('resize',fit);clearTimeout(resizeTimer);clearInterval(previewTimer);clearTimeout(validationTimer);++selectionSequence;++validationSequence})
+async function create(){if(busy.value)return;busy.value=true;error.value='';try{const policy=await api('/policies',{method:'POST',body:{name:newName.value,description:newDescription.value}});formOpen.value=false;newName.value='';newDescription.value='';await load();await choose(policies.value.find(p=>p.id===policy.id)||policy)}catch(e){error.value=e.message}finally{busy.value=false}}
+async function save(){
+  if(!editable.value||busy.value||staleDraft.value)return
+  busy.value=true;error.value=''
+  try{
+    const policyId=selected.value.id,graph=currentGraph()
+    await api(`/policies/${policyId}/versions`,{method:'POST',body:{graph,comment:comment.value,baseVersionId:baseVersionId.value}})
+    localStorage.removeItem(storageKey());localStorage.removeItem(`winfire_draft_${policyId}`);comment.value='';loadingPolicy.value=true
+    await load();await choose(policies.value.find(p=>p.id===policyId));message.value='Version saved. Apply the saved version or sync it from the top bar.'
+  }catch(e){error.value=e.message}finally{busy.value=false;loadingPolicy.value=false}
+}
+function discardDraft(){askConfirmation('Discard the local draft and load the latest saved version?',()=>choose(selected.value,{discard:true}))}
 async function assignTargetToPolicy(kind,target){
-  if(!selected.value||!canEdit.value||busy.value)return
+  if(!selected.value||!editable.value||busy.value)return
   busy.value=true;error.value='';message.value=''
   try{
     await api(`/policies/${selected.value.id}/assignments`,{method:'POST',body:kind==='node'?{nodeId:target}:{nodeGroupId:target}})
@@ -82,13 +111,13 @@ async function assignTargetToPolicy(kind,target){
 }
 async function assign(){await assignTargetToPolicy(assignKind.value,assignKind.value==='global'?'winfire-global-all-nodes':assignTarget.value)}
 function dragTarget(event,kind,target){
-  if(!canEdit.value||busy.value){event.preventDefault();return}
+  if(!editable.value||busy.value){event.preventDefault();return}
   event.dataTransfer.effectAllowed='copy'
   event.dataTransfer.setData('application/x-winfire-target',JSON.stringify({kind,target}))
 }
 function dropTarget(event){
   targetDropActive.value=false
-  if(!canEdit.value||busy.value)return
+  if(!editable.value||busy.value)return
   let payload
   try{payload=JSON.parse(event.dataTransfer.getData('application/x-winfire-target'))}catch{return}
   if(payload.kind==='node'&&nodes.value.some(node=>node.id===payload.target))assignTargetToPolicy('node',payload.target)
@@ -102,7 +131,7 @@ function removeAssignment(assignment){askConfirmation(`Remove the assignment to 
   catch(e){error.value=e.message}
   finally{busy.value=false}
 })}
-async function apply(){busy.value=true;try{const result=await api(`/policies/${selected.value.id}/apply`,{method:'POST',body:{}});message.value=`Applied to ${result.results.filter(r=>r.status==='success').length} node(s); ${result.results.filter(r=>r.status==='failed').length} failed` }catch(e){error.value=e.message}finally{busy.value=false}}
+async function apply(){busy.value=true;try{const result=await api(`/policies/${selected.value.id}/apply`,{method:'POST',body:{}});message.value=`Applied to ${result.results.filter(r=>r.status==='success').length} node(s); ${result.results.filter(r=>r.status==='queued').length} queued; ${result.results.filter(r=>r.status==='failed').length} failed` }catch(e){error.value=e.message}finally{busy.value=false}}
 async function verifyPolicy(){
   if(!selected.value)return
   verifyBusy.value=true;error.value='';message.value=''
@@ -115,15 +144,257 @@ async function verifyPolicy(){
   }catch(cause){error.value=cause.message}
   finally{verifyBusy.value=false}
 }
-async function recall(version){busy.value=true;try{await api(`/policies/${selected.value.id}/versions/${version.id}/recall`,{method:'POST',body:{}});historyOpen.value=false;message.value=`Recalled version ${version.version_no}. Sync it from the top bar.`;await load();await choose(selected.value)}catch(e){error.value=e.message}finally{busy.value=false}}
+async function recall(version){busy.value=true;try{await api(`/policies/${selected.value.id}/versions/${version.id}/recall`,{method:'POST',body:{}});historyOpen.value=false;message.value=`Recalled version ${version.version_no}. Sync it from the top bar.`;await load();await choose(selected.value,{discard:true})}catch(e){error.value=e.message}finally{busy.value=false}}
 async function compareVersions(){compareBusy.value=true;comparison.value=null;error.value='';try{comparison.value=await api(`/policies/${selected.value.id}/diff?from=${encodeURIComponent(compareFrom.value)}&to=${encodeURIComponent(compareTo.value)}`)}catch(e){error.value=e.message}finally{compareBusy.value=false}}
 function describeRule(rule){return `${rule.name}: ${rule.action} ${rule.direction} ${rule.protocol} local ${rule.localPort||'Any'} / remote ${rule.remotePort||'Any'} / ${rule.remoteAddress||'Any'}`}
 function describeNode(node){return `${nodeLabel(node)} (${node.type})`}
 </script>
-<template><div class="view"><PageHeader eyebrow="POLICY / AUTHORING" title="Policy studio" description="Compose, version and apply Windows Firewall rules"><button class="button primary" @click="formOpen=true"><i class="mdi mdi-plus"></i> New policy</button></PageHeader><div v-if="error" class="error-msg">{{error}}</div><div v-if="message" class="success-msg">{{message}}</div><div class="studio-layout"><aside class="panel glass policy-list" aria-label="Policy library"><div class="panel-title"><div><span class="eyebrow">LIBRARY</span><h2>Policies</h2></div><span class="count-chip">{{policies.length}}</span></div><button v-for="policy in policies" :key="policy.id" class="policy-item" :class="{active:selected?.id===policy.id}" @click="choose(policy)"><i class="mdi mdi-shield-outline"></i><span><strong>{{policy.name}}</strong><small>{{policy.origin==='learned'?`Personal · ${policy.learning?.status||'ready'}`:`Version ${policy.version_no||'draft'}`}}</small></span><span class="status" :class="policy.learning?.status==='active'?'learning':policy.verificationStatus||'unknown'">{{policy.learning?.status==='active'?'Learning':policy.verificationStatus||'Unchecked'}}</span><i class="mdi mdi-chevron-right"></i></button><div v-if="!policies.length" class="empty-side">Create a policy to start building rules.</div></aside><div v-if="selected" class="studio-main"><section class="panel glass canvas-panel"><div class="panel-title studio-title"><div><span class="eyebrow">{{isLearningPreview?'LIVE LEARNING PREVIEW':'VISUAL POLICY EDITOR'}}</span><h2>{{selected.name}}</h2></div><div class="inline-actions"><button class="button small secondary" @click="historyOpen=true"><i class="mdi mdi-history"></i> History</button><button v-if="!isLearningPreview" class="button small secondary" @click="verifyOpen=true"><i class="mdi mdi-radar"></i> Verify</button><button v-if="!isLearningPreview" class="button small secondary" @click="assignOpen=true"><i class="mdi mdi-link-variant"></i> Assign</button></div></div><div v-if="isLearningPreview" class="learning-preview-summary"><div><strong>{{learningPreview?.rules.length||0}} proposed rules</strong><span>{{learningPreview?.newFlowCount||0}} new rules · {{learningPreview?.observedFlowCount||0}} observed 5-tuples</span><small>Training ends {{new Date(selected.learning.ends_at).toLocaleString()}}<template v-if="learningPreview?.progressiveEnabled"> · next progressive apply {{new Date(learningPreview.nextProgressiveAt).toLocaleString()}}</template></small></div><button class="button small secondary" :disabled="previewBusy" @click="refreshLearningPreview()">{{previewBusy?'Refreshing…':'Refresh preview'}}</button></div><div v-if="!isLearningPreview" class="editor-mode-tabs"><button class="button small secondary" :class="{active:editorMode==='visual'}" @click="editorMode='visual';fit()">Flow editor</button><button class="button small secondary" :class="{active:editorMode==='classic'}" @click="editorMode='classic'">Classic rules</button></div><div v-if="!isLearningPreview" v-show="editorMode==='visual'" class="palette"><button v-for="type in types" :key="type[0]" @click="addNode(type[0])"><i class="mdi" :class="`mdi-${type[1]}`"></i>{{type[2]}}</button></div><div v-show="isLearningPreview||editorMode==='visual'" class="flow-area"><VueFlow v-model:nodes="graphNodes" v-model:edges="edges" :fit-view-on-init="true" :nodes-draggable="!isLearningPreview" :nodes-connectable="!isLearningPreview" @connect="connect" @node-click="({node})=>{if(!isLearningPreview)editor=node}" /></div><div v-if="!isLearningPreview&&editorMode==='classic'" class="classic-policy-editor"><div class="inline-actions"><button class="button small secondary" @click="addNode('allow')">Add allow rule</button><button class="button small secondary" @click="addNode('deny')">Add reject rule</button></div><div class="table-wrap"><table><thead><tr><th>Name</th><th>Action</th><th>Direction</th><th>Protocol</th><th>Local port</th><th>Remote port</th><th>Remote address</th><th>Profile</th><th>Program</th><th>Local account SID</th><th></th></tr></thead><tbody><tr v-for="rule in classicRules" :key="rule.id"><td><input v-model="rule.data.name" @input="rule.data.label=rule.data.name" aria-label="Rule name"></td><td><select v-model="rule.type" aria-label="Rule action" @change="rule.data.program=rule.type==='program'?rule.data.program||'Any':'Any'"><option value="allow">Allow</option><option value="deny">Reject</option><option value="program">Program</option></select></td><td><select v-model="rule.data.direction" aria-label="Direction"><option value="in">Inbound</option><option value="out">Outbound</option></select></td><td><select v-model="rule.data.protocol" aria-label="Protocol"><option>TCP</option><option>UDP</option><option>Any</option></select></td><td><input v-model="rule.data.localPort" aria-label="Local port"></td><td><input v-model="rule.data.remotePort" aria-label="Remote port"></td><td><input v-model="rule.data.remoteAddress" aria-label="Remote address"></td><td><select v-model="rule.data.profile" aria-label="Profile"><option>Any</option><option>Domain</option><option>Private</option><option>Public</option></select></td><td><input v-model="rule.data.program" :disabled="rule.type!=='program'" aria-label="Program path"></td><td><input v-model.trim="rule.data.localUserSid" :disabled="rule.type!=='deny'" aria-label="Local account SID" placeholder="All accounts"></td><td><button class="button small danger" :aria-label="`Delete ${rule.data.name}`" @click="removeClassicRule(rule)">Delete</button></td></tr><tr v-if="!classicRules.length"><td colspan="11">No rules yet. Add one above.</td></tr></tbody></table></div></div><div v-if="!isLearningPreview" class="canvas-footer"><input v-model="comment" placeholder="Version comment (optional)" aria-label="Version comment"><span class="hint">Draft saved locally</span><span v-if="validationIssue" class="validation-hint" role="alert">{{validationIssue}}</span><button class="button primary" :disabled="busy||!!validationIssue" @click="save"><i class="mdi mdi-content-save-outline"></i> Save version</button></div></section><section class="panel glass rules-panel"><div class="panel-title"><div><span class="eyebrow">COMPILED OUTPUT</span><h2>{{activeRules.length}} {{isLearningPreview?'proposed':'active'}} rules</h2></div></div><div v-if="activeMfaGates.length" class="mfa-gate-summary"><div v-for="gate in activeMfaGates" :key="gate.id" class="rule-row"><span class="status unknown">MFA gate</span><strong>{{gate.name}}</strong><span>TCP {{gate.targetPort}} · session {{gate.sessionTtlMinutes}}m · reactive {{gate.reactiveTtlMinutes}}m</span><span v-if="gate.entraGroupId" class="mono">Entra {{gate.entraGroupId}}</span><small>Staged metadata; deployment waits for the Windows challenge broker.</small></div></div><div v-if="!activeRules.length&&!activeMfaGates.length" class="empty-side">{{isLearningPreview?'No eligible traffic has been learned yet.':'Save a version to see compiled rules.'}}</div><div v-for="rule in activeRules" :key="rule.sourceNodeId" class="rule-row"><span class="status" :class="rule.action">{{rule.action}}</span><strong>{{rule.name}}</strong><span>{{rule.direction}} / {{rule.protocol}} / local {{rule.localPort}} / remote {{rule.remotePort||'Any'}}</span><span class="mono">{{rule.remoteAddress}}</span><span v-if="rule.localUserSid" class="mono">Account {{rule.localUserSid}}</span><LearnedRuleEvidence v-if="ruleEvidence(rule)" :evidence="ruleEvidence(rule)" /></div></section><section class="panel glass assignments-panel" :class="{'target-drop-active':targetDropActive}" @dragover.prevent="targetDropActive=true" @dragleave="targetDropActive=false" @drop.prevent="dropTarget"><div class="panel-title"><div><span class="eyebrow">TARGETS</span><h2>Assignments</h2></div><span class="count-chip">{{assignments.length}}</span></div><div v-if="canEdit&&!isLearningPreview" class="assignment-targets"><p>Drag a node or group here, or select one below to assign it.</p><button v-for="node in nodes.filter(item=>!assignments.some(assignment=>assignment.node_id===item.id))" :key="`node-${node.id}`" type="button" class="assignment-target-chip" draggable="true" :disabled="busy" @dragstart="dragTarget($event,'node',node.id)" @click="assignTargetToPolicy('node',node.id)"><i class="mdi mdi-server"></i> {{node.hostname}}</button><button v-for="group in groups.filter(item=>!assignments.some(assignment=>assignment.node_group_id===item.id))" :key="`group-${group.id}`" type="button" class="assignment-target-chip" draggable="true" :disabled="busy" @dragstart="dragTarget($event,'group',group.id)" @click="assignTargetToPolicy('group',group.id)"><i class="mdi mdi-server-network"></i> {{group.name}}</button></div><p v-if="!assignments.length" class="empty-side">No nodes or groups assigned yet.</p><div v-for="assignment in assignments" :key="assignment.id" class="assignment-row"><span><i class="mdi" :class="assignment.node_id?'mdi-server':'mdi-server-network'"></i> {{assignmentLabel(assignment)}} <small>{{assignment.node_id?'Node':'Group'}}</small></span><button v-if="canEdit" class="button small secondary" :disabled="busy||!!assignment.removal_job_id" :aria-label="`Remove assignment to ${assignmentLabel(assignment)}`" @click="removeAssignment(assignment)">{{assignment.removal_job_id?'Removal queued':'Remove'}}</button></div></section></div><section v-else class="panel glass studio-empty"><i class="mdi mdi-source-branch"></i><h2>Select a policy</h2><p>Choose an existing policy or create one to open the visual editor.</p></section></div><GlassWindow :model-value="!!editor" @update:model-value="editor=null" :title="`Edit ${editor?.type||'node'}`"><div v-if="editor" class="form-grid"><label>Name<input v-model="editor.data.name" @input="editor.data.label=editor.data.name"></label><template v-if="['allow','deny','program'].includes(editor.type)"><label>Direction<select v-model="editor.data.direction"><option value="in">Inbound</option><option value="out">Outbound</option></select></label><label>Protocol<select v-model="editor.data.protocol"><option>TCP</option><option>UDP</option><option>Any</option></select></label><label>Local port<input v-model="editor.data.localPort" placeholder="3389 or Any"></label><label>Remote port<input v-model="editor.data.remotePort" placeholder="443 or Any"></label><label>Remote address<input v-model="editor.data.remoteAddress" placeholder="Any or CIDR"></label><label v-if="editor.type==='program'">Program path<input v-model="editor.data.program" placeholder="C:\Program Files\app.exe"></label><label v-if="editor.type==='deny'">Local account SID<input v-model.trim="editor.data.localUserSid" placeholder="All accounts"></label><label>Profile<select v-model="editor.data.profile"><option>Any</option><option>Domain</option><option>Private</option><option>Public</option></select></label></template><label v-if="editor.type==='portGroup'">Ports<input v-model="editor.data.ports" placeholder="80,443"></label><label v-if="editor.type==='addressGroup'">Addresses<input v-model="editor.data.addresses" placeholder="10.0.0.0/8"></label><label v-if="editor.type==='profile'">Profile<select v-model="editor.data.profile"><option>Any</option><option>Domain</option><option>Private</option><option>Public</option></select></label><template v-if="editor.type==='schedule'"><label>Days (0 Sunday – 6 Saturday)<input v-model="editor.data.days" placeholder="1,2,3,4,5"></label><label>Start time<input v-model="editor.data.startTime" type="time"></label><label>End time<input v-model="editor.data.endTime" type="time"></label><label>Timezone<input v-model="editor.data.timezone" placeholder="UTC or America/Chicago"></label><p class="hint">Connect this window to an allow/reject rule. Outside the window, the scheduler removes that rule and reapplies it at the next transition.</p></template><template v-if="editor.type==='mfaGate'"><label>Target TCP port(s)<input v-model="editor.data.localPort" placeholder="3389"></label><label>Program<input v-model="editor.data.program" placeholder="Any or C:\\Program Files\\App\\app.exe"></label><label>Source asset scope<input v-model="editor.data.sourceAssetScope" placeholder="Any, node ID, or group ID"></label><label>Destination asset scope<input v-model="editor.data.destinationAssetScope" placeholder="Any, node ID, or group ID"></label><label>Source process<input v-model="editor.data.sourceProcess" placeholder="Any or C:\\Program Files\\Client\\client.exe"></label><label>Extra TCP ports<input v-model="editor.data.extraPorts" placeholder="22,5985"></label><label>Entra group ID<input v-model.trim="editor.data.entraGroupId" placeholder="Optional group object ID"></label><label>Session TTL (minutes)<input v-model.number="editor.data.sessionTtlMinutes" type="number" min="1" max="10080"></label><label>Reactive rule TTL (minutes)<input v-model.number="editor.data.reactiveTtlMinutes" type="number" min="1" max="10080"></label><label>Unavailable behavior<select v-model="editor.data.failMode"><option value="closed">Fail closed</option><option value="open">Fail open</option></select></label><label class="switch-field"><span>Fall back to logged-on user</span><input v-model="editor.data.fallbackToLoggedOnUser" type="checkbox" role="switch"><span class="switch-control" aria-hidden="true"></span></label><p class="hint">This gate is saved as policy metadata. Deployment remains blocked until the Windows challenge broker is available.</p></template><p v-if="editorIssue" class="error-msg" role="alert">{{editorIssue}}</p><div class="form-actions"><button class="button danger" @click="graphNodes=graphNodes.filter(n=>n.id!==editor.id);edges=edges.filter(e=>e.source!==editor.id&&e.target!==editor.id);editor=null">Delete node</button><button class="button primary" @click="editor=null">Done</button></div></div></GlassWindow><GlassWindow v-model="formOpen" title="New policy"><form class="form-grid" @submit.prevent="create"><label>Policy name<input v-model="newName" required placeholder="Production RDP access"></label><label>Description<textarea v-model="newDescription" placeholder="What this policy controls"></textarea></label><div class="form-actions"><button class="button primary">Create policy</button></div></form></GlassWindow><GlassWindow v-model="assignOpen" title="Assign policy"><div class="form-grid"><label>Target type<select v-model="assignKind" @change="assignTarget=''"><option value="node">Node</option><option value="group">Node group</option><option value="global">All nodes (global)</option></select></label><label v-if="assignKind==='node'">Node<select v-model="assignTarget"><option value="">Select a node</option><option v-for="node in nodes" :key="node.id" :value="node.id">{{node.hostname}}</option></select></label><label v-else-if="assignKind==='group'">Node group<select v-model="assignTarget"><option value="">Select a group</option><option v-for="group in groups.filter(item=>item.id!=='winfire-global-all-nodes')" :key="group.id" :value="group.id">{{group.name}}</option></select></label><p v-else>Apply this policy to every node, including nodes added later.</p><div class="form-actions"><button class="button primary" :disabled="assignKind!=='global'&&!assignTarget" @click="assign">Assign</button></div></div></GlassWindow><GlassWindow v-model="verifyOpen" title="Verify policy" width="520px"><form class="form-grid" @submit.prevent="verifyPolicy"><p>Probe inbound TCP rules from the control plane or from a managed Windows peer. The peer uses its assigned WinRM credential and does not change firewall rules.</p><label>Probe from<select v-model="verifyVantageId"><option value="">Control plane server</option><option v-for="node in verifierPeers" :key="node.id" :value="node.id">{{node.hostname}}</option></select></label><p v-if="verifyVantageId" class="hint">Checks against the peer itself will be inconclusive; select another peer to test that node.</p><div class="form-actions"><button type="button" class="button secondary" @click="verifyOpen=false">Cancel</button><button class="button primary" :disabled="verifyBusy">{{verifyBusy?'Verifying…':'Run verification'}}</button></div></form></GlassWindow><GlassWindow v-model="historyOpen" title="Version history"><div v-for="version in versions" :key="version.id" class="history-row"><div><strong>Version {{version.version_no}}</strong><small>{{version.comment||'No comment'}} · {{new Date(version.created_at).toLocaleString()}}</small></div><button class="button small secondary" :disabled="busy||version.id===selected?.current_version_id" @click="recall(version)">Recall</button></div><div v-if="!versions.length" class="empty-side">No saved versions yet.</div><div v-if="versions.length>1" class="form-grid" style="margin-top:1rem"><h3>Compare versions</h3><label>From<select v-model="compareFrom" @change="comparison=null"><option v-for="version in versions" :key="version.id" :value="version.id">Version {{version.version_no}}</option></select></label><label>To<select v-model="compareTo" @change="comparison=null"><option v-for="version in versions" :key="version.id" :value="version.id">Version {{version.version_no}}</option></select></label><button class="button secondary" :disabled="compareBusy||!compareFrom||!compareTo||compareFrom===compareTo" @click="compareVersions">Show changes</button></div><div v-if="comparison" class="version-diff" aria-live="polite"><h3>Version {{comparison.from.versionNo}} → {{comparison.to.versionNo}}</h3><h4>Canvas nodes</h4><ul><li v-for="node in comparison.graph.addedNodes" :key="`added-${node.id}`">Added {{describeNode(node)}}</li><li v-for="node in comparison.graph.removedNodes" :key="`removed-${node.id}`">Removed {{describeNode(node)}}</li><li v-for="change in comparison.graph.changedNodes" :key="`changed-${change.after.id}`">Changed {{describeNode(change.after)}}<details><summary>Show fields</summary><pre>Before: {{JSON.stringify({position:change.before.position,data:change.before.data},null,2)}}
-After: {{JSON.stringify({position:change.after.position,data:change.after.data},null,2)}}</pre></details></li></ul><h4>Connections</h4><ul><li v-for="edge in comparison.graph.addedEdges" :key="`added-${edge.source}-${edge.target}`">Added {{edge.source}} → {{edge.target}}</li><li v-for="edge in comparison.graph.removedEdges" :key="`removed-${edge.source}-${edge.target}`">Removed {{edge.source}} → {{edge.target}}</li></ul><h4>Compiled firewall rules</h4><ul><li v-for="rule in comparison.added" :key="`added-${rule.sourceNodeId}`">Added {{describeRule(rule)}}</li><li v-for="rule in comparison.removed" :key="`removed-${rule.sourceNodeId}`">Removed {{describeRule(rule)}}</li></ul><p v-if="!comparison.graph.addedNodes.length&&!comparison.graph.removedNodes.length&&!comparison.graph.changedNodes.length&&!comparison.graph.addedEdges.length&&!comparison.graph.removedEdges.length&&!comparison.added.length&&!comparison.removed.length">No changes between these versions.</p></div></GlassWindow><ConfirmDialog v-model="confirmDialogOpen" :message="confirmDialogMessage" :busy="confirmDialogBusy" @confirm="runConfirmation" /></div></template>
+<template>
+<div class="view">
+<PageHeader eyebrow="POLICY / AUTHORING" title="Policy studio" description="Compose, version and apply Windows Firewall rules">
+<button v-if="canEdit" class="button primary" @click="formOpen=true">
+<i class="mdi mdi-plus">
+</i> New policy</button>
+</PageHeader>
+<div v-if="error" class="error-msg">{{error}}</div>
+<div v-if="message" class="success-msg">{{message}}</div>
+<div class="studio-layout">
+<aside class="panel glass policy-list" aria-label="Policy library">
+<div class="panel-title">
+<div>
+<span class="eyebrow">LIBRARY</span>
+<h2>Policies</h2>
+</div>
+<span class="count-chip">{{policies.length}}</span>
+</div>
+<button v-for="policy in policies" :key="policy.id" :title="policy.name" :disabled="busy" class="policy-item" :class="{active:selected?.id===policy.id}" @click="choose(policy)">
+<i class="mdi mdi-shield-outline">
+</i>
+<span>
+<strong>{{policy.name}}</strong>
+<small>{{policy.origin==='learned'?`Personal · ${policy.learning?.status||'ready'}`:`Version ${policy.version_no||'draft'}`}}</small>
+</span>
+<span class="status" :class="policy.learning?.status==='active'?'learning':policy.verificationStatus||'unknown'">{{policy.learning?.status==='active'?'Learning':policy.verificationStatus||'Unchecked'}}</span>
+<i class="mdi mdi-chevron-right">
+</i>
+</button>
+<div v-if="!policies.length" class="empty-side">Create a policy to start building rules.</div>
+</aside>
+<div v-if="selected" class="studio-main">
+<section class="panel glass canvas-panel">
+<div class="panel-title studio-title">
+<div>
+<span class="eyebrow">{{isLearningPreview?'LIVE LEARNING PREVIEW':'VISUAL POLICY EDITOR'}}</span>
+<h2>{{selected.name}}</h2>
+</div>
+<div class="inline-actions">
+<button class="button small secondary" :disabled="!policyLoaded" @click="historyOpen=true">
+<i class="mdi mdi-history">
+</i> History</button>
+<button v-if="policyLoaded&&!isLearningPreview&&canEdit" class="button small secondary" @click="verifyOpen=true">
+<i class="mdi mdi-radar">
+</i> Verify</button>
+<button v-if="editable" class="button small secondary" @click="assignOpen=true">
+<i class="mdi mdi-link-variant">
+</i> Assign</button>
+<button v-if="editable&&['owner','admin'].includes(session.user?.role)" class="button small secondary" :disabled="busy||dirty||!selected.current_version_id" @click="askConfirmation('Apply the saved policy version to its assigned nodes? This changes their firewall rules.',apply)">
+<i class="mdi mdi-send-outline">
+</i> Apply</button>
+</div>
+</div>
+<div v-if="isLearningPreview" class="learning-preview-summary">
+<div>
+<strong>{{learningPreview?.rules.length||0}} proposed rules</strong>
+<span>{{learningPreview?.newFlowCount||0}} new rules · {{learningPreview?.observedFlowCount||0}} observed 5-tuples</span>
+<small>Training ends {{new Date(selected.learning.ends_at).toLocaleString()}}<template v-if="learningPreview?.progressiveEnabled"> · next progressive apply {{new Date(learningPreview.nextProgressiveAt).toLocaleString()}}</template>
+</small>
+</div>
+<button class="button small secondary" :disabled="previewBusy" @click="refreshLearningPreview()">{{previewBusy?'Refreshing…':'Refresh preview'}}</button>
+</div>
+<p v-if="loadingPolicy" class="editor-notice" role="status">Loading policy…</p>
+<p v-if="isLearningPreview" class="editor-notice">Automatic learning owns this policy until training ends. Both editors are available for inspecting rules and connections.</p>
+<p v-else-if="policyLoaded&&!editable" class="editor-notice">You have read-only access to this policy.</p>
+<p v-if="draftNotice" class="editor-notice" role="status">{{draftNotice}}</p>
+<p v-if="policyLoaded&&staleDraft&&!isLearningPreview" class="error-msg" role="alert">This draft is based on an older version. Use History to review changes, then discard the draft to load the latest saved version.</p>
+<p v-if="!loadingPolicy&&!policyLoaded" class="editor-notice">The policy could not be loaded. <button class="button small secondary" @click="choose(selected)">Retry</button></p>
+<PolicyEditor v-if="policyLoaded&&!loadingPolicy" :key="selected.id" ref="policyEditor" v-model:nodes="graphNodes" v-model:edges="edges" :policy-id="selected.id" :readonly="!editable||busy" :rules="activeRules" />
+<div v-if="editable" class="canvas-footer">
+<input v-model="comment" placeholder="Version comment (optional)" aria-label="Version comment">
+<span class="hint">{{dirty?'Unsaved changes · local draft':'Saved version'}}</span>
+<button class="button small secondary" :disabled="busy||(!dirty&&!staleDraft)" @click="discardDraft">Discard draft</button>
+<span v-if="validationIssue" class="validation-hint" role="alert">{{validationIssue}}</span>
+<button class="button primary" :disabled="busy||validating||!!validationIssue||!!draftError||!draftPreview?.canSave||staleDraft" @click="save">
+<i class="mdi mdi-content-save-outline">
+</i> Save version</button>
+</div>
+<p v-if="draftError" class="error-msg" role="alert">{{draftError}}</p>
+<p v-for="warning in draftPreview?.warnings||[]" :key="warning" class="editor-notice">{{warning}}</p>
+</section>
+<section v-if="policyLoaded" class="panel glass rules-panel">
+<div class="panel-title">
+<div>
+<span class="eyebrow">COMPILED OUTPUT</span>
+<h2>{{activeRules.length}} {{isLearningPreview?'proposed':dirty?'draft':'saved'}} rules</h2>
+</div>
+</div>
+<div v-if="activeMfaGates.length" class="mfa-gate-summary">
+<div v-for="gate in activeMfaGates" :key="gate.id" class="rule-row">
+<span class="status unknown">MFA gate</span>
+<strong>{{gate.name}}</strong>
+<span>TCP {{gate.targetPort}} · session {{gate.sessionTtlMinutes}}m · reactive {{gate.reactiveTtlMinutes}}m</span>
+<span v-if="gate.entraGroupId" class="mono">Entra {{gate.entraGroupId}}</span>
+<small>Staged metadata; deployment waits for the Windows challenge broker.</small>
+</div>
+</div>
+<div v-if="!activeRules.length&&!activeMfaGates.length" class="empty-side">{{isLearningPreview?'No eligible traffic has been learned yet.':validating?'Validating draft with the API…':draftError?'Resolve the validation error to preview compiled rules.':'No compiled rules in this policy.'}}</div>
+<div v-for="rule in activeRules" :key="rule.sourceNodeId" class="rule-row">
+<span class="status" :class="rule.action">{{rule.action}}</span>
+<strong>{{rule.name}}</strong>
+<span>{{rule.direction}} / {{rule.protocol}} / local {{rule.localPort}} / remote {{rule.remotePort||'Any'}}</span>
+<span class="mono">{{rule.remoteAddress}}</span>
+<span v-if="rule.localUserSid" class="mono">Account {{rule.localUserSid}}</span>
+<LearnedRuleEvidence v-if="ruleEvidence(rule)" :evidence="ruleEvidence(rule)" />
+</div>
+</section>
+<section class="panel glass assignments-panel" :class="{'target-drop-active':targetDropActive}" @dragover.prevent="targetDropActive=true" @dragleave="targetDropActive=false" @drop.prevent="dropTarget">
+<div class="panel-title">
+<div>
+<span class="eyebrow">TARGETS</span>
+<h2>Assignments</h2>
+</div>
+<span class="count-chip">{{assignments.length}}</span>
+</div>
+<div v-if="editable" class="assignment-targets">
+<p>Drag a node or group here, or select one below to assign it.</p>
+<button v-for="node in nodes.filter(item=>!assignments.some(assignment=>assignment.node_id===item.id))" :key="`node-${node.id}`" type="button" class="assignment-target-chip" draggable="true" :disabled="busy" @dragstart="dragTarget($event,'node',node.id)" @click="assignTargetToPolicy('node',node.id)">
+<i class="mdi mdi-server">
+</i> {{node.hostname}}</button>
+<button v-for="group in groups.filter(item=>!assignments.some(assignment=>assignment.node_group_id===item.id))" :key="`group-${group.id}`" type="button" class="assignment-target-chip" draggable="true" :disabled="busy" @dragstart="dragTarget($event,'group',group.id)" @click="assignTargetToPolicy('group',group.id)">
+<i class="mdi mdi-server-network">
+</i> {{group.name}}</button>
+</div>
+<p v-if="!assignments.length" class="empty-side">No nodes or groups assigned yet.</p>
+<div v-for="assignment in assignments" :key="assignment.id" class="assignment-row">
+<span>
+<i class="mdi" :class="assignment.node_id?'mdi-server':'mdi-server-network'">
+</i> {{assignmentLabel(assignment)}} <small>{{assignment.node_id?'Node':'Group'}}</small>
+</span>
+<button v-if="editable" class="button small secondary" :disabled="busy||!!assignment.removal_job_id" :aria-label="`Remove assignment to ${assignmentLabel(assignment)}`" @click="removeAssignment(assignment)">{{assignment.removal_job_id?'Removal queued':'Remove'}}</button>
+</div>
+</section>
+</div>
+<section v-else class="panel glass studio-empty">
+<i class="mdi mdi-source-branch">
+</i>
+<h2>Select a policy</h2>
+<p>Choose an existing policy or create one to open the visual editor.</p>
+</section>
+</div>
+<GlassWindow v-model="formOpen" title="New policy">
+<form class="form-grid" @submit.prevent="create">
+<label>Policy name<input v-model="newName" required placeholder="Production RDP access">
+</label>
+<label>Description<textarea v-model="newDescription" placeholder="What this policy controls">
+</textarea>
+</label>
+<div class="form-actions">
+<p v-if="error" class="error-msg" role="alert">{{error}}</p><button class="button primary" :disabled="busy">{{busy?'Creating…':'Create policy'}}</button>
+</div>
+</form>
+</GlassWindow>
+<GlassWindow v-model="assignOpen" title="Assign policy">
+<div class="form-grid">
+<label>Target type<select v-model="assignKind" @change="assignTarget=''">
+<option value="node">Node</option>
+<option value="group">Node group</option>
+<option value="global">All nodes (global)</option>
+</select>
+</label>
+<label v-if="assignKind==='node'">Node<select v-model="assignTarget">
+<option value="">Select a node</option>
+<option v-for="node in nodes" :key="node.id" :value="node.id">{{node.hostname}}</option>
+</select>
+</label>
+<label v-else-if="assignKind==='group'">Node group<select v-model="assignTarget">
+<option value="">Select a group</option>
+<option v-for="group in groups.filter(item=>item.id!=='winfire-global-all-nodes')" :key="group.id" :value="group.id">{{group.name}}</option>
+</select>
+</label>
+<p v-else>Apply this policy to every node, including nodes added later.</p>
+<div class="form-actions">
+<button class="button primary" :disabled="assignKind!=='global'&&!assignTarget" @click="assign">Assign</button>
+</div>
+</div>
+</GlassWindow>
+<GlassWindow v-model="verifyOpen" title="Verify policy" width="520px">
+<form class="form-grid" @submit.prevent="verifyPolicy">
+<p>Probe inbound TCP rules from the control plane or from a managed Windows peer. The peer uses its assigned WinRM credential and does not change firewall rules.</p>
+<label>Probe from<select v-model="verifyVantageId">
+<option value="">Control plane server</option>
+<option v-for="node in verifierPeers" :key="node.id" :value="node.id">{{node.hostname}}</option>
+</select>
+</label>
+<p v-if="verifyVantageId" class="hint">Checks against the peer itself will be inconclusive; select another peer to test that node.</p>
+<div class="form-actions">
+<button type="button" class="button secondary" @click="verifyOpen=false">Cancel</button>
+<button class="button primary" :disabled="verifyBusy">{{verifyBusy?'Verifying…':'Run verification'}}</button>
+</div>
+</form>
+</GlassWindow>
+<GlassWindow v-model="historyOpen" title="Version history">
+<div v-for="version in versions" :key="version.id" class="history-row">
+<div>
+<strong>Version {{version.version_no}}</strong>
+<small>{{version.comment||'No comment'}} · {{new Date(version.created_at).toLocaleString()}}</small>
+</div>
+<button class="button small secondary" :disabled="busy||!editable||version.id===selected?.current_version_id" @click="askConfirmation(`Recall version ${version.version_no}? The current local draft will be discarded.`,()=>recall(version))">Recall</button>
+</div>
+<div v-if="!versions.length" class="empty-side">No saved versions yet.</div>
+<div v-if="versions.length>1" class="form-grid" style="margin-top:1rem">
+<h3>Compare versions</h3>
+<label>From<select v-model="compareFrom" @change="comparison=null">
+<option v-for="version in versions" :key="version.id" :value="version.id">Version {{version.version_no}}</option>
+</select>
+</label>
+<label>To<select v-model="compareTo" @change="comparison=null">
+<option v-for="version in versions" :key="version.id" :value="version.id">Version {{version.version_no}}</option>
+</select>
+</label>
+<button class="button secondary" :disabled="compareBusy||!compareFrom||!compareTo||compareFrom===compareTo" @click="compareVersions">Show changes</button>
+</div>
+<div v-if="comparison" class="version-diff" aria-live="polite">
+<h3>Version {{comparison.from.versionNo}} → {{comparison.to.versionNo}}</h3>
+<h4>Canvas nodes</h4>
+<ul>
+<li v-for="node in comparison.graph.addedNodes" :key="`added-${node.id}`">Added {{describeNode(node)}}</li>
+<li v-for="node in comparison.graph.removedNodes" :key="`removed-${node.id}`">Removed {{describeNode(node)}}</li>
+<li v-for="change in comparison.graph.changedNodes" :key="`changed-${change.after.id}`">Changed {{describeNode(change.after)}}<details>
+<summary>Show fields</summary>
+<pre>Before: {{JSON.stringify({position:change.before.position,data:change.before.data},null,2)}}
+After: {{JSON.stringify({position:change.after.position,data:change.after.data},null,2)}}</pre>
+</details>
+</li>
+</ul>
+<h4>Connections</h4>
+<ul>
+<li v-for="edge in comparison.graph.addedEdges" :key="`added-${edge.source}-${edge.target}`">Added {{edge.source}} → {{edge.target}}</li>
+<li v-for="edge in comparison.graph.removedEdges" :key="`removed-${edge.source}-${edge.target}`">Removed {{edge.source}} → {{edge.target}}</li>
+</ul>
+<h4>Compiled firewall rules</h4>
+<ul>
+<li v-for="rule in comparison.added" :key="`added-${rule.sourceNodeId}`">Added {{describeRule(rule)}}</li>
+<li v-for="rule in comparison.removed" :key="`removed-${rule.sourceNodeId}`">Removed {{describeRule(rule)}}</li>
+</ul>
+<p v-if="!comparison.graph.addedNodes.length&&!comparison.graph.removedNodes.length&&!comparison.graph.changedNodes.length&&!comparison.graph.addedEdges.length&&!comparison.graph.removedEdges.length&&!comparison.added.length&&!comparison.removed.length">No changes between these versions.</p>
+</div>
+</GlassWindow>
+<ConfirmDialog v-model="confirmDialogOpen" :message="confirmDialogMessage" :busy="confirmDialogBusy" @confirm="runConfirmation" />
+</div>
+</template>
 
 <style scoped>
+.editor-notice{padding:10px 16px;font-size:12px;color:var(--muted);margin:0}.studio-main{min-width:0}.studio-title{flex-wrap:wrap;gap:10px}.studio-title h2{overflow-wrap:anywhere}.policy-item strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.canvas-footer{flex-wrap:wrap}.canvas-footer .hint{font-size:11px}.canvas-footer .validation-hint{flex-basis:100%}.studio-layout{grid-template-columns:minmax(180px,240px) minmax(0,1fr)}@media(max-width:1000px){.studio-layout{grid-template-columns:1fr}.policy-list{max-height:260px;overflow:auto}}
+
 .learning-preview-summary{display:flex;align-items:center;justify-content:space-between;gap:1rem;padding:.8rem 1rem;border-bottom:1px solid var(--border);background:color-mix(in srgb,var(--cyan) 9%,transparent)}
 .learning-preview-summary>div{display:grid;gap:.25rem;min-width:0}.learning-preview-summary strong{font-size:.8rem}.learning-preview-summary span,.learning-preview-summary small{font-size:.7rem;color:var(--muted);overflow-wrap:anywhere}.learning-preview-summary .button{flex:none}
 @media(max-width:650px){.learning-preview-summary{align-items:flex-start;flex-direction:column}}
@@ -145,5 +416,4 @@ After: {{JSON.stringify({position:change.after.position,data:change.after.data},
 .version-diff pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:.7rem}
 .version-diff summary{cursor:pointer}
 .validation-hint{color:#ffb99f;font-size:.75rem;max-width:22rem;line-height:1.3}
-.editor-mode-tabs{display:flex;gap:8px;padding:10px 14px;border-bottom:1px solid var(--border)}.editor-mode-tabs .active{border-color:var(--green);color:var(--green)}.classic-policy-editor{padding:14px;display:grid;gap:12px}.classic-policy-editor table{min-width:1180px}.classic-policy-editor td{min-width:85px}.classic-policy-editor td:first-child{min-width:160px}.classic-policy-editor input,.classic-policy-editor select{width:100%;min-width:78px;font-size:.72rem}.classic-policy-editor td:nth-child(7){min-width:145px}.classic-policy-editor td:nth-child(9){min-width:180px}
 </style>

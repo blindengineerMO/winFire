@@ -25,6 +25,7 @@ const entries=computed(()=>Object.entries(props.transaction||{}).filter(([key,va
 <template>
   <GlassWindow :model-value="modelValue" :title="title" width="760px" @update:modelValue="emit('update:modelValue',$event)">
     <div class="transaction-details">
+      <slot name="links" />
       <div v-if="transaction" class="transaction-grid">
         <div v-for="entry in entries" :key="entry.key" class="transaction-field" :class="{wide:entry.value.length>90}">
           <span>{{entry.label}}</span><code>{{entry.value}}</code>

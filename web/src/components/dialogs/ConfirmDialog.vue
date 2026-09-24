@@ -12,7 +12,7 @@ function confirm(){if(!checked.value||props.busy)return;emit('confirm')}
   <GlassWindow :model-value="modelValue" :title="title" width="500px" @update:model-value="emit('update:modelValue',$event)">
     <div class="confirm-dialog">
       <p>{{message}}</p>
-      <label class="check-label confirm-checkbox"><input v-model="checked" type="checkbox"> I understand this change may affect access or policy enforcement.</label>
+      <label class="switch-field"><span>I understand this change may affect access or policy enforcement.</span><input v-model="checked" type="checkbox" role="switch"><span class="switch-control" aria-hidden="true"></span></label>
       <div class="form-actions"><button type="button" class="button secondary" @click="close">Cancel</button><button type="button" class="button danger" :disabled="!checked||busy" @click="confirm">{{busy?'Working…':confirmLabel}}</button></div>
     </div>
   </GlassWindow>

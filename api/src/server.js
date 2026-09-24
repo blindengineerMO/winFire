@@ -1,3 +1,5 @@
+import {processInternetIndex} from './services/internetConnections.js'
+import {processPeerDns,pruneInternetPeers} from './services/internetPeers.js'
 import fs from 'node:fs'
 import path from 'node:path'
 import {fileURLToPath} from 'node:url'
@@ -244,3 +246,10 @@ const jobs=setInterval(async()=>{
 jobs.unref()
 process.on('SIGTERM',()=>listener.close())
 process.on('SIGINT',()=>listener.close())
+
+// Durable indexing is bounded; DNS runs independently from event ingestion.
+const internetIndexTimer=setInterval(()=>{try{processInternetIndex({limit:1000})}catch(error){console.error('Internet indexing failed:',error.message)}},500)
+internetIndexTimer.unref()
+let internetDnsBusy=false
+const internetDnsTimer=setInterval(async()=>{if(internetDnsBusy)return;internetDnsBusy=true;try{await processPeerDns();pruneInternetPeers()}catch(error){console.error('Internet peer DNS failed:',error.message)}finally{internetDnsBusy=false}},10000)
+internetDnsTimer.unref()

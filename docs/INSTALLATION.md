@@ -199,3 +199,7 @@ For explicit `.env` loading in development: `node --env-file=.env --watch api/sr
 - **WinRM authentication/transport failure:** verify sidecar dependencies, DNS/SPN, listener, account rights and TLS/HTTP policy; inspect the structured onboarding error in node details.
 - **No firewall events:** verify host audit policy, event delivery and exclusions. An empty table alone does not mean no traffic occurred.
 - **No agent mTLS:** verify the certificate reaches the native TLS listener, not an HTTP-only proxy.
+
+### Internet connection DNS and backfill
+
+Migration 103 creates the retained connection index and external-peer cache. The API server runs bounded backfill and reverse-DNS workers automatically. Configure local IPv4/IPv6 CIDRs in Server config. `INTERNET_DNS_SERVERS`, `INTERNET_DNS_POSITIVE_HOURS`, `INTERNET_DNS_NEGATIVE_HOURS`, `INTERNET_DNS_TIMEOUT_MS`, `INTERNET_DNS_CONCURRENCY` and `INTERNET_PEER_RETENTION_DAYS` control optional DNS behavior. See [defaults, limits and lifecycle](INTERNET_CONNECTIONS.md). Restart the API after environment changes.
