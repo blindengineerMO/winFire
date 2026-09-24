@@ -1,28 +1,35 @@
 import {ref} from 'vue'
 
 const overrideKey='winfire_theme_override'
+const prefersDark=window.matchMedia('(prefers-color-scheme: dark)')
 let serverTheme='enterprise'
-const prefersLight=window.matchMedia('(prefers-color-scheme: light)')
-export const activeTheme=ref('hacker')
-export const normalizeTheme=value=>value==='dark'?'hacker':value==='light'?'enterprise':value
-
-export function localTheme(){
-  const value=normalizeTheme(localStorage.getItem(overrideKey))
-  return ['system','hacker','enterprise'].includes(value)?value:'system'
-}
+export const normalizeTheme=value=>value==='hacker'?'dark':value==='light'?'enterprise':value
+const validTheme=value=>['system','dark','enterprise'].includes(normalizeTheme(value))?normalizeTheme(value):'system'
+function readOverride(){try{return validTheme(localStorage.getItem(overrideKey))}catch{return 'system'}}
+const browserPreference=ref(readOverride())
+export const activeTheme=ref('enterprise')
+export const localTheme=()=>browserPreference.value
 
 export function applyTheme(preference=serverTheme){
-  serverTheme=['system','hacker','enterprise'].includes(normalizeTheme(preference))?normalizeTheme(preference):'system'
-  const choice=localTheme()==='system'?serverTheme:localTheme()
-  activeTheme.value=choice==='system'?'enterprise':choice
+  serverTheme=validTheme(preference)
+  const choice=browserPreference.value==='system'?serverTheme:browserPreference.value
+  activeTheme.value=choice==='system'?(prefersDark.matches?'dark':'enterprise'):choice
+  document.documentElement.dataset.layout='enterprise'
   document.documentElement.dataset.theme=activeTheme.value
+  document.documentElement.style.colorScheme=activeTheme.value==='dark'?'dark':'light'
 }
 
 export function setLocalTheme(value){
-  if(value==='system')localStorage.removeItem(overrideKey)
-  else if(['hacker','enterprise'].includes(value))localStorage.setItem(overrideKey,value)
+  browserPreference.value=validTheme(value)
+  try{
+    if(browserPreference.value==='system')localStorage.removeItem(overrideKey)
+    else localStorage.setItem(overrideKey,browserPreference.value)
+  }catch{/* Keep the choice usable when browser storage is unavailable. */}
   applyTheme()
 }
 
-prefersLight.addEventListener('change',()=>applyTheme())
+prefersDark.addEventListener('change',()=>applyTheme())
+window.addEventListener('storage',event=>{
+  if(event.key===overrideKey||event.key===null){browserPreference.value=readOverride();applyTheme()}
+})
 applyTheme()
