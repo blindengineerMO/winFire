@@ -1,6 +1,9 @@
 node_modules/
 web/dist/
-data/
+data/winfire.db
+data/winfire.db-*
+data/backups
+data/secrets.json
 .env
 *.log
 *.db
@@ -26,4 +29,3 @@ IMPLEMENTATION_STATUS.md
 RESEARCH_AGENTLESS_MFA.md
 !data/mib-sources/
 !data/snmp-mibs/
-

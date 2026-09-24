@@ -1,0 +1,934 @@
+{
+  "origin": "cisco/cisco-mibs",
+  "revision": "dd0d3bacc0729725705039db56aec96afe41e0a5",
+  "sourceFiles": 3508,
+  "modules": 1859,
+  "ready": 1703,
+  "errors": [
+    {
+      "module": "AIRESPACE-SWITCHING-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-ADSL-DMT-LINE-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "CISCO-ADSL-DMT-LINE-MIB: unresolved import Unsigned32 FROM CISCO-TC"
+    },
+    {
+      "module": "CISCO-ATM-CELL-LAYER-CAPABILITY",
+      "status": "error",
+      "objects": 0,
+      "error": "CISCO-ATM-CELL-LAYER-CAPABILITY.my: expected one complete ASN.1 MIB module (DEFINITIONS ::= BEGIN … END)"
+    },
+    {
+      "module": "CISCO-ATM-CONN-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "CISCO-ATM-CONN-MIB: unresolved import AtmTrafficDescrParamIndex FROM ATM-MIB"
+    },
+    {
+      "module": "CISCO-ATM-SWITCH-FR-IWF-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "CISCO-ATM-SWITCH-FR-IWF-MIB: unresolved import Unsigned32 FROM CISCO-TC"
+    },
+    {
+      "module": "CISCO-BRIDGE-EXT-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-BULK-FILE-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "module": "CISCO-BUS-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "module": "CISCO-CABLE-PNM-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency DOCS-PNM-MIB"
+    },
+    {
+      "module": "CISCO-CALL-APPLICATION-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-CAS-IF-EXT-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "CISCO-IETF-MEGACO-MIB: cannot resolve OID for cmedLinkIdTable"
+    },
+    {
+      "module": "CISCO-CDMA-AHDLC-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-CDMA-PDSN-EXT-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-CDMA-PDSN-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-CLASS-BASED-QOS-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-CONTENT-NETWORK-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-DHCP-SNOOPING-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-DIST-DIRECTOR-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency DNS-SERVER-MIB"
+    },
+    {
+      "module": "CISCO-DLEP-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "CISCO-DLEP-MIB: unresolved import TimeTicks FROM SNMPv2-TC"
+    },
+    {
+      "module": "CISCO-DOCS-EXT-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-DOCS-REMOTE-QUERY-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-DYNAMIC-ARP-INSPECTION-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-ENTITY-ALARM-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "CISCO-ENTITY-ALARM-MIB: unresolved import Unsigned32 FROM CISCO-TC"
+    },
+    {
+      "module": "CISCO-ETHER-CFM-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-EVC-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-FCOE-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-ENTITY-VENDORTYPE-OID-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Parser exceeded 15 seconds"
+    },
+    {
+      "module": "CISCO-FLEX-LINKS-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-FLOW-MONITOR-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-IEEE8021-CFM-EXT-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-IETF-FRR-CAPABILITY",
+      "status": "error",
+      "objects": 0,
+      "error": "CISCO-IETF-FRR-CAPABILITY: cannot resolve OID for ciscoIetfFrrCapability"
+    },
+    {
+      "module": "CISCO-IETF-MEGACO-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "CISCO-IETF-MEGACO-MIB: cannot resolve OID for cmedLinkIdTable"
+    },
+    {
+      "module": "CISCO-IETF-PW-MPLS-CAPABILITY",
+      "status": "error",
+      "objects": 0,
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "module": "CISCO-INTERFACETOPN-EXT-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-IP-CBR-METRICS-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-IPMCAST-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-IPSLA-ETHERNET-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-IPSLA-VIDEO-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-L2-CONTROL-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-LAG-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-LEC-DATA-VCC-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "module": "CISCO-LEC-EXT-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "module": "CISCO-LECS-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "module": "CISCO-LES-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "module": "CISCO-LWAPP-AP-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Circular MIB dependency involving CISCO-LWAPP-DOT11-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-CCX-RM-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Circular MIB dependency involving CISCO-LWAPP-DOT11-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-CDP-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Circular MIB dependency involving CISCO-LWAPP-DOT11-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-CLIENT-ROAMING-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Circular MIB dependency involving CISCO-LWAPP-DOT11-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-DOT11-CCX-CLIENT-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-DOT11-CLIENT-CCX-REPORTS-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-DOT11-CLIENT-CCXV5-REPORTING-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-DOT11-CLIENT-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-DOT11-CLIENT-TS-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-DOT11-CLIENT-CALIB-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Circular MIB dependency involving CISCO-LWAPP-DOT11-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-DOT11-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Circular MIB dependency involving CISCO-LWAPP-AP-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-DOWNLOAD-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Circular MIB dependency involving CISCO-LWAPP-DOT11-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-IPV6-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-MESH-BATTERY-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Circular MIB dependency involving CISCO-LWAPP-DOT11-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-MFP-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-MESH-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Circular MIB dependency involving CISCO-LWAPP-DOT11-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-MESH-STATS-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Circular MIB dependency involving CISCO-LWAPP-DOT11-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-MOBILITY-EXT-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-PMIP-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-QOS-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-REAP-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Circular MIB dependency involving CISCO-LWAPP-DOT11-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-ROGUE-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-RRM-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-SYS-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-SI-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Circular MIB dependency involving CISCO-LWAPP-DOT11-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-TRUSTSEC-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Circular MIB dependency involving CISCO-LWAPP-DOT11-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-U3INTERFACE-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-TSM-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Circular MIB dependency involving CISCO-LWAPP-DOT11-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-TUNNEL-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Circular MIB dependency involving CISCO-LWAPP-DOT11-MIB"
+    },
+    {
+      "module": "CISCO-LWAPP-WEBAUTH-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Circular MIB dependency involving CISCO-LWAPP-DOT11-MIB"
+    },
+    {
+      "module": "CISCO-MDI-METRICS-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-MEDIA-METRICS-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-MEDIATRACE-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-MEGACO-EXT-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "CISCO-IETF-MEGACO-MIB: cannot resolve OID for cmedLinkIdTable"
+    },
+    {
+      "module": "CISCO-MOBILE-IP-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-MPOA-EXT-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "module": "CISCO-NETFLOW-CAPABILITY",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-NETFLOW-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-OPTICAL-IF-CROSS-CONNECT-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "module": "CISCO-OTV-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-PORT-SECURITY-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-PPPOE-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-PTOPO-EXTN-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-QINQ-VLAN-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-RESILIENT-ETHERNET-PROTOCOL-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-RHINO-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "CISCO-RHINO-MIB: unresolved import Unsigned32 FROM CISCO-TC"
+    },
+    {
+      "module": "CISCO-RMON-CONFIG-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-RTP-METRICS-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-RTTMON-ICMP-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-RTTMON-IP-EXT-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-RTTMON-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-RTTMON-RTP-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-SDWAN-PROBE-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "CISCO-SDWAN-PROBE-MIB: unresolved import TEXTUAL-CONVENTION FROM CISCO-SMI"
+    },
+    {
+      "module": "CISCO-SECY-EXT-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "IEEE8021-SECY-MIB: cannot resolve OID for ieee8021SecyMIB"
+    },
+    {
+      "module": "CISCO-SIBU-STACKABLE-DUAL-SPEED-HUB-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "CISCO-SIBU-STACKABLE-DUAL-SPEED-HUB-MIB: module could not be parsed"
+    },
+    {
+      "module": "CISCO-STACK-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-SWITCH-STATS-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-TCP-METRICS-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-TRUSTSEC-POLICY-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-TS-STACK-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1493"
+    },
+    {
+      "module": "CISCO-VLAN-TRANSLATION-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "CISCO-VOICE-FR-DIAL-CONTROL-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "CISCO-VOICE-FR-DIAL-CONTROL-MIB: unresolved import CvcGUid FROM CISCO-VOICE-DIAL-CONTROL-MIB"
+    },
+    {
+      "module": "CISCO-VOICE-HDLC-DIAL-CONTROL-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "CISCO-VOICE-HDLC-DIAL-CONTROL-MIB: unresolved import CvcGUid FROM CISCO-VOICE-DIAL-CONTROL-MIB"
+    },
+    {
+      "module": "CISCO-WAN-MODULE-CAPABILITY",
+      "status": "error",
+      "objects": 0,
+      "error": "CISCO-WAN-MODULE-CAPABILITY: unresolved import ciscoAgentCapability FROM CISCOWAN-SMI"
+    },
+    {
+      "module": "CISCO-WIRELESS-P2MP-PHY-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "CISCO-WIRELESS-P2MP-PHY-MIB: unresolved import Unsigned32 FROM CISCO-TC"
+    },
+    {
+      "module": "DOCS-CABLE-DEVICE-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "DOCS-CABLE-DEVICE-TRAP-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "DOCS-DIAG-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "DOCS-IETF-CABLE-DEVICE-NOTIFICATION-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "DOCS-IF3-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "DOCS-L2VPN-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "DOCS-LOADBAL3-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "DOCS-MCAST-AUTH-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "DOCS-MCAST-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "DOCS-QOS3-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "DOCS-SEC-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "DOCS-SUBMGT3-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "DS3-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "module": "FCMGMT-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "FCMGMT-MIB: module could not be parsed"
+    },
+    {
+      "module": "HC-RMON-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "IEEE8021-CFM-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "IEEE8021-CFM-V2-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "IEEE8021-SECY-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "IEEE8021-SECY-MIB: cannot resolve OID for ieee8021SecyMIB"
+    },
+    {
+      "module": "IEEE8023-LAG-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "IEEE8021X-PAE-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "IEEE8021-SECY-MIB: cannot resolve OID for ieee8021SecyMIB"
+    },
+    {
+      "module": "LAN-EMULATION-CLIENT-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "module": "LLDP-EXT-DOT1-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "LLDP-EXT-DOT3-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "LLDP-EXT-MED-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "LLDP-MIB",
+      "status": "error",
+      "error": "Missing dependency RFC1271-MIB",
+      "retainedExisting": true
+    },
+    {
+      "module": "ME1200-IPMC-PROFILE-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "module": "ME1200-NTP-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "ME1200-NTP-MIB: unresolved import ME1200InetAddress FROM ME1200-TC"
+    },
+    {
+      "module": "ME1200-PTP-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "ME1200-PTP-MIB: unresolved import ME1200Integer64 FROM ME1200-TC"
+    },
+    {
+      "module": "MEF-SOAM-PM-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "MPLS-LDP-CAPABILITY",
+      "status": "error",
+      "objects": 0,
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "module": "MPLS-TE-CAPABILITY",
+      "status": "error",
+      "objects": 0,
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "module": "MPOA-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "module": "Printer-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency IANA-PRINTER-MIB"
+    },
+    {
+      "module": "PTOPO-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "Q-BRIDGE-MIB",
+      "status": "error",
+      "error": "Missing dependency RFC1271-MIB",
+      "retainedExisting": true
+    },
+    {
+      "module": "RMON2-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "SCTE-HMS-HEADENDIDENT-TC-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "SCTE-HMS-HEADENDIDENT-TC-MIB: cannot resolve OID for hmsTextualConventionMIB"
+    },
+    {
+      "module": "SCTE-HMS-MPEG-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "SCTE-HMS-HEADENDIDENT-TC-MIB: cannot resolve OID for hmsTextualConventionMIB"
+    },
+    {
+      "module": "SMON-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    },
+    {
+      "module": "SCTE-HMS-QAM-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "SCTE-HMS-HEADENDIDENT-TC-MIB: cannot resolve OID for hmsTextualConventionMIB"
+    },
+    {
+      "module": "STAND-ALONE-ETHERNET-SWITCH-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "STAND-ALONE-ETHERNET-SWITCH-MIB: module could not be parsed"
+    },
+    {
+      "module": "TOKEN-RING-RMON-MIB",
+      "status": "error",
+      "objects": 0,
+      "error": "Missing dependency RFC1271-MIB"
+    }
+  ],
+  "completedAt": "2026-09-24T19:23:03.454Z",
+  "fileStatuses": [
+    {
+      "status": "archived",
+      "count": 1647
+    },
+    {
+      "status": "bundled",
+      "count": 5
+    },
+    {
+      "status": "error",
+      "count": 153
+    },
+    {
+      "status": "ready",
+      "count": 1703
+    }
+  ]
+}

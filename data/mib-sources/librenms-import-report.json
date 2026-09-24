@@ -1,0 +1,2070 @@
+{
+  "origin": "librenms/librenms",
+  "revision": "9ee283aa5b8a44dd311b289f6ece13b9a82e3cc2",
+  "sourceFiles": 4848,
+  "modules": 4671,
+  "fileStatuses": [
+    {
+      "status": "archived",
+      "count": 272
+    },
+    {
+      "status": "bundled",
+      "count": 9
+    },
+    {
+      "status": "error",
+      "count": 510
+    },
+    {
+      "status": "ready",
+      "count": 4057
+    }
+  ],
+  "ready": 3579,
+  "retainedExisting": 604,
+  "bundled": 9,
+  "errors": [
+    {
+      "filename": "mibs/DNS-RESOLVER-MIB",
+      "error": "Missing dependency RFC-1213"
+    },
+    {
+      "filename": "mibs/DNS-SERVER-MIB",
+      "error": "Missing dependency RFC-1213"
+    },
+    {
+      "filename": "mibs/FROGFOOT-RESOURCES-MIB",
+      "error": "FROGFOOT-RESOURCES-MIB: module could not be parsed"
+    },
+    {
+      "filename": "mibs/IEEE8021-CFMD8-MIB",
+      "error": "IEEE8021-CFMD8-MIB: cannot resolve OID for ieee8021cfmMIB"
+    },
+    {
+      "filename": "mibs/IEEE8021-SECY-MIB",
+      "error": "IEEE8021-SECY-MIB: cannot resolve OID for ieee8021SecyMIB"
+    },
+    {
+      "filename": "mibs/IEEE8023-LAG-MIB",
+      "error": "IEEE8023-LAG-MIB: cannot resolve OID for lagMIB"
+    },
+    {
+      "filename": "mibs/ISIS-MIB-LEGACY",
+      "error": "ISIS-MIB-LEGACY: cannot resolve OID for isisMIB"
+    },
+    {
+      "filename": "mibs/adic/ADIC-INTELLIGENT-STORAGE-MIB",
+      "error": "ADIC-INTELLIGENT-STORAGE-MIB: module could not be parsed"
+    },
+    {
+      "filename": "mibs/adic/ADIC-MANAGEMENT-MIB",
+      "error": "Cannot read properties of undefined (reading 'hardware')"
+    },
+    {
+      "filename": "mibs/adic/ADIC-SANMGR-PROXY-MIB",
+      "error": "Cannot read properties of undefined (reading 'network')"
+    },
+    {
+      "filename": "mibs/adva/ADVA-FSPR7-CFM-EXTENSION-MIB",
+      "error": "Missing dependency FspR7-LAYER2-MIB"
+    },
+    {
+      "filename": "mibs/adva/AOS-CORE-CONDITION-MIB",
+      "error": "Missing dependency AOS-CORE-ALARM-MIB"
+    },
+    {
+      "filename": "mibs/adva/AOS-CORE-FACILITY-MIB",
+      "error": "Missing dependency AOS-COMMON-PM-MIB"
+    },
+    {
+      "filename": "mibs/adva/CM-FACILITY-MIB",
+      "error": "F3-SYNC-MIB: unresolved import CmGenPgSwitchoverReason FROM CM-REDUNDANCY-MIB"
+    },
+    {
+      "filename": "mibs/adva/CM-PERFORMANCE-MIB",
+      "error": "IEEE8023-LAG-MIB: cannot resolve OID for lagMIB"
+    },
+    {
+      "filename": "mibs/adva/CM-SA-MIB",
+      "error": "F3-SYNC-MIB: unresolved import CmGenPgSwitchoverReason FROM CM-REDUNDANCY-MIB"
+    },
+    {
+      "filename": "mibs/adva/CM-SAT-MIB",
+      "error": "F3-SYNC-MIB: unresolved import CmGenPgSwitchoverReason FROM CM-REDUNDANCY-MIB"
+    },
+    {
+      "filename": "mibs/adva/F3-BFD-MIB",
+      "error": "F3-SYNC-MIB: unresolved import CmGenPgSwitchoverReason FROM CM-REDUNDANCY-MIB"
+    },
+    {
+      "filename": "mibs/adva/F3-BRIDGE-MIB",
+      "error": "F3-SYNC-MIB: unresolved import CmGenPgSwitchoverReason FROM CM-REDUNDANCY-MIB"
+    },
+    {
+      "filename": "mibs/adva/F3-CFM-MIB",
+      "error": "F3-SYNC-MIB: unresolved import CmGenPgSwitchoverReason FROM CM-REDUNDANCY-MIB"
+    },
+    {
+      "filename": "mibs/adva/F3-CONNECTGUARD-MIB",
+      "error": "IEEE8021-SECY-MIB: cannot resolve OID for ieee8021SecyMIB"
+    },
+    {
+      "filename": "mibs/adva/F3-ELMI-MIB",
+      "error": "F3-SYNC-MIB: unresolved import CmGenPgSwitchoverReason FROM CM-REDUNDANCY-MIB"
+    },
+    {
+      "filename": "mibs/adva/F3-EOMPLS-MIB",
+      "error": "F3-SYNC-MIB: unresolved import CmGenPgSwitchoverReason FROM CM-REDUNDANCY-MIB"
+    },
+    {
+      "filename": "mibs/adva/F3-FPM-MIB",
+      "error": "F3-SYNC-MIB: unresolved import CmGenPgSwitchoverReason FROM CM-REDUNDANCY-MIB"
+    },
+    {
+      "filename": "mibs/adva/F3-JDSU-MIB",
+      "error": "F3-SYNC-MIB: unresolved import CmGenPgSwitchoverReason FROM CM-REDUNDANCY-MIB"
+    },
+    {
+      "filename": "mibs/adva/F3-L3-MIB",
+      "error": "F3-SYNC-MIB: unresolved import CmGenPgSwitchoverReason FROM CM-REDUNDANCY-MIB"
+    },
+    {
+      "filename": "mibs/adva/F3-NTP-MIB",
+      "error": "F3-SYNC-MIB: unresolved import CmGenPgSwitchoverReason FROM CM-REDUNDANCY-MIB"
+    },
+    {
+      "filename": "mibs/adva/F3-OTN-MIB",
+      "error": "F3-SYNC-MIB: unresolved import CmGenPgSwitchoverReason FROM CM-REDUNDANCY-MIB"
+    },
+    {
+      "filename": "mibs/adva/F3-PBB-MIB",
+      "error": "F3-SYNC-MIB: unresolved import CmGenPgSwitchoverReason FROM CM-REDUNDANCY-MIB"
+    },
+    {
+      "filename": "mibs/adva/F3-POPM-MIB",
+      "error": "F3-SYNC-MIB: unresolved import CmGenPgSwitchoverReason FROM CM-REDUNDANCY-MIB"
+    },
+    {
+      "filename": "mibs/adva/F3-PORTMIRROR-MIB",
+      "error": "F3-SYNC-MIB: unresolved import CmGenPgSwitchoverReason FROM CM-REDUNDANCY-MIB"
+    },
+    {
+      "filename": "mibs/adva/F3-PTP-MIB",
+      "error": "F3-SYNC-MIB: unresolved import CmGenPgSwitchoverReason FROM CM-REDUNDANCY-MIB"
+    },
+    {
+      "filename": "mibs/adva/F3-PWE3-MIB",
+      "error": "F3-SYNC-MIB: unresolved import CmGenPgSwitchoverReason FROM CM-REDUNDANCY-MIB"
+    },
+    {
+      "filename": "mibs/adva/F3-SYNC-MIB",
+      "error": "F3-SYNC-MIB: unresolved import CmGenPgSwitchoverReason FROM CM-REDUNDANCY-MIB"
+    },
+    {
+      "filename": "mibs/adva/F3-SYNCJACK-MIB",
+      "error": "F3-SYNC-MIB: unresolved import CmGenPgSwitchoverReason FROM CM-REDUNDANCY-MIB"
+    },
+    {
+      "filename": "mibs/alaxala/AX-SMC-MIB",
+      "error": "Worker terminated due to reaching memory limit: JS heap out of memory"
+    },
+    {
+      "filename": "mibs/alaxala/AX12S-MIB",
+      "error": "Expected one complete ASN.1 MIB module"
+    },
+    {
+      "filename": "mibs/alaxala/AX2000R-MIB",
+      "error": "Missing dependency RFC-1213"
+    },
+    {
+      "filename": "mibs/alaxala/AX3660S-MIB",
+      "error": "Expected one complete ASN.1 MIB module"
+    },
+    {
+      "filename": "mibs/alaxala/AX36S-MIB",
+      "error": "Expected one complete ASN.1 MIB module"
+    },
+    {
+      "filename": "mibs/alaxala/AX4630S-MIB",
+      "error": "Expected one complete ASN.1 MIB module"
+    },
+    {
+      "filename": "mibs/alaxala/AX63S-MIB",
+      "error": "Expected one complete ASN.1 MIB module"
+    },
+    {
+      "filename": "mibs/alaxala/AXR-MIB",
+      "error": "Expected one complete ASN.1 MIB module"
+    },
+    {
+      "filename": "mibs/alaxala/AXS-MIB",
+      "error": "Expected one complete ASN.1 MIB module"
+    },
+    {
+      "filename": "mibs/alaxala/AXprimoM210-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/allied/AT-DOS-MIB",
+      "error": "AT-DOS-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/alvarion/ALVARION-DOT11-WLAN-TST-MIB",
+      "error": "Missing dependency RFC1212"
+    },
+    {
+      "filename": "mibs/arris/CADANT-CMTS-EQUIPMENT-MIB",
+      "error": "CADANT-CMTS-EQUIPMENT-MIB: unresolved import CerCardSubType FROM CADANT-TC"
+    },
+    {
+      "filename": "mibs/arris/DOCS-CABLE-DEVICE-TRAP-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/arris/d5/ARRIS-D5-DVB-EIS-MIB",
+      "error": "SIM-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/arris/d5/SIM-MIB",
+      "error": "SIM-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/arubaos/WLSX-TRAP-MIB",
+      "error": "WLSX-TRAP-MIB: unresolved import TEXTUAL-CONVENTION FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/awplus/AT-FIBER-MONITORING-MIB",
+      "error": "AT-FIBER-MONITORING-MIB: cannot resolve OID for atFiberMonAlarmSetNotify"
+    },
+    {
+      "filename": "mibs/bdcom/NMS-CARD-SYS-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/bdcom/NMS-CHASSIS",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/bdcom/NMS-EPON-OLT-PON",
+      "error": "NMS-OPTICAL-PORT-MIB: unresolved import INTEGER FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/bdcom/NMS-FAN-TRAP",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/bdcom/NMS-GPON-MIB",
+      "error": "NMS-GPON-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/bdcom/NMS-OPTICAL-PORT-MIB",
+      "error": "NMS-OPTICAL-PORT-MIB: unresolved import INTEGER FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/bdcom/NMS-POWER-MIB",
+      "error": "NMS-POWER-MIB: unresolved import INTEGER FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/bison/BISON-ROUTER-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/bktel/BKTEL-HFC862-BASE-MIB",
+      "error": "BKTEL-HFC862-BASE-MIB: unresolved import iso FROM RFC1155-SMI"
+    },
+    {
+      "filename": "mibs/bktel/BKTEL-HFC862-BES-V01-MIB",
+      "error": "BKTEL-HFC862-BASE-MIB: unresolved import iso FROM RFC1155-SMI"
+    },
+    {
+      "filename": "mibs/bktel/BKTEL-HFC862-HMSNE-MIB",
+      "error": "BKTEL-HFC862-BASE-MIB: unresolved import iso FROM RFC1155-SMI"
+    },
+    {
+      "filename": "mibs/bktel/BKTEL-HFC862-NECE-MIB",
+      "error": "BKTEL-HFC862-BASE-MIB: unresolved import iso FROM RFC1155-SMI"
+    },
+    {
+      "filename": "mibs/bktel/BKTEL-HFC862-OA-V01-MIB",
+      "error": "BKTEL-HFC862-BASE-MIB: unresolved import iso FROM RFC1155-SMI"
+    },
+    {
+      "filename": "mibs/bktel/BKTEL-HFC862-OVTX-V11-MIB",
+      "error": "BKTEL-HFC862-BASE-MIB: unresolved import iso FROM RFC1155-SMI"
+    },
+    {
+      "filename": "mibs/brocade/BROCADE-NP-TM-STATS-MIB",
+      "error": "FOUNDRY-SN-AGENT-MIB: cannot resolve OID for snAgent"
+    },
+    {
+      "filename": "mibs/brocade/FOUNDRY-CAR-MIB",
+      "error": "FOUNDRY-SN-AGENT-MIB: cannot resolve OID for snAgent"
+    },
+    {
+      "filename": "mibs/brocade/FOUNDRY-LAG-MIB",
+      "error": "FOUNDRY-SN-AGENT-MIB: cannot resolve OID for snAgent"
+    },
+    {
+      "filename": "mibs/brocade/FOUNDRY-MAC-VLAN-MIB",
+      "error": "FOUNDRY-MAC-VLAN-MIB: cannot resolve OID for fdryMacVlanMIB"
+    },
+    {
+      "filename": "mibs/brocade/FOUNDRY-SN-AGENT-MIB",
+      "error": "FOUNDRY-SN-AGENT-MIB: cannot resolve OID for snAgent"
+    },
+    {
+      "filename": "mibs/brocade/FOUNDRY-SN-APPLETALK-MIB",
+      "error": "FOUNDRY-SN-AGENT-MIB: cannot resolve OID for snAgent"
+    },
+    {
+      "filename": "mibs/brocade/FOUNDRY-SN-ARP-GROUP-MIB",
+      "error": "FOUNDRY-SN-ARP-GROUP-MIB: unresolved import snSwitch FROM FOUNDRY-SN-ROOT-MIB"
+    },
+    {
+      "filename": "mibs/brocade/FOUNDRY-SN-IP-ACL-MIB",
+      "error": "FOUNDRY-SN-AGENT-MIB: cannot resolve OID for snAgent"
+    },
+    {
+      "filename": "mibs/brocade/FOUNDRY-SN-IP-MIB",
+      "error": "FOUNDRY-SN-AGENT-MIB: cannot resolve OID for snAgent"
+    },
+    {
+      "filename": "mibs/brocade/FOUNDRY-SN-IPX-MIB",
+      "error": "FOUNDRY-SN-AGENT-MIB: cannot resolve OID for snAgent"
+    },
+    {
+      "filename": "mibs/brocade/FOUNDRY-SN-MAC-AUTHENTICATION-MIB",
+      "error": "FOUNDRY-SN-MAC-AUTHENTICATION-MIB: cannot resolve OID for snMacAuth"
+    },
+    {
+      "filename": "mibs/brocade/FOUNDRY-SN-MRP-MIB",
+      "error": "FOUNDRY-SN-MRP-MIB: cannot resolve OID for snMetroRing"
+    },
+    {
+      "filename": "mibs/brocade/FOUNDRY-SN-NOTIFICATION-MIB",
+      "error": "FOUNDRY-SN-AGENT-MIB: cannot resolve OID for snAgent"
+    },
+    {
+      "filename": "mibs/brocade/FOUNDRY-SN-ROUTER-TRAP-MIB",
+      "error": "Expected one complete ASN.1 MIB module"
+    },
+    {
+      "filename": "mibs/brocade/FOUNDRY-SN-STACKING-MIB",
+      "error": "FOUNDRY-SN-AGENT-MIB: cannot resolve OID for snAgent"
+    },
+    {
+      "filename": "mibs/brocade/FOUNDRY-SN-SW-L4-SWITCH-GROUP-MIB",
+      "error": "FOUNDRY-SN-AGENT-MIB: cannot resolve OID for snAgent"
+    },
+    {
+      "filename": "mibs/brocade/FOUNDRY-SN-SWITCH-GROUP-MIB",
+      "error": "FOUNDRY-SN-AGENT-MIB: cannot resolve OID for snAgent"
+    },
+    {
+      "filename": "mibs/brocade/FOUNDRY-SN-TRAP-MIB",
+      "error": "FOUNDRY-SN-AGENT-MIB: cannot resolve OID for snAgent"
+    },
+    {
+      "filename": "mibs/brocade/FOUNDRY-SN-VSRP-MIB",
+      "error": "FOUNDRY-SN-AGENT-MIB: cannot resolve OID for snAgent"
+    },
+    {
+      "filename": "mibs/brocade/FOUNDRY-SN-WIRELESS-GROUP-MIB",
+      "error": "FOUNDRY-SN-AGENT-MIB: cannot resolve OID for snAgent"
+    },
+    {
+      "filename": "mibs/brocade/FOUNDRY-VLAN-CAR-MIB",
+      "error": "FOUNDRY-SN-AGENT-MIB: cannot resolve OID for snAgent"
+    },
+    {
+      "filename": "mibs/calix/CALIX-EOAM-EXT-MIB",
+      "error": "CALIX-EOAM-EXT-MIB: cannot resolve OID for calixEoamExtMIB"
+    },
+    {
+      "filename": "mibs/calix/E5-110-AESCOMMON-MIB",
+      "error": "E5-110-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/calix/E5-110-AS-ATM-MIB",
+      "error": "E5-110-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/calix/E5-110-IESCOMMON-MIB",
+      "error": "E5-110-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/calix/E5-110-MIB",
+      "error": "E5-110-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/calix/E5-110-TRAPS-MIB",
+      "error": "E5-110-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/calix/E5-120-AS-ATM-MIB",
+      "error": "IEEE8021-CFMD8-MIB: cannot resolve OID for ieee8021cfmMIB"
+    },
+    {
+      "filename": "mibs/calix/E5-120-IESCOMMON-MIB",
+      "error": "IEEE8021-CFMD8-MIB: cannot resolve OID for ieee8021cfmMIB"
+    },
+    {
+      "filename": "mibs/calix/E5-120-MIB",
+      "error": "IEEE8021-CFMD8-MIB: cannot resolve OID for ieee8021cfmMIB"
+    },
+    {
+      "filename": "mibs/calix/E5-120-TRAPS-MIB",
+      "error": "IEEE8021-CFMD8-MIB: cannot resolve OID for ieee8021cfmMIB"
+    },
+    {
+      "filename": "mibs/calix/E5-121-AS-ATM-MIB",
+      "error": "IEEE8021-CFMD8-MIB: cannot resolve OID for ieee8021cfmMIB"
+    },
+    {
+      "filename": "mibs/calix/E5-121-IESCOMMON-MIB",
+      "error": "IEEE8021-CFMD8-MIB: cannot resolve OID for ieee8021cfmMIB"
+    },
+    {
+      "filename": "mibs/calix/E5-121-MIB",
+      "error": "IEEE8021-CFMD8-MIB: cannot resolve OID for ieee8021cfmMIB"
+    },
+    {
+      "filename": "mibs/calix/E5-121-TRAPS-MIB",
+      "error": "IEEE8021-CFMD8-MIB: cannot resolve OID for ieee8021cfmMIB"
+    },
+    {
+      "filename": "mibs/calix/E7-Calix-MIB",
+      "error": "E7-Calix-MIB: unresolved import E7EtherType FROM E7-TC"
+    },
+    {
+      "filename": "mibs/cambium/cnmatrix/ARICENT-CFA-MIB",
+      "error": "ARICENT-CFA-MIB: cannot resolve OID for fscfa"
+    },
+    {
+      "filename": "mibs/cambium/cnmatrix/ARICENT-ISS-MIB",
+      "error": "ARICENT-ISS-MIB: cannot resolve OID for iss"
+    },
+    {
+      "filename": "mibs/cambium/cnmatrix/ARICENT-POE-MIB",
+      "error": "ARICENT-POE-MIB: cannot resolve OID for fspoe"
+    },
+    {
+      "filename": "mibs/cdata/CDATA-GPON-MIB",
+      "error": "CDATA-GPON-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/cdata/FD-OLT-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/cdata/FD-ONU-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/cdata/FD-PERFORMANCE-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/cdata/FD-TRAP-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/cdata/NSCRTV-FTTX-EPON-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/cdata/NSCRTV-FTTX-GPON-MIB",
+      "error": "NSCRTV-FTTX-GPON-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/cdata/NSCRTV-HFCEMS-OPTICALAMPLIFIER-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/cdata/NSCRTV-PON-TREE-EXT-MIB",
+      "error": "NSCRTV-PON-TREE-EXT-MIB: unresolved import NscrtvPonExtDeviceIndex FROM VENDOR-COMMON-MIB"
+    },
+    {
+      "filename": "mibs/chatsworth/CPI-UNITY-MIB",
+      "error": "CPI-UNITY-MIB: cannot resolve OID for configuration"
+    },
+    {
+      "filename": "mibs/ciena/WWP-LEOS-PORT-MIB",
+      "error": "IEEE8023-LAG-MIB: cannot resolve OID for lagMIB"
+    },
+    {
+      "filename": "mibs/cisco/CISCO-DOCS-EXT-MIB",
+      "error": "Missing dependency DOCS-IF3-MIB"
+    },
+    {
+      "filename": "mibs/cisco/CISCO-ENTITY-ALARM-MIB",
+      "error": "CISCO-ENTITY-ALARM-MIB: unresolved import Unsigned32 FROM CISCO-TC"
+    },
+    {
+      "filename": "mibs/cisco/CISCO-ENTITY-VENDORTYPE-OID-MIB",
+      "error": "Parser exceeded 15 seconds"
+    },
+    {
+      "filename": "mibs/cisco/CISCO-LAG-MIB",
+      "error": "IEEE8023-LAG-MIB: cannot resolve OID for lagMIB"
+    },
+    {
+      "filename": "mibs/cisco/CISCO-LWAPP-AP-MIB",
+      "error": "Circular MIB dependency involving CISCO-LWAPP-DOT11-MIB"
+    },
+    {
+      "filename": "mibs/cisco/CISCO-LWAPP-DOT11-CLIENT-MIB",
+      "error": "Circular MIB dependency involving CISCO-LWAPP-DOT11-MIB"
+    },
+    {
+      "filename": "mibs/cisco/CISCO-LWAPP-DOT11-MIB",
+      "error": "Circular MIB dependency involving CISCO-LWAPP-AP-MIB"
+    },
+    {
+      "filename": "mibs/cisco/CISCO-LWAPP-SYS-MIB",
+      "error": "Circular MIB dependency involving CISCO-LWAPP-DOT11-MIB"
+    },
+    {
+      "filename": "mibs/cisco/CISCOSB-BRIDGEMIBOBJECTS-MIB",
+      "error": "CISCOSB-BRIDGEMIBOBJECTS-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/cisco/CISCOSB-DHCP-MIB",
+      "error": "CISCOSB-BRIDGEMIBOBJECTS-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/cisco/CISCOSB-DNSCL-MIB",
+      "error": "Missing dependency RFC-1213"
+    },
+    {
+      "filename": "mibs/cisco/CISCOSB-DOT1X-MIB",
+      "error": "Missing dependency IEEE8021X-PAE-MIB"
+    },
+    {
+      "filename": "mibs/cisco/CISCOSB-IPV6FHS-MIB",
+      "error": "CISCOSB-BRIDGEMIBOBJECTS-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/cisco/CISCOSB-POLICY-MIB",
+      "error": "CISCOSB-BRIDGEMIBOBJECTS-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/cisco/CISCOSB-QOS-CLI-MIB",
+      "error": "CISCOSB-BRIDGEMIBOBJECTS-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/cisco/CISCOSB-QUEUE-STATISTICS-MIB",
+      "error": "CISCOSB-BRIDGEMIBOBJECTS-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/cisco/CISCOSB-TRAPS-MIB",
+      "error": "CISCOSB-BRIDGEMIBOBJECTS-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/cisco/CISCOSB-TRUNK-MIB",
+      "error": "IEEE8023-LAG-MIB: cannot resolve OID for lagMIB"
+    },
+    {
+      "filename": "mibs/cisco/CISCOSB-TUNNEL-MIB",
+      "error": "Missing dependency RFC-1213"
+    },
+    {
+      "filename": "mibs/cisco/CISCOSB-Tuning",
+      "error": "CISCOSB-BRIDGEMIBOBJECTS-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/cisco/CISCOSB-rldot1q-MIB",
+      "error": "CISCOSB-BRIDGEMIBOBJECTS-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/cisco/CISCOSB-vlan-MIB",
+      "error": "CISCOSB-BRIDGEMIBOBJECTS-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/cisco/CISCOSB-vlanVoice-MIB",
+      "error": "CISCOSB-BRIDGEMIBOBJECTS-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/comware/HH3C-FC-ZONE-SERVER-MIB",
+      "error": "Missing dependency T11-FC-ZONE-SERVER-MIB"
+    },
+    {
+      "filename": "mibs/comware/HH3C-LswTRAP-MIB",
+      "error": "HH3C-LswTRAP-MIB: unresolved import hh3cLswCoreIndex FROM HH3C-LSW-DEV-ADM-MIB"
+    },
+    {
+      "filename": "mibs/comware/HH3C-SPB-MIB",
+      "error": "Missing dependency IEEE8021-SPB-MIB"
+    },
+    {
+      "filename": "mibs/comware/HH3C-STORAGE-SNAP-MIB",
+      "error": "HH3C-STORAGE-SNAP-MIB: unresolved import Hh3cExtendSelectPolicy FROM HH3C-STORAGE-REF-MIB"
+    },
+    {
+      "filename": "mibs/cradlepoint/WIPIPE-MIB",
+      "error": "WIPIPE-MIB: cannot resolve OID for mdmIndex"
+    },
+    {
+      "filename": "mibs/cts/HES-5106-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/cts/IES-3110-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/cts/IPS-3110-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/cts/IPS-3110-PB-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/cxr-networks/CXR-TS-MIB",
+      "error": "Missing dependency RFC-1213"
+    },
+    {
+      "filename": "mibs/dahua/DAHUA-SNMP-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/dasan/DASAN-ACCESS-MIB",
+      "error": "DASAN-ACCESS-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/dasan/DASAN-ACCESS-SLOT-H248-MIB",
+      "error": "DASAN-ACCESS-SLOT-H248-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/dasan/DASAN-ACCESS-SLOT-MGCP-MIB",
+      "error": "DASAN-ACCESS-SLOT-MGCP-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/dasan/DASAN-ACCESS-SLOT-POTS-MIB",
+      "error": "DASAN-ACCESS-SLOT-POTS-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/dasan/DASAN-ACCESS-SLOT-SIP-MIB",
+      "error": "DASAN-ACCESS-SLOT-SIP-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/dasan/DASAN-BRIDGE-MIB",
+      "error": "DASAN-BRIDGE-MIB: unresolved import dasanSwitchMIBObjects FROM DASAN-SWITCH-MIB"
+    },
+    {
+      "filename": "mibs/dasan/DASAN-MCAST-MIB",
+      "error": "DASAN-MCAST-MIB: cannot resolve OID for dsIgmpSnoopingChanged"
+    },
+    {
+      "filename": "mibs/dasan/DASAN-NOTIFICATION",
+      "error": "SLE-FAULTMGMT-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/dasan/DASAN-NOTIFICATION-V1",
+      "error": "DASAN-NOTIFICATION-V1: unresolved import dsSubnetConfName FROM DASAN-SWITCH-MIB"
+    },
+    {
+      "filename": "mibs/dasan/DASAN-SNMP-MIB",
+      "error": "DASAN-SNMP-MIB: unresolved import dasanSwitchMIBObjects FROM DASAN-SWITCH-MIB"
+    },
+    {
+      "filename": "mibs/dasan/DPW-ATM-MIB",
+      "error": "DPW-ATM-MIB: cannot resolve OID for dpwAtmMIB"
+    },
+    {
+      "filename": "mibs/dasan/SLE-BRIDGE-MIB",
+      "error": "SLE-BRIDGE-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/dasan/SLE-DEBUG-MIB",
+      "error": "SLE-DEBUG-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/dasan/SLE-DEVICE-MIB",
+      "error": "SLE-DEVICE-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/dasan/SLE-DHCP-MIB",
+      "error": "SLE-DHCP-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/dasan/SLE-DHCP-SNOOPING-MIB",
+      "error": "SLE-DHCP-SNOOPING-MIB: cannot resolve OID for sleFeatureEnable"
+    },
+    {
+      "filename": "mibs/dasan/SLE-EPON-MIB",
+      "error": "SLE-EPON-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/dasan/SLE-FAULTMGMT-MIB",
+      "error": "SLE-FAULTMGMT-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/dasan/SLE-GPON-MIB",
+      "error": "SLE-GPON-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/dasan/SLE-MPLS-TP-NODE-MIB",
+      "error": "Missing dependency MPLS-TC-EXT-STD-MIB"
+    },
+    {
+      "filename": "mibs/dasan/SLE-MPLS-TP-PW-MIB",
+      "error": "Missing dependency MPLS-TC-EXT-STD-MIB"
+    },
+    {
+      "filename": "mibs/dasan/SLE-MPLS-TP-TUNNEL-MIB",
+      "error": "Missing dependency MPLS-TC-EXT-STD-MIB"
+    },
+    {
+      "filename": "mibs/dasan/SLE-MPLS-TP-VPLS-MIB",
+      "error": "Missing dependency MPLS-TC-EXT-STD-MIB"
+    },
+    {
+      "filename": "mibs/dasan/SLE-MVQOS-MIB",
+      "error": "SLE-MVQOS-MIB: cannot resolve OID for sleMVQoS4BridgePort2TCMarkTable"
+    },
+    {
+      "filename": "mibs/dasan/SLE-NETWORK-MIB",
+      "error": "SLE-NETWORK-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/dasan/SLE-Network6-MIB",
+      "error": "SLE-NETWORK-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/dasan/SLE-OSPFv3-MIB",
+      "error": "SLE-OSPFv3-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/dasan/SLE-PERFORMANCEMGMT-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/dasan/SLE-QOS-MIB",
+      "error": "SLE-QOS-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/dasan/SLE-SECURITY-MIB",
+      "error": "SLE-SECURITY-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/dasan/SLE-SFLOW-MIB",
+      "error": "SLE-SFLOW-MIB: cannot resolve OID for sleSFlowEnable"
+    },
+    {
+      "filename": "mibs/dasan/SLEV2-DHCP-MIB",
+      "error": "SLEV2-DHCP-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/dasan/SLEV2-MULTICAST-MIB",
+      "error": "SLEV2-MULTICAST-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/dasan/SLEV2-QOS-MIB",
+      "error": "SLEV2-QOS-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/dasan/SLEV2-Security-MIB",
+      "error": "SLEV2-Security-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/datacom/DMswitch-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/dcn/DCN-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/deliberant/DLB-RADIO3-DRV-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/dpstelecom/DPS-MIB-V38",
+      "error": "Missing dependency RFC1212-MIB"
+    },
+    {
+      "filename": "mibs/dpstelecom/DPS-MIB-V38-V2",
+      "error": "Missing dependency RFC1212-MIB"
+    },
+    {
+      "filename": "mibs/dpstelecom/DPS-TEXT-RTU-MIB",
+      "error": "Missing dependency RFC1212-MIB"
+    },
+    {
+      "filename": "mibs/dragonwave/DRAGONWAVE-HORIZON-IDU-MIB",
+      "error": "DRAGONWAVE-HORIZON-IDU-MIB: unresolved import OBJECT-TYPE FROM IF-MIB"
+    },
+    {
+      "filename": "mibs/dragonwave/HORIZON-ODU-MIB",
+      "error": "HORIZON-ODU-MIB: unresolved import OBJECT-TYPE FROM IF-MIB"
+    },
+    {
+      "filename": "mibs/eaton/RPS-SC200-MIB",
+      "error": "Missing dependency RFC-1213"
+    },
+    {
+      "filename": "mibs/edgecos/ECS2100-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/edgecos/ECS3510-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/edgecos/ECS4100-52T-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/edgecos/ECS4110-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/edgecos/ECS4120-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/edgecos/ECS4150-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/edgecos/ECS4210-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/edgecos/ECS4510-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/edgecos/ECS4610-24F-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/edgecos/ECS4650-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/edgecos/ECS5520-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/edgecos/ES3510MA-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/edgecos/ES3528MO-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/edgecos/ES3528MV2-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/eds/EDS-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/eltexmes24xx/ARICENT-ISS-MIB",
+      "error": "ARICENT-ISS-MIB: cannot resolve OID for iss"
+    },
+    {
+      "filename": "mibs/eltexmes24xx/ELTEX-MES-ISS-ENV-MIB",
+      "error": "ARICENT-ISS-MIB: cannot resolve OID for iss"
+    },
+    {
+      "filename": "mibs/emerson/EES-POWER-FERRO-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/emerson/NETSURE-MIB-004-A",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/enlogic/ENLOGIC-PDU2-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/enterasys/CTRON-DLSW-MIB",
+      "error": "CTRON-DLSW-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/enterasys/CTRON-IPX-ROUTER-MIB",
+      "error": "CTRON-IPX-ROUTER-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/enterasys/CTRON-TRANSLATION-MIB",
+      "error": "CTRON-TRANSLATION-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/ericsson/PT-FM-MIB",
+      "error": "PT-FM-MIB: module could not be parsed"
+    },
+    {
+      "filename": "mibs/ericsson/PT-MONITOR-MIB",
+      "error": "PT-MONITOR-MIB: module could not be parsed"
+    },
+    {
+      "filename": "mibs/ericsson/PT-SFP-MIB",
+      "error": "PT-SFP-MIB: module could not be parsed"
+    },
+    {
+      "filename": "mibs/esphome/ESPHOME-ESP32-SNMP-MIB",
+      "error": "ESPHOME-ESP32-SNMP-MIB: cannot resolve OID for esphome"
+    },
+    {
+      "filename": "mibs/esphome/ESPHOME-ESP8266-SNMP-MIB",
+      "error": "ESPHOME-ESP8266-SNMP-MIB: cannot resolve OID for esphome"
+    },
+    {
+      "filename": "mibs/fibernet/XMUX4-PLUS",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/fibrolan/FIBROLAN-MIB-MS-TRAPS",
+      "error": "Missing dependency FIBROLAN-MIB-LTA41MA"
+    },
+    {
+      "filename": "mibs/firebrick/FIREBRICK-GLOBAL",
+      "error": "FIREBRICK-GLOBAL: unresolved import MODULE-IDENTITY FROM SNMPv2-CONF"
+    },
+    {
+      "filename": "mibs/foundry/FOUNDRY-SN-MAC-AUTHENTICATION-MIB",
+      "error": "FOUNDRY-SN-MAC-AUTHENTICATION-MIB: cannot resolve OID for snMacAuth"
+    },
+    {
+      "filename": "mibs/foundry/FOUNDRY-SN-MAC-VLAN-MIB",
+      "error": "FOUNDRY-SN-MAC-VLAN-MIB: cannot resolve OID for snMacVlan"
+    },
+    {
+      "filename": "mibs/foundry/FOUNDRY-SN-MRP-MIB",
+      "error": "FOUNDRY-SN-MRP-MIB: cannot resolve OID for snMetroRing"
+    },
+    {
+      "filename": "mibs/fs/FS-AC-MGMT-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/fs/FS-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/fs/FS-SYSTEM-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/fs/GBNDeviceSWAPI-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/fs/GBNL3IPPool-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/fs/GBNL3Rip-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/fs/GBNPlatformChassis-MIB",
+      "error": "GBNPlatformChassis-MIB: unresolved import MODULE-IDEntry FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/fs/GBNPlatformGNLink-MIB",
+      "error": "GBNPlatformGNLink-MIB: unresolved import MODULE-IDEntry FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/fs/GBNServiceCM-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/fs/GBNServiceRADIUS-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/fs/LAG-ARCH-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/fs/NSCRTV-EPON-IGMP-MGM-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/fs/bdcom/NMS-CARD-SYS-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/fs/bdcom/NMS-CHASSIS",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/fs/bdcom/NMS-EPON-OLT-PON",
+      "error": "NMS-OPTICAL-PORT-MIB: unresolved import INTEGER FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/fs/bdcom/NMS-FAN-TRAP",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/fs/bdcom/NMS-GPON-MIB",
+      "error": "NMS-GPON-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/fs/bdcom/NMS-OPTICAL-PORT-MIB",
+      "error": "NMS-OPTICAL-PORT-MIB: unresolved import INTEGER FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/fs/bdcom/NMS-POWER-MIB",
+      "error": "NMS-POWER-MIB: unresolved import INTEGER FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/genie/GENIE-ATM-SYSTEM-MIB",
+      "error": "GENIE-ATM-SYSTEM-MIB: unresolved import atm FROM GENIE-GE-ROOT-MIB"
+    },
+    {
+      "filename": "mibs/grandstream/GRANDSTREAM-GWN-PRODUCTS-SWITCH-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/gude/GUDEADS-EPC1104-MIB",
+      "error": "GUDEADS-EPC1104-MIB: cannot resolve OID for epc1104ExtInputToggleCount"
+    },
+    {
+      "filename": "mibs/gude/GUDEADS-EPC1105-MIB",
+      "error": "GUDEADS-EPC1105-MIB: cannot resolve OID for epc1105ExtInputEntry"
+    },
+    {
+      "filename": "mibs/gude/GUDEADS-EPC1121-MIB",
+      "error": "GUDEADS-EPC1121-MIB: cannot resolve OID for epc1121DeviceInfo"
+    },
+    {
+      "filename": "mibs/gude/GUDEADS-EPC1141-MIB",
+      "error": "GUDEADS-EPC1141-MIB: cannot resolve OID for epc1141ExtInputToggleCount"
+    },
+    {
+      "filename": "mibs/gude/GUDEADS-EPC1202-MIB",
+      "error": "GUDEADS-EPC1202-MIB: cannot resolve OID for epc1202ExtInputToggleCount"
+    },
+    {
+      "filename": "mibs/gude/GUDEADS-EPC8001-MIB",
+      "error": "GUDEADS-EPC8001-MIB: cannot resolve OID for epc8001ExtInputEntry"
+    },
+    {
+      "filename": "mibs/gude/GUDEADS-EPC8021-MIB",
+      "error": "GUDEADS-EPC8021-MIB: cannot resolve OID for epc8021DeviceInfo"
+    },
+    {
+      "filename": "mibs/gude/GUDEADS-EPC8031-MIB",
+      "error": "GUDEADS-EPC8031-MIB: cannot resolve OID for epc8031DeviceInfo"
+    },
+    {
+      "filename": "mibs/gude/GUDEADS-EPC8032-MIB",
+      "error": "GUDEADS-EPC8032-MIB: cannot resolve OID for epc8032CPUSensors"
+    },
+    {
+      "filename": "mibs/gude/GUDEADS-EPC8035-MIB",
+      "error": "GUDEADS-EPC8035-MIB: cannot resolve OID for epc8035DeviceInfo"
+    },
+    {
+      "filename": "mibs/gude/GUDEADS-EPC8041-MIB",
+      "error": "GUDEADS-EPC8041-MIB: cannot resolve OID for epc8041DeviceInfo"
+    },
+    {
+      "filename": "mibs/gude/GUDEADS-EPC8045-MIB",
+      "error": "GUDEADS-EPC8045-MIB: cannot resolve OID for epc8045DeviceInfo"
+    },
+    {
+      "filename": "mibs/gude/GUDEADS-EPC8221-MIB",
+      "error": "GUDEADS-EPC8221-MIB: cannot resolve OID for epc8221ExtInputToggleCount"
+    },
+    {
+      "filename": "mibs/gude/GUDEADS-EPC8226-MIB",
+      "error": "GUDEADS-EPC8226-MIB: cannot resolve OID for epc8226ExtInputToggleCount"
+    },
+    {
+      "filename": "mibs/gude/GUDEADS-EPC8291-MIB",
+      "error": "GUDEADS-EPC8291-MIB: cannot resolve OID for epc8291PortAmperageEvt"
+    },
+    {
+      "filename": "mibs/gude/GUDEADS-EPC8314-MIB",
+      "error": "GUDEADS-EPC8314-MIB: cannot resolve OID for epc8314ExtInputToggleCount"
+    },
+    {
+      "filename": "mibs/gude/GUDEADS-EPC8316-MIB",
+      "error": "GUDEADS-EPC8316-MIB: cannot resolve OID for epc8316ExtInputToggleCount"
+    },
+    {
+      "filename": "mibs/gude/GUDEADS-EPC871210-MIB",
+      "error": "GUDEADS-EPC871210-MIB: cannot resolve OID for epc871210DeviceInfo"
+    },
+    {
+      "filename": "mibs/gude/GUDEADS-EPC871310-MIB",
+      "error": "GUDEADS-EPC871310-MIB: cannot resolve OID for epc871310DeviceInfo"
+    },
+    {
+      "filename": "mibs/gude/GUDEADS-EPC873300-MIB",
+      "error": "GUDEADS-EPC873300-MIB: cannot resolve OID for epc873300DeviceInfo"
+    },
+    {
+      "filename": "mibs/gude/GUDEADS-ESB7213-MIB",
+      "error": "GUDEADS-ESB7213-MIB: cannot resolve OID for esb7213ExtInputEntry"
+    },
+    {
+      "filename": "mibs/gude/GUDEADS-ESB7214-MIB",
+      "error": "GUDEADS-ESB7214-MIB: cannot resolve OID for esb7214ExtInputEntry"
+    },
+    {
+      "filename": "mibs/hillstone/HILLSTONE-DHCP-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/hillstone/HILLSTONE-DNS-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/hillstone/HILLSTONE-FAN-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/hillstone/HILLSTONE-IF-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/hillstone/HILLSTONE-IPSEC-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/hillstone/HILLSTONE-MODULE-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/hillstone/HILLSTONE-NTP-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/hillstone/HILLSTONE-POWER-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/hillstone/HILLSTONE-STATISTICS-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/hillstone/HILLSTONE-TEMPERATURE-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/hillstone/HILLSTONE-ZONE-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/himoinsa/DISMUNTELv00-MIB",
+      "error": "Expected one complete ASN.1 MIB module"
+    },
+    {
+      "filename": "mibs/hp/HP-ICF-BRIDGE",
+      "error": "Missing dependency HP-ICF-FTRCO"
+    },
+    {
+      "filename": "mibs/hp/HP-ICF-USER-PROFILE-MIB",
+      "error": "HP-ICF-USER-PROFILE-MIB: unresolved import HpicfUsrProfilePortSpeed FROM CONFIG-MIB"
+    },
+    {
+      "filename": "mibs/huawei/HUAWEI-BRAS-IPTN-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/huawei/HUAWEI-DISMAN-PING-MIB",
+      "error": "HUAWEI-DISMAN-PING-MIB: unresolved import Unsigned32 FROM SNMPv2-TC"
+    },
+    {
+      "filename": "mibs/huawei/HUAWEI-FCOE-MIB",
+      "error": "HUAWEI-FCOE-MIB: unresolved import BITS FROM SNMPv2-TC"
+    },
+    {
+      "filename": "mibs/huawei/HUAWEI-INNER-LINK-MIB",
+      "error": "HUAWEI-INNER-LINK-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/huawei/HUAWEI-IPV6-MIB",
+      "error": "Missing dependency HUAWEI-VLAN-MIB"
+    },
+    {
+      "filename": "mibs/huawei/HUAWEI-ISIS-CONF-MIB",
+      "error": "HUAWEI-ISIS-CONF-MIB: unresolved import isisSysInstance FROM ISIS-MIB"
+    },
+    {
+      "filename": "mibs/huawei/HUAWEI-LI-MIB",
+      "error": "HUAWEI-LI-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/huawei/HUAWEI-LOAD-BACKUP-MIB",
+      "error": "Missing dependency HUAWEI-VS-MGMT-MIB"
+    },
+    {
+      "filename": "mibs/huawei/HUAWEI-MSDP-MIB",
+      "error": "Missing dependency MSDP-MIB"
+    },
+    {
+      "filename": "mibs/huawei/HUAWEI-OPENFLOW-MIB",
+      "error": "HUAWEI-OPENFLOW-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/huawei/HUAWEI-TRILL-CONF-MIB",
+      "error": "HUAWEI-ISIS-CONF-MIB: unresolved import isisSysInstance FROM ISIS-MIB"
+    },
+    {
+      "filename": "mibs/huawei/HUAWEI-XPON-MIB",
+      "error": "HUAWEI-XPON-MIB: cannot resolve OID for hwXponOntLoadFileType"
+    },
+    {
+      "filename": "mibs/ibm/GPFS-MIB",
+      "error": "GPFS-MIB: cannot resolve OID for gpfsFileSystemName"
+    },
+    {
+      "filename": "mibs/ibm/IBM-BCM-MIB",
+      "error": "Missing dependency LAN-EMULATION-CLIENT-MIB"
+    },
+    {
+      "filename": "mibs/ibm/IBM-CPS-MIB",
+      "error": "Missing dependency RFC1215"
+    },
+    {
+      "filename": "mibs/ibm/IBM-ELAN-MIB",
+      "error": "Missing dependency LAN-EMULATION-ELAN-MIB"
+    },
+    {
+      "filename": "mibs/ibm/IBM-ENETDISPATCHER-MIB",
+      "error": "IBM-ENETDISPATCHER-MIB: unresolved import IpAddress FROM SNMPv2-SMI-v1"
+    },
+    {
+      "filename": "mibs/ibm/IBM-FRAMERELAY-MIB",
+      "error": "IBM-FRAMERELAY-MIB: unresolved import IpAddress FROM SNMPv2-SMI-v1"
+    },
+    {
+      "filename": "mibs/ibm/IBM-GbTOR-10G-L2L3-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/ibm/IBM-GbTOR-G8052-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/ibm/IBM-GbTOR-G8264-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/ibm/IBM-GbTOR-G8264CS-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/ibm/IBM-GbTOR-G8264T-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/ibm/IBM-INTERFACE-MIB",
+      "error": "IBM-INTERFACE-MIB: unresolved import IpAddress FROM SNMPv2-SMI-v1"
+    },
+    {
+      "filename": "mibs/ibm/IBM-LAN-EMULATION-EXTENSION-MIB",
+      "error": "Missing dependency LAN-EMULATION-LES-MIB"
+    },
+    {
+      "filename": "mibs/ibm/IBM-LES-BUS-MIB",
+      "error": "Missing dependency LAN-EMULATION-CLIENT-MIB"
+    },
+    {
+      "filename": "mibs/ibm/IBM-NetFinity-Text-Alert-MIB",
+      "error": "Expected one complete ASN.1 MIB module"
+    },
+    {
+      "filename": "mibs/ibm/IBM-OSA-MIB",
+      "error": "IBM-OSA-MIB: cannot resolve OID for ibmOSAMibCompliance"
+    },
+    {
+      "filename": "mibs/ibm/IBM-TN3270E-MIB",
+      "error": "IBM-TN3270E-MIB: unresolved import IpAddress FROM SNMPv2-SMI-v1"
+    },
+    {
+      "filename": "mibs/ibm/IBM-TS3500-MIBv1",
+      "error": "Missing dependency RFC1212-MIB"
+    },
+    {
+      "filename": "mibs/ibm/IBM2210-MIB",
+      "error": "Missing dependency PROTEON-MIB"
+    },
+    {
+      "filename": "mibs/ibm/IBMESCON-MIB",
+      "error": "IBMESCON-MIB: unresolved import IpAddress FROM SNMPv2-SMI-v1"
+    },
+    {
+      "filename": "mibs/ibm/IBMESCONCUB-MIB",
+      "error": "IBMESCONCUB-MIB: unresolved import IpAddress FROM SNMPv2-SMI-v1"
+    },
+    {
+      "filename": "mibs/ibm/IBMFRBRS-MIB",
+      "error": "IBMFRBRS-MIB: unresolved import IpAddress FROM SNMPv2-SMI-v1"
+    },
+    {
+      "filename": "mibs/ibm/IBMIROC-MIB",
+      "error": "Missing dependency PROTEON-MIB"
+    },
+    {
+      "filename": "mibs/ibm/IBMIROCAUTH-MIB",
+      "error": "IBMIROCAUTH-MIB: unresolved import TimeTicks FROM SNMPv2-SMI-v1"
+    },
+    {
+      "filename": "mibs/ibm/IBMIROCDIALOUT-MIB",
+      "error": "IBMIROCDIALOUT-MIB: unresolved import TimeTicks FROM SNMPv2-SMI-v1"
+    },
+    {
+      "filename": "mibs/ibm/IBMIROCRLAN-MIB",
+      "error": "IBMIROCRLAN-MIB: unresolved import TimeTicks FROM SNMPv2-SMI-v1"
+    },
+    {
+      "filename": "mibs/ibm/IBMTCPIPMVS-MIB",
+      "error": "IBMTCPIPMVS-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/icr-os/CONEL-MBUS-MIB",
+      "error": "CONEL-MBUS-MIB: too many definitions (maximum 10000)"
+    },
+    {
+      "filename": "mibs/ignitenet/ES4552BH2-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/infinera/LUM-EQUIPMENT-MIB",
+      "error": "Missing dependency LUM-TC"
+    },
+    {
+      "filename": "mibs/infinera/LUM-IFBASIC-MIB",
+      "error": "Missing dependency LUM-TC"
+    },
+    {
+      "filename": "mibs/infinera/LUM-IFOTN-MIB",
+      "error": "Missing dependency LUM-TC"
+    },
+    {
+      "filename": "mibs/infinera/LUM-IFOTNMON-MIB",
+      "error": "Missing dependency LUM-TC"
+    },
+    {
+      "filename": "mibs/infinera/LUM-IFPERF-MIB",
+      "error": "Missing dependency LUM-TC"
+    },
+    {
+      "filename": "mibs/infinera/LUM-IFPHYSICAL-MIB",
+      "error": "Missing dependency LUM-TC"
+    },
+    {
+      "filename": "mibs/infinera/LUM-INVENTORY-MIB",
+      "error": "Missing dependency LUM-TC"
+    },
+    {
+      "filename": "mibs/infinera/LUM-OA-MIB",
+      "error": "Missing dependency LUM-TC"
+    },
+    {
+      "filename": "mibs/infinera/LUM-OCM-MIB",
+      "error": "Missing dependency LUM-TC"
+    },
+    {
+      "filename": "mibs/infinera/LUM-SYSINFO-MIB",
+      "error": "Missing dependency LUM-TC"
+    },
+    {
+      "filename": "mibs/infinera/LUM-SYSTEM-MIB",
+      "error": "Missing dependency LUM-TC"
+    },
+    {
+      "filename": "mibs/infinera/LUM-WDM-MIB",
+      "error": "Missing dependency LUM-TC"
+    },
+    {
+      "filename": "mibs/infoblox/IB-PLATFORMONE-MIB",
+      "error": "IB-PLATFORMONE-MIB: unresolved import IbFloat FROM IB-SMI-MIB"
+    },
+    {
+      "filename": "mibs/iqnos/INFINERA-ENTITY-CHASSIS-MIB",
+      "error": "INFINERA-REG-MIB: unresolved import iso FROM RFC1155-SMI"
+    },
+    {
+      "filename": "mibs/iqnos/INFINERA-PM-BANDCTP-MIB",
+      "error": "INFINERA-REG-MIB: unresolved import iso FROM RFC1155-SMI"
+    },
+    {
+      "filename": "mibs/iqnos/INFINERA-PM-OCHCTP-MIB",
+      "error": "INFINERA-REG-MIB: unresolved import iso FROM RFC1155-SMI"
+    },
+    {
+      "filename": "mibs/iqnos/INFINERA-PM-OSCCTP-MIB",
+      "error": "INFINERA-REG-MIB: unresolved import iso FROM RFC1155-SMI"
+    },
+    {
+      "filename": "mibs/iqnos/INFINERA-PM-SCHCTP-MIB",
+      "error": "INFINERA-REG-MIB: unresolved import iso FROM RFC1155-SMI"
+    },
+    {
+      "filename": "mibs/iqnos/INFINERA-REG-MIB",
+      "error": "INFINERA-REG-MIB: unresolved import iso FROM RFC1155-SMI"
+    },
+    {
+      "filename": "mibs/iqnos/INFINERA-TC-MIB",
+      "error": "INFINERA-REG-MIB: unresolved import iso FROM RFC1155-SMI"
+    },
+    {
+      "filename": "mibs/juniper/junos/JUNIPER-MOBILE-GATEWAY-GTP-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/juniper/junos/JUNIPER-MOBILE-GATEWAY-SGW-GTP-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/juniper/junos/JUNIPER-MOBILITY-CHARGING-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/juniper/junos/JUNIPER-MOBILITY-SGW-CHARGING-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/lancom/LCOS-MIB",
+      "error": "LCOS-MIB: too many definitions (maximum 10000)"
+    },
+    {
+      "filename": "mibs/linksys/LINKSYS-DNSCL-MIB",
+      "error": "Missing dependency RFC-1213"
+    },
+    {
+      "filename": "mibs/linksys/LINKSYS-DOT1X-MIB",
+      "error": "LINKSYS-DOT1X-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/linksys/LINKSYS-MODEL-MIB",
+      "error": "Expected one complete ASN.1 MIB module"
+    },
+    {
+      "filename": "mibs/linksys/LINKSYS-STACK-MIB",
+      "error": "LINKSYS-STACK-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/linksys/LINKSYS-TRUNK-MIB",
+      "error": "IEEE8023-LAG-MIB: cannot resolve OID for lagMIB"
+    },
+    {
+      "filename": "mibs/linksys/LINKSYS-TUNNEL-MIB",
+      "error": "Missing dependency RFC-1213"
+    },
+    {
+      "filename": "mibs/metaswitch/METASWITCH-MIB",
+      "error": "Dependency graph exceeds the 32 MiB compilation budget"
+    },
+    {
+      "filename": "mibs/microsemi/SYMM-SMI",
+      "error": "SYMM-SMI: unresolved import MODULE-IDENTITY FROM RFC-1212"
+    },
+    {
+      "filename": "mibs/netping/DKSF-70-6-X-X-1",
+      "error": "DKSF-70-6-X-X-1: cannot resolve OID for uniPingServerSolutionV3"
+    },
+    {
+      "filename": "mibs/nokia/1830/TN-LAG-MIB",
+      "error": "IEEE8023-LAG-MIB: cannot resolve OID for lagMIB"
+    },
+    {
+      "filename": "mibs/nokia/1830/TROPIC-OPTICALPORT-MIB",
+      "error": "IEEE8023-LAG-MIB: cannot resolve OID for lagMIB"
+    },
+    {
+      "filename": "mibs/nokia/1830/TROPIC-PSD-MIB",
+      "error": "IEEE8023-LAG-MIB: cannot resolve OID for lagMIB"
+    },
+    {
+      "filename": "mibs/nokia/ASAM-SYSTEM-MIB",
+      "error": "ASAM-SYSTEM-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/nokia/SFP-MIB",
+      "error": "SFP-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/nokia/TIMETRA-OAM-TEST-MIB",
+      "error": "Missing dependency TIMETRA-LAG-MIB"
+    },
+    {
+      "filename": "mibs/nokia/aos6/ALCATEL-IND1-LAG-MIB",
+      "error": "IEEE8023-LAG-MIB: cannot resolve OID for lagMIB"
+    },
+    {
+      "filename": "mibs/nokia/aos6/ALCATEL-IND1-LLDP-MED-MIB",
+      "error": "ALCATEL-IND1-LLDP-MED-MIB: unresolved import Dscp FROM LLDP-EXT-MED-MIB"
+    },
+    {
+      "filename": "mibs/nokia/aos6/ALCATEL-IND1-MAC-SERVER-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/nokia/aos6/ALCATEL-ISIS-MIB",
+      "error": "ALCATEL-ISIS-MIB: unresolved import isisSysInstance FROM ISIS-MIB"
+    },
+    {
+      "filename": "mibs/nokia/aos7/ALCATEL-IND1-DCBX-MIB",
+      "error": "Missing dependency LLDP-EXT-DOT1-V2-MIB"
+    },
+    {
+      "filename": "mibs/nokia/aos7/ALCATEL-IND1-EVB-MIB",
+      "error": "Missing dependency IEEE8021-EVBB-MIB"
+    },
+    {
+      "filename": "mibs/nokia/aos7/ALCATEL-IND1-ISIS-MIB",
+      "error": "ALCATEL-IND1-ISIS-MIB: unresolved import isisSysInstance FROM ISIS-MIB"
+    },
+    {
+      "filename": "mibs/nokia/aos7/ALCATEL-IND1-ISIS-SPB-MIB",
+      "error": "ALCATEL-IND1-ISIS-SPB-MIB: unresolved import VlanIdOrNone FROM IEEE8021-CFM-MIB"
+    },
+    {
+      "filename": "mibs/nokia/aos7/ALCATEL-IND1-LAG-MIB",
+      "error": "IEEE8023-LAG-MIB: cannot resolve OID for lagMIB"
+    },
+    {
+      "filename": "mibs/nokia/aos7/ALCATEL-IND1-MAC-SERVER-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/nokia/aos7/ALCATEL-IND1-TIMETRA-OAM-TEST-MIB",
+      "error": "ALCATEL-IND1-TIMETRA-OAM-TEST-MIB: unresolved import MplsLabel FROM MPLS-LDP-STD-MIB"
+    },
+    {
+      "filename": "mibs/nortel/RAPID-CITY",
+      "error": "Missing dependency MSDP-MIB"
+    },
+    {
+      "filename": "mibs/nortel/RAPID-CITY-BAY-STACK",
+      "error": "Missing dependency MSDP-MIB"
+    },
+    {
+      "filename": "mibs/nortel/RC-MLT-MIB",
+      "error": "Missing dependency MSDP-MIB"
+    },
+    {
+      "filename": "mibs/nortel/RC-VLAN-MIB",
+      "error": "Missing dependency MSDP-MIB"
+    },
+    {
+      "filename": "mibs/nortel/RC-VRF-MIB",
+      "error": "Missing dependency MSDP-MIB"
+    },
+    {
+      "filename": "mibs/nortel/SWPRIMGMT-MIB",
+      "error": "Missing dependency MSDP-MIB"
+    },
+    {
+      "filename": "mibs/openaccess/OACOMMON-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/opengear/OG-CONNECT-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/opengear/OG-DATA-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/opengear/OG-FAILOVER-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/opengear/OG-HOST-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/opengear/OG-PATTERN-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/opengear/OG-SENSOR-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/opengear/OG-SIGNAL-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/opengear/OG-STATUSv2-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/opengear/OG-UPS-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/opengear/OGTRAPv2-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/parks/PARKS-PK700",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/patton/SMARTNODE-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/pbi/PBI-4000P-5000P-MIB",
+      "error": "Cannot convert undefined or null to object"
+    },
+    {
+      "filename": "mibs/pbi/PBI-MAIN-MIB",
+      "error": "Cannot convert undefined or null to object"
+    },
+    {
+      "filename": "mibs/pbi/PBI-MGSIGNALCHARACTERISTICS-MIB",
+      "error": "Cannot convert undefined or null to object"
+    },
+    {
+      "filename": "mibs/pbi/PBI-MGSYSTEM-MIB",
+      "error": "Cannot convert undefined or null to object"
+    },
+    {
+      "filename": "mibs/pbn/NMS-MEMORY-POOL-MIB",
+      "error": "NMS-QOS-PIB-MIB: unresolved import Unsigned32 FROM NMS-TC"
+    },
+    {
+      "filename": "mibs/pbn/NMS-QOS-PIB-MIB",
+      "error": "NMS-QOS-PIB-MIB: unresolved import Unsigned32 FROM NMS-TC"
+    },
+    {
+      "filename": "mibs/poweralert/TRIPPLITE-PRODUCTS",
+      "error": "TRIPPLITE-PRODUCTS: cannot resolve OID for tlpUpsConfigContactTable"
+    },
+    {
+      "filename": "mibs/procera/PACKETLOGIC-CHANNEL-MIB",
+      "error": "PACKETLOGIC-MIB: too many definitions (maximum 10000)"
+    },
+    {
+      "filename": "mibs/procera/PACKETLOGIC-HW-MIB",
+      "error": "PACKETLOGIC-MIB: too many definitions (maximum 10000)"
+    },
+    {
+      "filename": "mibs/procera/PACKETLOGIC-HW-SENSORS-MIB",
+      "error": "PACKETLOGIC-MIB: too many definitions (maximum 10000)"
+    },
+    {
+      "filename": "mibs/procera/PACKETLOGIC-HW-SFP-MIB",
+      "error": "PACKETLOGIC-MIB: too many definitions (maximum 10000)"
+    },
+    {
+      "filename": "mibs/procera/PACKETLOGIC-MIB",
+      "error": "PACKETLOGIC-MIB: too many definitions (maximum 10000)"
+    },
+    {
+      "filename": "mibs/procera/PACKETLOGIC-NIC-MIB",
+      "error": "PACKETLOGIC-MIB: too many definitions (maximum 10000)"
+    },
+    {
+      "filename": "mibs/procera/PACKETLOGIC-OVERVIEW-MIB",
+      "error": "PACKETLOGIC-MIB: too many definitions (maximum 10000)"
+    },
+    {
+      "filename": "mibs/procera/PACKETLOGIC-RAID-MIB",
+      "error": "PACKETLOGIC-MIB: too many definitions (maximum 10000)"
+    },
+    {
+      "filename": "mibs/procera/PACKETLOGIC-SNOOPER-DHCP-MIB",
+      "error": "PACKETLOGIC-MIB: too many definitions (maximum 10000)"
+    },
+    {
+      "filename": "mibs/procera/PACKETLOGIC-TRAP-MIB",
+      "error": "PACKETLOGIC-MIB: too many definitions (maximum 10000)"
+    },
+    {
+      "filename": "mibs/qtech/QTECH-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/quanta/IEEE8021-PFC-MIB",
+      "error": "IEEE8021-PFC-MIB: cannot resolve OID for ieee8021PFCMib"
+    },
+    {
+      "filename": "mibs/quanta/LAG-MIB",
+      "error": "LAG-MIB: unresolved import BITS FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-AAA",
+      "error": "RADLAN-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-BaudRate-MIB",
+      "error": "RADLAN-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-COPY-MIB",
+      "error": "Missing dependency RADLAN-SECSD-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-DNSCL-MIB",
+      "error": "Missing dependency RFC-1213"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-IP",
+      "error": "RADLAN-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-IPv6",
+      "error": "RADLAN-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-LLDP-MIB",
+      "error": "RADLAN-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-LOCALIZATION-MIB",
+      "error": "RADLAN-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-MAC-BASE-PRIO",
+      "error": "RADLAN-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-MNGINF-MIB",
+      "error": "RADLAN-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-QOS-CLI-MIB",
+      "error": "Missing dependency RADLAN-BRIDGEMIBOBJECTS-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-QOS-SERV",
+      "error": "RADLAN-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-RMON",
+      "error": "RADLAN-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-SENSORENTMIB",
+      "error": "RADLAN-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-SNMP-MIB",
+      "error": "RADLAN-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-SSH-MIB",
+      "error": "RADLAN-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-SSL",
+      "error": "RADLAN-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-STACK-MIB",
+      "error": "RADLAN-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-SYSLOG-MIB",
+      "error": "RADLAN-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-TIMESYNCHRONIZATION-MIB",
+      "error": "RADLAN-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-Tuning",
+      "error": "Missing dependency RADLAN-BRIDGEMIBOBJECTS-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-UDP",
+      "error": "RADLAN-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-rlInterfaces",
+      "error": "RADLAN-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-rlLcli-MIB",
+      "error": "RADLAN-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-rndApplications",
+      "error": "RADLAN-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/radlan/RADLAN-vlan-MIB",
+      "error": "Missing dependency RADLAN-BRIDGEMIBOBJECTS-MIB"
+    },
+    {
+      "filename": "mibs/raisecom/RAISECOM-PON-DEVICE-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/redlion/SIXNET-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/ros/RUGGEDCOM-TRAPS-MIB",
+      "error": "Missing dependency RUGGEDCOM-SWITCH-MIB"
+    },
+    {
+      "filename": "mibs/ruijie/RUIJIE-SYSTEM-MIB",
+      "error": "Missing dependency RUIJIE-AC-MGMT-MIB"
+    },
+    {
+      "filename": "mibs/rutos/TELTONIKA-MIB",
+      "error": "TELTONIKA-MIB: unresolved import NetworkAddress FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/sagemcom/PPP-BRIDGE-NCP-MIB",
+      "error": "Missing dependency PPP-LCP-MIB"
+    },
+    {
+      "filename": "mibs/seagate/SEAGATESYSTEMTRAP-MIB",
+      "error": "SEAGATESYSTEMTRAP-MIB: module could not be parsed"
+    },
+    {
+      "filename": "mibs/snrerd/SNR-ERD-4",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/sonicwall/SNWL-SSLVPN-MIB",
+      "error": "Cannot read properties of undefined (reading 'sonicwall')"
+    },
+    {
+      "filename": "mibs/sonicwall/SONICWALL-FIREWALL-IP-STATISTICS-MIB",
+      "error": "Cannot read properties of undefined (reading 'sonicwallFw')"
+    },
+    {
+      "filename": "mibs/sonicwall/SONICWALL-SMI",
+      "error": "SONICWALL-SMI: module could not be parsed"
+    },
+    {
+      "filename": "mibs/spectracom/SPECTRACOM-PTPBASE-MIB",
+      "error": "Cannot read properties of undefined (reading 'includes')"
+    },
+    {
+      "filename": "mibs/synso/SYNSO-UPSMIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/tailyn/IMP-HF528-MIB",
+      "error": "Cannot read properties of undefined (reading 'replace')"
+    },
+    {
+      "filename": "mibs/telco-systems/binos/PRVT-EPS-MIB",
+      "error": "PRVT-SERV-MIB: unresolved import TSapEgressPolicyIdOrNone FROM PRVT-QOS-MIB"
+    },
+    {
+      "filename": "mibs/telco-systems/binos/PRVT-L2TUNNELING-MIB",
+      "error": "PRVT-SERV-MIB: unresolved import TSapEgressPolicyIdOrNone FROM PRVT-QOS-MIB"
+    },
+    {
+      "filename": "mibs/telco-systems/binos/PRVT-MPLS-LDP-MIB",
+      "error": "PRVT-MPLS-LDP-MIB: unresolved import MplsIndexType FROM MPLS-LSR-MIB"
+    },
+    {
+      "filename": "mibs/telco-systems/binos/PRVT-NETWORK-LOOPBACK-TEST-MIB",
+      "error": "PRVT-SERV-MIB: unresolved import TSapEgressPolicyIdOrNone FROM PRVT-QOS-MIB"
+    },
+    {
+      "filename": "mibs/telco-systems/binos/PRVT-SERV-MIB",
+      "error": "PRVT-SERV-MIB: unresolved import TSapEgressPolicyIdOrNone FROM PRVT-QOS-MIB"
+    },
+    {
+      "filename": "mibs/telco-systems/binos/PRVT-SWITCH-ACCESS-LIST-MIB",
+      "error": "PRVT-SERV-MIB: unresolved import TSapEgressPolicyIdOrNone FROM PRVT-QOS-MIB"
+    },
+    {
+      "filename": "mibs/teltonika/TELTONIKA-MIB",
+      "error": "TELTONIKA-MIB: unresolved import NetworkAddress FROM SNMPv2-SMI"
+    },
+    {
+      "filename": "mibs/transition/TN-DEV-SYS-IPMGMT-MIB",
+      "error": "TN-DEV-SYS-IPMGMT-MIB: unresolved import MODULE-IDENTITY FROM ENTITY-MIB"
+    },
+    {
+      "filename": "mibs/transition/TN-MRP-MIB",
+      "error": "Missing dependency IEC-62439-2-MIB"
+    },
+    {
+      "filename": "mibs/transition/TN-PTP-MIB",
+      "error": "TN-PTP-MIB: unresolved import MODULE-IDENTITY FROM INET-ADDRESS-MIB"
+    },
+    {
+      "filename": "mibs/transition/TN-SA-MIB",
+      "error": "TN-SA-MIB: cannot resolve OID for tnSaMIB"
+    },
+    {
+      "filename": "mibs/transition/TN-SYNCE-MIB",
+      "error": "TN-SYNCE-MIB: unresolved import MODULE-IDENTITY FROM ENTITY-MIB"
+    },
+    {
+      "filename": "mibs/transition/TN-XSTP-MIB",
+      "error": "Missing dependency IEEE8021-MSTP-MIB"
+    },
+    {
+      "filename": "mibs/transition/TN-ZERO-TOUCH-PROVISION-MIB",
+      "error": "TN-DEV-SYS-IPMGMT-MIB: unresolved import MODULE-IDENTITY FROM ENTITY-MIB"
+    },
+    {
+      "filename": "mibs/ubiquoss/UBIQUOSS-10GEPON-PM-GROUP-MIB",
+      "error": "UBIQUOSS-10GEPON-PM-GROUP-MIB: unresolved import ubiPortIndex FROM UBQS-INTERFACE-MIB"
+    },
+    {
+      "filename": "mibs/ubiquoss/UBIQUOSS-10GEPON-PON-MAC-GROUP-MIB",
+      "error": "UBIQUOSS-10GEPON-PON-MAC-GROUP-MIB: unresolved import ubiPortIndex FROM UBQS-INTERFACE-MIB"
+    },
+    {
+      "filename": "mibs/ubiquoss/UBIQUOSS-10GEPON-PON-PROFILE-GROUP-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/ubiquoss/UBIQUOSS-10GEPON-SERVICE-POLICY-GROUP-MIB",
+      "error": "UBIQUOSS-10GEPON-SERVICE-POLICY-GROUP-MIB: unresolved import ubiPortIndex FROM UBQS-INTERFACE-MIB"
+    },
+    {
+      "filename": "mibs/ubiquoss/UBIQUOSS-10GEPON-SOFTWARE-MANAGEMENT-GROUP-MIB",
+      "error": "UBIQUOSS-10GEPON-SOFTWARE-MANAGEMENT-GROUP-MIB: unresolved import ubiPortIndex FROM UBQS-INTERFACE-MIB"
+    },
+    {
+      "filename": "mibs/ubiquoss/UBIQUOSS-EPON-MIB",
+      "error": "UBIQUOSS-EPON-MIB: unresolved import ubiSysIndex FROM UBQS-INTERFACE-MIB"
+    },
+    {
+      "filename": "mibs/ubiquoss/UBIQUOSS-EPON-ONTMANAGER-GROUP-MIB",
+      "error": "UBIQUOSS-EPON-ONTMANAGER-GROUP-MIB: unresolved import ubiPortIndex FROM UBQS-INTERFACE-MIB"
+    },
+    {
+      "filename": "mibs/ubiquoss/UBIQUOSS-EPON-PM-GROUP-MIB",
+      "error": "UBIQUOSS-EPON-PM-GROUP-MIB: unresolved import ubiPortIndex FROM UBQS-INTERFACE-MIB"
+    },
+    {
+      "filename": "mibs/ubiquoss/UBIQUOSS-EPON-PM-MIB",
+      "error": "UBIQUOSS-EPON-PM-MIB: unresolved import ubiSysIndex FROM UBQS-INTERFACE-MIB"
+    },
+    {
+      "filename": "mibs/ubiquoss/UBIQUOSS-EPON-PON-MAC-GROUP-MIB",
+      "error": "UBIQUOSS-EPON-PON-MAC-GROUP-MIB: unresolved import ubiPortIndex FROM UBQS-INTERFACE-MIB"
+    },
+    {
+      "filename": "mibs/ubiquoss/UBIQUOSS-EPON-SERVICE-POLICY-GROUP-MIB",
+      "error": "UBIQUOSS-EPON-SERVICE-POLICY-GROUP-MIB: unresolved import ubiPortIndex FROM UBQS-INTERFACE-MIB"
+    },
+    {
+      "filename": "mibs/ubiquoss/UBIQUOSS-EPON-SOFTWARE-MANAGEMENT-GROUP-MIB",
+      "error": "UBIQUOSS-EPON-SOFTWARE-MANAGEMENT-GROUP-MIB: unresolved import ubiPortIndex FROM UBQS-INTERFACE-MIB"
+    },
+    {
+      "filename": "mibs/ubiquoss/UBIQUOSS-MAC-MIB",
+      "error": "UBIQUOSS-MAC-MIB: unresolved import TimeTicks FROM SNMPv2-TC"
+    },
+    {
+      "filename": "mibs/ubiquoss/UBQS-DHCP-MIB",
+      "error": "UBQS-DHCP-MIB: unresolved import TimeTicks FROM SNMPv2-TC"
+    },
+    {
+      "filename": "mibs/ubiquoss/UBQS-DOT1BRIDGE-MIB",
+      "error": "Cannot read properties of undefined (reading 'replace')"
+    },
+    {
+      "filename": "mibs/ubiquoss/UBQS-ENTITY-ALARM-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/ubiquoss/UBQS-ERPS-MIB",
+      "error": "UBQS-ERPS-MIB: unresolved import ubiSysMacAddr FROM UBQS-SYSTEM-MIB"
+    },
+    {
+      "filename": "mibs/ubiquoss/UBQS-MPLS-LDP-MIB",
+      "error": "UBQS-MPLS-LDP-MIB: unresolved import IpAddress FROM SNMPv2-TC"
+    },
+    {
+      "filename": "mibs/ubiquoss/UBQS-MPLS-MIB",
+      "error": "UBQS-MPLS-MIB: unresolved import IpAddress FROM SNMPv2-TC"
+    },
+    {
+      "filename": "mibs/ubiquoss/UBQS-MPLS-PW-MIB",
+      "error": "UBQS-MPLS-PW-MIB: unresolved import IpAddress FROM SNMPv2-TC"
+    },
+    {
+      "filename": "mibs/ubiquoss/UBQS-MPLS-RSVP-MIB",
+      "error": "UBQS-MPLS-RSVP-MIB: unresolved import IpAddress FROM SNMPv2-TC"
+    },
+    {
+      "filename": "mibs/ubiquoss/UBQS-OSPF-MIB",
+      "error": "UBQS-OSPF-MIB: unresolved import IpAddress FROM SNMPv2-TC"
+    },
+    {
+      "filename": "mibs/vmware/VMWARE-VCHA-MIB",
+      "error": "VMWARE-VCHA-MIB: module could not be parsed"
+    },
+    {
+      "filename": "mibs/westermo/TTDP-MIB",
+      "error": "TTDP-MIB: module could not be parsed"
+    },
+    {
+      "filename": "mibs/wut/WebGraph-Thermo-Hygro-Barometer-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/zhone/ZHONE-CARD-RESOURCES-MIB",
+      "error": "Zhone: cannot resolve OID for zhoneShelfSlotGroup"
+    },
+    {
+      "filename": "mibs/zhone/ZHONE-INTERFACE-TRANSLATION-MIB",
+      "error": "Zhone: cannot resolve OID for zhoneShelfSlotGroup"
+    },
+    {
+      "filename": "mibs/zhone/Zhone",
+      "error": "Zhone: cannot resolve OID for zhoneShelfSlotGroup"
+    },
+    {
+      "filename": "mibs/zhone/Zhone-TC",
+      "error": "Zhone: cannot resolve OID for zhoneShelfSlotGroup"
+    },
+    {
+      "filename": "mibs/zte/ZTE-AN-ENVMON-MIB",
+      "error": "ZTE-AN-ENVMON-MIB: cannot resolve OID for zxAnPowerSupplyGlobalObjects"
+    },
+    {
+      "filename": "mibs/zyxel/IES5206-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/zyxel/IES5206-TRAPS-MIB",
+      "error": "Cannot read properties of undefined (reading 'startsWith')"
+    },
+    {
+      "filename": "mibs/zyxel/ZYXEL-AS-MIB",
+      "error": "ZYXEL-AS-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/zyxel/ZYXEL-GS4012F-MIB",
+      "error": "ZYXEL-GS4012F-MIB: unresolved import ospfLsdbLSID FROM OSPF-MIB"
+    },
+    {
+      "filename": "mibs/zyxel/ZYXEL-IES5000-MIB",
+      "error": "ZYXEL-IES5000-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/zyxel/ZYXEL-IESCOMMON-MIB",
+      "error": "ZYXEL-IESCOMMON-MIB: unresolved import MacAddress FROM BRIDGE-MIB"
+    },
+    {
+      "filename": "mibs/zyxel/ZYXEL-NWA-SERIES_v1-4-2",
+      "error": "ZYXEL-NWA-SERIES_v1-4-2: unresolved import PhysAddress FROM RFC1155-SMI"
+    },
+    {
+      "filename": "mibs/zyxel/ZYXEL-PRESTIGE-MIB",
+      "error": "Missing dependency APPLETALK-MIB"
+    },
+    {
+      "filename": "mibs/zyxel/ZYXEL-SAM1216",
+      "error": "ZYXEL-SAM1216: unresolved import MacAddress FROM BRIDGE-MIB"
+    }
+  ],
+  "completedAt": "2026-09-24T19:45:55.566Z"
+}
