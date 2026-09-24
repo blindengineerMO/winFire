@@ -45,6 +45,8 @@ The **Unmanaged assets** tab is a local inventory triage queue after a configura
 
 Open **Administration → Discovery → SNMP → MIB library**. Built-in profiles collect additional interface, hardware, host-resource, routing, neighbor, TCP, VLAN-forwarding and LLDP evidence. Import one or more vendor ASN.1 MIBs with their dependencies, preview, then import. Use **Details / Configure** to select readable objects and set sysObjectID prefixes or sysDescr phrases; use switches to disable a source or object.
 
+The **Modules** tab configures collection. **Source files** provides search, status filters and downloads of original files, including alternate versions and files needing attention. Uploads use multipart form data; source files live on the API server under `SNMP_MIB_LIBRARY_DIR` (default `DATA_DIR/snmp-mibs`). Total library capacity is limited by available disk space. Full [Cisco](SNMP_LIBRARY.md#source-files-and-full-cisco-catalog) and [LibreNMS](SNMP_LIBRARY.md#librenms-catalog-and-vendor-folders) importers run on the server. LibreNMS vendor subfolders remain part of each source filename and can be searched. Back up the source directory along with the database.
+
 Each successful identity poll matches enabled profiles and persists links to the node. Later polls recognize those links, recheck identity, and discover newly imported matching sources. The node's details show **SNMP library and collected data**, match evidence, collection status and searchable paginated values. Unsupported MIBs do not make a successfully authenticated device unreachable. [Full workflow, supported MIBs and API examples](SNMP_LIBRARY.md).
 
 ## Static and dynamic node groups

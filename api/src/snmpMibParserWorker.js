@@ -27,10 +27,10 @@ try {
   byName.forEach((_,name)=>visit(name))
   // Avoid emitting untrusted module text into server logs.
   console.log=()=>{};console.warn=()=>{}
+  for(const file of ordered)store.parser.ParseModule(file.moduleName,file.content)
+  store.parser.Serialize()
   const result=[]
   for(const file of ordered){
-    store.parser.ParseModule(file.moduleName,file.content)
-    store.parser.Serialize()
     const module=store.getModule(file.moduleName)
     if(!module)throw Error(`${file.moduleName}: module could not be parsed`)
     for(const [dependency,names] of Object.entries(module.IMPORTS||{})){

@@ -57,7 +57,8 @@ import {mappingRoutes} from './routes/mapping.js'
 import {expandCidrs,runDiscoveryScan,queueDiscoveryScan,publicDiscoverySchedule,runDiscoveryScheduleNow,persistHypervisor,DISCOVERY_MIN_INTERVAL_MINUTES,DISCOVERY_MAX_INTERVAL_MINUTES} from './networkDiscovery.js'
 import {validSnmpHost,normalizeSnmpSecret,ipInCidr} from './snmpDiscovery.js'
 import {snmpTargets,pollSnmpDiscoveryTarget,pollSnmpNode} from './snmpDiscoveryService.js'
-import {listMibs,mibDetails,importMibs,updateMib,deleteMib,nodeMibFacts} from './snmpMibLibrary.js'
+import {listMibs,mibDetails,mibRecord,importMibs,updateMib,deleteMib,nodeMibFacts} from './snmpMibLibrary.js'
+import {mibUpload,mibUploadInput,cleanupMibUploads,listMibFiles,sourcePath} from './snmpMibStorage.js'
 import {passiveDiscoveryRows,passiveDiscoverySummary,processPassiveDiscovery} from './passiveDiscovery.js'
 import {previewDhcpImport,importDhcpLeases,dhcpImportHistory,dhcpImportById} from './dhcpDiscovery.js'
 import {asyncHandler} from './middleware/asyncHandler.js'
@@ -634,8 +635,11 @@ const snmpCidr=value=>{
   return isIP(address)===4&&Number.isInteger(prefix)&&prefix>=0&&prefix<=32?`${address}/${prefix}`:null
 }
 api.get('/discovery/snmp-library',requireRole('admin'),(req,res)=>res.json(listMibs(req.query)))
-api.post('/discovery/snmp-library/preview',requireRole('admin'),wrap(async(req,res)=>res.json(await importMibs(req.body,req.user.id,{preview:true}))))
-api.post('/discovery/snmp-library/import',requireRole('admin'),wrap(async(req,res)=>res.status(201).json(await importMibs(req.body,req.user.id))))
+api.post('/discovery/snmp-library/preview',requireRole('admin'),mibUpload,wrap(async(req,res)=>{try{res.json(await importMibs(mibUploadInput(req),req.user.id,{preview:true}))}finally{cleanupMibUploads(req)}}))
+api.post('/discovery/snmp-library/import',requireRole('admin'),mibUpload,wrap(async(req,res)=>{try{res.status(201).json(await importMibs(mibUploadInput(req),req.user.id))}finally{cleanupMibUploads(req)}}))
+api.get('/discovery/snmp-library/files',requireRole('admin'),(req,res)=>res.json(listMibFiles(req.query)))
+api.get('/discovery/snmp-library/files/:id/download',requireRole('admin'),(req,res)=>{const file=one('SELECT * FROM snmp_mib_files WHERE id=?',reqId(req));if(!file)return res.status(404).json({error:'MIB source not found'});res.set('Cache-Control','no-store');res.download(sourcePath(file.source_path),file.filename.split('/').pop())})
+api.get('/discovery/snmp-library/:id/download',requireRole('admin'),(req,res)=>{const file=mibRecord(reqId(req));if(!file.source_path)return res.status(404).json({error:'This profile has no source file'});res.set('Cache-Control','no-store');res.download(sourcePath(file.source_path),file.filename)})
 api.get('/discovery/snmp-library/:id',requireRole('admin'),(req,res)=>res.json(mibDetails(reqId(req),req.query)))
 api.patch('/discovery/snmp-library/:id',requireRole('admin'),(req,res)=>res.json(updateMib(reqId(req),req.body,req.user.id)))
 api.delete('/discovery/snmp-library/:id',requireRole('admin'),(req,res)=>{deleteMib(reqId(req),req.user.id);res.status(204).end()})

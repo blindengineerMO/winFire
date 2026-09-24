@@ -12,7 +12,7 @@ WinFire Secure is an API-first control plane for host inventory, firewall visibi
 | [Operator guide](docs/USAGE.md) | Discovery, inventory, triage, groups, policy learning, events, mapping, administration and every interface route. |
 | [API usage and curl examples](docs/API.md) | Authentication, inventory queries, credentials, discovery, DHCP, groups, events, topology and JIT access. |
 | [Complete API route reference](docs/API_ROUTES.md) | Every registered API operation, authentication/permission gates, source handler links and published request schemas. |
-| [SNMP MIB library](docs/SNMP_LIBRARY.md) | Built-in coverage, multi-file imports, matching, device links, collected facts, limits and curl examples. |
+| [SNMP MIB library](docs/SNMP_LIBRARY.md) | Built-in coverage, filesystem storage, multipart uploads/downloads, full Cisco and LibreNMS catalog imports, matching, device links, collected facts and curl examples. |
 | [DHCP lease import](docs/DHCP_IMPORT.md) | Windows export script, preview/import, MAC/IP correlation, retained evidence, conflict handling and API contract. |
 | [JIT MFA: how it works](docs/JIT_MFA.md) | Setup, supported platforms, prompting, identity checks, firewall gates, temporary grants, expiry, fallback and verification. |
 | [Enterprise Internet deployment](docs/INTERNET_ENTERPRISE_DEPLOYMENT.md) | Browser extension deployment and URL telemetry/policy. |

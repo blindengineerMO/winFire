@@ -10,7 +10,79 @@
 6. In the same dialog, review device matching. Vendor enterprise prefixes are inferred from module OIDs. A module without an inferred enterprise needs a sysObjectID prefix or sysDescr phrase before it can match. Dependency-only and notification-only MIBs can be imported but have no readable data to collect.
 7. Run **Poll now** or wait for the existing scheduled node/target poll. The node's facts show **SNMP library and collected data**, including source, evidence, support status and searchable collected values.
 
-Imports use a JSON API containing filename and source text; filenames are labels, not filesystem paths. No external compiler, executable, shell command, URL fetch, SNMP SET or trap listener is invoked. MIB descriptions and filenames are rendered as text. The imported source is retained in SQLite for dependency resolution and auditability; operator responses expose compiled metadata, not the full source text.
+The UI uses Multer multipart uploads to the API server. JSON imports remain compatible for small batches. Filenames are labels, not filesystem paths. No external compiler, executable, shell command, URL fetch, SNMP SET or trap listener is invoked. MIB descriptions and filenames are rendered as text. Source files live under `SNMP_MIB_LIBRARY_DIR` (default `DATA_DIR/snmp-mibs`) with content-addressed storage keys. SQLite stores metadata, configuration, source indexes and device links. Authenticated administrator download routes serve the original bytes; the directory is not a public static mount. Existing SQLite source text is migrated to disk on library access.
+
+## Source files and full Cisco catalog
+
+**Administration → Discovery → SNMP polling → MIB library** has **Modules** and **Source files** tabs.
+Modules are the preferred definitions for each module name; Source files includes alternate SMIv1/SMIv2
+versions, bundled dependencies and sources that need attention. Search and paging are server-side.
+Download preserves original source bytes. Files with parser errors or absent upstream dependencies are
+retained and marked `error`; they cannot be enabled until corrected/reimported. Other files continue
+importing independently. Existing usable built-in profiles remain available if a vendor replacement fails.
+
+For a full repository import on the API host:
+
+```bash
+git clone --depth 1 https://github.com/cisco/cisco-mibs.git /var/lib/winfire/mib-sources/cisco-mibs
+# Run as the service account, with the same DATA_DIR and SNMP_MIB_LIBRARY_DIR as the API.
+DATA_DIR=/var/lib/winfire node scripts/import-cisco-mibs.mjs /var/lib/winfire/mib-sources/cisco-mibs
+```
+
+The importer records the repository commit and source URL, retains all discovered ASN.1 MIB source
+files, and prefers `v2/` definitions over product-specific, `v1/` and archived duplicates. Compiler
+results and missing-dependency errors are visible in the library and in `cisco-import-report.json`
+beside the checkout. The full checkout also retains Cisco support lists and ancillary OID/schema files.
+Those ancillary files are not ASN.1 collection modules.
+
+Existing collection switches and selected objects are preserved. New catalog modules are stored with
+collection disabled except a bounded discovery set for CDP, CPU, memory, sensors, FRU, VLAN membership
+and StackWise. Built-in standard/vendor collection profiles retain their selected table roots. Enable
+additional modules and select relevant objects in Modules → Details / Configure; the existing device
+matching and per-poll limits apply. Importing the catalog does not perform a device poll.
+
+Back up **both SQLite and the library directory**. Keep an alternate `SNMP_MIB_LIBRARY_DIR` on a
+persistent volume writable only by the service account. No hard-coded total storage limit applies;
+monitor disk capacity. Retained source versions are intentionally not deleted when a collection profile
+is removed. The importer writes a catalog-import audit record. Cisco source is downloaded into server
+state, not checked into the application repository.
+
+## LibreNMS catalog and vendor folders
+
+The [LibreNMS MIB collection](https://github.com/librenms/librenms/tree/master/mibs) groups
+vendor definitions in named subfolders. Download just that part of the repository using a sparse
+checkout, then run the importer as the API service account with its storage environment:
+
+```bash
+git clone --depth 1 --filter=blob:none --sparse https://github.com/librenms/librenms.git /var/lib/winfire/mib-sources/librenms
+git -C /var/lib/winfire/mib-sources/librenms sparse-checkout set mibs
+DATA_DIR=/var/lib/winfire node scripts/import-librenms-mibs.mjs /var/lib/winfire/mib-sources/librenms
+```
+
+The importer recursively retains every regular file under `mibs/`, including extensionless MIBs.
+It preserves original bytes, repository revision, source URLs and folder names such as
+`mibs/cisco/CISCO-CDP-MIB`. Symbolic links are not followed. In **Source files**, search a vendor
+folder (for example `mibs/juniper/`) or module name to find and download its sources.
+
+Working definitions already in the library, including Cisco imports and curated profiles, are
+preserved with their matching rules, switches, selections and device links. Sources with the same
+module name remain downloadable as alternate versions. Identical sources are stored once on disk
+but retain their separate repository entries. A newly compiled module starts with collection disabled;
+configure its device match and readable objects before enabling it. Catalog imports do not poll hosts.
+
+For new module names, root/common definitions are preferred, then the shortest path and lexical
+filename order. If a candidate cannot compile, other definitions of the same module are tried.
+Dependencies favor the nearest vendor folder, then common definitions, then the existing library
+when the repository lacks a dependency. The chosen source dependencies are recorded in module
+metadata. Parsing is bounded per module; invalid definitions and missing dependencies are marked
+**Needs attention** while all source files remain downloadable. This does not guarantee that every
+definition can compile or that every device implements it.
+
+Rerunning the command adds missing definitions and retries failed modules without replacing working
+ones. To deliberately replace a working module, download the desired source and dependencies,
+then use **Import MIBs → Replace existing modules** and review the preview. The importer writes
+`librenms-import-report.json` beside the checkout, with counts and per-file errors, plus an audit record.
+Back up both the database and the source library before a large import.
 
 ## Matching and subsequent polls
 
@@ -55,12 +127,12 @@ Disable modules or individual objects with switches to stop future queries. Buil
 
 ## Limits and persistence
 
-- Import: 20 files, each at most 1 MiB of text, combined at most 1.5 MB per request. JSON request bodies are also limited by the application's 2 MB HTTP body limit; heavily escaped files may need a smaller batch.
-- Imported library: 100 modules / 8 MB of source text. Parsing runs in a worker with a 10-second timeout and bounded memory. Only one validation runs at a time.
+- Import: 20 files, each at most 8 MiB, combined at most 32 MiB per request using multipart `files` fields. JSON request bodies retain the application's 2 MB HTTP body limit. Temporary Multer files are removed after preview/import and rejected uploads.
+- Library storage has no module-count or aggregate-byte quota: capacity is the available server filesystem. Per-request validation loads only affected modules and dependencies, with a 32 MiB compilation budget, a 10-second worker timeout and bounded memory. Only one API validation runs at a time. Large catalog imports run through the server CLI, one module/dependency graph at a time; their workers have a 15-second deadline and 256 MiB memory limit.
 - Collection: 64 selected objects/module, four concurrent library queries, 128 queries and 8,192 values per device library pass, at most 1,024 values per object walk. The pass has a 30-second budget; each optional query has a maximum 5-second duration. These limits are independent of the initial identity and four legacy table queries.
 - Legacy tables: each walk is capped at 2,048 values / 6 seconds. Limits are retained as collection diagnostics. Large tables can be incomplete.
 - String values are capped at 1,024 characters; binary values are shown as bounded hexadecimal. Counter64 values retain exact decimal precision. The UI browses retained values using server-side paging/search.
-- The most recent device collection lives in `node_facts`. Links live in `node_snmp_mibs`; library text/configuration lives in `snmp_mib_library`. Existing target poll history retains its normal behavior; this is not a time-series store.
+- The most recent device collection lives in `node_facts`. Links live in `node_snmp_mibs`; library configuration lives in `snmp_mib_library`; `snmp_mib_files` indexes the filesystem sources and alternate versions. Existing target poll history retains its normal behavior; this is not a time-series store.
 - Library import/configuration/deletion requires Administration permission and is audited. Node collection reads use the existing authenticated node-facts access model. SNMP credentials remain encrypted in the credential vault, separate from MIB source files.
 
 ## API and curl examples
@@ -71,6 +143,16 @@ All paths are relative to `/api/v1`. Set `BASE` to the server origin and `TOKEN`
 # List built-in and imported sources, defaulting to 25 rows.
 curl --fail-with-body -H "Authorization: Bearer $TOKEN" \
   "$BASE/api/v1/discovery/snmp-library?source=all&search=CISCO&sort=name&direction=asc&page=1&limit=25"
+
+# Multer multipart import (repeat files for dependencies).
+curl --fail-with-body -H "Authorization: Bearer $TOKEN" \
+  -F 'replace=true' -F 'files=@CISCO-SMI.my' -F 'files=@CISCO-ENVMON-MIB.my' \
+  "$BASE/api/v1/discovery/snmp-library/preview"
+# Use the same multipart fields with /import after reviewing the preview.
+
+# Download an original source; IDs come from the paginated /files endpoint.
+curl --fail-with-body -H "Authorization: Bearer $TOKEN" \
+  "$BASE/api/v1/discovery/snmp-library/files/$FILE_ID/download" -o module.my
 
 # Encode exact source text (including newlines) with jq, never shell interpolation.
 jq -n --rawfile smi CISCO-SMI.my --rawfile mib CISCO-ENVMON-MIB.my \

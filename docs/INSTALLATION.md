@@ -132,6 +132,7 @@ Secrets are environment/deployment settings; most operator settings are persiste
 |---|---|
 | `NODE_ENV` | `production` requires explicit vault/JWT secrets and encrypted native TLS keys. |
 | `HOST`, `PORT` | Listener; defaults `0.0.0.0`, `3000`. |
+| `SNMP_MIB_LIBRARY_DIR` | MIB source storage directory; default `DATA_DIR/snmp-mibs`. No total library quota; back up with SQLite and persist on a writable volume. |
 | `DATA_DIR` | Persistent state; default `./data` relative to working directory. |
 | `JWT_SECRET` | Access-token signing secret, at least 32 characters in production. |
 | `VAULT_MASTER_KEY` | Base64 encoding of exactly 32 bytes; retain for decrypting stored credentials and MFA secrets. |

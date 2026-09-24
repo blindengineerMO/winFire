@@ -7,7 +7,8 @@ export const session={
   get user(){try{return JSON.parse(localStorage.getItem('winfire_user'))}catch{return null}}
 }
 export async function api(path,options={},retry=true){
-  const response=await fetch(base+path,{...options,headers:{'Content-Type':'application/json',...(session.token?{Authorization:`Bearer ${session.token}`}:{}) ,...(options.headers||{})},body:options.body&&typeof options.body!=='string'?JSON.stringify(options.body):options.body})
+  const multipart=options.body instanceof FormData
+  const response=await fetch(base+path,{...options,headers:{...(!multipart?{'Content-Type':'application/json'}:{}),...(session.token?{Authorization:`Bearer ${session.token}`}:{}) ,...(options.headers||{})},body:options.body&&!multipart&&typeof options.body!=='string'?JSON.stringify(options.body):options.body})
   if(response.status===401&&retry&&session.refresh){
     const refresh=await fetch(base+'/auth/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({refreshToken:session.refresh})})
     if(refresh.ok){session.setTokens(await refresh.json());return api(path,options,false)}

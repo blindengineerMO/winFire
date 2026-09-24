@@ -3,21 +3,23 @@ import {createHash} from 'node:crypto'
 import {z} from 'zod'
 import {db,all,one,run,id,now,json,audit} from './db.js'
 import {builtinMibProfiles,collectedObjectName} from './snmpMibCatalog.js'
-import {mibModuleName} from './snmpMibSyntax.js'
+import {mibModuleName,mibEnvelope} from './snmpMibSyntax.js'
+import {readSource,storeSource,migrateMibSources,recordMibFile} from './snmpMibStorage.js'
 
 const fail=(message,status=400)=>Object.assign(new Error(message),{status})
 const oidPattern=/^(?:0|1|2)(?:\.(?:0|[1-9]\d*)){2,127}$/
 export const mibMatchSchema=z.object({sysObjectIdPrefixes:z.array(z.string().trim().max(512).regex(oidPattern)).max(32).default([]),sysDescrContains:z.array(z.string().trim().min(2).max(120)).max(32).default([])})
-export const mibImportSchema=z.object({files:z.array(z.object({filename:z.string().trim().min(1).max(200),content:z.string().min(1).max(1048576)})).min(1).max(20),replace:z.boolean().default(false)})
+export const mibImportSchema=z.object({files:z.array(z.object({filename:z.string().trim().min(1).max(200),content:z.string().min(1).max(8*1024*1024)})).min(1).max(20),replace:z.boolean().default(false)})
 export const mibUpdateSchema=z.object({enabled:z.boolean().optional(),match:mibMatchSchema.optional(),selectedObjects:z.array(z.string().min(1).max(128)).max(64).optional()}).strict()
-function seed(){
+export function seed(){
+  migrateMibSources()
   const stamp=now()
   const insert=db.prepare('INSERT OR IGNORE INTO snmp_mib_library(id,module_name,source,metadata_json,config_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,1,?,?)')
   db.transaction(()=>{for(const profile of builtinMibProfiles)insert.run(`builtin:${profile.moduleName}`,profile.moduleName,'builtin',json({...profile,imports:[],definitionCount:profile.objects.length}),json({match:profile.match,selectedObjects:profile.objects.map(o=>o.name)}),stamp,stamp)})()
 }
 const parseRow=row=>({...row,metadata:JSON.parse(row.metadata_json),config:JSON.parse(row.config_json)})
 export function mibRecord(mibId){seed();const row=one('SELECT * FROM snmp_mib_library WHERE id=?',mibId);if(!row)throw fail('MIB not found',404);return parseRow(row)}
-function publicRow(row){const r=parseRow(row);return {id:r.id,moduleName:r.module_name,source:r.source,filename:r.filename,sha256:r.sha256,enabled:!!r.enabled,description:r.metadata.description,sourceUrl:r.metadata.sourceUrl||null,imports:r.metadata.imports,objectCount:r.metadata.objects.length,selectedCount:r.config.selectedObjects.length,match:r.config.match,linkedNodes:row.linked_nodes||0,updatedAt:r.updated_at}}
+function publicRow(row){const r=parseRow(row);return {id:r.id,moduleName:r.module_name,source:r.source,filename:r.filename,sha256:r.sha256,enabled:!!r.enabled,description:r.metadata.description,sourceUrl:r.metadata.sourceUrl||null,imports:r.metadata.imports,objectCount:r.metadata.objects.length,selectedCount:r.config.selectedObjects.length,match:r.config.match,linkedNodes:row.linked_nodes||0,updatedAt:r.updated_at,parseStatus:r.parse_status||'ready',parseError:r.parse_error||null,downloadable:!!r.source_path}}
 export function listMibs(query={}){
   seed()
   const parsed=z.object({search:z.string().max(200).default(''),source:z.enum(['all','builtin','imported']).default('all'),page:z.coerce.number().int().min(1).default(1),limit:z.coerce.number().int().min(1).max(100).default(25),sort:z.enum(['name','source','updated']).default('name'),direction:z.enum(['asc','desc']).default('asc')}).parse(query)
@@ -37,7 +39,7 @@ export function mibDetails(mibId,query={}){
   return {...publicRow(row),selectedObjects:row.config.selectedObjects,objects:objects.slice((actualPage-1)*limit,actualPage*limit),total:objects.length,page:actualPage,limit,bindings:all('SELECT b.node_id AS nodeId,n.hostname,b.status,b.last_polled_at AS lastPolledAt,b.evidence_json FROM node_snmp_mibs b JOIN nodes n ON n.id=b.node_id WHERE b.mib_id=? ORDER BY b.last_polled_at DESC LIMIT 100',row.id).map(({evidence_json,...b})=>({...b,evidence:JSON.parse(evidence_json)}))}
 }
 let parsing=false
-async function parseFiles(files){
+export async function parseFiles(files){
   if(parsing)throw fail('Another MIB import is being validated. Retry shortly.',409)
   parsing=true
   try{return await new Promise((resolve,reject)=>{
@@ -52,13 +54,21 @@ const digest=text=>createHash('sha256').update(text).digest('hex')
 function currentRevision(){return digest(json(all('SELECT id,sha256,config_json,enabled,updated_at FROM snmp_mib_library ORDER BY id')))}
 export async function importMibs(input,actorId,{preview=false}={}){
   seed();const data=mibImportSchema.parse(input),files=data.files
-  if(files.reduce((sum,f)=>sum+Buffer.byteLength(f.content),0)>1500000)throw fail('Import is limited to 1.5 MB per batch')
+  if(files.reduce((sum,f)=>sum+Buffer.byteLength(f.content),0)>32*1024*1024)throw fail('Import is limited to 32 MiB per batch')
   for(const f of files)if(/[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(f.content))throw fail(`${f.filename}: upload plain text ASN.1 MIB files`)
-  const revision=currentRevision(),existing=all("SELECT * FROM snmp_mib_library WHERE source='imported'")
+  const revision=currentRevision()
+  const existing=all("SELECT id,module_name,filename,source_path,content,sha256,json_extract(metadata_json,'$.imports') imports FROM snmp_mib_library WHERE source='imported'")
   let incomingNames;try{incomingNames=files.map(f=>mibModuleName(f.content))}catch(error){throw fail(error.message)}
-  const retained=existing.filter(r=>!incomingNames.includes(r.module_name)).map(r=>({filename:r.filename,content:r.content}))
-  if(retained.length+files.length>100||[...retained,...files].reduce((n,f)=>n+Buffer.byteLength(f.content),0)>8000000)throw fail('Imported library limit: 100 modules or 8 MB of source text')
-  const modules=await parseFiles([...retained,...files]),parsed=modules.filter(m=>incomingNames.includes(m.moduleName))
+  if(incomingNames.some(n=>!n)||new Set(incomingNames).size!==files.length)throw fail('Expected one complete ASN.1 module per file, with unique module names')
+  const incoming=new Map(files.map((f,i)=>[incomingNames[i],{...f,module_name:incomingNames[i],imports:JSON.stringify([...mibEnvelope(f.content).matchAll(/\bFROM\s+([A-Za-z][\w-]*)/g)].map(m=>m[1]))}]))
+  const known=new Map(existing.map(r=>[r.module_name,r]));for(const [n,f] of incoming)known.set(n,f)
+  const affected=new Set(incomingNames.filter(name=>{const prior=existing.find(r=>r.module_name===name);return !prior||prior.sha256!==digest(incoming.get(name).content)}));let changed=true
+  while(changed){changed=false;for(const r of existing)if(!affected.has(r.module_name)&&JSON.parse(r.imports||'[]').some(n=>affected.has(n))){affected.add(r.module_name);changed=true}}
+  const selected=new Set(),validation=[]
+  function add(name){if(selected.has(name))return;selected.add(name);const r=known.get(name);if(!r)return;for(const dep of JSON.parse(r.imports||'[]'))add(dep);validation.push({filename:r.filename,content:incoming.has(name)?r.content:readSource(r)})}
+  new Set([...affected,...incomingNames]).forEach(add)
+  if(validation.reduce((n,f)=>n+Buffer.byteLength(f.content),0)>32*1024*1024)throw fail('Affected dependency graph exceeds the 32 MiB compilation budget; use the server catalog import job for this update')
+  const modules=await parseFiles(validation),parsed=modules.filter(m=>incomingNames.includes(m.moduleName))
   if(parsed.length!==files.length)throw fail('Unable to identify every submitted MIB module')
   const candidates=parsed.map(m=>{
     const file=files[incomingNames.indexOf(m.moduleName)],old=one('SELECT * FROM snmp_mib_library WHERE module_name=?',m.moduleName),sha256=digest(file.content)
@@ -77,10 +87,12 @@ export async function importMibs(input,actorId,{preview=false}={}){
       config.selectedObjects=config.selectedObjects.filter(name=>m.objects.some(o=>o.name===name))
       // Replacing a curated profile keeps its matching criteria; selections use imported symbols.
       if(old?.source==='builtin')config.selectedObjects=selectedObjects
-      run('INSERT INTO snmp_mib_library(id,module_name,source,filename,content,sha256,metadata_json,config_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(module_name) DO UPDATE SET source=excluded.source,filename=excluded.filename,content=excluded.content,sha256=excluded.sha256,metadata_json=excluded.metadata_json,config_json=excluded.config_json,updated_at=excluded.updated_at',old?.id||id(),m.moduleName,'imported',file.filename,file.content,sha256,json(m),json(config),old?.enabled??1,old?.created_at||stamp,stamp)
+      const stored=storeSource(file.content)
+      run('INSERT INTO snmp_mib_library(id,module_name,source,filename,source_path,sha256,metadata_json,config_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(module_name) DO UPDATE SET source=excluded.source,filename=excluded.filename,content=NULL,source_path=excluded.source_path,parse_status=\'ready\',parse_error=NULL,sha256=excluded.sha256,metadata_json=excluded.metadata_json,config_json=excluded.config_json,updated_at=excluded.updated_at',old?.id||id(),m.moduleName,'imported',file.filename,stored.sourcePath,sha256,json(m),json(config),old?.enabled??1,old?.created_at||stamp,stamp)
+      recordMibFile({moduleName:m.moduleName,filename:file.filename,content:file.content})
     }
     // Recompile dependent metadata when a dependency was replaced.
-    for(const m of modules.filter(m=>!incomingNames.includes(m.moduleName))){
+    for(const m of modules.filter(m=>affected.has(m.moduleName)&&!incomingNames.includes(m.moduleName))){
       const r=one('SELECT * FROM snmp_mib_library WHERE module_name=?',m.moduleName),config=JSON.parse(r.config_json)
       config.selectedObjects=config.selectedObjects.filter(name=>m.objects.some(o=>o.name===name))
       run('UPDATE snmp_mib_library SET metadata_json=?,config_json=?,updated_at=? WHERE id=?',json(m),json(config),stamp,r.id)
@@ -92,6 +104,7 @@ export async function importMibs(input,actorId,{preview=false}={}){
 export function updateMib(mibId,input,actorId){
   const data=mibUpdateSchema.parse(input),row=mibRecord(mibId),config=row.config
   if(data.match)config.match=data.match
+  if(data.enabled&&row.parse_status==='error')throw fail('Fix and reimport this module before enabling collection')
   if(data.selectedObjects){if(data.selectedObjects.some(name=>!row.metadata.objects.some(o=>o.name===name)))throw fail('Selected object is not a readable object in this MIB');config.selectedObjects=[...new Set(data.selectedObjects)]}
   run('UPDATE snmp_mib_library SET enabled=?,config_json=?,updated_at=? WHERE id=?',data.enabled===undefined?row.enabled:Number(data.enabled),json(config),now(),row.id)
   audit(actorId,'snmp-mib.update','snmp-mib',row.id,null,{enabled:data.enabled,config})
@@ -118,7 +131,7 @@ export function collectionPlan(identity,{nodeId=null,host=null}={}){
   if(!nodeId&&host)nodeId=one('SELECT id FROM nodes WHERE ip=? OR lower(hostname)=lower(?) OR lower(fqdn)=lower(?) LIMIT 1',host,host,host)?.id
   const identityKey=json([normalizedOid(identity.sysObjectId),identity.sysDescr||''])
   const linked=new Set(nodeId?all('SELECT mib_id FROM node_snmp_mibs WHERE node_id=? AND identity_key=?',nodeId,identityKey).map(r=>r.mib_id):[])
-  const profiles=all('SELECT * FROM snmp_mib_library WHERE enabled=1 ORDER BY source DESC,module_name').map(parseRow).map(r=>{
+  const profiles=all("SELECT id,module_name,source,sha256,metadata_json,config_json FROM snmp_mib_library WHERE enabled=1 AND parse_status='ready' ORDER BY source DESC,module_name").map(parseRow).map(r=>{
     const evidence=matchMib(identity,r.config.match)
     return evidence?{id:r.id,moduleName:r.module_name,source:r.source,sha256:r.sha256,evidence:{...evidence,reused:linked.has(r.id)},objects:r.metadata.objects.filter(o=>r.config.selectedObjects.includes(o.name))}:null
   }).filter(Boolean).sort((a,b)=>Number(b.evidence.method==='standard')-Number(a.evidence.method==='standard')||Number(b.evidence.reused)-Number(a.evidence.reused))
