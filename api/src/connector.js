@@ -319,7 +319,7 @@ try {
 } finally { Remove-PSSession $session }
 `
 function nodeCredential(nodeId,credentialId) {
-  const rows=all(`SELECT DISTINCT c.* FROM credentials c JOIN credential_assignments a ON a.credential_id=c.id WHERE (a.node_id=? OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?)) AND (? IS NULL OR c.id=?) ORDER BY c.priority`,nodeId,nodeId,credentialId||null,credentialId||null)
+  const rows=all(`SELECT DISTINCT c.* FROM credentials c JOIN credential_assignments a ON a.credential_id=c.id WHERE (a.node_id=? OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?)) AND (? IS NULL OR c.id=?) ORDER BY CASE WHEN a.source='directory' THEN 1 ELSE 0 END,c.priority`,nodeId,nodeId,credentialId||null,credentialId||null)
   if(!credentialId){
     const directory=one(`SELECT c.* FROM credentials c JOIN directory_connections d ON d.node_credential_id=c.id JOIN nodes n ON n.id=?
       WHERE d.id='default' AND d.enabled=1 AND n.ad_guid IS NOT NULL AND n.ad_enabled=1 AND n.ad_missing=0 AND n.connection_mode='agentless'`,nodeId)

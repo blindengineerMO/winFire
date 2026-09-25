@@ -262,7 +262,7 @@ export async function registerHost(ip,scanId,livenessMethod='icmp',livenessMeta=
   const nodeId=id(),credentialId=defaultCredential(),linuxCredential=linuxDiscoveryCredential(),isLinux=!hypervisor&&(/linux|unix|freebsd|ubuntu|debian|red hat|centos|rocky|alma|fedora|suse|macos/i.test(String(livenessMeta.osHint||''))||livenessMethod==='tcp:22')
   db.transaction(()=>{
     run("INSERT INTO nodes(id,hostname,fqdn,ip,connection_mode,status,inventory_source,discovery_source,first_discovered_at,last_discovered_at,agent_required,mac_address,os_name) VALUES(?,?,?,?,?,?,?,?,?,?,1,?,?)",nodeId,hostname,fqdn,ip,'agentless','reachable','discovery',`${livenessMethod}:${scanId}`,now(),now(),candidateMac,hypervisor?.osName||livenessMeta.osHint||null)
-    if(credentialId)run('INSERT OR IGNORE INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,NULL)',credentialId,nodeId)
+    if(credentialId)run("INSERT OR IGNORE INTO credential_assignments(credential_id,node_id,node_group_id,source) VALUES(?,?,NULL,'directory')",credentialId,nodeId)
     if(isLinux&&linuxCredential)run('INSERT OR IGNORE INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,NULL)',linuxCredential.id,nodeId)
     audit(null,'node.discovery.register','node',nodeId,null,{ip,hostname,fqdn,credentialId,scanId})
   })()

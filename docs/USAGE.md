@@ -102,6 +102,21 @@ Filter by node, subnet, switch, time range and internal/external traffic classif
 
 Use **Rebuild map** to reconstruct stored aggregates from retained evidence after configuration/data changes, then Refresh. External peers do not need inventory records to appear. Empty maps can mean filters excluded all observations, collection is missing, or the API process lacks the current routes; check errors before rebuilding repeatedly.
 
+## AD credentials by organizational unit
+
+In **Administration → Directory → OU credential preferences**, add one or more full OU distinguished names and select a Windows local/domain credential from the vault. Save the connection, then use **Sync computers now** or wait for the scheduled sync. No credentials are tested merely by saving a preference; normal host probing uses the assigned credential.
+
+- A mapping applies to the OU and all descendants. The closest matching parent wins regardless of row order. For example, `OU=Production,OU=Servers,DC=example,DC=com` takes priority over `OU=Servers,DC=example,DC=com`.
+- Unmatched computers use **Default Windows credential for discovered nodes**. The directory bind credential remains separate and is used only to read AD.
+- Explicit Windows node/group credentials take precedence. Supplemental SNMP/SSH/ESXi bindings are preserved. Automatically assigned Windows credentials are replaced on subsequent successful syncs when an OU, mapping or default changes.
+- Bindings created before migration 105 have no provenance and remain explicit. To let an existing node inherit an OU preference, remove its old Windows binding in **Edit node** (and any applicable explicit Windows group binding), then sync. Merely saving a manual binding pins it, even if it equals the current hint.
+- Removing a mapping or deleting its vault credential causes the next sync to use a matching parent or the default. Rotating a secret preserves the mapping by credential ID. Clearing all mappings does not delete nodes or manual bindings.
+- Enter a full OU DN within the configured search base. Case differences and escaped commas are supported; use `OU=Sales\, West,DC=example,DC=com` for an OU named “Sales, West”. Duplicate equivalent DNs, out-of-scope OUs and non-Windows credentials are rejected. At most 200 mappings are allowed. When changing the search base, update or remove mappings outside the new base in the same save.
+
+Selection and assignment happen on the API server for scheduled and manual syncs. `directory.settings.update` and `directory.credential.assign` audit entries retain credential IDs and OU evidence, never vault secrets. An OU hint does not prove that authentication succeeded and does not change verification status by itself. Network-only discoveries have no trusted AD OU: they retain the global fallback until AD sync correlates them with a computer object.
+
+DN handling follows the component/escape structure described by [Microsoft AD distinguished names](https://learn.microsoft.com/en-us/previous-versions/windows/desktop/ldap/distinguished-names) and [RFC 4514](https://www.rfc-editor.org/rfc/rfc4514.html). This feature matches common AD text DNs; it does not query arbitrary LDAP schema matching rules or accept BER-encoded DN values.
+
 ## Classifier, directory, identity and administration
 
 Built-in and IANA classifier rules are enabled unless explicitly disabled. Custom port/protocol and process rules provide environment-specific names; conflicting definitions are rejected. Use existing rules' edit/disable controls instead of duplicating a match.

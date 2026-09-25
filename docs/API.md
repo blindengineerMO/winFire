@@ -200,6 +200,35 @@ curl --fail-with-body "$BASE/learning-sessions" -H "Authorization: Bearer $TOKEN
 
 Directory test/sync uses the saved `/settings/directory` configuration. Policy graphs and compiled rules have richer schemas: create/revise through `/policies` and `/policies/{id}/versions`, inspect differences and verification, then assign through `/policies/{id}/assignments`. Use the handler/schema reference for the exact graph payload and apply/sync routes. Learning sessions can own a generated policy and block manual changes until review. Report/download routes can return CSV or PDF instead of JSON; use `curl -o report.csv`/`report.pdf` with the applicable endpoint and authorization header.
 
+### OU credential preferences
+
+Admin/owner `GET /settings/directory` returns `ouCredentialHints: [{ouDn, credentialId}]`. `PATCH /settings/directory` accepts this optional array with the normal connection fields. Omission preserves saved mappings; `[]` clears them. The API rejects duplicate equivalent OU DNs, OUs outside `baseDn`, unavailable credentials, non-Windows credential types, and more than 200 mappings with HTTP 400. Unauthorized roles receive 403. Updates are atomic and audited.
+
+This example saves an LDAPS connection and two OU preferences. Replace the credential UUIDs with IDs from `/credentials`; do not put passwords in the mapping.
+
+```bash
+curl --fail-with-body -X PATCH "$BASE/settings/directory" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  --data-binary @- <<'JSON'
+{
+  "url": "ldaps://dc.example.com:636/",
+  "baseDn": "DC=example,DC=com",
+  "bindCredentialId": "11111111-1111-4111-8111-111111111111",
+  "nodeCredentialId": "22222222-2222-4222-8222-222222222222",
+  "enabled": true,
+  "syncIntervalMinutes": 60,
+  "ouCredentialHints": [
+    {"ouDn": "OU=Servers,DC=example,DC=com", "credentialId": "33333333-3333-4333-8333-333333333333"},
+    {"ouDn": "OU=Production,OU=Servers,DC=example,DC=com", "credentialId": "44444444-4444-4444-8444-444444444444"}
+  ]
+}
+JSON
+curl --fail-with-body "$BASE/settings/directory" -H "Authorization: Bearer $TOKEN"
+curl --fail-with-body -X POST "$BASE/directory/sync" -H "Authorization: Bearer $TOKEN"
+```
+
+The closest ancestor OU wins; unmatched nodes use the default. Explicit Windows node/group bindings take precedence. Changes apply on the next successful AD sync, including OU moves and correlated network-discovered nodes. Automatic bindings reuse `credential_assignments` with `source=directory` and `source_dn` evidence. Older bindings are preserved as manual because their provenance is unknown. See [usage and migration behavior](USAGE.md#ad-credentials-by-organizational-unit). GET responses, settings audits and assignment audits contain no secrets. Hints do not themselves verify or authenticate a host.
+
 ## JIT MFA access
 
 Read [JIT MFA](JIT_MFA.md) before creating a segment. Creating a segment does not make an unsafe firewall gate safe. A sample segment payload in `segment.json`:

@@ -25,7 +25,7 @@ Live OpenAPI: **`GET /api/v1/openapi.json`**. Regenerate the route reference wit
 ## Feature summary
 
 - **Inventory and correlation:** local-CIDR inventory boundary, server-side search/filter/sort/pagination, managed-first ordering, MAC correlation, TTL family hints, authenticated OS/hardware facts, hypervisor identity, ESXi VM inventory/correlation, and retained device-classification evidence. External peers remain in events and mapping.
-- **Discovery:** CIDR scans with ICMP/ARP/TCP fallback; recurring scans with new/dark/changed diffs; Windows directory sync; SNMP identity/ARP/routes/TCP/forwarding tables, hardware/interface/LLDP coverage, and an importable MIB library with automatic device matching; Linux SSH defaults; passive ARP candidates; optional Windows DHCP lease import with preview and conflict reports.
+- **Discovery:** CIDR scans with ICMP/ARP/TCP fallback; recurring scans with new/dark/changed diffs; Windows directory sync with [per-OU credential preferences](docs/USAGE.md#ad-credentials-by-organizational-unit); SNMP identity/ARP/routes/TCP/forwarding tables, hardware/interface/LLDP coverage, and an importable MIB library with automatic device matching; Linux SSH defaults; passive ARP candidates; optional Windows DHCP lease import with preview and conflict reports.
 - **Management:** Windows agentless transports, Linux SSH facts and supported firewall actions, SNMP visibility, VMware ESXi API inventory, and optional enrolled agents. Unknown/discovery-only assets remain unmanaged until independent management verification succeeds.
 - **Triage and groups:** unmanaged/rogue asset queue, bulk credential retry/flag/exclude/restore, static groups and server-evaluated dynamic membership rules.
 - **Vault and access:** encrypted write-only credentials, resource grants, credential preflight and rotation-failure notices, owner/admin/editor/auditor permissions, custom roles, teams, invitations, TOTP and audit history.
@@ -150,3 +150,6 @@ The frontend route is `/` for Dashboard, `/inventory` for assets/groups/triage, 
 
 ## Visual Network Topology Mapping
 ![ScreenShot13](assets/networkMap.png)
+
+## AI Usage Monitoring with built-in MCP Server
+![ScreenShot14](assets/AIUsage.png)

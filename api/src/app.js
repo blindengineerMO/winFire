@@ -1,3 +1,4 @@
+import {directoryOuHints,validateOuHints,applyDirectoryCredential} from './directoryCredentials.js'
 import {aiRoutes,nodeAiUsage} from './routes/ai.js'
 import {mountAiMcp} from './ai/mcp.js'
 import express from 'express'
@@ -189,7 +190,7 @@ const effectivePublicBaseUrl=req=>String(process.env.PUBLIC_BASE_URL||serverPubl
 function publicWef(req){
   return {...publicWefSettings({enabled:wefEnabled(),secretConfigured:!!wefSecret(),baseUrl:effectivePublicBaseUrl(req),path:wefPath()}),secretSource:wefSecretSource(),baseUrlSource:process.env.PUBLIC_BASE_URL?'environment':serverPublicBaseUrl()?'administration':'request'}
 }
-const publicDirectory=settings=>settings&&({url:settings.url||'',baseDn:settings.base_dn||'',bindCredentialId:settings.bind_credential_id||null,nodeCredentialId:settings.node_credential_id||null,actionCredentialId:settings.action_credential_id||null,enabled:!!settings.enabled,syncIntervalMinutes:settings.sync_interval_minutes,allowLdapFallback:!!settings.allow_ldap_fallback,ldapFallbackApprovedBy:settings.ldap_fallback_approved_by||null,ldapFallbackApprovedAt:settings.ldap_fallback_approved_at||null,lastTransport:settings.last_transport||null,lastSyncedAt:settings.last_synced_at,lastSyncAttemptAt:settings.last_sync_attempt_at,lastSyncStatus:settings.last_sync_status,lastSyncError:settings.last_sync_error,lastSyncCount:settings.last_sync_count})
+const publicDirectory=settings=>settings&&({ouCredentialHints:directoryOuHints(),url:settings.url||'',baseDn:settings.base_dn||'',bindCredentialId:settings.bind_credential_id||null,nodeCredentialId:settings.node_credential_id||null,actionCredentialId:settings.action_credential_id||null,enabled:!!settings.enabled,syncIntervalMinutes:settings.sync_interval_minutes,allowLdapFallback:!!settings.allow_ldap_fallback,ldapFallbackApprovedBy:settings.ldap_fallback_approved_by||null,ldapFallbackApprovedAt:settings.ldap_fallback_approved_at||null,lastTransport:settings.last_transport||null,lastSyncedAt:settings.last_synced_at,lastSyncAttemptAt:settings.last_sync_attempt_at,lastSyncStatus:settings.last_sync_status,lastSyncError:settings.last_sync_error,lastSyncCount:settings.last_sync_count})
 function directoryCredential(settings) {
   const credential=one('SELECT * FROM credentials WHERE id=?',settings.bind_credential_id)
   if(!credential)throw Object.assign(new Error('Directory bind credential is missing'),{status:400})
@@ -1230,11 +1231,19 @@ api.patch('/settings/directory',requireRole('admin'),(req,res)=>{
   const data=body(z.object({
     url:z.string().url().refine(value=>{const parsed=new URL(value);return parsed.protocol==='ldaps:'&&!parsed.username&&!parsed.password&&parsed.pathname==='/'&&!parsed.search&&!parsed.hash},{message:'Use an ldaps:// server URL without embedded credentials or query parameters'}),
     baseDn:z.string().min(3).max(512).refine(value=>/(^|,)\s*DC=/i.test(value),{message:'Search base must include a DC component'}),
+    ouCredentialHints:z.array(z.object({ouDn:z.string().trim().min(3).max(512),credentialId:z.string().uuid()})).max(200).optional(),
     bindCredentialId:z.string().min(1),nodeCredentialId:z.string().nullable().optional(),enabled:z.boolean().default(false),syncIntervalMinutes:z.number().int().min(5).max(1440).default(60),allowLdapFallback:z.boolean().optional(),ldapFallbackApproved:z.boolean().optional(),ldapFallbackApproval:z.string().optional()
   }),req)
   for(const credentialId of [data.bindCredentialId,data.nodeCredentialId].filter(Boolean)){
     const credential=one('SELECT * FROM credentials WHERE id=?',credentialId)
     if(!credential||!canUseCredential(req.user,credential))return res.status(400).json({error:'Selected directory credential is unavailable'})
+  }
+  let ouHints
+  try{ouHints=validateOuHints(data.ouCredentialHints??directoryOuHints(),data.baseDn)}
+  catch(error){return res.status(400).json({error:error.message})}
+  for(const hint of ouHints){
+    const credential=one('SELECT * FROM credentials WHERE id=?',hint.credentialId)
+    if(!credential||!['local','domain'].includes(credential.type)||!canUseCredential(req.user,credential))return res.status(400).json({error:'OU hints require an available Windows local or domain credential'})
   }
   const prior=directorySettings(),before=publicDirectory(prior)
   const allowLdapFallback=data.allowLdapFallback===undefined?!!prior.allow_ldap_fallback:data.allowLdapFallback
@@ -1245,9 +1254,11 @@ api.patch('/settings/directory',requireRole('admin'),(req,res)=>{
   const approvedBy=needsApproval?req.user.id:allowLdapFallback?prior.ldap_fallback_approved_by:null
   db.transaction(()=>{
     run("UPDATE directory_connections SET url=?,base_dn=?,bind_credential_id=?,node_credential_id=?,enabled=?,sync_interval_minutes=?,allow_ldap_fallback=?,ldap_fallback_approved_by=?,ldap_fallback_approved_at=?,last_transport=CASE WHEN ? THEN NULL ELSE last_transport END,last_sync_status=CASE WHEN ? THEN NULL ELSE last_sync_status END,last_sync_error=CASE WHEN ? THEN NULL ELSE last_sync_error END WHERE id='default'",data.url,data.baseDn,data.bindCredentialId,data.nodeCredentialId||null,Number(data.enabled),data.syncIntervalMinutes,Number(allowLdapFallback),approvedBy,approvedAt,Number(scopeChanged),Number(scopeChanged),Number(scopeChanged))
+    run('DELETE FROM directory_ou_credentials')
+    for(const hint of ouHints)run('INSERT INTO directory_ou_credentials(ou_key,ou_dn,credential_id) VALUES(?,?,?)',hint.key,hint.ouDn,hint.credentialId)
     if(needsApproval)audit(req.user.id,'directory.ldap_fallback.approve','directory','default',null,{url:data.url,bindCredentialId:data.bindCredentialId,approvedAt})
     if(prior.allow_ldap_fallback&&!allowLdapFallback)audit(req.user.id,'directory.ldap_fallback.revoke','directory','default',null,{url:data.url})
-    audit(req.user.id,'directory.settings.update','directory','default',before,{url:data.url,baseDn:data.baseDn,bindCredentialId:data.bindCredentialId,nodeCredentialId:data.nodeCredentialId||null,enabled:data.enabled,syncIntervalMinutes:data.syncIntervalMinutes,allowLdapFallback})
+    audit(req.user.id,'directory.settings.update','directory','default',before,{ouCredentialHints:ouHints.map(({ouDn,credentialId})=>({ouDn,credentialId})),url:data.url,baseDn:data.baseDn,bindCredentialId:data.bindCredentialId,nodeCredentialId:data.nodeCredentialId||null,enabled:data.enabled,syncIntervalMinutes:data.syncIntervalMinutes,allowLdapFallback})
   })()
   res.json(publicDirectory(directorySettings()))
 })
@@ -1287,6 +1298,7 @@ export async function syncDirectory(actorId=null,clientFactory=undefined) {
   if(!settings.url||!settings.base_dn)throw Object.assign(new Error('Directory connection is incomplete'),{status:400})
   run("UPDATE directory_connections SET last_sync_attempt_at=?,last_sync_status='running',last_sync_error=NULL WHERE id='default'",now())
   try {
+    const ouHints=validateOuHints(directoryOuHints(),settings.base_dn)
     const {computers,transport}=await readDirectoryComputers(settings,directoryCredential(settings),clientFactory)
     const seenAt=now(),stats={found:computers.length,created:0,updated:0,missing:0,transport,fallbackUsed:transport==='ldap'},unresolved=[]
     db.transaction(()=>{
@@ -1308,7 +1320,7 @@ export async function syncDirectory(actorId=null,clientFactory=undefined) {
           audit(actorId,'directory.node.import','node',nodeId,null,{guid:computer.guid,fqdn:computer.fqdn})
           stats.created++
         }
-        if(settings.node_credential_id&&!one('SELECT 1 FROM credential_assignments WHERE credential_id=? AND node_id=?',settings.node_credential_id,node.id))run('INSERT INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,NULL)',settings.node_credential_id,node.id)
+        applyDirectoryCredential(node.id,computer.dn,settings,actorId,ouHints)
         if(computer.enabled&&!node.ip)unresolved.push(node.id)
       }
       stats.missing=one('SELECT COUNT(*) n FROM nodes WHERE ad_guid IS NOT NULL AND ad_missing=1')?.n||0
@@ -1531,7 +1543,11 @@ api.post('/credentials/:id/assignments',requireRole('editor'),(req,res)=>{
   const targetGroup=data.nodeGroupId?one('SELECT * FROM node_groups WHERE id=?',data.nodeGroupId):null
   if(data.nodeGroupId&&!targetGroup)return notFound(res,'Node group')
   if(targetGroup&&!canWriteResource(req.user,'node_group',targetGroup))return res.status(403).json({error:'Insufficient permission for node group'})
-  if(one('SELECT 1 FROM credential_assignments WHERE credential_id=? AND node_id IS ? AND node_group_id IS ?',credential.id,data.nodeId||null,data.nodeGroupId||null))return res.json({ok:true,alreadyAssigned:true})
+  if(one('SELECT 1 FROM credential_assignments WHERE credential_id=? AND node_id IS ? AND node_group_id IS ?',credential.id,data.nodeId||null,data.nodeGroupId||null)){
+    run("UPDATE credential_assignments SET source='manual',source_dn=NULL WHERE credential_id=? AND node_id IS ? AND node_group_id IS ?",credential.id,data.nodeId||null,data.nodeGroupId||null)
+    audit(req.user.id,'credential.assign','credential',credential.id,null,data)
+    return res.json({ok:true,alreadyAssigned:true})
+  }
   run('INSERT INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,?)',reqId(req),data.nodeId||null,data.nodeGroupId||null)
   audit(req.user.id,'credential.assign','credential',reqId(req),null,data);res.status(201).json({ok:true})
 })
@@ -1691,7 +1707,7 @@ api.post('/nodes/triage/bulk',requireRole('editor'),wrap(async(req,res)=>{
     for(const node of nodes){
       const before={status:node.triage_status||'none',note:node.triage_note||null,credentialIds:all('SELECT credential_id FROM credential_assignments WHERE node_id=?',node.id).map(row=>row.credential_id)}
       const note=data.action==='assign_and_retry'?null:data.note===undefined?node.triage_note:data.note||null
-      if(credential)run('INSERT OR IGNORE INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,NULL)',credential.id,node.id)
+      if(credential){if(!one('SELECT 1 FROM credential_assignments WHERE credential_id=? AND node_id=?',credential.id,node.id))run('INSERT INTO credential_assignments(credential_id,node_id,node_group_id) VALUES(?,?,NULL)',credential.id,node.id);run("UPDATE credential_assignments SET source='manual',source_dn=NULL WHERE credential_id=? AND node_id=?",credential.id,node.id)}
       run('UPDATE nodes SET triage_status=?,triage_note=?,triage_updated_at=?,triage_updated_by=? WHERE id=?',nextStatus,note,now(),req.user.id,node.id)
       audit(req.user.id,'node.triage.bulk.update','node',node.id,before,{action:data.action,status:nextStatus,credentialId:credential?.id||null,note})
     }
