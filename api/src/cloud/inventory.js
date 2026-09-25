@@ -41,6 +41,10 @@ function candidates(record,scopeId){
     if(sameUuid||sameAd||(sameName&&sameMac))strong.push({nodeId:n.id,reason:sameUuid?'Hardware/VM UUID':sameAd?'AD object GUID':'FQDN and scoped MAC'})
     else if(sameName||(record.addresses||[]).includes(canonicalIp(n.ip)))weak.push({nodeId:n.id,reason:'Name or address only; identity review required'})
   }
+  for(const s of all("SELECT node_id,evidence_json FROM asset_sources WHERE scope_id=? AND node_id IS NOT NULL AND state='linked'",scopeId)){
+    const other=parse(s.evidence_json)
+    if(uuid(other.uuid)&&ids.has(uuid(other.uuid))&&!strong.some(c=>c.nodeId===s.node_id))strong.push({nodeId:s.node_id,reason:'Matching scoped provider VM UUID'})
+  }
   return {strong,weak}
 }
 function conflict(sourceId,reason,items){
@@ -64,8 +68,6 @@ export function reconcileRecord(record,config,runId,actor=null){
   else if(nodeId){state='linked';why='Existing provider identity link'}
   else{
     const {strong,weak}=candidates(record,scopeId)
-    const sourceMatches=all("SELECT node_id,evidence_json FROM asset_sources WHERE scope_id=? AND node_id IS NOT NULL AND state='linked' AND id<>?",scopeId,sourceId).filter(s=>{const other=parse(s.evidence_json);return uuid(record.uuid)&&uuid(other.uuid)===uuid(record.uuid)})
-    for(const s of sourceMatches)if(!strong.some(c=>c.nodeId===s.node_id))strong.push({nodeId:s.node_id,reason:'Matching scoped provider VM UUID'})
     const duplicateProvider=strong.length===1&&one("SELECT id FROM asset_sources WHERE node_id=? AND provider=? AND resource_id<>? AND state='linked'",strong[0].nodeId,record.provider,resourceId)
     if(strong.length===1&&!duplicateProvider){nodeId=strong[0].nodeId;state='linked';why=strong[0].reason}
     else if(duplicateProvider){state='conflict';why='Possible clone or resource move: another resource of this provider uses the identity'}

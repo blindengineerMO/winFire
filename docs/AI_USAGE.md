@@ -192,6 +192,8 @@ Revocation blocks **both** REST and OAuth ingestion immediately, including previ
 
 ## 3. Remote MCP with a maintained OAuth provider
 
+User-owned MCP reporting keys are also available under **Administration → Security → API keys**. They authenticate the same `/mcp/ai-usage` endpoint without an OAuth issuer. See [API and MCP keys](API_KEYS.md) for creation, node binding, expiry, rotation and client configuration. The following section describes the OAuth option.
+
 The endpoint is **`https://winfire.example.com/mcp/ai-usage`**, outside `/api/v1`. It exposes
 only `report_ai_usage` and `report_ai_usage_batch`. Both write metadata through the same domain
 service as REST and return the same durable receipt contract. Tool schemas declare writes,

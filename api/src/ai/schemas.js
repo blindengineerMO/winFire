@@ -1,7 +1,7 @@
 import {z} from 'zod'
 import {domainToASCII} from 'node:url'
 import {isIP} from 'node:net'
-const secretLike=value=>/^(?:sk-(?:ant-|proj-)?[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.)/.test(value)
+const secretLike=value=>/^(?:wf(?:uk|ai)_[A-Za-z0-9_-]{20,}|sk-(?:ant-|proj-)?[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.)/.test(value)
 export const identifier=z.string().trim().min(1).max(160).regex(/^[a-zA-Z0-9_.:@/ -]+$/).refine(v=>!secretLike(v),'Credential-like identifier rejected')
 export const tag=z.string().trim().min(1).max(128).regex(/^[a-zA-Z0-9_.:/@-]+$/).refine(v=>!secretLike(v),'Credential-like metadata rejected')
 export function hostname(raw){

@@ -1,4 +1,5 @@
 import {cloudSchemas,describeCloudOperation} from './cloud/openapi.js'
+import {userApiKeySchemas,describeUserApiKeyOperation} from './services/userApiKeysOpenapi.js'
 import {aiSchemas,describeAiOperation} from './ai/openapi.js'
 import {internetConnectionSchemas} from './services/internetConnectionSchemas.js'
 const publicRoutes=new Set([
@@ -165,6 +166,7 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
         if(responseSchemas[routeKey])operation.responses[200]={description:'JSON response',content:{'application/json':{schema:{$ref:`#/components/schemas/${responseSchemas[routeKey]}`}}}}
         describeAiOperation(operation,method,path)
         describeCloudOperation(operation,method,path)
+        describeUserApiKeyOperation(operation,method,path)
         pathItem[method]=operation
       }
     }
@@ -175,8 +177,9 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
   return {
     openapi:'3.1.0',info:{title:'WinFire Secure API',version:'0.1.0',description:'Control-plane operations use bearer tokens. Enrolled agent operations use client certificates.'},
     servers:[{url:'/api/v1'}],paths,
-    components:{securitySchemes:{aiReporterBearer:{type:'http',scheme:'bearer',bearerFormat:'Reporter enrollment credential',description:'Node-scoped REST/stdio reporting credential. Cannot access operator or fleet routes. Remote MCP uses OAuth with ai:report instead.'},bearerAuth:{type:'http',scheme:'bearer',bearerFormat:'JWT'},internetDeviceBearer:{type:'http',scheme:'bearer',bearerFormat:'Internet device token'},mutualTLS:{type:'mutualTLS'},wefHmac:{type:'apiKey',in:'header',name:'X-WinFire-WEF-Token',description:'Node-scoped HMAC token derived from WEF_SHARED_SECRET. The receiver also accepts the token query parameter for Windows Subscription Manager compatibility.'}},schemas:{
+    components:{securitySchemes:{aiReporterBearer:{type:'http',scheme:'bearer',bearerFormat:'Reporter enrollment credential',description:'Node-scoped REST/stdio reporting credential. Cannot access operator or fleet routes. Remote MCP accepts OAuth with ai:report or a user-owned MCP reporting key.'},bearerAuth:{type:'http',scheme:'bearer',bearerFormat:'JWT or user API key',description:'User API keys (wfuk_) with api:read/api:write use the owner’s current permissions. Key administration requires a user-session JWT. MCP-only keys cannot authenticate these operator routes.'},internetDeviceBearer:{type:'http',scheme:'bearer',bearerFormat:'Internet device token'},mutualTLS:{type:'mutualTLS'},wefHmac:{type:'apiKey',in:'header',name:'X-WinFire-WEF-Token',description:'Node-scoped HMAC token derived from WEF_SHARED_SECRET. The receiver also accepts the token query parameter for Windows Subscription Manager compatibility.'}},schemas:{
       ...cloudSchemas,
+      ...userApiKeySchemas,
       ...internetConnectionSchemas,
       ...aiSchemas,
       PolicyGraph:{type:'object',required:['nodes'],properties:{nodes:{type:'array',items:{type:'object',required:['id','type'],properties:{id:{type:'string'},type:{type:'string',enum:['allow','deny','program','portGroup','addressGroup','profile','schedule','mfaGate']},position:{type:'object',properties:{x:{type:'number'},y:{type:'number'}}},data:{type:'object',additionalProperties:true}}}},edges:{type:'array',items:{type:'object',required:['id','source','target'],properties:{id:{type:'string'},source:{type:'string'},target:{type:'string'}}}}}},

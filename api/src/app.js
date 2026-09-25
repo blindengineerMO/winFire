@@ -4,6 +4,7 @@ import {cloudRoutes} from './cloud/routes.js'
 import {directoryOuHints,validateOuHints,applyDirectoryCredential} from './directoryCredentials.js'
 import {aiRoutes,nodeAiUsage} from './routes/ai.js'
 import {mountAiMcp} from './ai/mcp.js'
+import {apiKeyRoutes} from './routes/apiKeys.js'
 import express from 'express'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -370,7 +371,7 @@ api.get('/agent-package/enroll.ps1',wrap(async(req,res)=>{
   catch(error){return res.status(503).json({error:error.message})}
   res.set('Cache-Control','private, no-store').type('text/plain').send(script)
 }))
-api.get('/openapi.json',(_req,res)=>res.json(buildOpenApi(api,agentRoutes,{internet:internetRoutes,mapping:mappingRoutes,ai:aiRoutes,'':cloudRoutes})))
+api.get('/openapi.json',(_req,res)=>res.json(buildOpenApi(api,agentRoutes,{internet:internetRoutes,mapping:mappingRoutes,ai:aiRoutes,'':cloudRoutes,'api-keys':apiKeyRoutes})))
 const loginLimit=rateLimit({windowMs:15*60*1000,limit:Number(process.env.AUTH_RATE_LIMIT||20),standardHeaders:'draft-8',legacyHeaders:false})
 const publicMfaLimit=rateLimit({windowMs:15*60*1000,limit:10,standardHeaders:'draft-8',legacyHeaders:false})
 api.post('/auth/login',loginLimit,wrap(async(req,res)=>{
@@ -580,6 +581,7 @@ api.use(auth)
 api.get('/nodes/:id/ai-usage',requireRole('auditor'),nodeAiUsage)
 api.use('/mapping',mappingRoutes)
 api.use(cloudRoutes)
+api.use('/api-keys',apiKeyRoutes)
 api.get('/settings/tls',requireRole('admin'),(_req,res)=>{
   const paths=tlsMaterialPaths(),files=Object.fromEntries(Object.entries(paths).map(([name,file])=>[name,{configured:fs.existsSync(file),source:process.env[name]?'environment':'administration',path:process.env[name]?null:file}]))
   res.json({httpsEnabled:Object.values(files).every(item=>item.configured),files,restartRequired:true})

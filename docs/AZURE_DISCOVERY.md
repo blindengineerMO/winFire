@@ -126,3 +126,76 @@ auditing state. Older agents can continue shipping events, but must be upgraded 
 learning can finish using the new collection-health gate. A heartbeat alone is insufficient.
 Failed or stale collection leaves learning pending with an actionable error. Quiet healthy hosts
 can still finish learning once the agent confirms empty successful reads with auditing enabled.
+
+## Source history and reviewed reversals
+
+In Azure / Arc → Resources, open **View details** to see identity/change history and the
+provider snapshot. **Review binding** allows an administrator to link to a verified node in
+that scope, unlink and hold, ignore, or reopen automatic review. The same history is shown
+under Cloud discovery sources in node details. Every decision requires a reason and retains
+the previous node reference. This reverses a source association; it does not delete or merge
+node records, credentials, groups, or policies. A recreated resource stays in conflict review
+on subsequent scans until an operator resolves it. Retired, conflicted or ignored source
+observations cannot independently establish a new strong identity match.
+
+History is paginated on the API (25 rows by default):
+
+```bash
+curl -sS "$WINFIRE_URL/api/v1/discovery/azure/resources/$SOURCE_ID/history?page=1&pageSize=25" \
+  -H "Authorization: Bearer $WINFIRE_TOKEN"
+curl -sS -X POST "$WINFIRE_URL/api/v1/discovery/azure/resources/$SOURCE_ID/resolve" \
+  -H "Authorization: Bearer $WINFIRE_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"action":"unlink","reason":"Reversing an association after identity review"}'
+# Filter the monitored inventory by any linked source, including an AD node with an Arc observation.
+curl -sS "$WINFIRE_URL/api/v1/nodes?source=azure-arc&scopeId=$SCOPE_ID&page=1&pageSize=25" \
+  -H "Authorization: Bearer $WINFIRE_TOKEN"
+```
+
+## P0 pilot procedure and evidence record
+
+**Status on 2026-09-25:** local implementation and fixture validation are available. The owner
+confirmed that no Azure test tenant is currently available. PLAN 28-06 remains open; local
+fixtures do not establish compatibility with an actual subscription or Arc deployment.
+
+When the test tenant is ready:
+
+1. Select an authorized subscription/resource group containing a Windows VM, a Linux VM and
+   an already-onboarded Arc server. Save a Reader credential in the existing vault. Record
+   the resource IDs from the Azure portal for that exact scope, including tag filters.
+2. Create an inventory-only scope with the owned CIDRs. Record an existing node whose BIOS/VM
+   UUID should match a cloud/Arc machine, and one resource whose address is outside the scope.
+   Export the node IDs, group/credential associations and current management/firewall states.
+3. Save a paused connection. Run **Test access**, wait for completion, and review every scope's
+   permissions and collection counts. A partial run is not a successful completeness check.
+4. Run **Preview**. Compare all counts with the portal inventory. The preview displays at most
+   250 records, so for larger scopes compare the complete synced resource export in step 5.
+   Confirm that test/preview have not created inventory assets or changed host verification.
+5. Run **Sync now**, then export Resources using the same connection/scope filters. Compare
+   normalized full resource IDs, not just names. Confirm VM/Arc observations, all available
+   NICs and the unknown-version behavior. Explain any provider permission/count discrepancy.
+6. Check the expected existing-node correlation in source history. Confirm the node ID and
+   its policy, credential and group associations are retained. Confirm the excluded resource
+   remains an out-of-scope observation and was not created as a managed asset.
+7. Compare management mode, verification and firewall states with the baseline. Arc Connected
+   and an Azure provisioning status must not mark WinFire management verified or enforcing.
+8. Enable a five-minute schedule. Record a completed scheduled run; restart the API using the
+   installation's normal process manager and record the next completed scheduled run. Check
+   that source/node IDs are stable and no duplicate connection run is active.
+9. Record the evidence below, redact secrets, and only then complete PLAN 28-06. Restore the
+   desired schedule interval or pause the connection after the test.
+
+| Evidence | Required result | Current result |
+| --- | --- | --- |
+| Tenant, selected subscription/RGs and filters | Authorized scope recorded | Awaiting tenant |
+| Windows VM, Linux VM and existing Arc resource IDs | All expected IDs observed | Awaiting tenant |
+| Expected and imported ID sets/counts | Exact match or documented provider exclusions | Awaiting tenant |
+| Existing-node correlation | Same node ID; history explains strong match | Awaiting tenant |
+| Out-of-scope resource | Observation retained, no new managed asset | Awaiting tenant |
+| Management/verification/firewall comparison | Unchanged by cloud import | Awaiting tenant |
+| Scheduled run before/after API restart | Completed without duplicate identities | Awaiting tenant |
+
+For local UI regression checks, build the frontend and run
+`node scripts/azure-ui-fixture.mjs`. It serves a disposable database on `127.0.0.1:3319`,
+with 32 provider observations and a recreated-resource conflict. The fixture logs its
+throwaway sign-in details, starts no Azure scheduler and deletes its database on SIGTERM.
+It must not be exposed as a deployed service.

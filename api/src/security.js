@@ -3,6 +3,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import argon2 from 'argon2'
 import jwt from 'jsonwebtoken'
+import {isUserApiKey,authenticateApiKey} from './apiKeyAuth.js'
 import {db, one, run, id, now, audit} from './db.js'
 
 const dataDir = path.resolve(process.env.DATA_DIR || 'data')
@@ -116,6 +117,12 @@ export const publicUser = user => ({id:user.id,email:user.email,role:user.role,t
 export function auth(req,res,next) {
   const token = req.headers.authorization?.replace(/^Bearer /i,'')
   if (!token) return res.status(401).json({error:'Authentication required'})
+  if(isUserApiKey(token)){
+    try{
+      const {key,user}=authenticateApiKey(token,['GET','HEAD','OPTIONS'].includes(req.method)?'api:read':'api:write')
+      req.apiKey=key;req.user=user;return next()
+    }catch(error){return res.status(error.status||401).json({error:error.message})}
+  }
   try {
     const payload = verifyAccess(token)
     const user = one('SELECT * FROM users WHERE id=? AND suspended=0',payload.sub)

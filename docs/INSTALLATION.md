@@ -206,4 +206,4 @@ Migration 103 creates the retained connection index and external-peer cache. The
 
 ## AI telemetry and remote MCP
 
-AI metadata collection is included in migration 104 and the normal server worker. See [AI usage installation and OAuth configuration](AI_USAGE.md#1-install-and-enable) for `AI_OAUTH_ISSUER`, `AI_MCP_RESOURCE_URL`, HTTPS/Origin requirements, maintained provider setup and scoped reporter enrollment. Remote MCP is unavailable until that provider is configured; REST/stdio reporters can be enrolled independently.
+AI metadata collection is included in migration 104 and the normal server worker. See [AI usage installation and OAuth configuration](AI_USAGE.md#1-install-and-enable) for `AI_OAUTH_ISSUER`, `AI_MCP_RESOURCE_URL`, HTTPS/Origin requirements, maintained provider setup and scoped reporter enrollment. Remote MCP supports that OAuth provider or user-owned MCP keys created under Administration → Security → API keys. MCP keys do not require an OAuth issuer; configure the server public URL/HTTPS as described in [API keys](API_KEYS.md). REST/stdio reporters can be enrolled independently.

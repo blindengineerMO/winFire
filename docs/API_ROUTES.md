@@ -12,40 +12,40 @@ Some older operations publish a generic JSON body. For those, follow the linked 
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/access/grants`](../api/src/app.js#L931) | bearerAuth; portal.edit | — |
-| POST | [`/access/grants`](../api/src/app.js#L937) | bearerAuth; portal.edit | See handler |
-| DELETE | [`/access/grants/{id}`](../api/src/app.js#L952) | bearerAuth; portal.edit | — |
-| GET | [`/access/resources`](../api/src/app.js#L922) | bearerAuth; portal.edit | — |
-| GET | [`/access/users`](../api/src/app.js#L921) | bearerAuth; portal.edit | — |
+| GET | [`/access/grants`](../api/src/app.js#L933) | bearerAuth; portal.edit | — |
+| POST | [`/access/grants`](../api/src/app.js#L939) | bearerAuth; portal.edit | See handler |
+| DELETE | [`/access/grants/{id}`](../api/src/app.js#L954) | bearerAuth; portal.edit | — |
+| GET | [`/access/resources`](../api/src/app.js#L924) | bearerAuth; portal.edit | — |
+| GET | [`/access/users`](../api/src/app.js#L923) | bearerAuth; portal.edit | — |
 
 ## agent-package
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/agent-package/enroll.ps1`](../api/src/app.js#L362) | No bearer | — |
-| GET | [`/agent-package/WinFire.Agent.exe`](../api/src/app.js#L350) | No bearer | — |
-| GET | [`/agent-package/WinFire.Agent.msi`](../api/src/app.js#L356) | No bearer | — |
+| GET | [`/agent-package/enroll.ps1`](../api/src/app.js#L363) | No bearer | — |
+| GET | [`/agent-package/WinFire.Agent.exe`](../api/src/app.js#L351) | No bearer | — |
+| GET | [`/agent-package/WinFire.Agent.msi`](../api/src/app.js#L357) | No bearer | — |
 
 ## agents
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/agents`](../api/src/app.js#L3421) | bearerAuth | — |
-| GET | [`/agents/{id}`](../api/src/app.js#L3465) | bearerAuth | — |
+| GET | [`/agents`](../api/src/app.js#L3423) | bearerAuth | — |
+| GET | [`/agents/{id}`](../api/src/app.js#L3467) | bearerAuth | — |
 | POST | [`/agents/{id}/events`](../api/src/routes/agents.js#L122) | mutualTLS | [AgentEventBatchRequest](#agenteventbatchrequest) |
 | POST | [`/agents/{id}/heartbeat`](../api/src/routes/agents.js#L64) | mutualTLS | [AgentHeartbeatRequest](#agentheartbeatrequest) |
 | GET | [`/agents/{id}/jobs`](../api/src/routes/agents.js#L155) | mutualTLS | — |
 | POST | [`/agents/{id}/jobs/{jobId}/result`](../api/src/routes/agents.js#L201) | mutualTLS | [AgentJobResultRequest](#agentjobresultrequest) |
 | POST | [`/agents/{id}/network`](../api/src/routes/agents.js#L146) | mutualTLS | [AgentNetworkRequest](#agentnetworkrequest) |
 | POST | [`/agents/{id}/renew`](../api/src/routes/agents.js#L302) | mutualTLS | See handler |
-| POST | [`/agents/{id}/revoke`](../api/src/app.js#L3422) | bearerAuth; portal.admin | See handler |
+| POST | [`/agents/{id}/revoke`](../api/src/app.js#L3424) | bearerAuth; portal.admin | See handler |
 | GET | [`/agents/{id}/stream`](../api/src/routes/agents.js#L86) | mutualTLS | — |
 | POST | [`/agents/{id}/telemetry-health`](../api/src/routes/agents.js#L116) | mutualTLS | See handler |
 | GET | [`/agents/{id}/update`](../api/src/routes/agents.js#L101) | mutualTLS | — |
 | GET | [`/agents/{id}/update/package`](../api/src/routes/agents.js#L108) | mutualTLS | — |
 | POST | [`/agents/enroll`](../api/src/routes/agents.js#L47) | No bearer | [AgentEnrollRequest](#agentenrollrequest) |
-| POST | [`/agents/enrollment-tokens`](../api/src/app.js#L3457) | bearerAuth; portal.admin | See handler |
-| POST | [`/agents/enrollment-tokens/bulk`](../api/src/app.js#L3444) | bearerAuth; portal.admin | See handler |
+| POST | [`/agents/enrollment-tokens`](../api/src/app.js#L3459) | bearerAuth; portal.admin | See handler |
+| POST | [`/agents/enrollment-tokens/bulk`](../api/src/app.js#L3446) | bearerAuth; portal.admin | See handler |
 
 ## AI usage
 
@@ -77,7 +77,7 @@ Some older operations publish a generic JSON body. For those, follow the linked 
 | GET | `/ai/usage/{id}` | bearerAuth; auditor | — |
 | GET | `/ai/usage/export` | bearerAuth; auditor | — |
 | GET | `/ai/usage/summary` | bearerAuth; auditor | — |
-| GET | [`/nodes/{id}/ai-usage`](../api/src/app.js#L580) | bearerAuth; auditor | — |
+| GET | [`/nodes/{id}/ai-usage`](../api/src/app.js#L581) | bearerAuth; auditor | — |
 
 **GET /ai/actors**
 
@@ -211,44 +211,44 @@ Query parameters: `q` (string; default ), `groupId` (string), `reporterId` (stri
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/audit`](../api/src/app.js#L959) | bearerAuth; portal.read | — |
-| GET | [`/audit/search`](../api/src/app.js#L960) | bearerAuth; portal.read | — |
+| GET | [`/audit`](../api/src/app.js#L961) | bearerAuth; portal.read | — |
+| GET | [`/audit/search`](../api/src/app.js#L962) | bearerAuth; portal.read | — |
 
 ## auth
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| POST | [`/auth/ad-totp/confirm`](../api/src/app.js#L429) | No bearer | [AuthenticatorConfirmRequest](#authenticatorconfirmrequest) |
-| POST | [`/auth/ad-totp/enroll`](../api/src/app.js#L424) | No bearer | [AdAuthenticatorEnrollRequest](#adauthenticatorenrollrequest) |
-| POST | [`/auth/ad/login`](../api/src/app.js#L404) | No bearer | [AdLoginRequest](#adloginrequest) |
-| POST | [`/auth/email-verification/request`](../api/src/app.js#L774) | bearerAuth | [EmptyRequest](#emptyrequest) |
-| POST | [`/auth/login`](../api/src/app.js#L376) | No bearer | [LoginRequest](#loginrequest) |
-| POST | [`/auth/logout`](../api/src/app.js#L396) | bearerAuth | [LogoutRequest](#logoutrequest) |
-| GET | [`/auth/me`](../api/src/app.js#L397) | bearerAuth | — |
-| POST | [`/auth/refresh`](../api/src/app.js#L395) | No bearer | [RefreshRequest](#refreshrequest) |
-| POST | [`/auth/totp/confirm`](../api/src/app.js#L785) | bearerAuth | [AuthenticatorCodeRequest](#authenticatorcoderequest) |
-| POST | [`/auth/totp/disable`](../api/src/app.js#L793) | bearerAuth | [TotpDisableRequest](#totpdisablerequest) |
-| POST | [`/auth/totp/setup`](../api/src/app.js#L778) | bearerAuth | [EmptyRequest](#emptyrequest) |
-| POST | [`/auth/verify-email`](../api/src/app.js#L451) | No bearer | [VerifyEmailRequest](#verifyemailrequest) |
+| POST | [`/auth/ad-totp/confirm`](../api/src/app.js#L430) | No bearer | [AuthenticatorConfirmRequest](#authenticatorconfirmrequest) |
+| POST | [`/auth/ad-totp/enroll`](../api/src/app.js#L425) | No bearer | [AdAuthenticatorEnrollRequest](#adauthenticatorenrollrequest) |
+| POST | [`/auth/ad/login`](../api/src/app.js#L405) | No bearer | [AdLoginRequest](#adloginrequest) |
+| POST | [`/auth/email-verification/request`](../api/src/app.js#L776) | bearerAuth | [EmptyRequest](#emptyrequest) |
+| POST | [`/auth/login`](../api/src/app.js#L377) | No bearer | [LoginRequest](#loginrequest) |
+| POST | [`/auth/logout`](../api/src/app.js#L397) | bearerAuth | [LogoutRequest](#logoutrequest) |
+| GET | [`/auth/me`](../api/src/app.js#L398) | bearerAuth | — |
+| POST | [`/auth/refresh`](../api/src/app.js#L396) | No bearer | [RefreshRequest](#refreshrequest) |
+| POST | [`/auth/totp/confirm`](../api/src/app.js#L787) | bearerAuth | [AuthenticatorCodeRequest](#authenticatorcoderequest) |
+| POST | [`/auth/totp/disable`](../api/src/app.js#L795) | bearerAuth | [TotpDisableRequest](#totpdisablerequest) |
+| POST | [`/auth/totp/setup`](../api/src/app.js#L780) | bearerAuth | [EmptyRequest](#emptyrequest) |
+| POST | [`/auth/verify-email`](../api/src/app.js#L452) | No bearer | [VerifyEmailRequest](#verifyemailrequest) |
 
 ## avatars
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/avatars/{id}`](../api/src/app.js#L466) | No bearer | — |
+| GET | [`/avatars/{id}`](../api/src/app.js#L467) | No bearer | — |
 
 ## credentials
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/credentials`](../api/src/app.js#L1504) | bearerAuth | — |
-| POST | [`/credentials`](../api/src/app.js#L1512) | bearerAuth; portal.edit | See handler |
-| DELETE | [`/credentials/{id}`](../api/src/app.js#L1542) | bearerAuth; portal.edit | — |
-| PATCH | [`/credentials/{id}`](../api/src/app.js#L1518) | bearerAuth; portal.edit | See handler |
-| POST | [`/credentials/{id}/assignments`](../api/src/app.js#L1543) | bearerAuth; portal.edit | See handler |
-| POST | [`/credentials/{id}/preflight`](../api/src/app.js#L1569) | bearerAuth; portal.edit | See handler |
-| POST | [`/credentials/{id}/test`](../api/src/app.js#L1560) | bearerAuth; portal.edit | See handler |
-| GET | [`/credentials/health`](../api/src/app.js#L1499) | bearerAuth; portal.edit | — |
+| GET | [`/credentials`](../api/src/app.js#L1506) | bearerAuth | — |
+| POST | [`/credentials`](../api/src/app.js#L1514) | bearerAuth; portal.edit | See handler |
+| DELETE | [`/credentials/{id}`](../api/src/app.js#L1544) | bearerAuth; portal.edit | — |
+| PATCH | [`/credentials/{id}`](../api/src/app.js#L1520) | bearerAuth; portal.edit | See handler |
+| POST | [`/credentials/{id}/assignments`](../api/src/app.js#L1545) | bearerAuth; portal.edit | See handler |
+| POST | [`/credentials/{id}/preflight`](../api/src/app.js#L1571) | bearerAuth; portal.edit | See handler |
+| POST | [`/credentials/{id}/test`](../api/src/app.js#L1562) | bearerAuth; portal.edit | See handler |
+| GET | [`/credentials/health`](../api/src/app.js#L1501) | bearerAuth; portal.edit | — |
 
 **POST /credentials**
 
@@ -258,15 +258,15 @@ Store a credential in the shared encrypted vault. Azure / Arc uses type=azure wi
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/directory/accounts`](../api/src/app.js#L1348) | bearerAuth; portal.read | — |
-| GET | [`/directory/local-accounts/{id}`](../api/src/app.js#L1367) | bearerAuth; portal.read | — |
-| POST | [`/directory/local-accounts/{id}/network-rule`](../api/src/app.js#L1379) | bearerAuth; portal.admin | See handler |
-| POST | [`/directory/sync`](../api/src/app.js#L1347) | bearerAuth; portal.admin | See handler |
-| POST | [`/directory/test`](../api/src/app.js#L1277) | bearerAuth; portal.admin | See handler |
-| GET | [`/directory/users`](../api/src/app.js#L1413) | bearerAuth; portal.read | — |
-| GET | [`/directory/users/{id}`](../api/src/app.js#L1425) | bearerAuth; portal.read | — |
-| POST | [`/directory/users/{id}/import-operator`](../api/src/app.js#L1480) | bearerAuth; portal.admin | See handler |
-| POST | [`/directory/users/{id}/status`](../api/src/app.js#L1433) | bearerAuth; portal.admin | See handler |
+| GET | [`/directory/accounts`](../api/src/app.js#L1350) | bearerAuth; portal.read | — |
+| GET | [`/directory/local-accounts/{id}`](../api/src/app.js#L1369) | bearerAuth; portal.read | — |
+| POST | [`/directory/local-accounts/{id}/network-rule`](../api/src/app.js#L1381) | bearerAuth; portal.admin | See handler |
+| POST | [`/directory/sync`](../api/src/app.js#L1349) | bearerAuth; portal.admin | See handler |
+| POST | [`/directory/test`](../api/src/app.js#L1279) | bearerAuth; portal.admin | See handler |
+| GET | [`/directory/users`](../api/src/app.js#L1415) | bearerAuth; portal.read | — |
+| GET | [`/directory/users/{id}`](../api/src/app.js#L1427) | bearerAuth; portal.read | — |
+| POST | [`/directory/users/{id}/import-operator`](../api/src/app.js#L1482) | bearerAuth; portal.admin | See handler |
+| POST | [`/directory/users/{id}/status`](../api/src/app.js#L1435) | bearerAuth; portal.admin | See handler |
 
 ## discovery
 
@@ -280,39 +280,41 @@ Store a credential in the shared encrypted vault. Azure / Arc uses type=azure wi
 | POST | `/discovery/azure/connections/{id}/sync` | bearerAuth; portal.admin | See handler |
 | POST | `/discovery/azure/connections/{id}/test` | bearerAuth; portal.admin | See handler |
 | GET | `/discovery/azure/resources` | bearerAuth | — |
+| GET | `/discovery/azure/resources/{id}/history` | bearerAuth | — |
+| POST | `/discovery/azure/resources/{id}/resolve` | bearerAuth; portal.admin | [InventoryResolutionRequest](#inventoryresolutionrequest) |
 | GET | `/discovery/azure/resources/export` | bearerAuth | — |
 | GET | `/discovery/azure/runs` | bearerAuth | — |
 | GET | `/discovery/azure/runs/{id}` | bearerAuth | — |
 | POST | `/discovery/azure/runs/{id}/cancel` | bearerAuth; portal.admin | See handler |
-| POST | [`/discovery/dhcp/import`](../api/src/app.js#L687) | bearerAuth; portal.admin | [DhcpImportRequest](#dhcpimportrequest) |
-| GET | [`/discovery/dhcp/imports`](../api/src/app.js#L688) | bearerAuth; portal.admin | — |
-| GET | [`/discovery/dhcp/imports/{id}`](../api/src/app.js#L689) | bearerAuth; portal.admin | — |
-| POST | [`/discovery/dhcp/preview`](../api/src/app.js#L686) | bearerAuth; portal.admin | [DhcpImportRequest](#dhcpimportrequest) |
-| GET | [`/discovery/passive-candidates`](../api/src/app.js#L690) | bearerAuth; portal.admin | — |
-| POST | [`/discovery/passive-candidates/process`](../api/src/app.js#L691) | bearerAuth; portal.admin | See handler |
-| GET | [`/discovery/scans`](../api/src/app.js#L602) | bearerAuth; portal.admin | — |
-| POST | [`/discovery/scans`](../api/src/app.js#L604) | bearerAuth; portal.admin | [DiscoveryScanRequest](#discoveryscanrequest) |
-| GET | [`/discovery/scans/{id}`](../api/src/app.js#L603) | bearerAuth; portal.admin | — |
-| GET | [`/discovery/schedules`](../api/src/app.js#L613) | bearerAuth; portal.admin | — |
-| POST | [`/discovery/schedules`](../api/src/app.js#L614) | bearerAuth; portal.admin | See handler |
-| DELETE | [`/discovery/schedules/{id}`](../api/src/app.js#L632) | bearerAuth; portal.admin | — |
-| PATCH | [`/discovery/schedules/{id}`](../api/src/app.js#L622) | bearerAuth; portal.admin | See handler |
-| POST | [`/discovery/schedules/{id}/run`](../api/src/app.js#L635) | bearerAuth; portal.admin | See handler |
-| POST | [`/discovery/schedules/{id}/run-now`](../api/src/app.js#L634) | bearerAuth; portal.admin | See handler |
-| GET | [`/discovery/snmp-library`](../api/src/app.js#L641) | bearerAuth; portal.admin | — |
-| DELETE | [`/discovery/snmp-library/{id}`](../api/src/app.js#L649) | bearerAuth; portal.admin | — |
-| GET | [`/discovery/snmp-library/{id}`](../api/src/app.js#L647) | bearerAuth; portal.admin | — |
-| PATCH | [`/discovery/snmp-library/{id}`](../api/src/app.js#L648) | bearerAuth; portal.admin | [SnmpMibUpdateRequest](#snmpmibupdaterequest) |
-| GET | [`/discovery/snmp-library/{id}/download`](../api/src/app.js#L646) | bearerAuth; portal.admin | — |
-| GET | [`/discovery/snmp-library/files`](../api/src/app.js#L644) | bearerAuth; portal.admin | — |
-| GET | [`/discovery/snmp-library/files/{id}/download`](../api/src/app.js#L645) | bearerAuth; portal.admin | — |
-| POST | [`/discovery/snmp-library/import`](../api/src/app.js#L643) | bearerAuth; portal.admin | [SnmpMibImportRequest](#snmpmibimportrequest) |
-| POST | [`/discovery/snmp-library/preview`](../api/src/app.js#L642) | bearerAuth; portal.admin | [SnmpMibImportRequest](#snmpmibimportrequest) |
-| GET | [`/discovery/snmp-targets`](../api/src/app.js#L650) | bearerAuth; portal.admin | — |
-| POST | [`/discovery/snmp-targets`](../api/src/app.js#L651) | bearerAuth; portal.admin | See handler |
-| DELETE | [`/discovery/snmp-targets/{id}`](../api/src/app.js#L681) | bearerAuth; portal.admin | — |
-| PATCH | [`/discovery/snmp-targets/{id}`](../api/src/app.js#L666) | bearerAuth; portal.admin | See handler |
-| POST | [`/discovery/snmp-targets/{id}/poll`](../api/src/app.js#L682) | bearerAuth; portal.admin | See handler |
+| POST | [`/discovery/dhcp/import`](../api/src/app.js#L689) | bearerAuth; portal.admin | [DhcpImportRequest](#dhcpimportrequest) |
+| GET | [`/discovery/dhcp/imports`](../api/src/app.js#L690) | bearerAuth; portal.admin | — |
+| GET | [`/discovery/dhcp/imports/{id}`](../api/src/app.js#L691) | bearerAuth; portal.admin | — |
+| POST | [`/discovery/dhcp/preview`](../api/src/app.js#L688) | bearerAuth; portal.admin | [DhcpImportRequest](#dhcpimportrequest) |
+| GET | [`/discovery/passive-candidates`](../api/src/app.js#L692) | bearerAuth; portal.admin | — |
+| POST | [`/discovery/passive-candidates/process`](../api/src/app.js#L693) | bearerAuth; portal.admin | See handler |
+| GET | [`/discovery/scans`](../api/src/app.js#L604) | bearerAuth; portal.admin | — |
+| POST | [`/discovery/scans`](../api/src/app.js#L606) | bearerAuth; portal.admin | [DiscoveryScanRequest](#discoveryscanrequest) |
+| GET | [`/discovery/scans/{id}`](../api/src/app.js#L605) | bearerAuth; portal.admin | — |
+| GET | [`/discovery/schedules`](../api/src/app.js#L615) | bearerAuth; portal.admin | — |
+| POST | [`/discovery/schedules`](../api/src/app.js#L616) | bearerAuth; portal.admin | See handler |
+| DELETE | [`/discovery/schedules/{id}`](../api/src/app.js#L634) | bearerAuth; portal.admin | — |
+| PATCH | [`/discovery/schedules/{id}`](../api/src/app.js#L624) | bearerAuth; portal.admin | See handler |
+| POST | [`/discovery/schedules/{id}/run`](../api/src/app.js#L637) | bearerAuth; portal.admin | See handler |
+| POST | [`/discovery/schedules/{id}/run-now`](../api/src/app.js#L636) | bearerAuth; portal.admin | See handler |
+| GET | [`/discovery/snmp-library`](../api/src/app.js#L643) | bearerAuth; portal.admin | — |
+| DELETE | [`/discovery/snmp-library/{id}`](../api/src/app.js#L651) | bearerAuth; portal.admin | — |
+| GET | [`/discovery/snmp-library/{id}`](../api/src/app.js#L649) | bearerAuth; portal.admin | — |
+| PATCH | [`/discovery/snmp-library/{id}`](../api/src/app.js#L650) | bearerAuth; portal.admin | [SnmpMibUpdateRequest](#snmpmibupdaterequest) |
+| GET | [`/discovery/snmp-library/{id}/download`](../api/src/app.js#L648) | bearerAuth; portal.admin | — |
+| GET | [`/discovery/snmp-library/files`](../api/src/app.js#L646) | bearerAuth; portal.admin | — |
+| GET | [`/discovery/snmp-library/files/{id}/download`](../api/src/app.js#L647) | bearerAuth; portal.admin | — |
+| POST | [`/discovery/snmp-library/import`](../api/src/app.js#L645) | bearerAuth; portal.admin | [SnmpMibImportRequest](#snmpmibimportrequest) |
+| POST | [`/discovery/snmp-library/preview`](../api/src/app.js#L644) | bearerAuth; portal.admin | [SnmpMibImportRequest](#snmpmibimportrequest) |
+| GET | [`/discovery/snmp-targets`](../api/src/app.js#L652) | bearerAuth; portal.admin | — |
+| POST | [`/discovery/snmp-targets`](../api/src/app.js#L653) | bearerAuth; portal.admin | See handler |
+| DELETE | [`/discovery/snmp-targets/{id}`](../api/src/app.js#L683) | bearerAuth; portal.admin | — |
+| PATCH | [`/discovery/snmp-targets/{id}`](../api/src/app.js#L668) | bearerAuth; portal.admin | See handler |
+| POST | [`/discovery/snmp-targets/{id}/poll`](../api/src/app.js#L684) | bearerAuth; portal.admin | See handler |
 
 **GET /discovery/azure/connections**
 
@@ -347,6 +349,16 @@ Azure/Arc discovery retains provider observations separately from host verificat
 Azure/Arc discovery retains provider observations separately from host verification and firewall enforcement. Inventory requires an explicit owned network scope. Mutations require administrator access and are audited.
 
 Query parameters: `q` (string; default ), `page` (integer; default 1; min 1; max 9007199254740991), `pageSize` (integer; default 25; min 1; max 250), `sort` (string; default updated), `direction` (string; default desc), `state` (string; default all), `scopeId` (string), `connectionId` (string).
+
+**GET /discovery/azure/resources/{id}/history**
+
+Azure/Arc discovery retains provider observations separately from host verification and firewall enforcement. Inventory requires an explicit owned network scope. Mutations require administrator access and are audited.
+
+Query parameters: `q` (string; default ), `page` (integer; default 1; min 1; max 9007199254740991), `pageSize` (integer; default 25; min 1; max 250), `sort` (string; default updated), `direction` (string; default desc), `state` (string; default all), `scopeId` (string), `connectionId` (string).
+
+**POST /discovery/azure/resources/{id}/resolve**
+
+Azure/Arc discovery retains provider observations separately from host verification and firewall enforcement. Inventory requires an explicit owned network scope. Mutations require administrator access and are audited.
 
 **GET /discovery/azure/resources/export**
 
@@ -432,30 +444,30 @@ Validate one or more ASN.1 MIBs and their dependencies without saving.
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/drift/checks`](../api/src/app.js#L2324) | bearerAuth | — |
-| POST | [`/drift/checks`](../api/src/app.js#L2319) | bearerAuth; portal.edit | See handler |
+| GET | [`/drift/checks`](../api/src/app.js#L2326) | bearerAuth | — |
+| POST | [`/drift/checks`](../api/src/app.js#L2321) | bearerAuth; portal.edit | See handler |
 
 ## event-export
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/event-export/destinations`](../api/src/app.js#L2943) | bearerAuth; portal.admin | — |
-| POST | [`/event-export/destinations`](../api/src/app.js#L2944) | bearerAuth; portal.admin | See handler |
-| DELETE | [`/event-export/destinations/{id}`](../api/src/app.js#L2962) | bearerAuth; portal.admin | — |
-| PATCH | [`/event-export/destinations/{id}`](../api/src/app.js#L2953) | bearerAuth; portal.admin | See handler |
-| POST | [`/event-export/send`](../api/src/app.js#L2968) | bearerAuth; portal.admin | See handler |
+| GET | [`/event-export/destinations`](../api/src/app.js#L2945) | bearerAuth; portal.admin | — |
+| POST | [`/event-export/destinations`](../api/src/app.js#L2946) | bearerAuth; portal.admin | See handler |
+| DELETE | [`/event-export/destinations/{id}`](../api/src/app.js#L2964) | bearerAuth; portal.admin | — |
+| PATCH | [`/event-export/destinations/{id}`](../api/src/app.js#L2955) | bearerAuth; portal.admin | See handler |
+| POST | [`/event-export/send`](../api/src/app.js#L2970) | bearerAuth; portal.admin | See handler |
 
 ## health
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/health`](../api/src/app.js#L349) | No bearer | — |
+| GET | [`/health`](../api/src/app.js#L350) | No bearer | — |
 
 ## identity
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/identity/learning-preview`](../api/src/app.js#L2480) | bearerAuth | — |
+| GET | [`/identity/learning-preview`](../api/src/app.js#L2482) | bearerAuth | — |
 
 ## internet
 
@@ -548,39 +560,39 @@ Azure/Arc discovery retains provider observations separately from host verificat
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/invites`](../api/src/app.js#L801) | bearerAuth; portal.admin | — |
-| POST | [`/invites`](../api/src/app.js#L802) | bearerAuth; portal.admin | See handler |
-| DELETE | [`/invites/{id}`](../api/src/app.js#L817) | bearerAuth; portal.admin | — |
-| POST | [`/invites/accept`](../api/src/app.js#L435) | No bearer | [InviteAcceptRequest](#inviteacceptrequest) |
+| GET | [`/invites`](../api/src/app.js#L803) | bearerAuth; portal.admin | — |
+| POST | [`/invites`](../api/src/app.js#L804) | bearerAuth; portal.admin | See handler |
+| DELETE | [`/invites/{id}`](../api/src/app.js#L819) | bearerAuth; portal.admin | — |
+| POST | [`/invites/accept`](../api/src/app.js#L436) | No bearer | [InviteAcceptRequest](#inviteacceptrequest) |
 
 ## learning-sessions
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/learning-sessions`](../api/src/app.js#L3154) | bearerAuth | — |
-| POST | [`/learning-sessions`](../api/src/app.js#L3155) | bearerAuth; portal.edit | [TrainingSessionRequest](#trainingsessionrequest) |
-| POST | [`/learning-sessions/{id}/approve`](../api/src/app.js#L3285) | bearerAuth; portal.edit | See handler |
-| POST | [`/learning-sessions/{id}/finalize`](../api/src/app.js#L3255) | bearerAuth; portal.edit | See handler |
+| GET | [`/learning-sessions`](../api/src/app.js#L3156) | bearerAuth | — |
+| POST | [`/learning-sessions`](../api/src/app.js#L3157) | bearerAuth; portal.edit | [TrainingSessionRequest](#trainingsessionrequest) |
+| POST | [`/learning-sessions/{id}/approve`](../api/src/app.js#L3287) | bearerAuth; portal.edit | See handler |
+| POST | [`/learning-sessions/{id}/finalize`](../api/src/app.js#L3257) | bearerAuth; portal.edit | See handler |
 
 ## logon-rights
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/logon-rights`](../api/src/app.js#L2862) | bearerAuth | — |
-| POST | [`/logon-rights/baseline`](../api/src/app.js#L2864) | bearerAuth; portal.admin | [LogsPullRequest](#logspullrequest) |
-| POST | [`/logon-rights/change`](../api/src/app.js#L2880) | bearerAuth; portal.admin | See handler |
-| POST | [`/logon-rights/jit-grant`](../api/src/app.js#L3419) | bearerAuth; portal.admin | See handler |
-| POST | [`/logon-rights/revoke`](../api/src/app.js#L3418) | bearerAuth; portal.admin | See handler |
+| GET | [`/logon-rights`](../api/src/app.js#L2864) | bearerAuth | — |
+| POST | [`/logon-rights/baseline`](../api/src/app.js#L2866) | bearerAuth; portal.admin | [LogsPullRequest](#logspullrequest) |
+| POST | [`/logon-rights/change`](../api/src/app.js#L2882) | bearerAuth; portal.admin | See handler |
+| POST | [`/logon-rights/jit-grant`](../api/src/app.js#L3421) | bearerAuth; portal.admin | See handler |
+| POST | [`/logon-rights/revoke`](../api/src/app.js#L3420) | bearerAuth; portal.admin | See handler |
 
 ## logs
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| POST | [`/logs/{id}/ignore-traffic`](../api/src/app.js#L2984) | bearerAuth; portal.admin | See handler |
-| POST | [`/logs/{id}/rule`](../api/src/app.js#L2998) | bearerAuth; portal.admin | See handler |
-| POST | [`/logs/ingest`](../api/src/app.js#L3027) | bearerAuth; portal.edit | See handler |
-| POST | [`/logs/pull`](../api/src/app.js#L3148) | bearerAuth; portal.edit | [LogsPullRequest](#logspullrequest) |
-| GET | [`/logs/search`](../api/src/app.js#L2907) | bearerAuth | — |
+| POST | [`/logs/{id}/ignore-traffic`](../api/src/app.js#L2986) | bearerAuth; portal.admin | See handler |
+| POST | [`/logs/{id}/rule`](../api/src/app.js#L3000) | bearerAuth; portal.admin | See handler |
+| POST | [`/logs/ingest`](../api/src/app.js#L3029) | bearerAuth; portal.edit | See handler |
+| POST | [`/logs/pull`](../api/src/app.js#L3150) | bearerAuth; portal.edit | [LogsPullRequest](#logspullrequest) |
+| GET | [`/logs/search`](../api/src/app.js#L2909) | bearerAuth | — |
 
 ## mapping
 
@@ -608,58 +620,58 @@ Query parameters: `nodeId` (string), `subnet` (string), `switchId` (string), `fr
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/mfa/challenges/search`](../api/src/app.js#L2836) | bearerAuth; portal.read | — |
-| POST | [`/mfa/entra/cancel`](../api/src/app.js#L554) | No bearer | [MfaEntraCancelRequest](#mfaentracancelrequest) |
-| POST | [`/mfa/entra/complete`](../api/src/app.js#L538) | No bearer | [MfaEntraCompleteRequest](#mfaentracompleterequest) |
-| GET | [`/mfa/prompts/{id}`](../api/src/app.js#L491) | No bearer | — |
-| POST | [`/mfa/prompts/{id}/entra/start`](../api/src/app.js#L525) | No bearer | [EmptyRequest](#emptyrequest) |
-| POST | [`/mfa/prompts/{id}/totp`](../api/src/app.js#L499) | No bearer | [MfaPromptTotpRequest](#mfaprompttotprequest) |
+| GET | [`/mfa/challenges/search`](../api/src/app.js#L2838) | bearerAuth; portal.read | — |
+| POST | [`/mfa/entra/cancel`](../api/src/app.js#L555) | No bearer | [MfaEntraCancelRequest](#mfaentracancelrequest) |
+| POST | [`/mfa/entra/complete`](../api/src/app.js#L539) | No bearer | [MfaEntraCompleteRequest](#mfaentracompleterequest) |
+| GET | [`/mfa/prompts/{id}`](../api/src/app.js#L492) | No bearer | — |
+| POST | [`/mfa/prompts/{id}/entra/start`](../api/src/app.js#L526) | No bearer | [EmptyRequest](#emptyrequest) |
+| POST | [`/mfa/prompts/{id}/totp`](../api/src/app.js#L500) | No bearer | [MfaPromptTotpRequest](#mfaprompttotprequest) |
 
 ## node-groups
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/node-groups`](../api/src/app.js#L2053) | bearerAuth | — |
-| POST | [`/node-groups`](../api/src/app.js#L2060) | bearerAuth; portal.edit | See handler |
-| GET | [`/node-groups/{id}`](../api/src/app.js#L2054) | bearerAuth | — |
-| PATCH | [`/node-groups/{id}`](../api/src/app.js#L2071) | bearerAuth; portal.edit | See handler |
-| POST | [`/node-groups/{id}/members`](../api/src/app.js#L2086) | bearerAuth; portal.edit | See handler |
-| DELETE | [`/node-groups/{id}/members/{nodeId}`](../api/src/app.js#L2101) | bearerAuth; portal.edit | — |
-| POST | [`/node-groups/{id}/refresh`](../api/src/app.js#L2080) | bearerAuth; portal.edit | See handler |
+| GET | [`/node-groups`](../api/src/app.js#L2055) | bearerAuth | — |
+| POST | [`/node-groups`](../api/src/app.js#L2062) | bearerAuth; portal.edit | See handler |
+| GET | [`/node-groups/{id}`](../api/src/app.js#L2056) | bearerAuth | — |
+| PATCH | [`/node-groups/{id}`](../api/src/app.js#L2073) | bearerAuth; portal.edit | See handler |
+| POST | [`/node-groups/{id}/members`](../api/src/app.js#L2088) | bearerAuth; portal.edit | See handler |
+| DELETE | [`/node-groups/{id}/members/{nodeId}`](../api/src/app.js#L2103) | bearerAuth; portal.edit | — |
+| POST | [`/node-groups/{id}/refresh`](../api/src/app.js#L2082) | bearerAuth; portal.edit | See handler |
 
 ## nodes
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/nodes`](../api/src/app.js#L1614) | bearerAuth | — |
-| POST | [`/nodes`](../api/src/app.js#L1637) | bearerAuth; portal.edit | See handler |
-| DELETE | [`/nodes/{id}`](../api/src/app.js#L1763) | bearerAuth; portal.admin | — |
-| GET | [`/nodes/{id}`](../api/src/app.js#L1649) | bearerAuth | — |
-| PATCH | [`/nodes/{id}`](../api/src/app.js#L1656) | bearerAuth; portal.edit | See handler |
-| POST | [`/nodes/{id}/activate-agentless`](../api/src/app.js#L1813) | bearerAuth; portal.admin | See handler |
-| POST | [`/nodes/{id}/arp/collect`](../api/src/app.js#L692) | bearerAuth; portal.edit | See handler |
-| GET | [`/nodes/{id}/audit-policy`](../api/src/app.js#L2001) | bearerAuth | — |
-| POST | [`/nodes/{id}/audit-policy/enable`](../api/src/app.js#L2002) | bearerAuth; portal.admin | See handler |
-| GET | [`/nodes/{id}/break-glass`](../api/src/app.js#L1940) | bearerAuth; portal.admin | — |
-| POST | [`/nodes/{id}/break-glass`](../api/src/app.js#L1945) | bearerAuth; portal.admin | See handler |
-| POST | [`/nodes/{id}/break-glass/end`](../api/src/app.js#L1978) | bearerAuth; portal.admin | See handler |
+| GET | [`/nodes`](../api/src/app.js#L1616) | bearerAuth | — |
+| POST | [`/nodes`](../api/src/app.js#L1639) | bearerAuth; portal.edit | See handler |
+| DELETE | [`/nodes/{id}`](../api/src/app.js#L1765) | bearerAuth; portal.admin | — |
+| GET | [`/nodes/{id}`](../api/src/app.js#L1651) | bearerAuth | — |
+| PATCH | [`/nodes/{id}`](../api/src/app.js#L1658) | bearerAuth; portal.edit | See handler |
+| POST | [`/nodes/{id}/activate-agentless`](../api/src/app.js#L1815) | bearerAuth; portal.admin | See handler |
+| POST | [`/nodes/{id}/arp/collect`](../api/src/app.js#L694) | bearerAuth; portal.edit | See handler |
+| GET | [`/nodes/{id}/audit-policy`](../api/src/app.js#L2003) | bearerAuth | — |
+| POST | [`/nodes/{id}/audit-policy/enable`](../api/src/app.js#L2004) | bearerAuth; portal.admin | See handler |
+| GET | [`/nodes/{id}/break-glass`](../api/src/app.js#L1942) | bearerAuth; portal.admin | — |
+| POST | [`/nodes/{id}/break-glass`](../api/src/app.js#L1947) | bearerAuth; portal.admin | See handler |
+| POST | [`/nodes/{id}/break-glass/end`](../api/src/app.js#L1980) | bearerAuth; portal.admin | See handler |
 | GET | `/nodes/{id}/capabilities` | bearerAuth | — |
-| PUT | [`/nodes/{id}/credentials`](../api/src/app.js#L1744) | bearerAuth; portal.edit | See handler |
-| POST | [`/nodes/{id}/deploy-agent`](../api/src/app.js#L1856) | bearerAuth; portal.admin | See handler |
-| GET | [`/nodes/{id}/dns`](../api/src/app.js#L2051) | bearerAuth | — |
-| POST | [`/nodes/{id}/dns/refresh`](../api/src/app.js#L2052) | bearerAuth; portal.edit | See handler |
-| GET | [`/nodes/{id}/facts`](../api/src/app.js#L2000) | bearerAuth | — |
-| POST | [`/nodes/{id}/facts/refresh`](../api/src/app.js#L2028) | bearerAuth; portal.edit | See handler |
-| GET | [`/nodes/{id}/firewall-rules`](../api/src/app.js#L2044) | bearerAuth | — |
-| POST | [`/nodes/{id}/local-accounts/refresh`](../api/src/app.js#L1372) | bearerAuth; portal.admin | See handler |
-| POST | [`/nodes/{id}/probe`](../api/src/app.js#L1785) | bearerAuth; portal.edit | See handler |
-| GET | [`/nodes/{id}/snmp-mibs`](../api/src/app.js#L1999) | bearerAuth | — |
+| PUT | [`/nodes/{id}/credentials`](../api/src/app.js#L1746) | bearerAuth; portal.edit | See handler |
+| POST | [`/nodes/{id}/deploy-agent`](../api/src/app.js#L1858) | bearerAuth; portal.admin | See handler |
+| GET | [`/nodes/{id}/dns`](../api/src/app.js#L2053) | bearerAuth | — |
+| POST | [`/nodes/{id}/dns/refresh`](../api/src/app.js#L2054) | bearerAuth; portal.edit | See handler |
+| GET | [`/nodes/{id}/facts`](../api/src/app.js#L2002) | bearerAuth | — |
+| POST | [`/nodes/{id}/facts/refresh`](../api/src/app.js#L2030) | bearerAuth; portal.edit | See handler |
+| GET | [`/nodes/{id}/firewall-rules`](../api/src/app.js#L2046) | bearerAuth | — |
+| POST | [`/nodes/{id}/local-accounts/refresh`](../api/src/app.js#L1374) | bearerAuth; portal.admin | See handler |
+| POST | [`/nodes/{id}/probe`](../api/src/app.js#L1787) | bearerAuth; portal.edit | See handler |
+| GET | [`/nodes/{id}/snmp-mibs`](../api/src/app.js#L2001) | bearerAuth | — |
 | GET | `/nodes/{id}/sources` | bearerAuth | — |
-| POST | [`/nodes/{id}/training`](../api/src/app.js#L1650) | bearerAuth; portal.edit | See handler |
-| PATCH | [`/nodes/{id}/triage`](../api/src/app.js#L1686) | bearerAuth; portal.edit | See handler |
-| POST | [`/nodes/{id}/wef/configure`](../api/src/app.js#L1828) | bearerAuth; portal.admin | [WefConfigureRequest](#wefconfigurerequest) |
-| GET | [`/nodes/triage`](../api/src/app.js#L1601) | bearerAuth | — |
-| POST | [`/nodes/triage/bulk`](../api/src/app.js#L1695) | bearerAuth; portal.edit | [TriageBulkRequest](#triagebulkrequest) |
+| POST | [`/nodes/{id}/training`](../api/src/app.js#L1652) | bearerAuth; portal.edit | See handler |
+| PATCH | [`/nodes/{id}/triage`](../api/src/app.js#L1688) | bearerAuth; portal.edit | See handler |
+| POST | [`/nodes/{id}/wef/configure`](../api/src/app.js#L1830) | bearerAuth; portal.admin | [WefConfigureRequest](#wefconfigurerequest) |
+| GET | [`/nodes/triage`](../api/src/app.js#L1603) | bearerAuth | — |
+| POST | [`/nodes/triage/bulk`](../api/src/app.js#L1697) | bearerAuth; portal.edit | [TriageBulkRequest](#triagebulkrequest) |
 
 **GET /nodes/{id}/snmp-mibs**
 
@@ -675,35 +687,35 @@ Azure/Arc discovery retains provider observations separately from host verificat
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/notifications`](../api/src/app.js#L765) | bearerAuth | — |
-| PATCH | [`/notifications/{id}/read`](../api/src/app.js#L766) | bearerAuth | See handler |
-| POST | [`/notifications/read-all`](../api/src/app.js#L770) | bearerAuth | See handler |
+| GET | [`/notifications`](../api/src/app.js#L767) | bearerAuth | — |
+| PATCH | [`/notifications/{id}/read`](../api/src/app.js#L768) | bearerAuth | See handler |
+| POST | [`/notifications/read-all`](../api/src/app.js#L772) | bearerAuth | See handler |
 
 ## openapi.json
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/openapi.json`](../api/src/app.js#L373) | No bearer | — |
+| GET | [`/openapi.json`](../api/src/app.js#L374) | No bearer | — |
 
 ## policies
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/policies`](../api/src/app.js#L2146) | bearerAuth | — |
-| POST | [`/policies`](../api/src/app.js#L2166) | bearerAuth; portal.edit | See handler |
-| GET | [`/policies/{id}`](../api/src/app.js#L2167) | bearerAuth | — |
-| POST | [`/policies/{id}/apply`](../api/src/app.js#L2257) | bearerAuth; portal.admin | See handler |
-| POST | [`/policies/{id}/assignments`](../api/src/app.js#L2206) | bearerAuth; portal.edit | See handler |
-| DELETE | [`/policies/{id}/assignments/{assignmentId}`](../api/src/app.js#L2207) | bearerAuth; portal.edit | — |
-| GET | [`/policies/{id}/diff`](../api/src/app.js#L2258) | bearerAuth | — |
-| GET | [`/policies/{id}/learning-preview`](../api/src/app.js#L2169) | bearerAuth | — |
-| POST | [`/policies/{id}/preview`](../api/src/app.js#L2176) | bearerAuth | [PolicyDraftRequest](#policydraftrequest) |
-| GET | [`/policies/{id}/versions`](../api/src/app.js#L2168) | bearerAuth | — |
-| POST | [`/policies/{id}/versions`](../api/src/app.js#L2189) | bearerAuth; portal.edit | [PolicyVersionRequest](#policyversionrequest) |
-| POST | [`/policies/{id}/versions/{versionId}/recall`](../api/src/app.js#L2205) | bearerAuth; portal.edit | See handler |
-| GET | [`/policies/sync`](../api/src/app.js#L2147) | bearerAuth; portal.admin | — |
-| POST | [`/policies/sync`](../api/src/app.js#L2148) | bearerAuth; portal.admin | See handler |
-| DELETE | [`/policies/sync/{scheduleId}`](../api/src/app.js#L2159) | bearerAuth; portal.admin | — |
+| GET | [`/policies`](../api/src/app.js#L2148) | bearerAuth | — |
+| POST | [`/policies`](../api/src/app.js#L2168) | bearerAuth; portal.edit | See handler |
+| GET | [`/policies/{id}`](../api/src/app.js#L2169) | bearerAuth | — |
+| POST | [`/policies/{id}/apply`](../api/src/app.js#L2259) | bearerAuth; portal.admin | See handler |
+| POST | [`/policies/{id}/assignments`](../api/src/app.js#L2208) | bearerAuth; portal.edit | See handler |
+| DELETE | [`/policies/{id}/assignments/{assignmentId}`](../api/src/app.js#L2209) | bearerAuth; portal.edit | — |
+| GET | [`/policies/{id}/diff`](../api/src/app.js#L2260) | bearerAuth | — |
+| GET | [`/policies/{id}/learning-preview`](../api/src/app.js#L2171) | bearerAuth | — |
+| POST | [`/policies/{id}/preview`](../api/src/app.js#L2178) | bearerAuth | [PolicyDraftRequest](#policydraftrequest) |
+| GET | [`/policies/{id}/versions`](../api/src/app.js#L2170) | bearerAuth | — |
+| POST | [`/policies/{id}/versions`](../api/src/app.js#L2191) | bearerAuth; portal.edit | [PolicyVersionRequest](#policyversionrequest) |
+| POST | [`/policies/{id}/versions/{versionId}/recall`](../api/src/app.js#L2207) | bearerAuth; portal.edit | See handler |
+| GET | [`/policies/sync`](../api/src/app.js#L2149) | bearerAuth; portal.admin | — |
+| POST | [`/policies/sync`](../api/src/app.js#L2150) | bearerAuth; portal.admin | See handler |
+| DELETE | [`/policies/sync/{scheduleId}`](../api/src/app.js#L2161) | bearerAuth; portal.admin | — |
 
 **POST /policies/{id}/preview**
 
@@ -717,8 +729,8 @@ Save an immutable policy graph version. Supply baseVersionId (null for the initi
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/portal-branding`](../api/src/app.js#L471) | No bearer | — |
-| GET | [`/portal-branding/image`](../api/src/app.js#L472) | No bearer | — |
+| GET | [`/portal-branding`](../api/src/app.js#L472) | No bearer | — |
+| GET | [`/portal-branding/image`](../api/src/app.js#L473) | No bearer | — |
 
 ## reports
 
@@ -727,7 +739,7 @@ Save an immutable policy graph version. Supply baseVersionId (null for the initi
 | GET | `/reports/capabilities` | bearerAuth | — |
 | GET | `/reports/compliance` | bearerAuth | — |
 | GET | `/reports/coverage` | bearerAuth | — |
-| GET | [`/reports/dashboard`](../api/src/app.js#L2466) | bearerAuth | — |
+| GET | [`/reports/dashboard`](../api/src/app.js#L2468) | bearerAuth | — |
 | GET | `/reports/dns` | bearerAuth | — |
 | GET | `/reports/inventory` | bearerAuth | — |
 | GET | `/reports/verification` | bearerAuth | — |
@@ -736,136 +748,178 @@ Save an immutable policy graph version. Supply baseVersionId (null for the initi
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/roles`](../api/src/app.js#L920) | bearerAuth | — |
+| GET | [`/roles`](../api/src/app.js#L922) | bearerAuth | — |
 
 ## rpc-filters
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/rpc-filters`](../api/src/app.js#L3371) | bearerAuth; portal.read | — |
-| POST | [`/rpc-filters`](../api/src/app.js#L3376) | bearerAuth; portal.admin | See handler |
-| DELETE | [`/rpc-filters/{id}`](../api/src/app.js#L3406) | bearerAuth; portal.admin | — |
-| POST | [`/rpc-filters/{id}/apply-inventory`](../api/src/app.js#L3386) | bearerAuth; portal.admin | See handler |
-| GET | [`/rpc-filters/{id}/inventory`](../api/src/app.js#L3399) | bearerAuth; portal.read | — |
+| GET | [`/rpc-filters`](../api/src/app.js#L3373) | bearerAuth; portal.read | — |
+| POST | [`/rpc-filters`](../api/src/app.js#L3378) | bearerAuth; portal.admin | See handler |
+| DELETE | [`/rpc-filters/{id}`](../api/src/app.js#L3408) | bearerAuth; portal.admin | — |
+| POST | [`/rpc-filters/{id}/apply-inventory`](../api/src/app.js#L3388) | bearerAuth; portal.admin | See handler |
+| GET | [`/rpc-filters/{id}/inventory`](../api/src/app.js#L3401) | bearerAuth; portal.read | — |
 
 ## security-automations
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/security-automations`](../api/src/app.js#L707) | bearerAuth; portal.admin | — |
-| POST | [`/security-automations`](../api/src/app.js#L708) | bearerAuth; portal.admin | See handler |
-| PATCH | [`/security-automations/{id}`](../api/src/app.js#L716) | bearerAuth; portal.admin | See handler |
-| GET | [`/security-automations/incidents`](../api/src/app.js#L730) | bearerAuth; portal.admin | — |
-| POST | [`/security-automations/preview`](../api/src/app.js#L725) | bearerAuth; portal.admin | See handler |
+| GET | [`/security-automations`](../api/src/app.js#L709) | bearerAuth; portal.admin | — |
+| POST | [`/security-automations`](../api/src/app.js#L710) | bearerAuth; portal.admin | See handler |
+| PATCH | [`/security-automations/{id}`](../api/src/app.js#L718) | bearerAuth; portal.admin | See handler |
+| GET | [`/security-automations/incidents`](../api/src/app.js#L732) | bearerAuth; portal.admin | — |
+| POST | [`/security-automations/preview`](../api/src/app.js#L727) | bearerAuth; portal.admin | See handler |
 
 ## segments
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/segments`](../api/src/app.js#L2560) | bearerAuth | — |
-| POST | [`/segments`](../api/src/app.js#L2561) | bearerAuth; portal.admin | See handler |
-| PATCH | [`/segments/{id}`](../api/src/app.js#L2572) | bearerAuth; portal.admin | See handler |
-| POST | [`/segments/{id}/access`](../api/src/app.js#L2773) | bearerAuth | See handler |
-| GET | [`/segments/{id}/challenges`](../api/src/app.js#L2835) | bearerAuth | — |
-| POST | [`/segments/{id}/challenges`](../api/src/app.js#L2846) | bearerAuth; portal.edit | [MfaChallengeRequest](#mfachallengerequest) |
-| POST | [`/segments/{id}/challenges/{challengeId}/resolve`](../api/src/app.js#L2854) | bearerAuth; portal.admin | [MfaResolveRequest](#mfaresolverequest) |
-| GET | [`/segments/{id}/entra-group/members`](../api/src/app.js#L2597) | bearerAuth; portal.admin | — |
-| POST | [`/segments/{id}/entra-group/sync`](../api/src/app.js#L2584) | bearerAuth; portal.admin | See handler |
-| POST | [`/segments/{id}/entra/start`](../api/src/app.js#L2788) | bearerAuth | See handler |
-| GET | [`/segments/{id}/lsa-baselines`](../api/src/app.js#L2604) | bearerAuth; portal.admin | — |
-| POST | [`/segments/{id}/lsa-baselines`](../api/src/app.js#L2608) | bearerAuth; portal.admin | [LsaBaselineRequest](#lsabaselinerequest) |
-| GET | [`/segments/access`](../api/src/app.js#L2746) | bearerAuth | — |
-| GET | [`/segments/access/grants`](../api/src/app.js#L2754) | bearerAuth | — |
-| POST | [`/segments/access/grants/{grantId}/revoke`](../api/src/app.js#L2766) | bearerAuth | See handler |
-| GET | [`/segments/access/prompts/{promptId}`](../api/src/app.js#L2759) | bearerAuth | — |
-| POST | [`/segments/entra/cancel`](../api/src/app.js#L2824) | bearerAuth | See handler |
-| POST | [`/segments/entra/complete`](../api/src/app.js#L2803) | bearerAuth | See handler |
+| GET | [`/segments`](../api/src/app.js#L2562) | bearerAuth | — |
+| POST | [`/segments`](../api/src/app.js#L2563) | bearerAuth; portal.admin | See handler |
+| PATCH | [`/segments/{id}`](../api/src/app.js#L2574) | bearerAuth; portal.admin | See handler |
+| POST | [`/segments/{id}/access`](../api/src/app.js#L2775) | bearerAuth | See handler |
+| GET | [`/segments/{id}/challenges`](../api/src/app.js#L2837) | bearerAuth | — |
+| POST | [`/segments/{id}/challenges`](../api/src/app.js#L2848) | bearerAuth; portal.edit | [MfaChallengeRequest](#mfachallengerequest) |
+| POST | [`/segments/{id}/challenges/{challengeId}/resolve`](../api/src/app.js#L2856) | bearerAuth; portal.admin | [MfaResolveRequest](#mfaresolverequest) |
+| GET | [`/segments/{id}/entra-group/members`](../api/src/app.js#L2599) | bearerAuth; portal.admin | — |
+| POST | [`/segments/{id}/entra-group/sync`](../api/src/app.js#L2586) | bearerAuth; portal.admin | See handler |
+| POST | [`/segments/{id}/entra/start`](../api/src/app.js#L2790) | bearerAuth | See handler |
+| GET | [`/segments/{id}/lsa-baselines`](../api/src/app.js#L2606) | bearerAuth; portal.admin | — |
+| POST | [`/segments/{id}/lsa-baselines`](../api/src/app.js#L2610) | bearerAuth; portal.admin | [LsaBaselineRequest](#lsabaselinerequest) |
+| GET | [`/segments/access`](../api/src/app.js#L2748) | bearerAuth | — |
+| GET | [`/segments/access/grants`](../api/src/app.js#L2756) | bearerAuth | — |
+| POST | [`/segments/access/grants/{grantId}/revoke`](../api/src/app.js#L2768) | bearerAuth | See handler |
+| GET | [`/segments/access/prompts/{promptId}`](../api/src/app.js#L2761) | bearerAuth | — |
+| POST | [`/segments/entra/cancel`](../api/src/app.js#L2826) | bearerAuth | See handler |
+| POST | [`/segments/entra/complete`](../api/src/app.js#L2805) | bearerAuth | See handler |
 
 ## settings
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/settings/agent-poll`](../api/src/app.js#L993) | bearerAuth; portal.admin | — |
-| PUT | [`/settings/agent-poll`](../api/src/app.js#L994) | bearerAuth; portal.admin | See handler |
-| GET | [`/settings/classifier`](../api/src/app.js#L1119) | bearerAuth; portal.admin | — |
-| GET | [`/settings/classifier/process-rules`](../api/src/app.js#L1148) | bearerAuth; portal.admin | — |
-| POST | [`/settings/classifier/process-rules`](../api/src/app.js#L1152) | bearerAuth; portal.admin | [ClassifierProcessRuleRequest](#classifierprocessrulerequest) |
-| DELETE | [`/settings/classifier/process-rules/{id}`](../api/src/app.js#L1164) | bearerAuth; portal.admin | — |
-| PATCH | [`/settings/classifier/process-rules/{id}`](../api/src/app.js#L1157) | bearerAuth; portal.admin | [ClassifierProcessRuleRequest](#classifierprocessrulerequest) |
-| POST | [`/settings/classifier/rules`](../api/src/app.js#L1123) | bearerAuth; portal.admin | [ClassifierRuleRequest](#classifierrulerequest) |
-| DELETE | [`/settings/classifier/rules/{id}`](../api/src/app.js#L1135) | bearerAuth; portal.admin | — |
-| PATCH | [`/settings/classifier/rules/{id}`](../api/src/app.js#L1128) | bearerAuth; portal.admin | [ClassifierRuleRequest](#classifierrulerequest) |
+| GET | [`/settings/agent-poll`](../api/src/app.js#L995) | bearerAuth; portal.admin | — |
+| PUT | [`/settings/agent-poll`](../api/src/app.js#L996) | bearerAuth; portal.admin | See handler |
+| GET | [`/settings/classifier`](../api/src/app.js#L1121) | bearerAuth; portal.admin | — |
+| GET | [`/settings/classifier/process-rules`](../api/src/app.js#L1150) | bearerAuth; portal.admin | — |
+| POST | [`/settings/classifier/process-rules`](../api/src/app.js#L1154) | bearerAuth; portal.admin | [ClassifierProcessRuleRequest](#classifierprocessrulerequest) |
+| DELETE | [`/settings/classifier/process-rules/{id}`](../api/src/app.js#L1166) | bearerAuth; portal.admin | — |
+| PATCH | [`/settings/classifier/process-rules/{id}`](../api/src/app.js#L1159) | bearerAuth; portal.admin | [ClassifierProcessRuleRequest](#classifierprocessrulerequest) |
+| POST | [`/settings/classifier/rules`](../api/src/app.js#L1125) | bearerAuth; portal.admin | [ClassifierRuleRequest](#classifierrulerequest) |
+| DELETE | [`/settings/classifier/rules/{id}`](../api/src/app.js#L1137) | bearerAuth; portal.admin | — |
+| PATCH | [`/settings/classifier/rules/{id}`](../api/src/app.js#L1130) | bearerAuth; portal.admin | [ClassifierRuleRequest](#classifierrulerequest) |
 | GET | `/settings/coverage` | bearerAuth; portal.admin | — |
 | PUT | `/settings/coverage` | bearerAuth; portal.admin | See handler |
-| GET | [`/settings/directory`](../api/src/app.js#L1233) | bearerAuth; portal.admin | — |
-| PATCH | [`/settings/directory`](../api/src/app.js#L1234) | bearerAuth; portal.admin | [DirectorySettingsRequest](#directorysettingsrequest) |
-| PATCH | [`/settings/directory/action-credential`](../api/src/app.js#L1269) | bearerAuth; portal.admin | See handler |
-| GET | [`/settings/discovery-linux`](../api/src/app.js#L1028) | bearerAuth; portal.admin | — |
-| PATCH | [`/settings/discovery-linux`](../api/src/app.js#L1033) | bearerAuth; portal.admin | See handler |
-| GET | [`/settings/discovery-triage`](../api/src/app.js#L1020) | bearerAuth; portal.admin | — |
-| PATCH | [`/settings/discovery-triage`](../api/src/app.js#L1021) | bearerAuth; portal.admin | See handler |
-| GET | [`/settings/entra`](../api/src/app.js#L731) | bearerAuth; portal.admin | — |
-| PATCH | [`/settings/entra`](../api/src/app.js#L732) | bearerAuth; portal.admin | [EntraSettingsRequest](#entrasettingsrequest) |
-| GET | [`/settings/logs-display`](../api/src/app.js#L1217) | bearerAuth | — |
-| GET | [`/settings/mfa-prompt`](../api/src/app.js#L736) | bearerAuth; portal.admin | — |
-| PATCH | [`/settings/mfa-prompt`](../api/src/app.js#L737) | bearerAuth; portal.admin | See handler |
-| GET | [`/settings/observability`](../api/src/app.js#L1044) | bearerAuth; portal.admin | — |
-| PATCH | [`/settings/observability`](../api/src/app.js#L1218) | bearerAuth; portal.admin | See handler |
-| PATCH | [`/settings/portal-branding`](../api/src/app.js#L748) | bearerAuth; portal.admin | See handler |
-| DELETE | [`/settings/portal-branding/image`](../api/src/app.js#L760) | bearerAuth; portal.admin | — |
-| PUT | [`/settings/portal-branding/image`](../api/src/app.js#L754) | bearerAuth; portal.admin | See handler |
-| GET | [`/settings/process-exclusions`](../api/src/app.js#L1090) | bearerAuth; portal.admin | — |
-| PUT | [`/settings/process-exclusions`](../api/src/app.js#L1091) | bearerAuth; portal.admin | See handler |
-| GET | [`/settings/server`](../api/src/app.js#L1050) | bearerAuth; portal.admin | — |
-| PATCH | [`/settings/server`](../api/src/app.js#L1061) | bearerAuth; portal.admin | [ServerSettingsRequest](#serversettingsrequest) |
-| GET | [`/settings/tls`](../api/src/app.js#L583) | bearerAuth; portal.admin | — |
-| PUT | [`/settings/tls/{kind}`](../api/src/app.js#L587) | bearerAuth; portal.admin | See handler |
-| GET | [`/settings/traffic-ignores`](../api/src/app.js#L1170) | bearerAuth; portal.admin | — |
-| POST | [`/settings/traffic-ignores`](../api/src/app.js#L1171) | bearerAuth; portal.admin | See handler |
-| DELETE | [`/settings/traffic-ignores/{id}`](../api/src/app.js#L1193) | bearerAuth; portal.admin | — |
-| POST | [`/settings/traffic-ignores/cleanup`](../api/src/app.js#L1200) | bearerAuth; portal.admin | See handler |
-| GET | [`/settings/training`](../api/src/app.js#L992) | bearerAuth | — |
-| PATCH | [`/settings/training`](../api/src/app.js#L1007) | bearerAuth; portal.admin | See handler |
-| GET | [`/settings/wef`](../api/src/app.js#L1076) | bearerAuth; portal.admin | — |
-| PATCH | [`/settings/wef`](../api/src/app.js#L1077) | bearerAuth; portal.admin | [WefSettingsRequest](#wefsettingsrequest) |
+| GET | [`/settings/directory`](../api/src/app.js#L1235) | bearerAuth; portal.admin | — |
+| PATCH | [`/settings/directory`](../api/src/app.js#L1236) | bearerAuth; portal.admin | [DirectorySettingsRequest](#directorysettingsrequest) |
+| PATCH | [`/settings/directory/action-credential`](../api/src/app.js#L1271) | bearerAuth; portal.admin | See handler |
+| GET | [`/settings/discovery-linux`](../api/src/app.js#L1030) | bearerAuth; portal.admin | — |
+| PATCH | [`/settings/discovery-linux`](../api/src/app.js#L1035) | bearerAuth; portal.admin | See handler |
+| GET | [`/settings/discovery-triage`](../api/src/app.js#L1022) | bearerAuth; portal.admin | — |
+| PATCH | [`/settings/discovery-triage`](../api/src/app.js#L1023) | bearerAuth; portal.admin | See handler |
+| GET | [`/settings/entra`](../api/src/app.js#L733) | bearerAuth; portal.admin | — |
+| PATCH | [`/settings/entra`](../api/src/app.js#L734) | bearerAuth; portal.admin | [EntraSettingsRequest](#entrasettingsrequest) |
+| GET | [`/settings/logs-display`](../api/src/app.js#L1219) | bearerAuth | — |
+| GET | [`/settings/mfa-prompt`](../api/src/app.js#L738) | bearerAuth; portal.admin | — |
+| PATCH | [`/settings/mfa-prompt`](../api/src/app.js#L739) | bearerAuth; portal.admin | See handler |
+| GET | [`/settings/observability`](../api/src/app.js#L1046) | bearerAuth; portal.admin | — |
+| PATCH | [`/settings/observability`](../api/src/app.js#L1220) | bearerAuth; portal.admin | See handler |
+| PATCH | [`/settings/portal-branding`](../api/src/app.js#L750) | bearerAuth; portal.admin | See handler |
+| DELETE | [`/settings/portal-branding/image`](../api/src/app.js#L762) | bearerAuth; portal.admin | — |
+| PUT | [`/settings/portal-branding/image`](../api/src/app.js#L756) | bearerAuth; portal.admin | See handler |
+| GET | [`/settings/process-exclusions`](../api/src/app.js#L1092) | bearerAuth; portal.admin | — |
+| PUT | [`/settings/process-exclusions`](../api/src/app.js#L1093) | bearerAuth; portal.admin | See handler |
+| GET | [`/settings/server`](../api/src/app.js#L1052) | bearerAuth; portal.admin | — |
+| PATCH | [`/settings/server`](../api/src/app.js#L1063) | bearerAuth; portal.admin | [ServerSettingsRequest](#serversettingsrequest) |
+| GET | [`/settings/tls`](../api/src/app.js#L585) | bearerAuth; portal.admin | — |
+| PUT | [`/settings/tls/{kind}`](../api/src/app.js#L589) | bearerAuth; portal.admin | See handler |
+| GET | [`/settings/traffic-ignores`](../api/src/app.js#L1172) | bearerAuth; portal.admin | — |
+| POST | [`/settings/traffic-ignores`](../api/src/app.js#L1173) | bearerAuth; portal.admin | See handler |
+| DELETE | [`/settings/traffic-ignores/{id}`](../api/src/app.js#L1195) | bearerAuth; portal.admin | — |
+| POST | [`/settings/traffic-ignores/cleanup`](../api/src/app.js#L1202) | bearerAuth; portal.admin | See handler |
+| GET | [`/settings/training`](../api/src/app.js#L994) | bearerAuth | — |
+| PATCH | [`/settings/training`](../api/src/app.js#L1009) | bearerAuth; portal.admin | See handler |
+| GET | [`/settings/wef`](../api/src/app.js#L1078) | bearerAuth; portal.admin | — |
+| PATCH | [`/settings/wef`](../api/src/app.js#L1079) | bearerAuth; portal.admin | [WefSettingsRequest](#wefsettingsrequest) |
 
 ## teams
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/teams`](../api/src/app.js#L877) | bearerAuth | — |
-| POST | [`/teams`](../api/src/app.js#L878) | bearerAuth; portal.admin | See handler |
-| DELETE | [`/teams/{id}`](../api/src/app.js#L886) | bearerAuth; portal.admin | — |
-| PATCH | [`/teams/{id}`](../api/src/app.js#L879) | bearerAuth; portal.admin | See handler |
-| POST | [`/teams/{id}/members`](../api/src/app.js#L897) | bearerAuth; portal.admin | See handler |
-| DELETE | [`/teams/{id}/members/{userId}`](../api/src/app.js#L909) | bearerAuth; portal.admin | — |
+| GET | [`/teams`](../api/src/app.js#L879) | bearerAuth | — |
+| POST | [`/teams`](../api/src/app.js#L880) | bearerAuth; portal.admin | See handler |
+| DELETE | [`/teams/{id}`](../api/src/app.js#L888) | bearerAuth; portal.admin | — |
+| PATCH | [`/teams/{id}`](../api/src/app.js#L881) | bearerAuth; portal.admin | See handler |
+| POST | [`/teams/{id}/members`](../api/src/app.js#L899) | bearerAuth; portal.admin | See handler |
+| DELETE | [`/teams/{id}/members/{userId}`](../api/src/app.js#L911) | bearerAuth; portal.admin | — |
+
+## User API keys
+
+| Method | Route / handler | Authentication; permission | JSON body schema |
+|---|---|---|---|
+| GET | `/api-keys/` | bearerAuth | — |
+| POST | `/api-keys/` | bearerAuth | [UserApiKeyCreateRequest](#userapikeycreaterequest) |
+| DELETE | `/api-keys/{id}` | bearerAuth | — |
+| PATCH | `/api-keys/{id}` | bearerAuth | [UserApiKeyEditRequest](#userapikeyeditrequest) |
+| POST | `/api-keys/{id}/revoke` | bearerAuth | See handler |
+| POST | `/api-keys/{id}/rotate` | bearerAuth | See handler |
+| GET | `/api-keys/options` | bearerAuth | — |
+
+**GET /api-keys/**
+
+Requires an interactive user-session bearer token. Users manage their own keys; administrators may administer users with equal or lower permissions. API keys cannot call key-management endpoints. Secrets are returned only on create/rotate; all responses are no-store.
+
+Query parameters: `q` (string), `owner` (string; default self), `status` (string; default all), `purpose` (string; default all), `sort` (string; default created), `direction` (string; default desc), `page` (integer; default 1; min 1), `pageSize` (integer; default 25; min 1; max 100).
+
+**POST /api-keys/**
+
+Requires an interactive user-session bearer token. Users manage their own keys; administrators may administer users with equal or lower permissions. API keys cannot call key-management endpoints. Secrets are returned only on create/rotate; all responses are no-store.
+
+**DELETE /api-keys/{id}**
+
+Requires an interactive user-session bearer token. Users manage their own keys; administrators may administer users with equal or lower permissions. API keys cannot call key-management endpoints. Secrets are returned only on create/rotate; all responses are no-store.
+
+**PATCH /api-keys/{id}**
+
+Requires an interactive user-session bearer token. Users manage their own keys; administrators may administer users with equal or lower permissions. API keys cannot call key-management endpoints. Secrets are returned only on create/rotate; all responses are no-store.
+
+**POST /api-keys/{id}/revoke**
+
+Requires an interactive user-session bearer token. Users manage their own keys; administrators may administer users with equal or lower permissions. API keys cannot call key-management endpoints. Secrets are returned only on create/rotate; all responses are no-store.
+
+**POST /api-keys/{id}/rotate**
+
+Requires an interactive user-session bearer token. Users manage their own keys; administrators may administer users with equal or lower permissions. API keys cannot call key-management endpoints. Secrets are returned only on create/rotate; all responses are no-store.
+
+**GET /api-keys/options**
+
+Requires an interactive user-session bearer token. Users manage their own keys; administrators may administer users with equal or lower permissions. API keys cannot call key-management endpoints. Secrets are returned only on create/rotate; all responses are no-store.
 
 ## users
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/users`](../api/src/app.js#L800) | bearerAuth; portal.admin | — |
-| POST | [`/users`](../api/src/app.js#L824) | bearerAuth; portal.admin | See handler |
-| DELETE | [`/users/{id}`](../api/src/app.js#L841) | bearerAuth; portal.owner | — |
-| PATCH | [`/users/{id}`](../api/src/app.js#L830) | bearerAuth; portal.admin | See handler |
-| DELETE | [`/users/{id}/avatar`](../api/src/app.js#L871) | bearerAuth | — |
-| PUT | [`/users/{id}/avatar`](../api/src/app.js#L862) | bearerAuth | See handler |
-| PATCH | [`/users/{id}/profile`](../api/src/app.js#L848) | bearerAuth | See handler |
-| POST | [`/users/{id}/revoke-sessions`](../api/src/app.js#L842) | bearerAuth; portal.admin | See handler |
+| GET | [`/users`](../api/src/app.js#L802) | bearerAuth; portal.admin | — |
+| POST | [`/users`](../api/src/app.js#L826) | bearerAuth; portal.admin | See handler |
+| DELETE | [`/users/{id}`](../api/src/app.js#L843) | bearerAuth; portal.owner | — |
+| PATCH | [`/users/{id}`](../api/src/app.js#L832) | bearerAuth; portal.admin | See handler |
+| DELETE | [`/users/{id}/avatar`](../api/src/app.js#L873) | bearerAuth | — |
+| PUT | [`/users/{id}/avatar`](../api/src/app.js#L864) | bearerAuth | See handler |
+| PATCH | [`/users/{id}/profile`](../api/src/app.js#L850) | bearerAuth | See handler |
+| POST | [`/users/{id}/revoke-sessions`](../api/src/app.js#L844) | bearerAuth; portal.admin | See handler |
 
 ## verifier
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| GET | [`/verifier/results`](../api/src/app.js#L2413) | bearerAuth | — |
-| POST | [`/verifier/runs`](../api/src/app.js#L2407) | bearerAuth; portal.edit | See handler |
-| GET | [`/verifier/runs/{id}`](../api/src/app.js#L2412) | bearerAuth | — |
+| GET | [`/verifier/results`](../api/src/app.js#L2415) | bearerAuth | — |
+| POST | [`/verifier/runs`](../api/src/app.js#L2409) | bearerAuth; portal.edit | See handler |
+| GET | [`/verifier/runs/{id}`](../api/src/app.js#L2414) | bearerAuth | — |
 
 ## wef
 
 | Method | Route / handler | Authentication; permission | JSON body schema |
 |---|---|---|---|
-| POST | [`/wef/wsman`](../api/src/app.js#L566) | wefHmac | See handler |
+| POST | [`/wef/wsman`](../api/src/app.js#L567) | wefHmac | See handler |
 
 ## Schemas
 
@@ -4147,6 +4201,85 @@ Schemas include types, required fields, allowed values, bounds, and descriptions
         "null"
       ],
       "maxLength": 500
+    }
+  },
+  "additionalProperties": false
+}
+```
+
+### UserApiKeyCreateRequest
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100
+    },
+    "userId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "purpose": {
+      "type": "string",
+      "enum": [
+        "api",
+        "mcp"
+      ]
+    },
+    "access": {
+      "default": "read",
+      "type": "string",
+      "enum": [
+        "read",
+        "write"
+      ]
+    },
+    "expiresAt": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+    },
+    "nodeIds": {
+      "default": [],
+      "maxItems": 100,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "required": [
+    "name",
+    "purpose",
+    "access",
+    "expiresAt",
+    "nodeIds"
+  ],
+  "additionalProperties": false
+}
+```
+
+### UserApiKeyEditRequest
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100
+    },
+    "expiresAt": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
     }
   },
   "additionalProperties": false

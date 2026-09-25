@@ -2,7 +2,7 @@
 
 # WinFire Secure
 
-WinFire Secure is an API-first control plane for host inventory, firewall visibility and policy, network mapping, and identity-based access. The Vue operator interface and Express API can be served from one origin. The current persistent store is SQLite.
+WinFire Secure is an API-first control plane for host inventory, firewall visibility and policy, network mapping, and identity-based access. The Vue operator interface and Express API can be served from one origin. The current persistent store is SQLite.  Docker information contained for enterprise scalable deployments.
 
 ## Documentation
 
@@ -13,31 +13,42 @@ WinFire Secure is an API-first control plane for host inventory, firewall visibi
 | [API usage and curl examples](docs/API.md) | Authentication, inventory queries, credentials, discovery, DHCP, groups, events, topology and JIT access. |
 | [Complete API route reference](docs/API_ROUTES.md) | Every registered API operation, authentication/permission gates, source handler links and published request schemas. |
 | [Internet connections](docs/INTERNET_CONNECTIONS.md) | Outside-LAN firewall observations, dual-stack CIDRs, PTR evidence, lifecycle, API filters and exports. |
-| [AI usage setup and operations](docs/AI_USAGE.md) | Reporter enrollment, REST/MCP OAuth, stdio, JS/Python/hooks/OTLP, evidence, retention and troubleshooting. |
-| [AI usage research decisions](docs/AI_USAGE_RESEARCH.md) | Completed PLAN §27.1 research: MCP/OAuth, reporting, attribution, provider evidence and delivery gates. Delivery is implemented; deployment-specific OAuth configuration is required for remote MCP. |
+| [AI usage setup and operations](docs/AI_USAGE.md) | Reporter enrollment, REST/MCP OAuth or user keys, stdio, JS/Python/hooks/OTLP, evidence, retention and troubleshooting. |
+| [AI usage research decisions](docs/AI_USAGE_RESEARCH.md) | Completed PLAN §27.1 research: MCP/OAuth, reporting, attribution, provider evidence and delivery gates. Delivery is implemented; remote MCP supports a configured OAuth provider or user-owned MCP reporting keys. |
 | [SNMP MIB library](docs/SNMP_LIBRARY.md) | Built-in coverage, filesystem storage, multipart uploads/downloads, full Cisco and LibreNMS catalog imports, matching, device links, collected facts and curl examples. |
 | [DHCP lease import](docs/DHCP_IMPORT.md) | Windows export script, preview/import, MAC/IP correlation, retained evidence, conflict handling and API contract. |
 | [JIT MFA: how it works](docs/JIT_MFA.md) | Setup, supported platforms, prompting, identity checks, firewall gates, temporary grants, expiry, fallback and verification. |
 | [Enterprise Internet deployment](docs/INTERNET_ENTERPRISE_DEPLOYMENT.md) | Browser extension deployment and URL telemetry/policy. |
 
-Administration → Discovery → **Azure / Arc** provides scoped VM/Arc inventory, dedicated Azure vault credentials, access tests, previews, recurring read-only syncs, identity conflict review and source details. Cloud status stays separate from host management verification. See [Azure discovery setup, API examples and rollout gates](docs/AZURE_DISCOVERY.md).
-
-Live OpenAPI: **`GET /api/v1/openapi.json`**. Regenerate the route reference with `npm run docs:api`; generation uses a disposable database and does not contact inventory hosts.
-
 ## Feature summary
 
+- **Administration → Discovery → Azure / Arc** provides scoped VM/Arc inventory, dedicated Azure vault credentials, access tests, previews, recurring read-only syncs, identity conflict review and source details. Cloud status stays separate from host management verification. See [Azure discovery setup, API examples and rollout gates](docs/AZURE_DISCOVERY.md).
+
+- **Live OpenAPI:** `GET /api/v1/openapi.json`. Regenerate the route reference with `npm run docs:api`; generation uses a disposable database and does not contact inventory hosts.
+
+- **Administration → Security → API keys** manages user-owned API automation keys and MCP reporting keys. Create, edit expiry/name, rotate, revoke or delete keys; the secret is shown once. Administrators can manage keys for permitted users. See [API key setup and usage](docs/API_KEYS.md) for scopes, MCP configuration and curl examples.
+
 - **Inventory and correlation:** local-CIDR inventory boundary, server-side search/filter/sort/pagination, managed-first ordering, MAC correlation, TTL family hints, authenticated OS/hardware facts, hypervisor identity, ESXi VM inventory/correlation, and retained device-classification evidence. External peers remain in events and mapping.
+
 - **Discovery:** CIDR scans with ICMP/ARP/TCP fallback; recurring scans with new/dark/changed diffs; Windows directory sync with [per-OU credential preferences](docs/USAGE.md#ad-credentials-by-organizational-unit); SNMP identity/ARP/routes/TCP/forwarding tables, hardware/interface/LLDP coverage, and an importable MIB library with automatic device matching; Linux SSH defaults; passive ARP candidates; optional Windows DHCP lease import with preview and conflict reports.
+
 - **Management:** Windows agentless transports, Linux SSH facts and supported firewall actions, SNMP visibility, VMware ESXi API inventory, and optional enrolled agents. Unknown/discovery-only assets remain unmanaged until independent management verification succeeds.
+
 - **Triage and groups:** unmanaged/rogue asset queue, bulk credential retry/flag/exclude/restore, static groups and server-evaluated dynamic membership rules.
+
 - **Vault and access:** encrypted write-only credentials, resource grants, credential preflight and rotation-failure notices, owner/admin/editor/auditor permissions, custom roles, teams, invitations, TOTP and audit history.
+
 - **Policies and learning:** visual/classic editors, versions/diffs, conflict checks, assignments, verification, scheduled sync, training proposals, progressive learning and rollback workflows.
+
 - **Events and mapping:** separate Firewall events and Accounts tables, transaction details and quick rule actions, classifier catalog/custom rules, exports/ignores, WEF/agent collection, topology graph, neighbors, top talkers and node/subnet/switch/time filters.
+
 - **Identity and JIT MFA:** TOTP or Entra portal requests, optional source-desktop browser prompts, scoped temporary Windows firewall grants, host-local expiry plus server cleanup, optional account-right baselines and audited fallback behavior.
+
 - **AI visibility:** metadata-only REST/MCP reporting, scoped reporter credentials, versioned provider catalog, uncertain network evidence, separate usage/traffic totals, node timelines and server-filtered AI Usage tables.
+
 - **Operations:** administration settings, TLS/agent PKI, branding, notifications, security automation, Internet extension visibility, retention/compaction, reporting and health endpoints.
 
-Capabilities depend on the transport, permissions and remote platform. SNMP tables vary by device/MIB. TTL hints are advisory. SSH source-desktop prompting is implemented, while the current agentless **portal grant target still requires WinRM/WinRMS**. See the supported-path table in the JIT MFA guide.
+**Capabilities depend on the transport, permissions and remote platform. SNMP tables vary by device/MIB. TTL hints are advisory. SSH source-desktop prompting is implemented, while the current agentless **portal grant target still requires WinRM/WinRMS**. See the supported-path table in the JIT MFA guide.**
 
 ## Quick start
 
@@ -116,11 +127,13 @@ The frontend route is `/` for Dashboard, `/inventory` for assets/groups/triage, 
 
 ## Simple Dashboard
 ![ScreenShot1](assets/dashboardEnterprise.png)
+- **Web Dashboard** Shows the entire control plane status from one quick easy to understand dashboard.
 
 ## Intuitive Administration
 ![ScreenShot2](assets/admin.png)
+- **Web Driven Administration** Makes the administration experience easier than ever removing the need for a lot of manual environment variables (still an option though).
 
-## Easily Identify Assets using Active Directory, ICMP, or SNMP Scanning.
+## Easily Identify Assets using Active Directory, Azure ARC, ARP, ICMP, Switch Discovery via state tables or SNMP Scanning.
 ![ScreenShot3](assets/assetsView.png)
 
 ## Drag and Drop Policy Editor
@@ -129,7 +142,7 @@ The frontend route is `/` for Dashboard, `/inventory` for assets/groups/triage, 
 ## Easily Identify Firewall Events from every node in one place with simple one-click rule creation.
 ![ScreenShot5](assets/firewallevents.png)
 
-## Enterprise Logon
+## Enterprise Logon with support for EntraID and Active Directory over LDAPS
 ![ScreenShot6](assets/login.png)
 
 ## Dynamic Rules Engine Auto-Learns from traffic detected at the client firewalls.

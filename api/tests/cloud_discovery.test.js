@@ -197,3 +197,100 @@ test('Azure certificate validation, tenant mismatch and explicit host identity e
     try{await assert.rejects(azureClient({...settings,authMethod:'managed-identity'}).accessToken(),e=>e.code==='identity_unavailable')}finally{if(previous!==undefined)process.env.AZURE_DISCOVERY_MANAGED_IDENTITY=previous}
   }finally{fs.rmSync(certDir,{recursive:true,force:true})}
 })
+
+test('recreated resources stay quarantined across scans and automatic links can be reviewed and reversed',async()=>{
+  const original=record('recreated','10.0.0.90'),first=reconcileRecord(original,connection,'identity-original',owner.id)
+  const replacement={...original,uuid:id(),hostname:'replacement'}
+  assert.equal(reconcileRecord(replacement,connection,'identity-replaced',owner.id).state,'conflict')
+  assert.equal(reconcileRecord(replacement,connection,'identity-repeat',owner.id).state,'conflict')
+  assert.equal(one('SELECT hostname FROM nodes WHERE id=?',first.nodeId).hostname,original.hostname)
+  await auth(request.post(`/api/v1/discovery/azure/resources/${first.sourceId}/resolve`)).send({action:'link',nodeId:first.nodeId,reason:'Operator confirmed replacement retains asset ownership'}).expect(200)
+  assert.equal(reconcileRecord(replacement,connection,'identity-reviewed',owner.id).state,'linked')
+  await auth(request.post(`/api/v1/discovery/azure/resources/${first.sourceId}/resolve`)).send({action:'unlink',reason:'Reversing source association'}).expect(200)
+  assert.equal(reconcileRecord(replacement,connection,'identity-unlinked',owner.id).nodeId,null)
+  const history=(await auth(request.get(`/api/v1/discovery/azure/resources/${first.sourceId}/history`)).expect(200)).body
+  assert.equal(history.pageSize,25)
+  assert.ok(history.items.some(h=>h.after.reason==='Resource identity changed or was recreated'))
+  assert.ok(history.items.some(h=>h.after.previousNodeId===first.nodeId&&h.after.action==='unlink'))
+  assert.ok(one('SELECT id FROM nodes WHERE id=?',first.nodeId))
+  run("UPDATE users SET role='auditor' WHERE id=?",owner.id)
+  try{
+    await auth(request.get(`/api/v1/discovery/azure/resources/${first.sourceId}/history`)).expect(200)
+    await auth(request.post(`/api/v1/discovery/azure/resources/${first.sourceId}/resolve`)).send({action:'ignore',reason:'Not permitted'}).expect(403)
+  }finally{run("UPDATE users SET role='owner' WHERE id=?",owner.id)}
+})
+
+test('clones, resource moves and IP reuse require review while renames preserve manual fields',()=>{
+  const original=record('move-original','10.0.0.91'),first=reconcileRecord(original,connection,'move-original',owner.id)
+  const clone={...original,resourceId:original.resourceId+'-clone',name:'clone'}
+  assert.equal(reconcileRecord(clone,connection,'clone',owner.id).state,'conflict')
+  assert.equal(reconcileRecord({...original,resourceId:original.resourceId.replace('/fixture/','/moved-group/')},connection,'moved',owner.id).state,'conflict')
+  const reuse={...record('ip-reused','10.0.0.91'),uuid:id()}
+  assert.equal(reconcileRecord(reuse,connection,'ip-reused',owner.id).state,'conflict')
+  run('UPDATE nodes SET hostname=? WHERE id=?','Operator chosen name',first.nodeId)
+  const renamed=reconcileRecord({...original,name:'renamed',hostname:'Provider renamed host'},connection,'rename',owner.id)
+  assert.equal(renamed.nodeId,first.nodeId)
+  assert.equal(one('SELECT hostname FROM nodes WHERE id=?',first.nodeId).hostname,'Operator chosen name')
+})
+
+test('complete misses require grace and provider confirmation; deletion and re-onboarding preserve the node',async()=>{
+  const {saveConnection}=await import('../src/cloud/service.js')
+  const cfg=saveConnection({name:'Lifecycle fixture',credentialId:connection.credentialId,subscriptions:[subscription],scopeId:scopeA},owner.id)
+  const observed=record('lifecycle','10.0.0.92')
+  let records=[observed],complete=true,confirmation='exists'
+  const adapter=async()=>({records,scopes:[{subscriptionId:subscription,complete}],complete,requests:1})
+  const clientFactory=()=>({request:async()=>{if(confirmation==='missing')throw Object.assign(new Error('Deleted'),{code:'resource_unavailable'});if(confirmation==='denied')throw Object.assign(new Error('Denied'),{code:'permission_denied'});return {id:observed.resourceId}}})
+  const sync=async()=>{const job=enqueueRun(cfg.id,'sync',owner.id);await processAzureWork({adapter,clientFactory,schedule:false});return getRun(job.id)}
+  await sync()
+  const source=one('SELECT * FROM asset_sources WHERE resource_id=?',observed.resourceId.toLowerCase())
+  run("UPDATE nodes SET firewall_state='learning' WHERE id=?",source.node_id)
+  const groupCount=one('SELECT COUNT(*) n FROM node_group_members WHERE node_id=?',source.node_id).n
+  records=[];complete=false;await sync()
+  assert.equal(one('SELECT missing_runs FROM asset_sources WHERE id=?',source.id).missing_runs,0)
+  complete=true;await sync();await sync();await sync()
+  assert.equal(one('SELECT state FROM asset_sources WHERE id=?',source.id).state,'missing')
+  run("UPDATE asset_sources SET missing_since='2020-01-01T00:00:00Z' WHERE id=?",source.id)
+  confirmation='denied';await sync()
+  assert.equal(one('SELECT state FROM asset_sources WHERE id=?',source.id).state,'missing')
+  confirmation='exists';await sync()
+  assert.equal(one('SELECT state FROM asset_sources WHERE id=?',source.id).state,'missing')
+  confirmation='missing';await sync()
+  assert.equal(one('SELECT state FROM asset_sources WHERE id=?',source.id).state,'retired')
+  assert.equal(one('SELECT firewall_state FROM nodes WHERE id=?',source.node_id).firewall_state,'learning')
+  assert.equal(one('SELECT COUNT(*) n FROM node_group_members WHERE node_id=?',source.node_id).n,groupCount)
+  records=[observed];await sync()
+  const returned=one('SELECT * FROM asset_sources WHERE id=?',source.id)
+  assert.equal(returned.node_id,source.node_id);assert.equal(returned.state,'linked');assert.equal(returned.missing_runs,0)
+})
+
+test('resource search, sort, pagination and export share the filtered population',async()=>{
+  for(let i=0;i<32;i++)reconcileRecord(record('page-'+String(i).padStart(2,'0'),'10.0.0.'+(120+i)),connection,'pagination',owner.id)
+  const query='q=page-&scopeId='+scopeA+'&sort=name&direction=asc'
+  const page1=(await auth(request.get('/api/v1/discovery/azure/resources?'+query)).expect(200)).body
+  const page2=(await auth(request.get('/api/v1/discovery/azure/resources?'+query+'&page=2')).expect(200)).body
+  const exported=(await auth(request.get('/api/v1/discovery/azure/resources/export?'+query)).expect(200)).body
+  assert.equal(page1.total,32);assert.equal(page1.items.length,25);assert.equal(page2.items.length,7)
+  assert.deepEqual(exported.items.map(r=>r.id),[...page1.items,...page2.items].map(r=>r.id))
+  assert.equal(new Set(exported.items.map(r=>r.id)).size,32)
+})
+
+test('recurring sync recovers an abandoned lease without duplicates and running cancellation writes no assets',async()=>{
+  const {saveConnection,cancelRun}=await import('../src/cloud/service.js')
+  const cfg=saveConnection({name:'Scheduled fixture',credentialId:connection.credentialId,subscriptions:[subscription],scopeId:scopeA,enabled:true,intervalMinutes:5},owner.id)
+  const observation=record('scheduled','10.0.0.190')
+  const adapter=async()=>({records:[observation],scopes:[{subscriptionId:subscription,complete:true}],complete:true,requests:1})
+  await processAzureWork({adapter,clientFactory:()=>({})})
+  assert.equal(one('SELECT status FROM azure_runs WHERE connection_id=?',cfg.id).status,'completed')
+  assert.ok(Date.parse(one('SELECT next_run_at FROM azure_connections WHERE id=?',cfg.id).next_run_at)>Date.now())
+  const source=one('SELECT node_id FROM asset_sources WHERE resource_id=?',observation.resourceId.toLowerCase())
+  const abandoned=enqueueRun(cfg.id,'sync',owner.id)
+  run("UPDATE azure_runs SET status='running',lease_until='2020-01-01T00:00:00Z' WHERE id=?",abandoned.id)
+  await processAzureWork({adapter,clientFactory:()=>({})})
+  assert.equal(getRun(abandoned.id).status,'completed')
+  assert.equal(one('SELECT COUNT(*) n FROM azure_runs WHERE connection_id=?',cfg.id).n,2)
+  assert.equal(one('SELECT node_id FROM asset_sources WHERE resource_id=?',observation.resourceId.toLowerCase()).node_id,source.node_id)
+  const cancelled=enqueueRun(cfg.id,'sync',owner.id),before=one('SELECT COUNT(*) n FROM nodes').n
+  await processAzureWork({schedule:false,clientFactory:()=>({}),adapter:async()=>{cancelRun(cancelled.id,owner.id);return {records:[record('cancelled','10.0.0.191')],scopes:[],complete:true,requests:1}}})
+  assert.equal(getRun(cancelled.id).status,'cancelled')
+  assert.equal(one('SELECT COUNT(*) n FROM nodes').n,before)
+})

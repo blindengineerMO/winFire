@@ -21,7 +21,7 @@ export function describeCloudOperation(operation,method,path){
     if(/\/(test|preview|sync)$/.test(path))operation.responses={202:{description:'Durable run queued; poll /discovery/azure/runs/{id}. Test and preview do not write inventory.'},default:operation.responses.default}
     else if(method==='post'&&!resolution&&!path.endsWith('/cancel'))operation.responses={201:{description:'Created'},default:operation.responses.default}
   }
-  if(method==='get'&&['/discovery/azure/resources','/discovery/azure/resources/export','/discovery/azure/runs','/inventory/conflicts'].includes(path)){
+  if(method==='get'&&['/discovery/azure/resources','/discovery/azure/resources/export','/discovery/azure/runs','/inventory/conflicts'].includes(path)||method==='get'&&path.endsWith('/history')){
     const fields=z.toJSONSchema(pageSchema).properties
     operation.parameters.push(...Object.entries(fields).map(([name,schema])=>({name,in:'query',schema})))
   }

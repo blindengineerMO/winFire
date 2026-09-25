@@ -1,0 +1,100 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import supertest from 'supertest'
+import {Client,StreamableHTTPClientTransport} from '@modelcontextprotocol/client'
+const dir=fs.mkdtempSync(os.tmpdir()+'/winfire-api-keys-')
+process.env.DATA_DIR=dir;process.env.NODE_ENV='test';delete process.env.AI_OAUTH_ISSUER
+const {app}=await import('../src/app.js')
+const {db,one,run,id}=await import('../src/db.js')
+const {issueAccess}=await import('../src/security.js')
+const {authenticateApiKey}=await import('../src/apiKeyAuth.js')
+const user=(role,email)=>{const uid=id();run('INSERT INTO users(id,email,password_hash,role,email_verified) VALUES(?,?,?,?,1)',uid,email,'unused-test-password',role);return one('SELECT * FROM users WHERE id=?',uid)}
+const owner=user('owner','key-owner@example.test'),editor=user('editor','key-editor@example.test'),admin=user('admin','key-admin@example.test'),auditor=user('auditor','key-auditor@example.test')
+const request=supertest(app),as=(who,r)=>r.set('Authorization','Bearer '+issueAccess(who)),using=(secret,r)=>r.set('Authorization','Bearer '+secret)
+const expiresAt=new Date(Date.now()+86400000).toISOString()
+const create=async(who,body={})=>(await as(who,request.post('/api/v1/api-keys')).send({name:'Fixture key',purpose:'api',expiresAt,...body}).expect(201)).body
+let server,client
+test.after(async()=>{if(client)await client.close();if(server)await new Promise(r=>server.close(r));db.close();fs.rmSync(dir,{recursive:true,force:true})})
+test('keys are write-once secrets; list/search/page expose metadata only; read/write scopes preserve role checks',async()=>{
+ const k=await create(owner)
+ assert.match(k.secret,/^wfuk_[A-Za-z0-9_-]{43}$/)
+ const stored=one('SELECT * FROM user_api_keys WHERE id=?',k.key.id)
+ assert.ok(!JSON.stringify(stored).includes(k.secret));assert.equal(stored.token_hash.length,64)
+ const list=await as(owner,request.get('/api/v1/api-keys?q=Fixture&sort=name')).expect(200)
+ assert.equal(list.body.pageSize,25);assert.equal(list.body.total,1);assert.ok(!JSON.stringify(list.body).includes(k.secret));assert.equal(list.body.items[0].token_hash,undefined)
+ await using(k.secret,request.get('/api/v1/nodes?page=1')).expect(200)
+ assert.ok(one('SELECT last_used_at FROM user_api_keys WHERE id=?',k.key.id).last_used_at)
+ await using(k.secret,request.post('/api/v1/node-groups')).send({name:'Read key denied'}).expect(403)
+ await using(k.secret,request.get('/api/v1/api-keys')).expect(403)
+ const writer=await create(auditor,{access:'write'})
+ await using(writer.secret,request.post('/api/v1/node-groups')).send({name:'Auditor still denied'}).expect(403)
+ assert.ok(!JSON.stringify(db.prepare('SELECT * FROM audit_log').all()).includes(k.secret))
+ const spec=(await request.get('/api/v1/openapi.json').expect(200)).body
+ assert.equal(spec.paths['/api-keys/'].post.requestBody.content['application/json'].schema.$ref,'#/components/schemas/UserApiKeyCreateRequest')
+ assert.equal(spec.paths['/api-keys/'].get.parameters.find(p=>p.name==='pageSize').schema.default,25)
+})
+test('users manage only their own keys; admins cannot mint owner keys and can revoke suspended-user keys',async()=>{
+ const theirs=await create(editor)
+ await as(auditor,request.patch('/api/v1/api-keys/'+theirs.key.id)).send({name:'stolen'}).expect(403)
+ await as(editor,request.get('/api/v1/api-keys?owner=all')).expect(403)
+ await as(admin,request.post('/api/v1/api-keys')).send({name:'No elevation',purpose:'api',userId:owner.id,expiresAt}).expect(403)
+ const bound=await create(owner,{purpose:'mcp',userId:editor.id})
+ assert.equal(bound.key.userId,editor.id)
+ run('UPDATE users SET suspended=1 WHERE id=?',editor.id)
+ const all=(await as(admin,request.get('/api/v1/api-keys?owner=all')).expect(200)).body
+ assert.ok(all.items.some(k=>k.id===theirs.key.id))
+ await using(theirs.secret,request.get('/api/v1/nodes')).expect(401)
+ await as(admin,request.post('/api/v1/api-keys/'+theirs.key.id+'/revoke')).expect(200)
+ run('UPDATE users SET suspended=0 WHERE id=?',editor.id)
+ await using(theirs.secret,request.get('/api/v1/nodes')).expect(401)
+})
+test('rotation, expiry, revocation and deletion take effect on the next request',async()=>{
+ const k=await create(editor)
+ const rotated=(await as(editor,request.post('/api/v1/api-keys/'+k.key.id+'/rotate')).expect(200)).body
+ await using(k.secret,request.get('/api/v1/nodes')).expect(401)
+ await using(rotated.secret,request.get('/api/v1/nodes')).expect(200)
+ run("UPDATE user_api_keys SET expires_at='2020-01-01T00:00:00Z' WHERE id=?",k.key.id)
+ await using(rotated.secret,request.get('/api/v1/nodes')).expect(401)
+ await as(editor,request.patch('/api/v1/api-keys/'+k.key.id)).send({name:'Updated key',expiresAt}).expect(200)
+ await using(rotated.secret,request.get('/api/v1/nodes')).expect(200)
+ await as(editor,request.post('/api/v1/api-keys/'+k.key.id+'/revoke')).expect(200)
+ await using(rotated.secret,request.get('/api/v1/nodes')).expect(401)
+ await as(editor,request.post('/api/v1/api-keys/'+k.key.id+'/rotate')).expect(409)
+ await as(editor,request.delete('/api/v1/api-keys/'+k.key.id)).expect(204)
+ assert.equal(one('SELECT id FROM user_api_keys WHERE id=?',k.key.id),undefined)
+ await as(owner,request.post('/api/v1/api-keys')).send({name:'Bad expiry',purpose:'api',expiresAt:'2020-01-01T00:00:00Z'}).expect(400)
+})
+test('MCP keys authenticate an independent SDK without OAuth and stay bound to the user and reporting nodes',async()=>{
+ run("INSERT INTO nodes(id,hostname) VALUES('key-node','Key fixture')")
+ await as(editor,request.post('/api/v1/api-keys')).send({name:'Unauthorized node binding',purpose:'mcp',expiresAt,nodeIds:['key-node']}).expect(403)
+ const k=await create(owner,{purpose:'mcp',userId:editor.id,nodeIds:['key-node']})
+ assert.equal(one('SELECT credential_hash FROM ai_reporters WHERE id=?',k.key.reporterId).credential_hash,null)
+ const {rotateReporter,editReporter,revokeReporter}=await import('../src/ai/reporters.js')
+ assert.throws(()=>rotateReporter(k.key.reporterId,owner.id),/manage reporter in security api keys/)
+ assert.throws(()=>editReporter(k.key.reporterId,{name:'Changed actor',actorId:owner.id},owner.id),/manage reporter in security api keys/)
+ server=app.listen(0,'127.0.0.1');await new Promise(r=>server.once('listening',r))
+ const url=`http://127.0.0.1:${server.address().port}/mcp/ai-usage`;process.env.AI_MCP_RESOURCE_URL=url
+ client=new Client({name:'user-api-key-fixture',version:'1'})
+ await client.connect(new StreamableHTTPClientTransport(new URL(url),{authProvider:{token:async()=>k.secret}}))
+ assert.equal((await client.listTools()).tools.length,2)
+ const event={schemaVersion:1,eventId:'key-event',operation:'research',observedAt:new Date().toISOString()}
+ const result=await client.callTool({name:'report_ai_usage',arguments:event})
+ assert.equal(result.structuredContent.results[0].status,'accepted')
+ const usage=one("SELECT node_id,actor_id FROM ai_usage_events WHERE reporter_id=?",k.key.reporterId)
+ assert.equal(usage.node_id,'key-node');assert.equal(usage.actor_id,editor.id)
+ const denied=await client.callTool({name:'report_ai_usage',arguments:{...event,eventId:'other-node',nodeId:'not-bound'}})
+ assert.equal(denied.structuredContent.results[0].code,'node_not_authorized')
+ await using(k.secret,request.get('/api/v1/nodes')).expect(403)
+ const api=await create(owner)
+ const {eventSchema}=await import('../src/ai/schemas.js')
+ assert.equal(eventSchema.safeParse({...event,provider:api.secret}).success,false)
+ assert.throws(()=>authenticateApiKey(api.secret,'mcp:report'),/does not permit/)
+ await as(owner,request.delete('/api/v1/api-keys/'+k.key.id)).expect(204)
+ await assert.rejects(client.listTools())
+ assert.equal(one('SELECT status FROM ai_reporters WHERE id=?',k.key.reporterId).status,'revoked')
+ const other=await create(owner,{purpose:'mcp'})
+ revokeReporter(other.key.reporterId,owner.id)
+ assert.ok(one('SELECT revoked_at FROM user_api_keys WHERE id=?',other.key.id).revoked_at)
+})
