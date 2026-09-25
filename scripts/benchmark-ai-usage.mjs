@@ -1,0 +1,11 @@
+import fs from 'node:fs'
+import os from 'node:os'
+process.chdir(new URL('..',import.meta.url).pathname);process.env.DATA_DIR=fs.mkdtempSync(os.tmpdir()+'/winfire-ai-scale-');process.env.NODE_ENV='test'
+const {app}=await import('../api/src/app.js'),{db,run,one}=await import('../api/src/db.js'),{listAi}=await import('../api/src/ai/queries.js'),{processAiWork}=await import('../api/src/ai/observations.js')
+run("INSERT INTO nodes(id,hostname,ip) VALUES('scale-node','Scale node','192.0.2.10')");run("INSERT INTO ai_reporters(id,name,created_at,updated_at,coverage) VALUES('scale-reporter','Benchmark',datetime('now'),datetime('now'),'instrumented')")
+let started=performance.now();db.transaction(()=>{run(`WITH RECURSIVE n(x) AS(VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<50000) INSERT INTO ai_usage_events(id,reporter_id,operation_id,node_id,operation,provider,model,outcome,coverage,observed_at,received_at,input_tokens) SELECT 'scale-'||x,'scale-reporter','scale-'||x,'scale-node','model_request',CASE WHEN x%2=0 THEN 'local' ELSE 'openai' END,'fixture','success','instrumented',?, ?,10 FROM n`,new Date().toISOString(),new Date().toISOString())})();const insertMs=performance.now()-started
+started=performance.now();const result=listAi({nodeId:'scale-node',provider:'local',page:900,limit:25},'usage',{role:'owner'});const queryMs=performance.now()-started
+started=performance.now();db.transaction(()=>{run(`WITH RECURSIVE n(x) AS(VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<50000) INSERT INTO log_events(id,node_id,event_id,event_type,action,event_time,src_ip,dst_ip,dst_port,direction,protocol,program) SELECT 'scale-log-'||x,'scale-node',5156,'firewall','allow',?,'192.0.2.10','203.0.113.10',443,'out','TCP','benchmark.exe' FROM n`,new Date().toISOString())})();const queueInsertMs=performance.now()-started
+started=performance.now();const worker=processAiWork({limit:50}),workerMs=performance.now()-started
+console.log(JSON.stringify({operations:50000,sourceEvents:50000,insertMs,queryMs,total:result.total,page:result.page,rows:result.items.length,queueInsertMs,workerMs,worker},null,2));if(result.total!==25000||result.items.length!==25||worker.processed>200||queryMs>3000||workerMs>2000)process.exitCode=1
+db.close();fs.rmSync(process.env.DATA_DIR,{recursive:true,force:true})

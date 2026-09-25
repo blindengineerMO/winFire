@@ -1,3 +1,4 @@
+import {registrableDomain} from '../ai/catalog.js'
 import express from 'express'
 import crypto from 'node:crypto'
 import {rateLimit} from 'express-rate-limit'
@@ -26,10 +27,6 @@ const collectionSchema=z.enum(['host','path']).default('host')
 const internetRuleSchema=z.object({pattern:z.string().trim().min(1).max(500),match:z.enum(['hostname','domain','prefix']).default('hostname'),action:z.enum(['allow','block']),nodeIds:z.array(z.string().min(1)).max(500).default([]),nodeGroupIds:z.array(z.string().min(1)).max(500).default([]),resourceTypes:z.array(z.enum(['main_frame','sub_frame','script','image','stylesheet','font','object','xmlhttprequest','other'])).min(1).max(20).default(['main_frame'])})
 const publicBase=req=>String(process.env.PUBLIC_BASE_URL||`${req.protocol}://${req.get('host')}`).replace(/\/$/,'')
 
-function registrableDomain(hostname){
-  const labels=String(hostname).split('.').filter(Boolean)
-  return labels.length>2?labels.slice(-2).join('.'):labels.join('.')
-}
 
 function normalizeUrl(raw,collectionLevel){
   let parsed

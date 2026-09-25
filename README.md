@@ -13,6 +13,8 @@ WinFire Secure is an API-first control plane for host inventory, firewall visibi
 | [API usage and curl examples](docs/API.md) | Authentication, inventory queries, credentials, discovery, DHCP, groups, events, topology and JIT access. |
 | [Complete API route reference](docs/API_ROUTES.md) | Every registered API operation, authentication/permission gates, source handler links and published request schemas. |
 | [Internet connections](docs/INTERNET_CONNECTIONS.md) | Outside-LAN firewall observations, dual-stack CIDRs, PTR evidence, lifecycle, API filters and exports. |
+| [AI usage setup and operations](docs/AI_USAGE.md) | Reporter enrollment, REST/MCP OAuth, stdio, JS/Python/hooks/OTLP, evidence, retention and troubleshooting. |
+| [AI usage research decisions](docs/AI_USAGE_RESEARCH.md) | Completed PLAN §27.1 research: MCP/OAuth, reporting, attribution, provider evidence and delivery gates. Delivery is implemented; deployment-specific OAuth configuration is required for remote MCP. |
 | [SNMP MIB library](docs/SNMP_LIBRARY.md) | Built-in coverage, filesystem storage, multipart uploads/downloads, full Cisco and LibreNMS catalog imports, matching, device links, collected facts and curl examples. |
 | [DHCP lease import](docs/DHCP_IMPORT.md) | Windows export script, preview/import, MAC/IP correlation, retained evidence, conflict handling and API contract. |
 | [JIT MFA: how it works](docs/JIT_MFA.md) | Setup, supported platforms, prompting, identity checks, firewall gates, temporary grants, expiry, fallback and verification. |
@@ -30,6 +32,7 @@ Live OpenAPI: **`GET /api/v1/openapi.json`**. Regenerate the route reference wit
 - **Policies and learning:** visual/classic editors, versions/diffs, conflict checks, assignments, verification, scheduled sync, training proposals, progressive learning and rollback workflows.
 - **Events and mapping:** separate Firewall events and Accounts tables, transaction details and quick rule actions, classifier catalog/custom rules, exports/ignores, WEF/agent collection, topology graph, neighbors, top talkers and node/subnet/switch/time filters.
 - **Identity and JIT MFA:** TOTP or Entra portal requests, optional source-desktop browser prompts, scoped temporary Windows firewall grants, host-local expiry plus server cleanup, optional account-right baselines and audited fallback behavior.
+- **AI visibility:** metadata-only REST/MCP reporting, scoped reporter credentials, versioned provider catalog, uncertain network evidence, separate usage/traffic totals, node timelines and server-filtered AI Usage tables.
 - **Operations:** administration settings, TLS/agent PKI, branding, notifications, security automation, Internet extension visibility, retention/compaction, reporting and health endpoints.
 
 Capabilities depend on the transport, permissions and remote platform. SNMP tables vary by device/MIB. TTL hints are advisory. SSH source-desktop prompting is implemented, while the current agentless **portal grant target still requires WinRM/WinRMS**. See the supported-path table in the JIT MFA guide.

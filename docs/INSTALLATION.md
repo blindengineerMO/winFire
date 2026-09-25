@@ -203,3 +203,7 @@ For explicit `.env` loading in development: `node --env-file=.env --watch api/sr
 ### Internet connection DNS and backfill
 
 Migration 103 creates the retained connection index and external-peer cache. The API server runs bounded backfill and reverse-DNS workers automatically. Configure local IPv4/IPv6 CIDRs in Server config. `INTERNET_DNS_SERVERS`, `INTERNET_DNS_POSITIVE_HOURS`, `INTERNET_DNS_NEGATIVE_HOURS`, `INTERNET_DNS_TIMEOUT_MS`, `INTERNET_DNS_CONCURRENCY` and `INTERNET_PEER_RETENTION_DAYS` control optional DNS behavior. See [defaults, limits and lifecycle](INTERNET_CONNECTIONS.md). Restart the API after environment changes.
+
+## AI telemetry and remote MCP
+
+AI metadata collection is included in migration 104 and the normal server worker. See [AI usage installation and OAuth configuration](AI_USAGE.md#1-install-and-enable) for `AI_OAUTH_ISSUER`, `AI_MCP_RESOURCE_URL`, HTTPS/Origin requirements, maintained provider setup and scoped reporter enrollment. Remote MCP is unavailable until that provider is configured; REST/stdio reporters can be enrolled independently.

@@ -248,3 +248,7 @@ curl --fail-with-body "$BASE/agents/$AGENT_ID/heartbeat" \
 ```
 
 The TLS peer certificate must reach the API listener itself. A normal proxy header carrying a certificate string is not accepted as mTLS. Production enrollment/deployment additionally requires the configured PKI and signed package prerequisites described in [Installation](INSTALLATION.md).
+
+## AI telemetry APIs and MCP
+
+[AI usage API examples](AI_USAGE.md#2-rest-quick-start) cover reporter enrollment, durable bounded `POST /api/v1/ai/usage:batch` receipts, DNS answers, matching list/summary/export filters and credential lifecycle. Operator read/admin credentials are separate from node-scoped reporter credentials. `/mcp/ai-usage` uses OAuth `ai:report`; [remote and stdio setup](AI_USAGE.md#3-remote-mcp-with-a-maintained-oauth-provider) documents the supported SDK and protocol paths.

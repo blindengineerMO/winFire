@@ -25,15 +25,23 @@
     "test:winrm:rights": "node api/tests/live_rights_read.mjs",
     "test:winrm:rights:write": "node api/tests/live_rights_write.mjs",
     "audit:deps": "npm audit --omit=dev --audit-level=high",
-    "docs:api": "node scripts/generate-api-docs.mjs"
+    "docs:api": "node scripts/generate-api-docs.mjs",
+    "test:ai": "node --test api/tests/ai_*.test.js",
+    "test:ai:scale": "node scripts/benchmark-ai-usage.mjs",
+    "test:ai:ui": "npm run build && bash scripts/verify-ai-ui.sh"
   },
   "dependencies": {
+    "@modelcontextprotocol/client": "2.1.0",
+    "@modelcontextprotocol/express": "2.0.1",
+    "@modelcontextprotocol/node": "2.1.0",
+    "@modelcontextprotocol/server": "2.1.0",
     "argon2": "^0.44.0",
     "better-sqlite3": "^12.2.0",
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "express-rate-limit": "^8.0.1",
     "helmet": "^8.1.0",
+    "jose": "6.2.12",
     "jsonwebtoken": "^9.0.2",
     "knex": "^3.1.0",
     "ldapts": "^8.2.0",
@@ -44,6 +52,7 @@
     "openid-client": "^6.8.8",
     "pdfkit": "^0.17.1",
     "ssh2": "^1.17.0",
+    "tldts": "7.4.15",
     "ws": "^8.18.3",
     "zod": "^4.0.5"
   },

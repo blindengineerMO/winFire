@@ -1,3 +1,4 @@
+import {processAiWork,pruneAi} from './ai/observations.js'
 import {processInternetIndex} from './services/internetConnections.js'
 import {processPeerDns,pruneInternetPeers} from './services/internetPeers.js'
 import fs from 'node:fs'
@@ -253,3 +254,7 @@ internetIndexTimer.unref()
 let internetDnsBusy=false
 const internetDnsTimer=setInterval(async()=>{if(internetDnsBusy)return;internetDnsBusy=true;try{await processPeerDns();pruneInternetPeers()}catch(error){console.error('Internet peer DNS failed:',error.message)}finally{internetDnsBusy=false}},10000)
 internetDnsTimer.unref()
+
+let aiTicks=0
+const aiTimer=setInterval(()=>{try{processAiWork({limit:50});if(++aiTicks%120===0)pruneAi()}catch{run("UPDATE ai_worker_state SET last_error='worker_failed' WHERE id=1")}},1000)
+aiTimer.unref()

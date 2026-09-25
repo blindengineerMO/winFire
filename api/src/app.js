@@ -1,3 +1,5 @@
+import {aiRoutes,nodeAiUsage} from './routes/ai.js'
+import {mountAiMcp} from './ai/mcp.js'
 import express from 'express'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -87,10 +89,13 @@ app.use(cors({origin:(origin,cb)=>{
   const allowed=[...(process.env.CORS_ORIGIN||'').split(','),...(process.env.EXTENSION_ORIGINS||'').split(',')].map(value=>value.trim()).filter(Boolean)
   cb(null,!origin||allowed.includes(origin))
 }}))
+app.use(['/api/v1/ai','/mcp/ai-usage'],express.json({limit:'256kb'}))
 app.use(express.json({limit:'2mb'}))
+mountAiMcp(app)
 const api=express.Router()
 app.use('/api/v1',api)
 api.use('/internet',internetRoutes)
+api.use('/ai',aiRoutes)
 const wrap=asyncHandler
 const body=(schema,req)=>schema.parse(req.body)
 const reqId=req=>String(req.params.id)
@@ -361,7 +366,7 @@ api.get('/agent-package/enroll.ps1',wrap(async(req,res)=>{
   catch(error){return res.status(503).json({error:error.message})}
   res.set('Cache-Control','private, no-store').type('text/plain').send(script)
 }))
-api.get('/openapi.json',(_req,res)=>res.json(buildOpenApi(api,agentRoutes,{internet:internetRoutes,mapping:mappingRoutes})))
+api.get('/openapi.json',(_req,res)=>res.json(buildOpenApi(api,agentRoutes,{internet:internetRoutes,mapping:mappingRoutes,ai:aiRoutes})))
 const loginLimit=rateLimit({windowMs:15*60*1000,limit:Number(process.env.AUTH_RATE_LIMIT||20),standardHeaders:'draft-8',legacyHeaders:false})
 const publicMfaLimit=rateLimit({windowMs:15*60*1000,limit:10,standardHeaders:'draft-8',legacyHeaders:false})
 api.post('/auth/login',loginLimit,wrap(async(req,res)=>{
@@ -568,6 +573,7 @@ api.post('/wef/wsman',express.raw({type:['application/soap+xml','text/xml','appl
   res.status(200).type('application/soap+xml').send(wefSoapResponse())
 }))
 api.use(auth)
+api.get('/nodes/:id/ai-usage',requireRole('auditor'),nodeAiUsage)
 api.use('/mapping',mappingRoutes)
 api.get('/settings/tls',requireRole('admin'),(_req,res)=>{
   const paths=tlsMaterialPaths(),files=Object.fromEntries(Object.entries(paths).map(([name,file])=>[name,{configured:fs.existsSync(file),source:process.env[name]?'environment':'administration',path:process.env[name]?null:file}]))

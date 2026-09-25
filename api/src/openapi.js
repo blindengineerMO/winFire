@@ -1,3 +1,4 @@
+import {aiSchemas,describeAiOperation} from './ai/openapi.js'
 import {internetConnectionSchemas} from './services/internetConnectionSchemas.js'
 const publicRoutes=new Set([
   'GET /health','GET /openapi.json','POST /auth/login','POST /auth/refresh',
@@ -100,7 +101,7 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
       // batch endpoint is `/events:batch`). Only convert colon parameters
       // that start a path segment; preserving the suffix keeps OpenAPI aligned
       // with the actual device endpoint.
-      const path=(prefix+layer.route.path).replace(/(^|\/)\:([A-Za-z]\w*)(?=\/|$)/g,'$1{$2}')
+      const path=(prefix+layer.route.path).replaceAll('\\:',':').replace(/(^|\/)\:([A-Za-z]\w*)(?=\/|$)/g,'$1{$2}')
       const pathItem=paths[path]||={}
       for(const method of Object.keys(layer.route.methods)){
         if(method==='head')continue
@@ -160,6 +161,7 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
         if(routeKey==='POST /auth/login')operation.requestBody={required:true,content:{'application/json':{schema:{$ref:'#/components/schemas/LoginRequest'}}}}
         if(routeKey==='POST /auth/refresh')operation.requestBody={required:true,content:{'application/json':{schema:{$ref:'#/components/schemas/RefreshRequest'}}}}
         if(responseSchemas[routeKey])operation.responses[200]={description:'JSON response',content:{'application/json':{schema:{$ref:`#/components/schemas/${responseSchemas[routeKey]}`}}}}
+        describeAiOperation(operation,method,path)
         pathItem[method]=operation
       }
     }
@@ -170,8 +172,9 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
   return {
     openapi:'3.1.0',info:{title:'WinFire Secure API',version:'0.1.0',description:'Control-plane operations use bearer tokens. Enrolled agent operations use client certificates.'},
     servers:[{url:'/api/v1'}],paths,
-    components:{securitySchemes:{bearerAuth:{type:'http',scheme:'bearer',bearerFormat:'JWT'},internetDeviceBearer:{type:'http',scheme:'bearer',bearerFormat:'Internet device token'},mutualTLS:{type:'mutualTLS'},wefHmac:{type:'apiKey',in:'header',name:'X-WinFire-WEF-Token',description:'Node-scoped HMAC token derived from WEF_SHARED_SECRET. The receiver also accepts the token query parameter for Windows Subscription Manager compatibility.'}},schemas:{
+    components:{securitySchemes:{aiReporterBearer:{type:'http',scheme:'bearer',bearerFormat:'Reporter enrollment credential',description:'Node-scoped REST/stdio reporting credential. Cannot access operator or fleet routes. Remote MCP uses OAuth with ai:report instead.'},bearerAuth:{type:'http',scheme:'bearer',bearerFormat:'JWT'},internetDeviceBearer:{type:'http',scheme:'bearer',bearerFormat:'Internet device token'},mutualTLS:{type:'mutualTLS'},wefHmac:{type:'apiKey',in:'header',name:'X-WinFire-WEF-Token',description:'Node-scoped HMAC token derived from WEF_SHARED_SECRET. The receiver also accepts the token query parameter for Windows Subscription Manager compatibility.'}},schemas:{
       ...internetConnectionSchemas,
+      ...aiSchemas,
       PolicyGraph:{type:'object',required:['nodes'],properties:{nodes:{type:'array',items:{type:'object',required:['id','type'],properties:{id:{type:'string'},type:{type:'string',enum:['allow','deny','program','portGroup','addressGroup','profile','schedule','mfaGate']},position:{type:'object',properties:{x:{type:'number'},y:{type:'number'}}},data:{type:'object',additionalProperties:true}}}},edges:{type:'array',items:{type:'object',required:['id','source','target'],properties:{id:{type:'string'},source:{type:'string'},target:{type:'string'}}}}}},
       PolicyDraftRequest:{type:'object',required:['graph'],properties:{graph:{$ref:'#/components/schemas/PolicyGraph'}}},
       PolicyVersionRequest:{type:'object',required:['graph'],properties:{graph:{$ref:'#/components/schemas/PolicyGraph'},comment:{type:'string'},baseVersionId:{type:['string','null'],description:'The saved version on which the draft is based; null for a policy with no saved version.'}}},

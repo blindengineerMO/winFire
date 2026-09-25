@@ -137,3 +137,7 @@ UI routes are client-side views; API calls use `/api/v1`. A reverse proxy must r
 ## Internet connections outside LAN
 
 **Internet** has separate **Browser activity**, **Internet connections**, **Browser devices**, and **Internet Policy Studio** tabs. The connections table uses configured IPv4/IPv6 local CIDRs, server-side filters/sorting and 25-row pagination. Private peers outside those CIDRs are included; special non-unicast peers are excluded. CIDR edits rebuild retained classifications in the background and expose pending status. Reverse-DNS names are PTR evidence, not confirmed website addresses. No external peer is added to inventory. See the [complete workflow, DNS configuration and curl examples](INTERNET_CONNECTIONS.md).
+
+## AI Usage visibility
+
+Open **Visibility → AI Usage** for reported operations, observed/suspected AI traffic and reporter coverage. Administration → AI usage manages reporters, provider rules and retention. Node details link to scoped activity. [The detailed guide](AI_USAGE.md) covers client configuration, interpretation, filters and troubleshooting. Connections do not imply completed operations or token usage.
