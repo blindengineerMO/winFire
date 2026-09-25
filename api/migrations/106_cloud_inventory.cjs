@@ -1,0 +1,22 @@
+exports.up=async k=>{
+  const nodeTriggers=await k('sqlite_master').select('name','sql').where({type:'trigger',tbl_name:'nodes'})
+  await k.schema.createTable('inventory_scopes',t=>{t.text('id').primary();t.text('name').notNullable();t.text('cidrs_json').notNullable().defaultTo('[]');t.text('kind').notNullable().defaultTo('site');t.boolean('direct_management').notNullable().defaultTo(false);t.text('created_at').notNullable()})
+  await k('inventory_scopes').insert({id:'default',name:'Local network',kind:'site',direct_management:true,created_at:new Date().toISOString()})
+  await k.schema.alterTable('nodes',t=>{t.text('scope_id').notNullable().defaultTo('default').references('id').inTable('inventory_scopes');t.index(['scope_id','ip'])})
+  // SQLite/Knex rebuilds the table to add a reference. Preserve node hooks, including
+  // membership in the global policy group; otherwise existing onboarding silently regresses.
+  for(const trigger of nodeTriggers)if(!(await k('sqlite_master').where({type:'trigger',name:trigger.name}).first()))await k.raw(trigger.sql)
+  await k.schema.createTable('azure_connections',t=>{t.text('id').primary();t.text('name').notNullable();t.text('credential_id').references('id').inTable('credentials').onDelete('SET NULL');t.text('config_json').notNullable();t.boolean('enabled').notNullable().defaultTo(false);t.integer('interval_minutes').notNullable().defaultTo(60);t.text('next_run_at');t.text('last_run_at');t.text('last_status');t.text('last_error');t.integer('revision').notNullable().defaultTo(1);t.text('created_at').notNullable()})
+  await k.schema.createTable('azure_runs',t=>{t.text('id').primary();t.text('connection_id').references('id').inTable('azure_connections').onDelete('SET NULL');t.text('kind').notNullable();t.text('status').notNullable();t.text('config_json').notNullable();t.text('result_json');t.text('error');t.text('requested_by');t.text('created_at').notNullable();t.text('started_at');t.text('finished_at');t.text('lease_until');t.boolean('cancel_requested').notNullable().defaultTo(false);t.index(['status','created_at'])})
+  await k.schema.createTable('asset_sources',t=>{t.text('id').primary();t.text('provider').notNullable();t.text('tenant_id').notNullable();t.text('resource_id').notNullable();t.text('scope_id').references('id').inTable('inventory_scopes');t.text('node_id').references('id').inTable('nodes').onDelete('SET NULL');t.text('state').notNullable().defaultTo('candidate');t.text('evidence_json').notNullable();t.text('observed_at');t.text('fetched_at').notNullable();t.text('first_seen_at').notNullable();t.text('missing_since');t.integer('missing_runs').notNullable().defaultTo(0);t.boolean('manual_link').notNullable().defaultTo(false);t.unique(['provider','tenant_id','resource_id']);t.index(['node_id','scope_id']);t.index(['state','fetched_at'])})
+  await k.schema.createTable('asset_source_connections',t=>{t.text('source_id').references('id').inTable('asset_sources').onDelete('CASCADE');t.text('connection_id').references('id').inTable('azure_connections').onDelete('CASCADE');t.text('last_run_id');t.primary(['source_id','connection_id'])})
+  await k.schema.createTable('asset_source_history',t=>{t.increments('id');t.text('source_id').notNullable().references('id').inTable('asset_sources').onDelete('CASCADE');t.text('run_id');t.text('change').notNullable();t.text('before_json');t.text('after_json');t.text('at').notNullable();t.index(['source_id','at'])})
+  await k.schema.createTable('asset_identity_conflicts',t=>{t.text('id').primary();t.text('source_id').notNullable().references('id').inTable('asset_sources').onDelete('CASCADE');t.text('state').notNullable().defaultTo('open');t.text('reason').notNullable();t.text('candidates_json').notNullable();t.text('decision_json');t.text('created_at').notNullable();t.text('resolved_at');t.index(['state','source_id'])})
+}
+exports.down=async k=>{
+  const nodeTriggers=await k('sqlite_master').select('name','sql').where({type:'trigger',tbl_name:'nodes'})
+  for(const name of ['asset_identity_conflicts','asset_source_history','asset_source_connections','asset_sources','azure_runs','azure_connections'])await k.schema.dropTable(name)
+  await k.schema.alterTable('nodes',t=>{t.dropIndex(['scope_id','ip']);t.dropColumn('scope_id')})
+  for(const trigger of nodeTriggers)if(!(await k('sqlite_master').where({type:'trigger',name:trigger.name}).first()))await k.raw(trigger.sql)
+  await k.schema.dropTable('inventory_scopes')
+}

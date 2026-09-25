@@ -32,3 +32,5 @@ IMPLEMENTATION_STATUS.md
 RESEARCH_AGENTLESS_MFA.md
 !data/mib-sources/
 !data/snmp-mibs/
+
+!/docs/AZURE_DISCOVERY.md

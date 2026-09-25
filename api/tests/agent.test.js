@@ -390,6 +390,7 @@ test('agent training waits for personal and global apply acknowledgements',async
   await request('POST',`/policies/${global.body.id}/versions`,{graph:{nodes:[{id:'fleet-rule',type:'allow',data:{name:'Fleet HTTPS',localPort:'443'}}],edges:[]}},token)
   assert.equal((await request('POST',`/policies/${global.body.id}/assignments`,{nodeGroupId:'winfire-global-all-nodes'},token)).status,201)
   run('UPDATE learning_sessions SET ends_at=?,last_attempt_at=NULL WHERE id=?',new Date(Date.now()-1000).toISOString(),node.body.training.id)
+  assert.equal((await request('POST',`/agents/${enrolled.body.agentId}/telemetry-health`,{checkedAt:new Date().toISOString(),caughtUp:true,successAuditEnabled:true},null,client)).status,200)
   const due=await processDueTraining()
   assert.equal(due.find(item=>item.sessionId===node.body.training.id).status,'applying')
   const jobs=(await request('GET',`/agents/${enrolled.body.agentId}/jobs`,undefined,null,client)).body.jobs.filter(job=>job.payload.learningSessionId===node.body.training.id)

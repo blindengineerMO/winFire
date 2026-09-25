@@ -4,6 +4,7 @@ import {api} from '../services/api.js'
 import ConfirmDialog from './ConfirmDialog.vue'
 import SnmpDiscoverySettings from './SnmpDiscoverySettings.vue'
 import DhcpDiscoverySettings from './DhcpDiscoverySettings.vue'
+import AzureDiscoverySettings from './AzureDiscoverySettings.vue'
 import LinuxDiscoverySettings from './LinuxDiscoverySettings.vue'
 
 const props = defineProps({credentials: {type: Array, default: () => []}})
@@ -61,9 +62,11 @@ onMounted(load)
       <button type="button" role="tab" :aria-selected="activeTab === 'arp'" :class="{active: activeTab === 'arp'}" @click="activeTab = 'arp'">ARP / Other</button>
       <button type="button" role="tab" :aria-selected="activeTab === 'linux'" :class="{active: activeTab === 'linux'}" @click="activeTab = 'linux'">Linux</button>
       <button type="button" role="tab" :aria-selected="activeTab === 'dhcp'" :class="{active: activeTab === 'dhcp'}" @click="activeTab = 'dhcp'">DHCP leases</button>
+      <button type="button" role="tab" :aria-selected="activeTab === 'azure'" :class="{active: activeTab === 'azure'}" @click="activeTab = 'azure'">Azure / Arc</button>
     </div>
+    <AzureDiscoverySettings v-if="activeTab === 'azure'"/>
 
-    <template v-if="activeTab === 'cidr'">
+    <template v-else-if="activeTab === 'cidr'">
       <p class="muted">Probe bounded IPv4 CIDRs with ICMP first, then a same-subnet ARP request and a small TCP management-port fallback (22, 445, 3389, 5985, 5986). Hosts that block ping can still be discovered and are marked with the liveness method used.</p>
       <form class="form-grid" @submit.prevent="scan"><label>CIDRs (one per line)<textarea v-model="cidrs" rows="4" required placeholder="10.20.0.0/24&#10;192.168.50.0/24"></textarea></label><div class="form-actions"><button class="button primary" :disabled="busy">{{busy ? 'Starting…' : 'Start discovery scan'}}</button></div></form><section class="preflight-panel"><div><span class="eyebrow">CREDENTIAL PREFLIGHT</span><h3>Test Windows credentials before discovery</h3><p class="muted">Test a representative host from this subnet before saving it to the discovery workflow. A failed test does not create an asset.</p></div><div class="form-grid preflight-grid"><label>Host or IP<input v-model.trim="preflightHost" placeholder="192.168.50.10"></label><label>Windows credential<select v-model="preflightCredentialId"><option value="">Select credential</option><option v-for="credential in props.credentials.filter(item=>['local','domain'].includes(item.type))" :key="credential.id" :value="credential.id">{{credential.name}} · {{credential.username}}</option></select></label></div><div class="inline-actions"><button type="button" class="button secondary" :disabled="preflightBusy" @click="preflightDiscoveryCredential">{{preflightBusy ? 'Testing…' : 'Test connection'}}</button><span v-if="preflightResult" class="status" :class="preflightResult.success ? 'reachable' : 'failed'">{{preflightLabel(preflightResult)}}</span><small v-if="preflightResult?.onboardingError" class="danger-text">{{preflightResult.onboardingError.remediation}}</small></div></section>
       <section class="triage-settings-panel"><div class="panel-title"><div><span class="eyebrow">COVERAGE WORKFLOW</span><h2>Unmanaged asset triage</h2></div><span class="status pending">{{triageWindowDays}} days</span></div><p class="muted">Hosts discovered in the local CIDRs that require an agent and have no successful WinRM or agent contact for this window appear in the Unmanaged assets tab under Monitored assets.</p><form class="inline-form" @submit.prevent="saveTriageSettings"><label>Wait before triage (days)<input v-model.number="triageWindowDays" type="number" min="1" max="3650" required></label><button class="button small primary" :disabled="scheduleBusy">{{scheduleBusy ? 'Saving…' : 'Save triage window'}}</button></form></section>

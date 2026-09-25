@@ -1,3 +1,5 @@
+import {capabilityEvidence} from './services/capabilities.js'
+import {assertDirectManagement} from './services/networkBoundary.js'
 import {spawn} from 'node:child_process'
 import {connect,isIP} from 'node:net'
 import dns from 'node:dns/promises'
@@ -263,11 +265,12 @@ try {
       'facts' {
         $computer=Get-CimInstance Win32_ComputerSystem; $osInfo=Get-CimInstance Win32_OperatingSystem; $biosInfo=Get-CimInstance Win32_BIOS
         $adapters=@(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' | ForEach-Object { [pscustomobject]@{description=$_.Description;macAddress=$_.MACAddress;ipAddresses=@($_.IPAddress);subnets=@($_.IPSubnet);gateways=@($_.DefaultIPGateway);dnsServers=@($_.DNSServerSearchOrder);dnsDomain=$_.DNSDomain;dnsSuffixes=@($_.DNSDomainSuffixSearchOrder);dhcpEnabled=$_.DHCPEnabled;dhcpServer=$_.DHCPServer} })
-        $lastUser=$null; $machineGuid=$null; $machineSid=$null
+        $lastUser=$null; $machineGuid=$null; $machineSid=$null; $biosUuid=$null
+        try {$biosUuid=(Get-CimInstance Win32_ComputerSystemProduct -ErrorAction Stop).UUID} catch {}
         try {$lastUser=(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Authentication\\LogonUI' -ErrorAction Stop).LastLoggedOnUser} catch {}
         try {$machineGuid=(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography' -ErrorAction Stop).MachineGuid} catch {}
         try {$admin=Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True AND SID LIKE '%-500'" | Select-Object -First 1; if($admin){$machineSid=$admin.SID -replace '-500$',''}} catch {}
-        [pscustomobject]@{computer=$computer | Select-Object Name,Model,Manufacturer,Domain,PartOfDomain,UserName;bios=$biosInfo | Select-Object SerialNumber;os=$osInfo | Select-Object Caption,Version,BuildNumber,OSArchitecture,InstallDate,LastBootUpTime;identity=[pscustomobject]@{machineGuid=$machineGuid;localMachineSid=$machineSid;domainJoined=[bool]$computer.PartOfDomain;domainName=$computer.Domain;sessionLogonServer=$env:LOGONSERVER;currentInteractiveUser=$computer.UserName;lastLoggedOnUser=$lastUser};network=$adapters;dnsSuffixes=@($adapters | ForEach-Object { @($_.dnsSuffixes)+@($_.dnsDomain) } | Where-Object { $_ } | Select-Object -Unique);firewall=@(Get-NetFirewallProfile | Select-Object Name,Enabled,DefaultInboundAction,DefaultOutboundAction);service=Get-Service MpsSvc | Select-Object Status}
+        [pscustomobject]@{computer=$computer | Select-Object Name,Model,Manufacturer,Domain,PartOfDomain,UserName;bios=$biosInfo | Select-Object SerialNumber;os=$osInfo | Select-Object Caption,Version,BuildNumber,OSArchitecture,InstallDate,LastBootUpTime;identity=[pscustomobject]@{machineGuid=$machineGuid;biosUuid=$biosUuid;localMachineSid=$machineSid;domainJoined=[bool]$computer.PartOfDomain;domainName=$computer.Domain;sessionLogonServer=$env:LOGONSERVER;currentInteractiveUser=$computer.UserName;lastLoggedOnUser=$lastUser};network=$adapters;dnsSuffixes=@($adapters | ForEach-Object { @($_.dnsSuffixes)+@($_.dnsDomain) } | Where-Object { $_ } | Select-Object -Unique);firewall=@(Get-NetFirewallProfile | Select-Object Name,Enabled,DefaultInboundAction,DefaultOutboundAction);service=Get-Service MpsSvc | Select-Object Status}
       }
       'all_rules' {
         $offset=[Math]::Max(0,[int]$argsData.offset); $limit=[Math]::Min(200,[Math]::Max(1,[int]$argsData.limit)); $total=(Get-NetFirewallRule | Measure-Object).Count
@@ -457,6 +460,15 @@ export async function activateWinrmViaWmi(node,{wmi=process.platform==='win32'?w
   }
 }
 export async function remote(node,operation,args={},options={}) {
+  const capability={auth:'authentication',facts:'facts',rules:'firewallRead',all_rules:'firewallRead',apply:'firewallWrite',events:'events',events_recent:'events',events_probe:'events'}[operation]
+  try{
+    const result=await remoteOperation(node,operation,args,options)
+    if(capability){capabilityEvidence(node.id,capability,node.transport||'unknown');capabilityEvidence(node.id,'authentication',node.transport||'unknown')}
+    return result
+  }catch(error){if(capability)capabilityEvidence(node.id,capability,node.transport||'unknown',{success:false,code:'operation_failed'});throw error}
+}
+async function remoteOperation(node,operation,args={},options={}) {
+  assertDirectManagement(node)
   if(node.transport==='ssh'){
     if(['jit_preflight','jit_start','jit_end','prompt_session','security_session_logoff','rights','rights_change','wef_configure'].includes(operation))throw new Error('This operation requires an enrolled Windows agent')
     if(!['auth','facts','all_rules','rules','apply','prompt_browser'].includes(operation))throw new Error('SSH transport supports Linux facts, firewall rules, and desktop MFA prompts only')
@@ -598,6 +610,7 @@ export function classifyProbe(transport,rpc,winrmAuthenticated=false,netshAuthen
   return {status:'unreachable',probeStatus:'unreachable'}
 }
 export async function probeNode(node,{verifyWinrm=true,probePort=tcpProbe,authenticate=remote,authenticateRpc=rpcProbe,authenticateNetsh=netshProbe,authenticateSsh=remote}={}) {
+  assertDirectManagement(node)
   const host=node.fqdn || node.ip || node.hostname
   const [winrm,winrms,wmi,smb,ssh]=await Promise.all([probePort(host,5985),probePort(host,5986),probePort(host,135),probePort(host,445),probePort(host,22)])
   const candidates=[['winrms',winrms],['winrm',winrm]].filter(([,port])=>port.status==='open')
@@ -630,6 +643,7 @@ export async function probeNode(node,{verifyWinrm=true,probePort=tcpProbe,authen
   return {transport,status,probeStatus,ports,rpc,winrmAuthenticated,winrmError,netshAuthenticated,netshError,sshAuthenticated,sshError,onboardingError,note:transport==='wmi'?'RPC authentication checked; WMI firewall and Security log access need a credentialed query.':netshAuthenticated?'SMB service execution authenticated; netsh is being used as the legacy fallback.':sshAuthenticated?'SSH authentication confirmed and Linux management is available.':winrmAuthenticated?'WinRM authentication confirmed.':transport?'A management port responded, but authentication was not confirmed.':'No supported management port responded.'}
 }
 export async function collectFacts(node,{credentialId,suppliedFacts}={}) {
+  assertDirectManagement(node)
   const facts=suppliedFacts||await remote(node,'facts',{}, {credentialId})
   run('INSERT INTO node_facts(node_id,snapshot_json,collected_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET snapshot_json=excluded.snapshot_json,collected_at=excluded.collected_at',node.id,JSON.stringify(facts),now())
   const osName=classifyOperatingSystem({caption:facts?.os?.Caption,version:facts?.os?.Version,build:facts?.os?.BuildNumber}),infrastructure=classifyInfrastructureFacts(facts),rawMac=String(facts?.network?.find(adapter=>adapter?.macAddress)?.macAddress||'').trim().toLowerCase().replaceAll('-',':'),macAddress=/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(rawMac)&&rawMac!=='00:00:00:00:00:00'?rawMac:null,managedAt=now()

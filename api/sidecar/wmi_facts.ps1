@@ -6,6 +6,7 @@ $bios=Get-WmiObject Win32_BIOS
 Out-Field 'NAME' $computer.Name; Out-Field 'DOMAIN' $computer.Domain; Out-Field 'JOINED' $computer.PartOfDomain
 Out-Field 'USER' $computer.UserName; Out-Field 'MODEL' $computer.Model; Out-Field 'MANUFACTURER' $computer.Manufacturer
 Out-Field 'CAPTION' $os.Caption; Out-Field 'VERSION' $os.Version; Out-Field 'BUILD' $os.BuildNumber
+try {Out-Field 'BIOS_UUID' (Get-WmiObject Win32_ComputerSystemProduct).UUID} catch {}
 Out-Field 'ARCH' $os.OSArchitecture; Out-Field 'SERIAL' $bios.SerialNumber
 try {Out-Field 'GUID' (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography').MachineGuid} catch {}
 foreach($adapter in @(Get-WmiObject Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True')) {

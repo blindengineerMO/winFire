@@ -212,9 +212,9 @@ function esxiCredentials(){
 }
 function existingNode(ip,hostname,mac=null){
   const normalizedMac=normalizeMac(mac)
-  if(normalizedMac){const byMac=one("SELECT * FROM nodes WHERE lower(mac_address)=? ORDER BY CASE WHEN inventory_source='ad' THEN 0 ELSE 1 END,created_at LIMIT 1",normalizedMac);if(byMac)return byMac}
+  if(normalizedMac){const byMac=one("SELECT * FROM nodes WHERE scope_id='default' AND lower(mac_address)=? ORDER BY CASE WHEN inventory_source='ad' THEN 0 ELSE 1 END,created_at LIMIT 1",normalizedMac);if(byMac)return byMac}
   const lower=String(hostname||'').toLowerCase()
-  return one('SELECT * FROM nodes WHERE ip=? OR lower(hostname)=? OR lower(fqdn)=? ORDER BY CASE WHEN inventory_source=\'ad\' THEN 0 ELSE 1 END LIMIT 1',ip,lower,lower)
+  return one('SELECT * FROM nodes WHERE scope_id=\'default\' AND (ip=? OR lower(hostname)=? OR lower(fqdn)=?) ORDER BY CASE WHEN inventory_source=\'ad\' THEN 0 ELSE 1 END LIMIT 1',ip,lower,lower)
 }
 export function persistHypervisor(nodeId,hypervisor){
   if(!hypervisor?.detected)return
@@ -229,7 +229,7 @@ export function persistHypervisor(nodeId,hypervisor){
 }
 function correlationValue(value){const text=String(value||'').trim().toLowerCase().replace(/\.$/,'');return text&&text!=='unknown'?text:null}
 function correlateVirtualMachines(hostNodeId,virtualMachines){
-  const host=one('SELECT hostname,ip,fqdn FROM nodes WHERE id=?',hostNodeId)
+  const host=one('SELECT hostname,ip,fqdn,scope_id FROM nodes WHERE id=?',hostNodeId)
   const hypervisorHost=host?.hostname||host?.fqdn||host?.ip||hostNodeId
   run('UPDATE nodes SET virtual_machine=0,virtual_machine_host_id=NULL,virtual_machine_details_json=NULL WHERE virtual_machine_host_id=?',hostNodeId)
   for(const vm of virtualMachines){
@@ -238,7 +238,7 @@ function correlateVirtualMachines(hostNodeId,virtualMachines){
     const clauses=values.flatMap(()=>['lower(coalesce(ip,\'\'))=?','lower(coalesce(hostname,\'\'))=?','lower(coalesce(fqdn,\'\'))=?']).join(' OR ')
     const args=[]
     for(const value of values)args.push(value,value,value)
-    const match=one(`SELECT id FROM nodes WHERE id<>? AND (${clauses}) ORDER BY CASE WHEN status='reachable' THEN 0 ELSE 1 END,created_at LIMIT 1`,hostNodeId,...args)
+    const match=one(`SELECT id FROM nodes WHERE id<>? AND scope_id=? AND (${clauses}) ORDER BY CASE WHEN status='reachable' THEN 0 ELSE 1 END,created_at LIMIT 1`,hostNodeId,host?.scope_id||'default',...args)
     if(!match)continue
     run('UPDATE nodes SET virtual_machine=1,virtual_machine_host_id=?,virtual_machine_details_json=? WHERE id=?',hostNodeId,json({...vm,hypervisorHostId:hostNodeId,hypervisorHost}),match.id)
   }

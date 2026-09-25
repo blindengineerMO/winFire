@@ -1,3 +1,6 @@
+import {saveAzureCredential,azureCredentialMetadata} from './cloud/service.js'
+import {nodeCoverage} from './services/capabilities.js'
+import {cloudRoutes} from './cloud/routes.js'
 import {directoryOuHints,validateOuHints,applyDirectoryCredential} from './directoryCredentials.js'
 import {aiRoutes,nodeAiUsage} from './routes/ai.js'
 import {mountAiMcp} from './ai/mcp.js'
@@ -146,7 +149,7 @@ function normalizedNodeOs(node){
 }
 const safeJson=value=>{try{return parse(value)}catch{return null}}
 const publicNode=node=>node && ({...node,...normalizedNodeOs(node),failures:Number(node.failures),firstDiscoveredAt:node.first_discovered_at||null,lastManagedAt:node.last_managed_at||null,triageStatus:node.triage_status||'none',triageNote:node.triage_note||null,triageUpdatedAt:node.triage_updated_at||null,onboardingError:node.onboarding_error_code?onboardingErrorForCode(node.onboarding_error_code):null,virtualMachine:!!Number(node.virtual_machine),virtualMachineHostId:node.virtual_machine_host_id||null,virtualMachineDetails:safeJson(node.virtual_machine_details_json),classificationEvidence:safeJson(node.classification_evidence_json),dhcpLease:safeJson(node.dhcp_lease_json),passiveDeviceHint:node.passive_device_hint||null,passiveDeviceHintEvidence:safeJson(node.passive_device_hint_json),facts:safeJson(node.snapshot_json),ad:safeJson(node.ad_snapshot_json),training:latestTraining(node.id)||null,verification:latestVerification(node.id),managementVerification:managementVerification(node)})
-const canUseCredential=(user,credential)=>credential&&(user.role==='owner'||user.role==='admin'||credential.owner_user_id===user.id||credential.visibility==='team'&&credential.team_id&&credential.team_id===user.team_id||canWriteResource(user,'credential',credential))
+const canUseCredential=(user,credential)=>credential&&credential.type!=='azure'&&(user.role==='owner'||user.role==='admin'||credential.owner_user_id===user.id||credential.visibility==='team'&&credential.team_id&&credential.team_id===user.team_id||canWriteResource(user,'credential',credential))
 const assignedNodeCredentials=nodeId=>all(`SELECT DISTINCT c.* FROM credentials c JOIN credential_assignments a ON a.credential_id=c.id WHERE a.node_id=? OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?) ORDER BY c.priority`,nodeId,nodeId)
 const assignedSnmpCredential=(nodeId,user)=>assignedNodeCredentials(nodeId).filter(credential=>['snmp-v2c','snmp-v3'].includes(credential.type)&&canUseCredential(user,credential))[0]||null
 const assignedEsxiCredentials=(nodeId,user)=>assignedNodeCredentials(nodeId).filter(credential=>credential.type==='esxi'&&canUseCredential(user,credential))
@@ -367,7 +370,7 @@ api.get('/agent-package/enroll.ps1',wrap(async(req,res)=>{
   catch(error){return res.status(503).json({error:error.message})}
   res.set('Cache-Control','private, no-store').type('text/plain').send(script)
 }))
-api.get('/openapi.json',(_req,res)=>res.json(buildOpenApi(api,agentRoutes,{internet:internetRoutes,mapping:mappingRoutes,ai:aiRoutes})))
+api.get('/openapi.json',(_req,res)=>res.json(buildOpenApi(api,agentRoutes,{internet:internetRoutes,mapping:mappingRoutes,ai:aiRoutes,'':cloudRoutes})))
 const loginLimit=rateLimit({windowMs:15*60*1000,limit:Number(process.env.AUTH_RATE_LIMIT||20),standardHeaders:'draft-8',legacyHeaders:false})
 const publicMfaLimit=rateLimit({windowMs:15*60*1000,limit:10,standardHeaders:'draft-8',legacyHeaders:false})
 api.post('/auth/login',loginLimit,wrap(async(req,res)=>{
@@ -576,6 +579,7 @@ api.post('/wef/wsman',express.raw({type:['application/soap+xml','text/xml','appl
 api.use(auth)
 api.get('/nodes/:id/ai-usage',requireRole('auditor'),nodeAiUsage)
 api.use('/mapping',mappingRoutes)
+api.use(cloudRoutes)
 api.get('/settings/tls',requireRole('admin'),(_req,res)=>{
   const paths=tlsMaterialPaths(),files=Object.fromEntries(Object.entries(paths).map(([name,file])=>[name,{configured:fs.existsSync(file),source:process.env[name]?'environment':'administration',path:process.env[name]?null:file}]))
   res.json({httpsEnabled:Object.values(files).every(item=>item.configured),files,restartRequired:true})
@@ -1491,7 +1495,7 @@ api.post('/directory/users/:id/import-operator',requireRole('admin'),wrap(async(
   res.status(user?200:201).json(publicUser(one('SELECT * FROM users WHERE id=?',userId)))
 }))
 
-const visibleCredentials=user=>(user.role==='owner'||user.role==='admin' ? all('SELECT id,name,type,username,owner_user_id,visibility,team_id,priority,created_at FROM credentials ORDER BY priority,name') : all(`SELECT id,name,type,username,owner_user_id,visibility,team_id,priority,created_at FROM credentials WHERE owner_user_id=? OR (visibility='team' AND team_id=?) OR EXISTS (SELECT 1 FROM resource_grants g WHERE g.resource_type='credential' AND g.resource_id=credentials.id AND g.grantee_user_id=?) ORDER BY priority,name`,user.id,user.team_id,user.id)).map(credential=>({...credential,canWrite:canWriteResource(user,'credential',credential)}))
+const visibleCredentials=user=>(user.role==='owner'||user.role==='admin' ? all('SELECT id,name,type,username,owner_user_id,visibility,team_id,priority,created_at FROM credentials ORDER BY priority,name') : all(`SELECT id,name,type,username,owner_user_id,visibility,team_id,priority,created_at FROM credentials WHERE owner_user_id=? OR (visibility='team' AND team_id=?) OR EXISTS (SELECT 1 FROM resource_grants g WHERE g.resource_type='credential' AND g.resource_id=credentials.id AND g.grantee_user_id=?) ORDER BY priority,name`,user.id,user.team_id,user.id)).map(credential=>({...credential,...(credential.type==='azure'?azureCredentialMetadata(credential.id):{}),canWrite:canWriteResource(user,'credential',credential)}))
 api.get('/credentials/health',requireRole('editor'),(req,res)=>{
   const visibleIds=new Set(visibleCredentials(req.user).map(credential=>credential.id))
   const notices=activeCredentialStaleNotices().filter(notice=>visibleIds.has(notice.credentialId))
@@ -1506,6 +1510,7 @@ const credentialInputSchema=z.object({name:z.string().trim().min(1).max(120),typ
 })
 const sealedCredentialSecret=data=>['snmp-v2c','snmp-v3'].includes(data.type)?normalizeSnmpSecret(data.type,data):data.type==='ssh'?{password:data.password||null,privateKey:data.privateKey||null,passphrase:data.passphrase||null,hostKeyFingerprint:data.hostKeyFingerprint||null,port:data.port||22}:{password:data.password}
 api.post('/credentials',requireRole('editor'),(req,res)=>{
+  if(req.body?.type==='azure'){if(!['owner','admin'].includes(req.user.role))return res.status(403).json({error:'Administrator access is required for Azure discovery credentials'});const {type,...data}=req.body;return res.status(201).json(saveAzureCredential({...data,teamId:data.teamId||req.user.team_id||null},req.user.id))}
   const data=body(credentialInputSchema,req),credentialId=id(),username=data.type==='snmp-v2c'?(data.username||'community') : data.username
   run('INSERT INTO credentials(id,name,type,username,encrypted_blob,owner_user_id,visibility,team_id,priority) VALUES(?,?,?,?,?,?,?,?,?)',credentialId,data.name,data.type,username,seal(sealedCredentialSecret(data)),req.user.id,data.visibility,data.teamId||req.user.team_id||null,data.priority)
   audit(req.user.id,'credential.create','credential',credentialId,null,{name:data.name,type:data.type});res.status(201).json({id:credentialId,name:data.name,type:data.type,username,visibility:data.visibility})
@@ -1513,6 +1518,7 @@ api.post('/credentials',requireRole('editor'),(req,res)=>{
 api.patch('/credentials/:id',requireRole('editor'),(req,res)=>{
   const credential=one('SELECT * FROM credentials WHERE id=?',reqId(req));if(!credential)return notFound(res)
   if(!canWriteResource(req.user,'credential',credential))return res.status(403).json({error:'Insufficient permission'})
+  if(credential.type==='azure'){if(!['owner','admin'].includes(req.user.role))return res.status(403).json({error:'Administrator access is required for Azure discovery credentials'});return res.json(saveAzureCredential({...openSealed(credential.encrypted_blob),...req.body},req.user.id,credential.id))}
   const data=body(z.object({name:z.string().trim().min(1).max(120).optional(),username:z.string().trim().max(255).optional(),password:z.string().max(4096).optional(),privateKey:z.string().max(32768).optional(),passphrase:z.string().max(4096).optional(),hostKeyFingerprint:z.string().trim().max(255).optional(),port:z.number().int().min(1).max(65535).optional(),community:z.string().max(255).optional(),securityLevel:z.enum(['noAuthNoPriv','authNoPriv','authPriv']).optional(),authProtocol:z.enum(['md5','sha','sha224','sha256','sha384','sha512']).optional(),authKey:z.string().max(4096).optional(),privProtocol:z.enum(['des','aes','aes256b','aes256r']).optional(),privKey:z.string().max(4096).optional(),priority:z.number().int().min(-100000).max(100000).optional()}),req)
   let encrypted=credential.encrypted_blob
   if(['snmp-v2c','snmp-v3'].includes(credential.type)&&(data.password||data.community||data.securityLevel||data.authProtocol||data.authKey||data.privProtocol||data.privKey||data.username)){
@@ -1613,6 +1619,8 @@ api.get('/nodes',(req,res)=>{
   if(!Object.keys(req.query||{}).length)return res.json(rows.sort((a,b)=>String(b.created_at||'').localeCompare(String(a.created_at||''))).map(publicNode))
   const page=Math.max(1,Number.parseInt(req.query.page||'1',10)||1),pageSize=Math.min(500,Math.max(1,Number.parseInt(req.query.pageSize||'25',10)||25)),term=String(req.query.search||'').trim().toLowerCase(),filter=String(req.query.filter||'all'),sort=String(req.query.sort||'priority'),direction=String(req.query.direction||'asc').toLowerCase()==='desc'?-1:1
   let filtered=rows.filter(node=>{
+    if(req.query.scopeId&&node.scope_id!==req.query.scopeId)return false
+    if(req.query.source&&node.inventory_source!==req.query.source&&!one('SELECT id FROM asset_sources WHERE node_id=? AND provider=?',node.id,req.query.source))return false
     if(term&&!([node.hostname,node.fqdn,node.ip,node.os_name,node.os_version,node.platform,node.device_type,node.passive_device_hint,node.transport,node.hypervisor,node.virtual_machine?'virtual machine':''].map(value=>String(value||'').toLowerCase()).join(' ').includes(term)))return false
     const managed=serverNodeManaged(node)
     if(filter==='managed'&& !managed)return false
@@ -2417,7 +2425,7 @@ function driftSummaryByNode() {
   return new Map([...byNode].map(([nodeId,statuses])=>[nodeId,statuses.includes('drift')?'drift':statuses.includes('unknown')?'unknown':statuses.includes('pending')?'pending':statuses.includes('unchecked')?'unchecked':'in-sync']))
 }
 function report(name,user=null) {
-  if(name==='inventory')return all(`SELECT n.id,n.hostname,n.fqdn,n.ip,n.os_name,n.os_version,n.os_build,n.status,n.last_seen_at,n.connection_mode,n.inventory_source,n.ad_enabled,n.ad_missing,n.firewall_state,f.snapshot_json,f.collected_at,(SELECT status FROM policy_apply_runs WHERE node_id=n.id AND policy_id IS NOT NULL ORDER BY started_at DESC,rowid DESC LIMIT 1) last_apply_status,(SELECT finished_at FROM policy_apply_runs WHERE node_id=n.id AND policy_id IS NOT NULL ORDER BY started_at DESC,rowid DESC LIMIT 1) last_apply_at,(SELECT status FROM verifier_results WHERE node_id=n.id ORDER BY run_at DESC,rowid DESC LIMIT 1) last_verify_status FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id ORDER BY n.hostname`).filter(isLocalAssetNode).map(({snapshot_json,...row})=>{
+  if(name==='inventory')return all(`SELECT n.id,n.hostname,n.fqdn,n.ip,n.scope_id,n.os_name,n.os_version,n.os_build,n.status,n.last_seen_at,n.connection_mode,n.inventory_source,n.ad_enabled,n.ad_missing,n.firewall_state,f.snapshot_json,f.collected_at,(SELECT status FROM policy_apply_runs WHERE node_id=n.id AND policy_id IS NOT NULL ORDER BY started_at DESC,rowid DESC LIMIT 1) last_apply_status,(SELECT finished_at FROM policy_apply_runs WHERE node_id=n.id AND policy_id IS NOT NULL ORDER BY started_at DESC,rowid DESC LIMIT 1) last_apply_at,(SELECT status FROM verifier_results WHERE node_id=n.id ORDER BY run_at DESC,rowid DESC LIMIT 1) last_verify_status FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id ORDER BY n.hostname`).filter(isLocalAssetNode).map(({snapshot_json,...row})=>{
     const facts=parse(snapshot_json)||{}
     const profiles=Array.isArray(facts.firewall)?facts.firewall:facts.firewall?[facts.firewall]:[]
     return {...row,...normalizedNodeOs(row),model:facts.computer?.Model||null,manufacturer:facts.computer?.Manufacturer||null,bios_serial:facts.bios?.SerialNumber||null,firewall_service:facts.service?.Status||null,firewall_profiles:profiles.map(profile=>`${profile.Name}: ${profile.Enabled?'on':'off'}`).join(', ')||null}
@@ -2432,7 +2440,7 @@ function report(name,user=null) {
   })
   if(name==='coverage'){
     const drift=driftSummaryByNode()
-    return all(`SELECT n.id,n.hostname,n.ip,n.status,COUNT(DISTINCT a.policy_id) AS policy_count,(SELECT status FROM policy_apply_runs WHERE node_id=n.id AND policy_id IS NOT NULL ORDER BY started_at DESC LIMIT 1) AS last_apply_status,(SELECT passed FROM verifier_results WHERE node_id=n.id ORDER BY run_at DESC LIMIT 1) AS last_verify_passed FROM nodes n LEFT JOIN policy_assignments a ON a.node_id=n.id OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=n.id) GROUP BY n.id ORDER BY n.hostname`).filter(isLocalAssetNode).map(row=>({...row,drift_status:drift.get(row.id)||null}))
+    return all(`SELECT n.id,n.hostname,n.ip,n.scope_id,n.status,COUNT(DISTINCT a.policy_id) AS policy_count,(SELECT status FROM policy_apply_runs WHERE node_id=n.id AND policy_id IS NOT NULL ORDER BY started_at DESC LIMIT 1) AS last_apply_status,(SELECT passed FROM verifier_results WHERE node_id=n.id ORDER BY run_at DESC LIMIT 1) AS last_verify_passed FROM nodes n LEFT JOIN policy_assignments a ON a.node_id=n.id OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=n.id) GROUP BY n.id ORDER BY n.hostname`).filter(isLocalAssetNode).map(row=>({...row,drift_status:drift.get(row.id)||null}))
   }
   if(name==='verification'){
     const visible=user?readablePolicyIds(user):null
@@ -2456,7 +2464,7 @@ function exportReport(req,res,name,data) {
 }
 for(const name of ['inventory','dns','coverage','compliance','verification'])api.get(`/reports/${name}`,(req,res)=>exportReport(req,res,name,report(name,req.user)))
 api.get('/reports/dashboard',(_req,res)=>{
-  const localNodes=all('SELECT id,ip,status FROM nodes').filter(isLocalAssetNode),localIds=new Set(localNodes.map(node=>node.id)),total=localNodes.length,reachable=localNodes.filter(node=>node.status==='reachable').length
+  const localNodes=all('SELECT id,ip,status,scope_id FROM nodes').filter(isLocalAssetNode),localIds=new Set(localNodes.map(node=>node.id)),total=localNodes.length,reachable=localNodes.filter(node=>node.status==='reachable').length
   const policies=one('SELECT COUNT(*) n FROM policies').n, failed=one("SELECT COUNT(*) n FROM policy_apply_runs WHERE status='failed' AND policy_id IS NOT NULL").n
   const checks=one('SELECT COUNT(passed) n,COALESCE(SUM(passed),0) passed,COUNT(*)-COUNT(passed) inconclusive FROM verifier_results')
   const agentCutoff=new Date(Date.now()-120_000).toISOString()
@@ -3280,6 +3288,9 @@ async function collectTrainingTelemetry(node){
   if(node.connection_mode==='agent'){
     const agent=one('SELECT last_checkin_at FROM agents WHERE id=? AND revoked_at IS NULL',node.agent_id)
     if(!agent?.last_checkin_at||Date.parse(agent.last_checkin_at)<Date.now()-5*60_000)throw new Error('Agent is not online to confirm training telemetry')
+    const telemetry=one("SELECT * FROM node_capability_evidence WHERE node_id=? AND capability='events' AND source='agent-collector'",node.id)
+    const coverage=nodeCoverage(node)
+    if(!telemetry?.last_success_at||Date.now()-Date.parse(telemetry.last_success_at)>coverage.capabilities.events.thresholdHours*3600000||telemetry.last_failure_at&&telemetry.last_failure_at>=telemetry.last_success_at||coverage.capabilities.events.state!=='fresh')throw new Error('Fresh agent collection health with success auditing and no backlog is required before automatic learning can finish. Upgrade the agent or restore collection.')
   }else{
     if(!['winrm','winrms','wmi','netsh'].includes(node.transport))throw new Error('No working event collection transport; probe the node before training can finish')
     const auditPolicy=await remote(node,'audit_policy')
@@ -3315,6 +3326,7 @@ export async function processDueTraining(limit=25) {
   const results=[]
   for(const session of due){
     try{
+      if(session.status!=='active')await collectTrainingTelemetry(getNode(session.node_id))
       if(session.status==='active'){
         const node=getNode(session.node_id)
         if(!node)throw new Error('Node is missing')

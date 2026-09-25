@@ -1,5 +1,5 @@
 import {isIP} from 'node:net'
-import {inventoryEligibleIp} from './services/networkBoundary.js'
+import {assertDirectManagement,inventoryEligibleIp} from './services/networkBoundary.js'
 import {db,all,one,run,id,now,json,audit} from './db.js'
 import {openSealed} from './security.js'
 import {registerHost} from './networkDiscovery.js'
@@ -68,6 +68,7 @@ export function ensureSnmpNode(target,device,stamp){
  * credential to a node must be enough to collect facts and begin ARP learning.
  */
 export async function pollSnmpNode(node,{credential,credentialId=null,actorId=null,devicePoll=pollSnmpDevice}={}){
+  assertDirectManagement(node)
   if(!node?.id)throw new Error('SNMP node is required')
   if(!credential?.type)throw new Error('An SNMP credential is required')
   const host=node.ip||node.fqdn||node.hostname

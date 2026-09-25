@@ -59,6 +59,12 @@ public sealed class EventLogWorker(ILogger<EventLogWorker> logger) : BackgroundS
                         fullBatch = events.Count == 500;
                         if (!fullBatch) break;
                     }
+                    // Report successful empty reads as well as busy streams. Heartbeat alone
+                    // cannot prove the Security log collector is healthy or auditing is enabled.
+                    using var health = await client.PostAsJsonAsync($"api/v1/agents/{config.AgentId}/telemetry-health",
+                        new { checkedAt = DateTimeOffset.UtcNow, caughtUp = !fullBatch, successAuditEnabled = AuditCoverage.SuccessAuditingEnabled() }, JsonOptions, stoppingToken);
+                    // Older controllers do not expose this endpoint; event delivery still works.
+                    if (health.StatusCode != System.Net.HttpStatusCode.NotFound) health.EnsureSuccessStatusCode();
                     if (fullBatch) continue;
                 }
                 catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }

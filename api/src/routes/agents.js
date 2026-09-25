@@ -1,3 +1,4 @@
+import {capabilityEvidence} from '../services/capabilities.js'
 import express from 'express'
 import crypto from 'node:crypto'
 import {rateLimit} from 'express-rate-limit'
@@ -112,6 +113,12 @@ agentRoutes.get('/:id/update/package',requireAgent,(req,res)=>{
   } catch (error) { res.status(503).json({error:error.message}) }
 })
 
+agentRoutes.post('/:id/telemetry-health',requireAgent,(req,res)=>{
+  const data=z.object({checkedAt:z.string().datetime({offset:true}),caughtUp:z.boolean(),successAuditEnabled:z.boolean().nullable()}).strict().parse(req.body)
+  if(Math.abs(Date.now()-Date.parse(data.checkedAt))>5*60000)return res.status(400).json({error:'Telemetry health timestamp must be within five minutes of server time'})
+  capabilityEvidence(req.agent.node_id,'events','agent-collector',{success:data.caughtUp&&data.successAuditEnabled===true,code:!data.caughtUp?'collection_backlog':data.successAuditEnabled===null?'audit_unknown':'audit_disabled',detail:data})
+  res.json({ok:true})
+})
 agentRoutes.post('/:id/events',requireAgent,(req,res)=>{
   const event=z.object({recordId:z.number().int().positive(),id:z.number().int().positive(),timeCreated:z.string().datetime({offset:true}),fields:z.record(z.string(),z.string()).default({})})
   const {events}=z.object({events:z.array(event).min(1).max(500)}).parse(req.body)
@@ -132,6 +139,7 @@ agentRoutes.post('/:id/events',requireAgent,(req,res)=>{
     run("UPDATE nodes SET status='reachable',last_seen_at=?,failures=0 WHERE id=?",now(),req.agent.node_id)
     audit(null,'agent.events.ingest','node',req.agent.node_id,null,{agentId:req.agent.id,received:events.length,inserted,excluded,lastRecordId:events.at(-1).recordId})
   })()
+  capabilityEvidence(req.agent.node_id,'events','agent')
   res.status(201).json({received:events.length,inserted,excluded,lastRecordId:events.at(-1).recordId})
 })
 
@@ -207,6 +215,8 @@ agentRoutes.post('/:id/jobs/:jobId/result',requireAgent,(req,res)=>{
   db.transaction(()=>{
     run('UPDATE agent_jobs SET status=?,result_json=?,error=?,finished_at=?,lease_until=NULL,lease_token=NULL WHERE id=?',status,json(data.result||data.diff||null),resultError,now(),job.id)
     if(job.type==='arp.collect'&&data.success&&Array.isArray(data.result?.arp))recordArpEntries(req.agent.node_id,data.result.arp,'agent')
+    if(job.type==='policy.apply')capabilityEvidence(req.agent.node_id,'firewallWrite','agent',{success:status==='success'})
+    if(job.type==='policy.read'&&data.success&&readRuleSchema.safeParse(data.result?.rules).success){capabilityEvidence(req.agent.node_id,'firewallRead','agent');capabilityEvidence(req.agent.node_id,'policyReadback','agent')}
     if(payload.applyRunId)run('UPDATE policy_apply_runs SET status=?,diff_json=?,error=?,finished_at=? WHERE id=?',status,json(data.diff||null),resultError,now(),payload.applyRunId)
     if(payload.loopbackBaseline){
       run('UPDATE node_loopback_baseline SET status=?,applied_at=?,last_error=?,job_id=NULL WHERE node_id=? AND job_id=?',data.success?'applied':'failed',data.success?now():null,data.error||null,req.agent.node_id,job.id)

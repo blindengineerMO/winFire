@@ -49,7 +49,8 @@ $result = switch ($operation) {
     $adapters = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' | ForEach-Object {
       [pscustomobject]@{description=$_.Description;macAddress=$_.MACAddress;ipAddresses=@($_.IPAddress);subnets=@($_.IPSubnet);gateways=@($_.DefaultIPGateway);dnsServers=@($_.DNSServerSearchOrder);dnsDomain=$_.DNSDomain;dnsSuffixes=@($_.DNSDomainSuffixSearchOrder);dhcpEnabled=$_.DHCPEnabled;dhcpServer=$_.DHCPServer}
     })
-    $lastUser=$null; $machineGuid=$null; $machineSid=$null
+    $lastUser=$null; $machineGuid=$null; $machineSid=$null; $biosUuid=$null
+        try {$biosUuid=(Get-CimInstance Win32_ComputerSystemProduct -ErrorAction Stop).UUID} catch {}
     try {$lastUser=(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI' -ErrorAction Stop).LastLoggedOnUser} catch {}
     try {$machineGuid=(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography' -ErrorAction Stop).MachineGuid} catch {}
     try {$admin=Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True AND SID LIKE '%-500'" | Select-Object -First 1; if($admin){$machineSid=$admin.SID -replace '-500$',''}} catch {}
@@ -57,7 +58,7 @@ $result = switch ($operation) {
       computer = $computer | Select-Object Name,Model,Manufacturer,Domain,PartOfDomain,UserName
       bios = $biosInfo | Select-Object SerialNumber
       os = $osInfo | Select-Object Caption,Version,BuildNumber,OSArchitecture,InstallDate,LastBootUpTime
-      identity = [pscustomobject]@{machineGuid=$machineGuid;localMachineSid=$machineSid;domainJoined=[bool]$computer.PartOfDomain;domainName=$computer.Domain;sessionLogonServer=$env:LOGONSERVER;currentInteractiveUser=$computer.UserName;lastLoggedOnUser=$lastUser}
+      identity = [pscustomobject]@{machineGuid=$machineGuid;biosUuid=$biosUuid;localMachineSid=$machineSid;domainJoined=[bool]$computer.PartOfDomain;domainName=$computer.Domain;sessionLogonServer=$env:LOGONSERVER;currentInteractiveUser=$computer.UserName;lastLoggedOnUser=$lastUser}
       network = $adapters
       dnsSuffixes = @($adapters | ForEach-Object { @($_.dnsSuffixes)+@($_.dnsDomain) } | Where-Object { $_ } | Select-Object -Unique)
       firewall = @(Get-NetFirewallProfile | Select-Object Name,Enabled,DefaultInboundAction,DefaultOutboundAction)
@@ -333,7 +334,7 @@ def parse_legacy_facts(output):
             fields[key] = decoded
     return {'computer':{'Name':fields.get('NAME'), 'Domain':fields.get('DOMAIN'), 'PartOfDomain':fields.get('JOINED', '').lower() == 'true', 'UserName':fields.get('USER'), 'Model':fields.get('MODEL'), 'Manufacturer':fields.get('MANUFACTURER')},
             'os':{'Caption':fields.get('CAPTION'), 'Version':fields.get('VERSION'), 'BuildNumber':fields.get('BUILD'), 'OSArchitecture':fields.get('ARCH')},
-            'bios':{'SerialNumber':fields.get('SERIAL')}, 'identity':{'machineGuid':fields.get('GUID'), 'domainJoined':fields.get('JOINED', '').lower() == 'true', 'domainName':fields.get('DOMAIN'), 'currentInteractiveUser':fields.get('USER')},
+            'bios':{'SerialNumber':fields.get('SERIAL')}, 'identity':{'biosUuid':fields.get('BIOS_UUID'), 'machineGuid':fields.get('GUID'), 'domainJoined':fields.get('JOINED', '').lower() == 'true', 'domainName':fields.get('DOMAIN'), 'currentInteractiveUser':fields.get('USER')},
             'network':adapters, 'dnsSuffixes':[item['dnsDomain'] for item in adapters if item['dnsDomain']], 'firewall':[], 'service':None}
 
 

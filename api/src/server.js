@@ -1,3 +1,4 @@
+import {processAzureWork} from './cloud/service.js'
 import {processAiWork,pruneAi} from './ai/observations.js'
 import {processInternetIndex} from './services/internetConnections.js'
 import {processPeerDns,pruneInternetPeers} from './services/internetPeers.js'
@@ -258,3 +259,6 @@ internetDnsTimer.unref()
 let aiTicks=0
 const aiTimer=setInterval(()=>{try{processAiWork({limit:50});if(++aiTicks%120===0)pruneAi()}catch{run("UPDATE ai_worker_state SET last_error='worker_failed' WHERE id=1")}},1000)
 aiTimer.unref()
+
+const azureTimer=setInterval(()=>processAzureWork().catch(()=>console.error('Azure discovery worker failed')),5000)
+azureTimer.unref()

@@ -57,7 +57,12 @@ export function addressCategory(value,cidrs=[]){
 export const unicastIp=(ip,cidrs=[])=>['public','private','shared','documentation'].includes(addressCategory(ip,cidrs))
 export const outsideLocal=(ip,cidrs)=>cidrs.length>0&&unicastIp(ip,cidrs)&&!inLocalCidrs(ip,cidrs)
 export const inventoryEligibleIp=ip=>{const scopes=configuredCidrs();return unicastIp(ip,scopes)&&(!scopes.length||inLocalCidrs(ip,scopes))}
-export const isLocalAssetNode=node=>{const cidrs=configuredCidrs();return !node?.ip||!cidrs.length||inLocalCidrs(node.ip,cidrs)}
+export const scopeCidrs=scopeId=>!scopeId||scopeId==='default'?configuredCidrs():JSON.parse(one('SELECT cidrs_json FROM inventory_scopes WHERE id=?',scopeId)?.cidrs_json||'[]')
+export const isLocalAssetNode=node=>{const cidrs=scopeCidrs(node?.scope_id);return !node?.scope_id||node.scope_id==='default'?(!node?.ip||!cidrs.length||inLocalCidrs(node.ip,cidrs)):!!node.ip&&inLocalCidrs(node.ip,cidrs)}
+export function assertDirectManagement(node){
+  if(node?.scope_id&&node.scope_id!=='default'&&!one('SELECT direct_management FROM inventory_scopes WHERE id=?',node.scope_id)?.direct_management)throw Object.assign(new Error('This network scope is inventory-only; configure a verified management path before host operations'),{status:409})
+}
+
 
 export function boundaryState(){
   const cidrs=configuredCidrs(),serialized=JSON.stringify(cidrs)

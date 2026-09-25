@@ -20,6 +20,8 @@ WinFire Secure is an API-first control plane for host inventory, firewall visibi
 | [JIT MFA: how it works](docs/JIT_MFA.md) | Setup, supported platforms, prompting, identity checks, firewall gates, temporary grants, expiry, fallback and verification. |
 | [Enterprise Internet deployment](docs/INTERNET_ENTERPRISE_DEPLOYMENT.md) | Browser extension deployment and URL telemetry/policy. |
 
+Administration → Discovery → **Azure / Arc** provides scoped VM/Arc inventory, dedicated Azure vault credentials, access tests, previews, recurring read-only syncs, identity conflict review and source details. Cloud status stays separate from host management verification. See [Azure discovery setup, API examples and rollout gates](docs/AZURE_DISCOVERY.md).
+
 Live OpenAPI: **`GET /api/v1/openapi.json`**. Regenerate the route reference with `npm run docs:api`; generation uses a disposable database and does not contact inventory hosts.
 
 ## Feature summary
@@ -153,3 +155,11 @@ The frontend route is `/` for Dashboard, `/inventory` for assets/groups/triage, 
 
 ## AI Usage Monitoring with built-in MCP Server
 ![ScreenShot14](assets/AIUsage.png)
+
+## SNMP MIB Library populated with support for over 5,000 devices.
+![ScreenShot15](assets/mibLibrary.png)
+
+## Azure/ARC Discovery
+![ScreenShot16](assets/arcDiscovery.png)
+
+![Footer](assets/logoFooter.png)

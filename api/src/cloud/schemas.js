@@ -1,0 +1,11 @@
+import {z} from 'zod'
+import {normalizeCidrs} from '../services/networkBoundary.js'
+const uuid=z.string().uuid(),text=z.string().trim().min(1).max(180)
+export const scopeSchema=z.object({name:text,kind:z.enum(['site','azure-vnet']).default('site'),cidrs:z.array(z.string().max(64)).max(256).transform(normalizeCidrs),directManagement:z.boolean().default(false)}).strict()
+export const azureCredentialSchema=z.object({name:text,tenantId:uuid,clientId:uuid.optional(),authMethod:z.enum(['secret','certificate','managed-identity','workload-identity']),clientSecret:z.string().min(1).max(4096).optional(),clientCertificatePem:z.string().min(1).max(32768).optional(),clientPrivateKeyPem:z.string().min(1).max(32768).optional(),visibility:z.enum(['private','team']).default('private'),teamId:z.string().nullable().optional(),priority:z.number().int().min(-100000).max(100000).default(100)}).strict().superRefine((v,c)=>{
+  if(v.authMethod!=='managed-identity'&&!v.clientId)c.addIssue({code:'custom',message:'A client ID is required'})
+  if(v.authMethod==='secret'&&!v.clientSecret)c.addIssue({code:'custom',message:'A client secret is required'})
+  if(v.authMethod==='certificate'&&(!v.clientCertificatePem||!v.clientPrivateKeyPem))c.addIssue({code:'custom',message:'Certificate and private key are required'})
+})
+export const connectionSchema=z.object({name:text,credentialId:uuid,subscriptions:z.array(uuid).min(1).max(100),resourceGroups:z.array(z.string().trim().min(1).max(90)).max(100).default([]),tags:z.record(z.string().max(128),z.string().max(256)).default({}),scopeId:z.string().min(1).max(80),networkScopes:z.array(z.object({networkId:z.string().min(1).max(2048),scopeId:z.string().min(1).max(80)}).strict()).max(100).default([]),enabled:z.boolean().default(false),intervalMinutes:z.number().int().min(5).max(10080).default(60)}).strict()
+export const pageSchema=z.object({q:z.string().max(200).default(''),page:z.coerce.number().int().min(1).default(1),pageSize:z.coerce.number().int().min(1).max(250).default(25),sort:z.enum(['name','updated','state']).default('updated'),direction:z.enum(['asc','desc']).default('desc'),state:z.enum(['all','candidate','linked','conflict','out-of-scope','missing','retired','ignored']).default('all'),scopeId:z.string().max(80).optional(),connectionId:uuid.optional()})

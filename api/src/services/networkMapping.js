@@ -1,4 +1,4 @@
-import {effectiveCidrs,outsideLocal,inLocalCidrs,inventoryEligibleIp,boundaryState} from './networkBoundary.js'
+import {scopeCidrs,effectiveCidrs,outsideLocal,inLocalCidrs,inventoryEligibleIp,boundaryState} from './networkBoundary.js'
 import {isIP} from 'node:net'
 import {mappingScope, mappingFlowWhere} from './mappingScope.js'
 import {all, one, run, id, now} from '../db.js'
@@ -232,7 +232,7 @@ export function classifyNetworkFlow({node, sourceIp, destinationIp, sourceNode, 
   const localCategories = new Set(['broadcast', 'multicast', 'loopback', 'link-local', 'private', 'unspecified'])
   const hasPublic = sourceCategory === 'public' || destinationCategory === 'public'
   let scope = trafficClass === 'loopback' ? 'host-local' : (localCategories.has(sourceCategory) && localCategories.has(destinationCategory) && !hasPublic) || sourceNode && destinationNode ? 'internal' : hasPublic ? 'external' : 'unknown'
-  const boundary=effectiveCidrs()
+  const boundary=node?.scope_id&&node.scope_id!=='default'?scopeCidrs(node.scope_id):effectiveCidrs()
   if(!['loopback','broadcast','multicast','link-local','unspecified'].includes(trafficClass))scope=boundary.length?(outsideLocal(source,boundary)||outsideLocal(destination,boundary)?'external':inLocalCidrs(source,boundary)&&inLocalCidrs(destination,boundary)?'internal':'unknown'):'unknown'
   let reason
   if (trafficClass === 'multicast') reason = `${destination || source} is a multicast group; multicast is link or site scoped and is treated as internal traffic`
@@ -255,8 +255,8 @@ const hasIdentifiedService = value => {
   const service = String(value || '').trim()
   return Boolean(service) && !/^(?:unknown|unidentified|unclassified)(?:\s+service)?$|^n\/a$|^-$/.test(service.toLowerCase())
 }
-const localNode = nodeId => one('SELECT n.id,n.ip,n.hostname,f.snapshot_json FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id WHERE n.id=?', nodeId)
-const nodeForIp = address => address ? one('SELECT id,hostname FROM nodes WHERE lower(ip)=lower(?) LIMIT 1', address) : null
+const localNode = nodeId => one('SELECT n.id,n.ip,n.hostname,n.scope_id,f.snapshot_json FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id WHERE n.id=?', nodeId)
+const nodeForIp = (address,scopeId='default') => address ? one('SELECT id,hostname FROM nodes WHERE scope_id=? AND lower(ip)=lower(?) LIMIT 1', scopeId,address) : null
 
 const PASSIVE_MANAGEMENT_PORTS = new Set([22, 80, 443, 445, 3389, 5985, 5986, 8006, 902])
 const PASSIVE_PRINTER_PORTS = new Set([515, 631, 9100])
@@ -348,13 +348,13 @@ export function recordNetworkFlow(nodeId, event, observedAt = null) {
   const sourceIp = clean(event.srcIp || (direction === 'out' ? node.ip : null))
   const destinationIp = clean(event.dstIp || (direction === 'in' ? node.ip : null))
   if (!sourceIp || !destinationIp || isIP(ipv4(sourceIp)) === 0 || isIP(ipv4(destinationIp)) === 0) return false
-  const sourceNode = sourceIp === node.ip ? node : nodeForIp(sourceIp)
-  const destinationNode = destinationIp === node.ip ? node : nodeForIp(destinationIp)
+  const sourceNode = sourceIp === node.ip ? node : nodeForIp(sourceIp,node.scope_id)
+  const destinationNode = destinationIp === node.ip ? node : nodeForIp(destinationIp,node.scope_id)
   const protocol = normalizeNetworkProtocol(event.protocol || 'UNKNOWN')
   const sourcePort = port(event.srcPort)
   const destinationPort = port(event.dstPort)
   const classification = classifyNetworkFlow({node, sourceIp, destinationIp, sourceNode, destinationNode, protocol, sourcePort, destinationPort, program:event.program})
-  const key = [sourceNode?.id || '', destinationNode?.id || '', sourceIp, destinationIp, protocol, sourcePort || '', destinationPort || ''].join('|')
+  const key = (node.scope_id&&node.scope_id!=='default'?node.scope_id+'|':'')+[sourceNode?.id || '', destinationNode?.id || '', sourceIp, destinationIp, protocol, sourcePort || '', destinationPort || ''].join('|')
   const at = observedAt || event.eventTime || now()
   const existing = one('SELECT map_key FROM network_map_pairs WHERE map_key=?', key)
   if (existing) {
@@ -368,7 +368,7 @@ export function recordNetworkFlow(nodeId, event, observedAt = null) {
 export function recordArpEntries(nodeId, entries, source = 'agent') {
   const items = Array.isArray(entries) ? entries.slice(0, 5000) : []
   let saved = 0
-  const sourceNode = one('SELECT id,ip FROM nodes WHERE id=?', nodeId)
+  const sourceNode = one('SELECT id,ip,scope_id FROM nodes WHERE id=?', nodeId)
   for (const item of items) {
     const ip = clean(item.ip)
     if (!ip || isIP(ipv4(ip)) === 0) continue
@@ -381,8 +381,8 @@ export function recordArpEntries(nodeId, entries, source = 'agent') {
     // addresses that are not already inventory records and never queue the
     // reporting node's own address. The queue keeps ingestion synchronous and
     // lets the normal DNS/WinRM onboarding worker handle network operations.
-    const inventoryNode = one('SELECT id FROM nodes WHERE lower(ip)=lower(?) LIMIT 1', ip)
-    if (sourceNode && ip !== sourceNode.ip && !inventoryNode && inventoryEligibleIp(ip)) run(`INSERT INTO passive_discovery_candidates(id,ip,mac,source_node_id,hostname,first_seen_at,last_seen_at,status,attempts,next_attempt_at,node_id,last_error,updated_at)
+    const inventoryNode = nodeForIp(ip,sourceNode?.scope_id)
+    if (sourceNode?.scope_id==='default' && ip !== sourceNode.ip && !inventoryNode && inventoryEligibleIp(ip)) run(`INSERT INTO passive_discovery_candidates(id,ip,mac,source_node_id,hostname,first_seen_at,last_seen_at,status,attempts,next_attempt_at,node_id,last_error,updated_at)
       VALUES(?,?,?,?,?,?,?,'queued',0,NULL,NULL,NULL,?)
       ON CONFLICT(ip) DO UPDATE SET mac=COALESCE(excluded.mac,passive_discovery_candidates.mac),source_node_id=excluded.source_node_id,hostname=COALESCE(excluded.hostname,passive_discovery_candidates.hostname),last_seen_at=excluded.last_seen_at,updated_at=excluded.updated_at,
         status=CASE WHEN passive_discovery_candidates.status='registered' THEN passive_discovery_candidates.status ELSE 'queued' END,

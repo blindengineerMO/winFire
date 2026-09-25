@@ -31,6 +31,7 @@
     "test:ai:ui": "npm run build && bash scripts/verify-ai-ui.sh"
   },
   "dependencies": {
+    "@azure/identity": "4.13.3",
     "@modelcontextprotocol/client": "2.1.0",
     "@modelcontextprotocol/express": "2.0.1",
     "@modelcontextprotocol/node": "2.1.0",

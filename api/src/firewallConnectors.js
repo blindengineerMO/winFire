@@ -1,3 +1,4 @@
+import {capabilityEvidence} from './services/capabilities.js'
 import {db, one, all, run, id, now, audit, json, parse} from './db.js'
 import {applyRules, remote} from './connector.js'
 
@@ -23,6 +24,7 @@ class RemoteFirewallConnector extends IFirewallConnector {
   }
   async readRules(group){
     const response=await remote(this.node,'rules',{group})
+    capabilityEvidence(this.node.id,'policyReadback',this.node.transport)
     return Array.isArray(response)?response:response?[response]:[]
   }
   async eventCursor(){return remote(this.node,'event_cursor')}
