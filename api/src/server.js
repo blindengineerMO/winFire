@@ -1,3 +1,10 @@
+import {processContainment} from './services/containment.js'
+import {refreshMetadataSources,notifyDependencyChanges} from './services/applicationContext.js'
+import {processDeployments} from './services/stagedDeployment.js'
+import {pruneTelemetry} from './telemetry/service.js'
+import {notifyExceptionReviews} from './services/ruleLifecycle.js'
+import {startTelemetryReceivers} from './telemetry/receiver.js'
+import {processSimulations} from './services/policySimulation.js'
 import {runDdosCycle} from './services/ddos.js'
 import {processAzureWork} from './cloud/service.js'
 import {processAiWork,pruneAi} from './ai/observations.js'
@@ -40,6 +47,13 @@ if(tlsSettings.some(Boolean)&&!tlsSettings.every(Boolean))throw new Error('TLS c
 const tls=agentTlsOptions()
 const server=tls?https.createServer(tls,app):app
 const listener=server.listen(Number(process.env.PORT||3000),process.env.HOST||'0.0.0.0',()=>console.log(`WinFire ready on ${tls?'https':'http'}://localhost:${process.env.PORT||3000}`))
+setInterval(()=>{try{processSimulations()}catch(error){console.error('Policy simulation failed:',error.message)}},1000).unref()
+const telemetryReceivers=startTelemetryReceivers()
+setInterval(()=>{try{pruneTelemetry()}catch(error){console.error('Telemetry retention:',error.message)}},60000).unref()
+setInterval(()=>{try{notifyExceptionReviews()}catch(error){console.error('Exception review sweep:',error.message)}},60000).unref()
+setInterval(()=>processDeployments().catch(error=>console.error('Staged deployment worker:',error.message)),2000).unref()
+setInterval(()=>{try{refreshMetadataSources();notifyDependencyChanges()}catch(error){console.error('Application context refresh:',error.message)}},60000).unref()
+setInterval(()=>processContainment().catch(error=>console.error('Containment worker:',error.message)),2000).unref()
 let trainingRunning=false
 async function sweepTraining(){
   if(trainingRunning)return

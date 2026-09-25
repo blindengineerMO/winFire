@@ -430,7 +430,7 @@ def windows_dialect(value):
 def main():
     payload = json.load(sys.stdin)
     operation = payload['operation']
-    if operation not in {'auth', 'tcp_probe', 'facts', 'all_rules', 'rules', 'apply', 'events', 'events_recent', 'events_probe', 'event_cursor', 'audit_policy', 'audit_policy_enable', 'rights', 'rights_change', 'account_inventory', 'breakglass_start', 'breakglass_end', 'jit_preflight', 'jit_start', 'jit_end', 'ddos_start', 'ddos_end', 'prompt_browser', 'prompt_session', 'agent_deploy', 'security_process_owner', 'security_session_logoff'}:
+    if operation not in {'auth', 'tcp_probe', 'facts', 'all_rules', 'rules', 'apply', 'events', 'events_recent', 'events_probe', 'event_cursor', 'audit_policy', 'audit_policy_enable', 'rights', 'rights_change', 'account_inventory', 'breakglass_start', 'breakglass_end', 'jit_preflight', 'jit_start', 'jit_end', 'ddos_start', 'ddos_end', 'safety_context', 'safety_arm', 'safety_apply', 'safety_commit', 'safety_restore', 'safety_status', 'prompt_browser', 'prompt_session', 'agent_deploy', 'security_process_owner', 'security_session_logoff'}:
         raise ValueError('Unsupported operation')
     host = payload['host']
     secure = payload.get('transport') == 'winrms'
@@ -455,13 +455,13 @@ def main():
         return
     args = base64.b64encode(json.dumps(payload.get('args') or {}).encode()).decode()
     shared_root = Path(__file__).resolve().parents[2] / 'packages' / 'shared'
-    calls = {'ddos_start':'Invoke-WinFireDdos $argsData $false','ddos_end':'Invoke-WinFireDdos $argsData $true','jit_preflight':'Test-WinFireJitGate $argsData','jit_start':'Start-WinFireJitAccess $argsData','jit_end':'End-WinFireJitAccess $argsData',
+    calls = {'safety_context':'Get-WinFirePolicyContext','safety_arm':"Invoke-WinFirePolicySafety $argsData 'arm'",'safety_apply':"Invoke-WinFirePolicySafety $argsData 'apply'",'safety_commit':"Invoke-WinFirePolicySafety $argsData 'commit'",'safety_restore':"Invoke-WinFirePolicySafety $argsData 'restore'",'safety_status':"Invoke-WinFirePolicySafety $argsData 'status'",'ddos_start':'Invoke-WinFireDdos $argsData $false','ddos_end':'Invoke-WinFireDdos $argsData $true','jit_preflight':'Test-WinFireJitGate $argsData','jit_start':'Start-WinFireJitAccess $argsData','jit_end':'End-WinFireJitAccess $argsData',
              'breakglass_start':'Start-WinFireBreakGlass $argsData','breakglass_end':'End-WinFireBreakGlass $argsData',
              'prompt_browser':'Open-WinFireMfaPortal $argsData','prompt_session':'@(Get-WinFireActiveSession)',
              'agent_deploy':'Install-WinFireAgentRemote $argsData','security_process_owner':'Get-WinFireProcessOwner $argsData',
              'security_session_logoff':'End-WinFireClientSession $argsData'}
     if operation in calls:
-        source = (Path(__file__).resolve().parent / ('agent_deploy.ps1' if operation == 'agent_deploy' else 'security_process_owner.ps1')) if operation in {'agent_deploy','security_process_owner','security_session_logoff'} else shared_root / ('ddosProtection.ps1' if operation.startswith('ddos_') else 'jitAccess.ps1' if operation.startswith('jit_') else 'mfaPrompt.ps1' if operation.startswith('prompt_') else 'breakGlass.ps1')
+        source = (Path(__file__).resolve().parent / ('agent_deploy.ps1' if operation == 'agent_deploy' else 'security_process_owner.ps1')) if operation in {'agent_deploy','security_process_owner','security_session_logoff'} else shared_root / ('policySafety.ps1' if operation.startswith('safety_') else 'ddosProtection.ps1' if operation.startswith('ddos_') else 'jitAccess.ps1' if operation.startswith('jit_') else 'mfaPrompt.ps1' if operation.startswith('prompt_') else 'breakGlass.ps1')
         functions = source.read_text()
         if operation.startswith('jit_'):
             functions = (Path(__file__).resolve().parent / 'lsa_rights.ps1').read_text() + '\n' + functions

@@ -3,6 +3,7 @@ import {useRoute} from 'vue-router'
 const route=useRoute()
 import {computed, onMounted, ref} from 'vue'
 import PageHeader from '../../components/PageHeader.vue'
+import TrafficContext from '../../components/mapping/TrafficContext.vue'
 import MappingFilters from '../../components/mapping/MappingFilters.vue'
 import MappingPairsTable from '../../components/mapping/MappingPairsTable.vue'
 import TopTalkersTable from '../../components/mapping/TopTalkersTable.vue'
@@ -13,7 +14,7 @@ import TransactionDetailsDialog from '../../components/TransactionDetailsDialog.
 import {api,session} from '../../services/api.js'
 import {mappingService} from '../../services/mapping.js'
 
-const activeTab=ref('pairs')
+const activeTab=ref(['pairs','topology','talkers','neighbors','applications','cloud'].includes(route.query.tab)?route.query.tab:'pairs')
 const rows=ref([]),topTalkers=ref([]),arp=ref([]),topology=ref({nodes:[],edges:[],nodeCount:0,edgeCount:0}),nodes=ref([]),policies=ref([])
 const emptyFilters=()=>({nodeId:'',external:'',trafficClass:'',subnet:'',switchId:'',from:'',to:''})
 const draft=ref({...emptyFilters(),nodeId:String(route.query.nodeId||'')}),applied=ref({...emptyFilters(),nodeId:String(route.query.nodeId||'')}),filterOptions=ref({switches:[],subnets:[]})
@@ -68,26 +69,29 @@ onMounted(async()=>{try{[nodes.value,policies.value,filterOptions.value]=await P
 
 <template>
   <div class="view mapping-view">
-    <PageHeader eyebrow="VISIBILITY / NETWORK MAP" title="Network mapping" description="Correlate observed traffic into internal node pairs, external connections and top talkers">
+    <PageHeader v-if="!['applications','cloud'].includes(activeTab)" eyebrow="VISIBILITY / NETWORK MAP" title="Network mapping" description="Correlate observed traffic into internal node pairs, external connections and top talkers">
       <div class="page-actions"><button class="button secondary" @click="rebuild"><i class="mdi mdi-database-refresh-outline"></i> Rebuild map</button><button class="button primary" :disabled="loading" @click="load"><i class="mdi mdi-refresh"></i> Refresh</button></div>
     </PageHeader>
     <div v-if="error" class="error-msg">{{error}}</div><div v-if="message" class="success-msg">{{message}}</div>
-    <div class="metric-grid"><div class="metric glass"><div class="metric-top"><span>MAPPED PAIRS</span><i class="mdi mdi-vector-link"></i></div><strong>{{total}}</strong><small>Observed connection patterns</small></div><div class="metric glass"><div class="metric-top"><span>TOP TALKER</span><i class="mdi mdi-swap-vertical"></i></div><strong>{{topTalkers[0]?.hostname||'—'}}</strong><small>{{topTalkers[0]?.connections||0}} connections</small></div><div class="metric glass"><div class="metric-top"><span>ARP ENTRIES</span><i class="mdi mdi-lan-connect"></i></div><strong>{{arp.length}}</strong><small>{{selectedNode?.hostname||'All managed nodes'}}</small></div><div class="metric glass"><div class="metric-top"><span>PAGE</span><i class="mdi mdi-table-large"></i></div><strong>{{page}}<span>/{{pages}}</span></strong><small>Rows {{pageSize}} per page</small></div></div>
+    <div v-if="!['applications','cloud'].includes(activeTab)" class="metric-grid"><div class="metric glass"><div class="metric-top"><span>MAPPED PAIRS</span><i class="mdi mdi-vector-link"></i></div><strong>{{total}}</strong><small>Observed connection patterns</small></div><div class="metric glass"><div class="metric-top"><span>TOP TALKER</span><i class="mdi mdi-swap-vertical"></i></div><strong>{{topTalkers[0]?.hostname||'—'}}</strong><small>{{topTalkers[0]?.connections||0}} connections</small></div><div class="metric glass"><div class="metric-top"><span>ARP ENTRIES</span><i class="mdi mdi-lan-connect"></i></div><strong>{{arp.length}}</strong><small>{{selectedNode?.hostname||'All managed nodes'}}</small></div><div class="metric glass"><div class="metric-top"><span>PAGE</span><i class="mdi mdi-table-large"></i></div><strong>{{page}}<span>/{{pages}}</span></strong><small>Rows {{pageSize}} per page</small></div></div>
 
-    <MappingFilters v-model="draft" :nodes="nodes" :switches="filterOptions.switches" :subnets="filterOptions.subnets" :busy="loading" @apply="changeFilter" @reset="clearFilters" />
+    <MappingFilters v-if="!['applications','cloud'].includes(activeTab)" v-model="draft" :nodes="nodes" :switches="filterOptions.switches" :subnets="filterOptions.subnets" :busy="loading" @apply="changeFilter" @reset="clearFilters" />
     <nav class="view-tabs" aria-label="Network mapping sections" role="tablist">
       <button type="button" role="tab" :aria-selected="activeTab==='pairs'" :class="{active:activeTab==='pairs'}" @click="activeTab='pairs'"><i class="mdi mdi-vector-link"></i> Connections <span>{{total}}</span></button>
       <button type="button" role="tab" :aria-selected="activeTab==='topology'" :class="{active:activeTab==='topology'}" @click="activeTab='topology';load()"><i class="mdi mdi-graph-outline"></i> Topology <span>{{topology.nodeCount||0}}</span></button>
       <button type="button" role="tab" :aria-selected="activeTab==='talkers'" :class="{active:activeTab==='talkers'}" @click="activeTab='talkers'"><i class="mdi mdi-swap-vertical"></i> Most active nodes <span>{{topTalkers.length}}</span></button>
       <button type="button" role="tab" :aria-selected="activeTab==='neighbors'" :class="{active:activeTab==='neighbors'}" @click="activeTab='neighbors'"><i class="mdi mdi-lan-connect"></i> Neighbors <span>{{arp.length}}</span></button>
+      <button type="button" role="tab" :aria-selected="activeTab==='applications'" :class="{active:activeTab==='applications'}" @click="activeTab='applications'">Applications</button>
+      <button type="button" role="tab" :aria-selected="activeTab==='cloud'" :class="{active:activeTab==='cloud'}" @click="activeTab='cloud'">Cloud context</button>
     </nav>
+    <TrafficContext v-if="['applications','cloud'].includes(activeTab)" :key="activeTab" :kind="activeTab"/>
 
     <section v-if="activeTab==='pairs'" class="mapping-tab" role="tabpanel">
       <section class="panel glass"><div class="panel-title"><div><span class="eyebrow">CONNECTION GRAPH</span><h2>Node pairs and analyzed traffic</h2></div></div><MappingPairsTable :rows="rows" :loading="loading" :total="total" :page="page" :pages="pages" @previous="next(-1)" @next="next(1)" @select="openTransaction" /></section>
     </section>
     <section v-else-if="activeTab==='topology'" class="mapping-tab" role="tabpanel"><TopologyGraph :graph="topology" :selected-id="topologySelectedId" @select="selectTopologyNode" /></section>
     <section v-else-if="activeTab==='talkers'" class="mapping-tab" role="tabpanel"><TopTalkersTable :talkers="topTalkers" /><p class="mapping-note">Top talkers are calculated from the observed connection pairs and include both managed nodes and external peers.</p></section>
-    <section v-else class="mapping-tab" role="tabpanel"><ArpSnapshotTable :entries="arp" :node-selected="!!nodeId" @collect="collectArp" /></section>
+    <section v-else-if="activeTab==='neighbors'" class="mapping-tab" role="tabpanel"><ArpSnapshotTable :entries="arp" :node-selected="!!nodeId" @collect="collectArp" /></section>
     <TransactionDetailsDialog v-model="detailOpen" :transaction="selectedRow" title="Network transaction details" :can-allow="canManageRules&&canRule(representativeEvent)" :can-deny="canManageRules&&canRule(representativeEvent)" :can-ignore="canManageRules&&canIgnore(representativeEvent)" :loading-actions="detailLoading" :busy="ruleBusy||ignoreBusy" @allow="beginRule('allow')" @deny="beginRule('block')" @ignore="ignoreTransaction" />
     <GlassWindow v-model="ruleOpen" title="Create rule from network transaction" width="560px"><div v-if="representativeEvent" class="form-grid"><p>{{representativeEvent.direction==='in'?'Inbound':'Outbound'}} {{representativeEvent.protocol}} {{representativeEvent.dst_port}} · {{representativeEvent.direction==='in'?representativeEvent.src_ip:representativeEvent.dst_ip}}</p><label>Action<select v-model="ruleAction"><option value="allow">Allow</option><option value="block">Reject</option></select></label><label>Policy<select v-model="rulePolicyId"><option value="personal">{{representativeEvent.node_name||representativeEvent.node_id}} personal policy</option><option v-for="policy in groupPolicies" :key="policy.id" :value="policy.id">{{policy.name}} · group/global</option></select></label><p class="muted">The rule is staged in a new version. It will reach enforced nodes when an administrator syncs policies.</p><div class="form-actions"><button class="button secondary" @click="ruleOpen=false">Cancel</button><button class="button primary" :disabled="ruleBusy" @click="addRule">{{ruleBusy?'Saving…':'Create rule'}}</button></div></div></GlassWindow>
   </div>

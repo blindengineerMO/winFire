@@ -3,7 +3,7 @@ import {db,all,one,run,id,now,json,parse,audit} from './db.js'
 
 const DEFAULT_INTERVAL_MINUTES=60
 const MAX_INTERVAL_MINUTES=10080
-const FIELD_NAMES=new Set(['hostname','fqdn','ip'])
+const FIELD_NAMES=new Set(['hostname','fqdn','ip','application','environment','workload_role','business_owner','criticality'])
 const OPERATORS=new Set(['contains','equals','cidr'])
 
 function fail(message){throw Object.assign(new Error(message),{status:400})}
@@ -97,7 +97,7 @@ export function updateDynamicGroup(groupId,input,actorId=null){
 export function refreshDynamicGroups({groupId=null,force=false,at=new Date()}={}){
   const timestamp=at instanceof Date?at:new Date(at)
   const groups=groupId?[one('SELECT * FROM node_groups WHERE id=? AND dynamic_enabled=1',groupId)]:all("SELECT * FROM node_groups WHERE dynamic_enabled=1 AND (dynamic_next_evaluation_at IS NULL OR dynamic_next_evaluation_at<=?) ORDER BY dynamic_next_evaluation_at",timestamp.toISOString())
-  const nodes=all('SELECT id,hostname,fqdn,ip FROM nodes')
+  const nodes=all('SELECT id,hostname,fqdn,ip,application,environment,workload_role,business_owner,criticality FROM nodes')
   const results=[]
   db.transaction(()=>{
     for(const group of groups.filter(Boolean)){

@@ -92,13 +92,16 @@ test('personal policy previews live flows, progresses by version, and freezes af
   db.prepare('UPDATE learning_sessions SET ends_at=?,last_attempt_at=? WHERE id=?').run(new Date(Date.now()-1000).toISOString(),yesterday,sessionId)
   const ended=await processDueTraining()
   assert.equal(ended.find(item=>item.sessionId===sessionId).status,'applying')
+  // Finalization may reuse an identical snapshot. Assert it freezes the actual final version.
+  const finalVersion=db.prepare('SELECT MAX(version_no) n FROM policy_versions WHERE policy_id=?').get(policyId).n
+  assert.ok(finalVersion>=4)
   const finalJobs=db.prepare("SELECT payload_json FROM agent_jobs WHERE agent_id=? AND status='queued' AND json_extract(payload_json,'$.learningSessionId')=?").all(agentId,sessionId)
   assert.equal(finalJobs.length,2)
   assert.equal(new Set(finalJobs.map(job=>JSON.parse(job.payload_json).learningAttemptId)).size,1)
   await auth(request.get(`/api/v1/policies/${policyId}/learning-preview`)).expect(409)
   addEvent.run(crypto.randomUUID(),node.body.id,3,5156,'allow','TCP','192.0.2.13','198.51.100.1',22,'in',new Date().toISOString())
   assert.equal((await processDueTraining()).length,0)
-  assert.equal(db.prepare('SELECT MAX(version_no) n FROM policy_versions WHERE policy_id=?').get(policyId).n,5)
+  assert.equal(db.prepare('SELECT MAX(version_no) n FROM policy_versions WHERE policy_id=?').get(policyId).n,finalVersion)
 })
 
 test('a quiet node receives the global policy when training ends',async()=>{

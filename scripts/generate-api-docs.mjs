@@ -18,7 +18,7 @@ await new Promise(resolve=>server.once('listening',resolve))
 try {
   const spec=await (await fetch(`http://127.0.0.1:${server.address().port}/api/v1/openapi.json`)).json()
   const locations=new Map()
-  for(const [file,router,prefix] of [['api/src/app.js','api',''],['api/src/routes/agents.js','agentRoutes','/agents'],['api/src/routes/internet.js','internetRoutes','/internet'],['api/src/routes/mapping.js','mappingRoutes','/mapping'],['api/src/routes/ai.js','aiRoutes','/ai'],['api/src/routes/protection.js','r',''],['api/src/routes/apiKeys.js','apiKeyRoutes','/api-keys']]){
+  for(const [file,router,prefix] of [['api/src/app.js','api',''],['api/src/routes/agents.js','agentRoutes','/agents'],['api/src/routes/internet.js','internetRoutes','/internet'],['api/src/routes/mapping.js','mappingRoutes','/mapping'],['api/src/routes/ai.js','aiRoutes','/ai'],['api/src/routes/protection.js','r',''],['api/src/routes/policySafety.js','r',''],['api/src/telemetry/routes.js','r',''],['api/src/cloud/routes.js','r',''],['api/src/routes/apiKeys.js','apiKeyRoutes','/api-keys']]){
     fs.readFileSync(file,'utf8').split('\n').forEach((line,index)=>{
       const match=line.match(new RegExp(`${router}\\.(get|post|patch|put|delete)\\('([^']+)'`))
       if(match)locations.set(`${match[1]} ${(prefix+match[2]).replace(/(^|\/)\:([A-Za-z]\w*)(?=\/|$)/g,'$1{$2}')}`,`../${file}#L${index+1}`)

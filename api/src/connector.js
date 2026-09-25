@@ -1,3 +1,4 @@
+import {linuxContainment} from './linuxContainment.js'
 import {linuxDdos,validateDdosBlock} from './ddosFirewall.js'
 import {capabilityEvidence} from './services/capabilities.js'
 import {assertDirectManagement} from './services/networkBoundary.js'
@@ -19,6 +20,7 @@ import {classifyOnboardingError,attachOnboardingError} from './onboardingErrors.
 import {recordCredentialAuthSuccess,recordCredentialAuthFailure} from './credentialHealth.js'
 import {collectLinuxFacts,collectLinuxRules,applyLinuxFirewall,testSshCredential,launchLinuxPortal} from './sshConnector.js'
 
+const policySafetyFunctions=fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../../packages/shared/policySafety.ps1'),'utf8')
 const ddosFunctions=fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../../packages/shared/ddosProtection.ps1'),'utf8')
 const timeoutMs = 40000
 const lsaRightsFunctions=fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../sidecar/lsa_rights.ps1'),'utf8')
@@ -109,7 +111,7 @@ async function wmiProbePython(input){
   return new Promise((resolve,reject)=>{
     const child=spawn(python,[sidecar],{stdio:['pipe','pipe','pipe']})
     let stdout='',stderr='',timedOut=false
-    const timer=setTimeout(()=>{timedOut=true;child.kill('SIGKILL')},['facts','audit_policy','audit_policy_enable','all_rules','rules','apply','events','events_recent','events_probe','event_cursor'].includes(input.mode)?45000:12000)
+    const timer=setTimeout(()=>{timedOut=true;child.kill('SIGKILL')},['safety_context','safety_arm','safety_apply','safety_restore','facts','audit_policy','audit_policy_enable','all_rules','rules','apply','events','events_recent','events_probe','event_cursor'].includes(input.mode)?45000:12000)
     child.stdout.on('data',chunk=>stdout+=chunk)
     child.stderr.on('data',chunk=>stderr+=chunk)
     child.once('error',error=>{clearTimeout(timer);reject(error)})
@@ -201,6 +203,7 @@ try {
     ${breakGlassFunctions}
     ${jitAccessFunctions}
     ${ddosFunctions}
+    # __WINFIRE_POLICY_SAFETY__
     __WINFIRE_AGENT_DEPLOY__
     __WINFIRE_PROMPT_FUNCTIONS__
     __WINFIRE_SECURITY_PROCESS_OWNER__
@@ -313,6 +316,12 @@ try {
       'breakglass_start' { Start-WinFireBreakGlass $argsData }
       'breakglass_end' { End-WinFireBreakGlass $argsData }
       'jit_preflight' { Test-WinFireJitGate $argsData }
+      'safety_context' { Get-WinFirePolicyContext }
+      'safety_arm' { Invoke-WinFirePolicySafety $argsData 'arm' }
+      'safety_apply' { Invoke-WinFirePolicySafety $argsData 'apply' }
+      'safety_commit' { Invoke-WinFirePolicySafety $argsData 'commit' }
+      'safety_restore' { Invoke-WinFirePolicySafety $argsData 'restore' }
+      'safety_status' { Invoke-WinFirePolicySafety $argsData 'status' }
       'ddos_start' { Invoke-WinFireDdos $argsData $false }
       'ddos_end' { Invoke-WinFireDdos $argsData $true }
       'jit_start' { Start-WinFireJitAccess $argsData }
@@ -465,7 +474,7 @@ export async function activateWinrmViaWmi(node,{wmi=process.platform==='win32'?w
   }
 }
 export async function remote(node,operation,args={},options={}) {
-  const capability={auth:'authentication',facts:'facts',rules:'firewallRead',all_rules:'firewallRead',apply:'firewallWrite',events:'events',events_recent:'events',events_probe:'events'}[operation]
+  const capability={safety_context:'firewallRead',auth:'authentication',facts:'facts',rules:'firewallRead',all_rules:'firewallRead',apply:'firewallWrite',events:'events',events_recent:'events',events_probe:'events'}[operation]
   try{
     const result=await remoteOperation(node,operation,args,options)
     if(capability){capabilityEvidence(node.id,capability,node.transport||'unknown');capabilityEvidence(node.id,'authentication',node.transport||'unknown')}
@@ -474,10 +483,12 @@ export async function remote(node,operation,args={},options={}) {
 }
 async function remoteOperation(node,operation,args={},options={}) {
   assertDirectManagement(node)
+  if(operation==='apply'&&one("SELECT t.job_id FROM policy_deployment_targets t JOIN policy_deployment_jobs j ON j.id=t.job_id WHERE t.node_id=? AND j.status IN ('queued','running','paused','partial','cancelling','restoring') LIMIT 1",node.id))throw Object.assign(new Error('A staged deployment owns this node; finish or restore it before another firewall write'),{status:409})
+  if(operation==='apply'&&one("SELECT t.job_id FROM containment_targets t JOIN containment_jobs j ON j.id=t.job_id WHERE t.node_id=? AND j.status<>'restored' LIMIT 1",node.id))throw Object.assign(new Error('Restore active containment before applying policy changes'),{status:409})
   if(operation==='ddos_start')validateDdosBlock(args)
   if(node.transport==='ssh'){
     if(['jit_preflight','jit_start','jit_end','prompt_session','security_session_logoff','rights','rights_change','wef_configure'].includes(operation))throw new Error('This operation requires an enrolled Windows agent')
-    if(!['auth','facts','all_rules','rules','apply','prompt_browser','ddos_start','ddos_end'].includes(operation))throw new Error('SSH transport supports Linux facts, firewall rules, and desktop MFA prompts only')
+    if(!['auth','facts','all_rules','rules','apply','prompt_browser','ddos_start','ddos_end','containment_start','containment_restore'].includes(operation))throw new Error('SSH transport supports Linux facts, firewall rules, and desktop MFA prompts only')
     if(operation==='apply')assertManagementAccess(args.add||[])
     let lastError
     for(const credential of nodeCredential(node.id,options.credentialId)){
@@ -489,7 +500,7 @@ async function remoteOperation(node,operation,args={},options={}) {
           run("UPDATE nodes SET connection_mode='agentless',management_type='ssh',transport='ssh',agent_required=0,firewall_state=CASE WHEN firewall_state='enforcing' THEN firewall_state ELSE 'learning' END WHERE id=?",node.id)
           recordCredentialAuthSuccess({credentialId:credential.id,nodeId:node.id,transport:'ssh'});recordNodeSuccess(node.id,'ssh-authenticated');return result
         }
-        const result=operation.startsWith('ddos_')?await linuxDdos(connection,operation,args):operation==='facts'?await collectLinuxFacts(connection):operation==='apply'?await applyLinuxFirewall(connection,args):await collectLinuxRules(connection)
+        const result=operation.startsWith('containment_')?await linuxContainment(connection,operation,args):operation.startsWith('ddos_')?await linuxDdos(connection,operation,args):operation==='facts'?await collectLinuxFacts(connection):operation==='apply'?await applyLinuxFirewall(connection,args):await collectLinuxRules(connection)
         if(operation==='facts'&&!result?.computer?.Name)throw new Error('SSH facts did not return the Linux host identity')
         if(!Array.isArray(result?.rules)&&['rules','all_rules'].includes(operation))throw new Error('SSH firewall inventory returned an invalid result')
         recordCredentialAuthSuccess({credentialId:credential.id,nodeId:node.id,transport:'ssh'});recordNodeSuccess(node.id,'ssh-authenticated');return result
@@ -528,7 +539,7 @@ async function remoteOperation(node,operation,args={},options={}) {
   if(node.transport==='wmi'){
     const eventOperation=['events','events_recent','events_probe','event_cursor'].includes(operation)
     if(['rpc_filters','rpc_filter_apply','rpc_filter_remove'].includes(operation))throw new Error('Native RPC filter management requires WinRM or SMB/netsh; WMI is read-only for this operation')
-    if(!['facts','audit_policy','audit_policy_enable','all_rules','rules','apply'].includes(operation)&&!eventOperation)throw new Error('WMI/DCOM supports host facts, audit policy, firewall rules and Security events; other operations require WinRM or an agent')
+    if(!['safety_context','safety_arm','safety_apply','safety_restore','facts','audit_policy','audit_policy_enable','all_rules','rules','apply'].includes(operation)&&!eventOperation)throw new Error('WMI/DCOM supports host facts, audit policy, firewall rules and Security events; other operations require WinRM or an agent')
     if(operation==='apply')assertManagementAccess(args.add||[])
     const host=node.fqdn||node.ip||node.hostname
     const expectedName=isIP(node.hostname)?null:node.hostname
@@ -582,11 +593,11 @@ async function remoteOperation(node,operation,args={},options={}) {
   let lastError
   for (const credential of nodeCredential(node.id,options.credentialId)) {
     const input={host,transport:node.transport||'winrm',osVersion:node.os_version||null,username:credential.username,password:credential.secret.password,operation,args}
-    const mutating=operation.startsWith('ddos_')||operation==='apply'||operation.startsWith('breakglass_')||operation==='jit_start'||operation==='jit_end'||operation==='prompt_browser'||operation==='rights_change'||operation==='audit_policy_enable'||operation==='agent_deploy'||operation==='security_session_logoff'||operation==='rpc_filter_apply'||operation==='rpc_filter_remove'||operation==='wef_configure'
+    const mutating=operation.startsWith('safety_')&&!['safety_status','safety_context'].includes(operation)||operation.startsWith('ddos_')||operation==='apply'||operation.startsWith('breakglass_')||operation==='jit_start'||operation==='jit_end'||operation==='prompt_browser'||operation==='rights_change'||operation==='audit_policy_enable'||operation==='agent_deploy'||operation==='security_session_logoff'||operation==='rpc_filter_apply'||operation==='rpc_filter_remove'||operation==='wef_configure'
     const attempts=mutating?1:2
     for(let attempt=0;attempt<attempts;attempt++){
       try {
-        const script=remoteScript.replace('__WINFIRE_PROMPT_FUNCTIONS__',operation.startsWith('prompt_')||operation==='security_session_logoff'?mfaPromptFunctions:'').replace('__WINFIRE_AGENT_DEPLOY__',operation==='agent_deploy'?agentDeployFunctions:'').replace('__WINFIRE_SECURITY_PROCESS_OWNER__',operation.startsWith('security_')?securityProcessOwnerFunctions:'').replace('# __WINFIRE_LSA_RIGHTS__',operation.startsWith('rights')||operation.startsWith('jit_')?lsaRightsFunctions:'').replace('# __WINFIRE_ACCOUNT_INVENTORY__',()=>operation==='account_inventory'?accountInventoryFunctions:'').replace('# __WINFIRE_FIREWALL_USER__',()=>['rules','apply'].includes(operation)?firewallUserFunctions:'')
+        const script=remoteScript.replace('# __WINFIRE_POLICY_SAFETY__',()=>operation.startsWith('safety_')?policySafetyFunctions:'').replace('__WINFIRE_PROMPT_FUNCTIONS__',operation.startsWith('prompt_')||operation==='security_session_logoff'?mfaPromptFunctions:'').replace('__WINFIRE_AGENT_DEPLOY__',operation==='agent_deploy'?agentDeployFunctions:'').replace('__WINFIRE_SECURITY_PROCESS_OWNER__',operation.startsWith('security_')?securityProcessOwnerFunctions:'').replace('# __WINFIRE_LSA_RIGHTS__',operation.startsWith('rights')||operation.startsWith('jit_')?lsaRightsFunctions:'').replace('# __WINFIRE_ACCOUNT_INVENTORY__',()=>operation==='account_inventory'?accountInventoryFunctions:'').replace('# __WINFIRE_FIREWALL_USER__',()=>['rules','apply'].includes(operation)?firewallUserFunctions:'')
         const legacy=/^(?:5\.[12]\.|6\.[01]\.|windows (?:xp|vista|7\b|server 2003|server 2008))/i.test(String(input.osVersion||''))
         const result=process.platform==='win32'&&!legacy&&operation!=='auth' ? await pwsh(script,input) : await pywinrm(input)
         recordCredentialAuthSuccess({credentialId:credential.id,nodeId:node.id,transport:input.transport||'winrm'});recordNodeSuccess(node.id,input.transport==='winrms'?'winrms-authenticated':'winrm-authenticated')

@@ -1,3 +1,4 @@
+import {capabilityEvidence} from './services/capabilities.js'
 import {isIP} from 'node:net'
 import {assertDirectManagement,inventoryEligibleIp} from './services/networkBoundary.js'
 import {db,all,one,run,id,now,json,audit} from './db.js'
@@ -55,6 +56,7 @@ export function ensureSnmpNode(target,device,stamp){
     nodeId=id()
     run("INSERT INTO nodes(id,hostname,fqdn,ip,connection_mode,transport,status,inventory_source,discovery_source,first_discovered_at,last_seen_at,last_discovered_at,last_probe_at,probe_status,agent_required,firewall_state,snmp_capable,device_type,vendor,classification_evidence_json,management_type,manageability,hypervisor,os_name,os_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",nodeId,hostname,null,target.host,persistedConnectionMode,persistedTransport,'reachable','snmp',target.source||`snmp:${target.id}`,stamp,stamp,stamp,stamp,persistedProbeStatus,0,firewallState,1,persistedDeviceType,classification.vendor||null,JSON.stringify(classificationEvidence),persistedManagementType,manageability,esxiNode?'VMware ESXi':persistedDeviceType==='hypervisor'?(classification.hypervisor||classification.vendor):null,osName,osVersion)
   }
+  for(const capability of ['discovery','authentication','facts','verification'])capabilityEvidence(nodeId,capability,'snmp')
   const previousFacts=existing?one('SELECT snapshot_json FROM node_facts WHERE node_id=?',nodeId):null
   let previous={};try{previous=previousFacts?.snapshot_json?JSON.parse(previousFacts.snapshot_json)||{}:{}}catch{}
   const snapshot={...previous,...(device.mibCollection?{mibCollection:device.mibCollection,hardware:device.hardware||[],interfaces:device.interfaces||{},interfaceDetails:device.interfaceDetails||{},lldp:device.lldp||{},collectionDiagnostics:device.collectionDiagnostics||{}}:{}),source:esxiNode?(previous.source||'esxi-soap'):'snmp',identity:{...(previous.identity||{}),...identity},classification:{...(previous.classification||{}),...classification},arp:device.arp||[],macPorts:device.macPorts||[],routes:device.routes||{},tcpStates:device.tcpStates||{},pfStates:device.pfStates||device.firewallStates||{},firewallStates:device.firewallStates||device.pfStates||{},collectedAt:stamp}

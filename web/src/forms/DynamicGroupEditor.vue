@@ -18,13 +18,13 @@ function normalizeOperator(){if(newRule.value.field!=='ip'&&newRule.value.operat
     <p class="muted">Matching nodes are added automatically. Nodes that stop matching are removed on the next refresh. Use all conditions for an intersection or any condition for a union.</p>
     <div class="dynamic-rule-toolbar" :class="{disabled:disabled||!draft.enabled}">
       <label>Match<select v-model="draft.match" :disabled="disabled||!draft.enabled" @change="update"><option value="all">All conditions</option><option value="any">Any condition</option></select></label>
-      <label>Field<select v-model="newRule.field" :disabled="disabled||!draft.enabled" @change="normalizeOperator"><option value="hostname">Name / hostname</option><option value="fqdn">FQDN</option><option value="ip">IP address</option></select></label>
+      <label>Field<select v-model="newRule.field" :disabled="disabled||!draft.enabled" @change="normalizeOperator"><option value="hostname">Name / hostname</option><option value="fqdn">FQDN</option><option value="ip">IP address</option><option value="application">Application</option><option value="environment">Environment</option><option value="workload_role">Workload role</option><option value="business_owner">Business owner</option><option value="criticality">Criticality</option></select></label>
       <label>Operator<select v-model="newRule.operator" :disabled="disabled||!draft.enabled"><option value="contains">Contains</option><option value="equals">Equals</option><option value="cidr">CIDR matches</option></select></label>
       <label class="dynamic-value">Value<input v-model.trim="newRule.value" :disabled="disabled||!draft.enabled" :placeholder="newRule.operator==='cidr'?'10.0.0.0/8':'server or address'" @keyup.enter.prevent="addRule"></label>
       <button type="button" class="button small secondary" :disabled="disabled||!draft.enabled||!newRule.value.trim()" @click="addRule"><i class="mdi mdi-plus"></i> Add condition</button>
     </div>
     <div v-if="draft.rules.length" class="dynamic-rule-list"><div v-for="(rule,index) in draft.rules" :key="`${rule.field}-${rule.operator}-${rule.value}-${index}`" class="dynamic-rule"><span class="status reachable">{{rule.field}}</span><strong>{{rule.operator}}</strong><code>{{rule.value}}</code><button type="button" class="icon-button" :disabled="disabled" :aria-label="`Remove condition ${index+1}`" @click="removeRule(index)"><i class="mdi mdi-close"></i></button></div></div>
-    <p v-else class="empty-side">No conditions configured. Enable rules and add a hostname, FQDN, IP, or CIDR condition.</p>
+    <p v-else class="empty-side">No conditions configured. Enable rules and add a hostname, FQDN, IP, CIDR, or application metadata condition.</p>
   </section>
 </template>
 <style scoped>

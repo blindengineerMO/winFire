@@ -1,3 +1,5 @@
+import {telemetryRoutes} from './telemetry/routes.js'
+import {policySafetyRoutes} from './routes/policySafety.js'
 import {protectionRoutes} from './routes/protection.js'
 import {saveAzureCredential,azureCredentialMetadata} from './cloud/service.js'
 import {nodeCoverage} from './services/capabilities.js'
@@ -372,7 +374,7 @@ api.get('/agent-package/enroll.ps1',wrap(async(req,res)=>{
   catch(error){return res.status(503).json({error:error.message})}
   res.set('Cache-Control','private, no-store').type('text/plain').send(script)
 }))
-api.get('/openapi.json',(_req,res)=>res.json(buildOpenApi(api,agentRoutes,{internet:internetRoutes,mapping:mappingRoutes,ai:aiRoutes,'':[cloudRoutes,protectionRoutes],'api-keys':apiKeyRoutes})))
+api.get('/openapi.json',(_req,res)=>res.json(buildOpenApi(api,agentRoutes,{internet:internetRoutes,mapping:mappingRoutes,ai:aiRoutes,'':[cloudRoutes,protectionRoutes,policySafetyRoutes,telemetryRoutes],'api-keys':apiKeyRoutes})))
 const loginLimit=rateLimit({windowMs:15*60*1000,limit:Number(process.env.AUTH_RATE_LIMIT||20),standardHeaders:'draft-8',legacyHeaders:false})
 const publicMfaLimit=rateLimit({windowMs:15*60*1000,limit:10,standardHeaders:'draft-8',legacyHeaders:false})
 api.post('/auth/login',loginLimit,wrap(async(req,res)=>{
@@ -584,6 +586,8 @@ api.use('/mapping',mappingRoutes)
 api.use(cloudRoutes)
 api.use('/api-keys',apiKeyRoutes)
 api.use(protectionRoutes)
+api.use(policySafetyRoutes)
+api.use(telemetryRoutes)
 api.get('/settings/tls',requireRole('admin'),(_req,res)=>{
   const paths=tlsMaterialPaths(),files=Object.fromEntries(Object.entries(paths).map(([name,file])=>[name,{configured:fs.existsSync(file),source:process.env[name]?'environment':'administration',path:process.env[name]?null:file}]))
   res.json({httpsEnabled:Object.values(files).every(item=>item.configured),files,restartRequired:true})
@@ -2923,7 +2927,7 @@ api.get('/logs/search',(req,res)=>{
   const filters=[visibleFirewallEventSql()],args=[]
   if(query.id){filters.push('e.id=?');args.push(query.id)}
   if(query.eventType==='logon')filters.push("(COALESCE(e.event_type,p.event_type)='logon' OR e.event_id IN (4624,4634))")
-  if(query.eventType==='firewall')filters.push("COALESCE(e.event_type,p.event_type,'firewall')<>'logon' AND e.event_id NOT IN (4624,4634)")
+  if(query.eventType==='firewall')filters.push("COALESCE(e.event_type,p.event_type,'firewall')<>'logon' AND (e.event_id IS NULL OR e.event_id NOT IN (4624,4634))")
   for(const [key,column] of [['nodeId','e.node_id'],['direction','COALESCE(e.direction,p.direction)'],['challengeId','e.challenge_id'],['eventId','e.event_id'],['port','COALESCE(e.dst_port,p.dst_port)']])if(query[key]!==undefined){filters.push(`${column}=?`);args.push(query[key])}
   if(query.action){if(query.action==='logon')filters.push('e.event_id=4624');else if(query.action==='logoff')filters.push('e.event_id=4634');else{filters.push('e.action=?');args.push(query.action)}}
   for(const [key,column] of [['program','COALESCE(e.program,p.program)'],['protocol','COALESCE(e.protocol,p.protocol)'],['srcIp','COALESCE(e.src_ip,p.src_ip)'],['dstIp','COALESCE(e.dst_ip,p.dst_ip)']])if(query[key]){filters.push(`${column} LIKE ? ESCAPE '\\'`);args.push(`%${query[key].replace(/[\\%_]/g,'\\$&')}%`)}

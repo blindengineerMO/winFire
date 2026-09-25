@@ -1,5 +1,8 @@
 <script setup>
 import {onMounted,onUnmounted,ref,computed,watch,nextTick} from 'vue'
+import PolicyGovernance from '../components/policies/PolicyGovernance.vue'
+import StagedDeployment from '../components/policies/StagedDeployment.vue'
+import PolicySimulation from '../components/policies/PolicySimulation.vue'
 import PolicyEditor from '../components/policies/PolicyEditor.vue'
 import {nodeLabel,nodeIssue,graphDocument} from '../components/policies/model.js'
 import PageHeader from '../components/PageHeader.vue'
@@ -17,6 +20,7 @@ const verifyOpen=ref(false),verifyVantageId=ref(''),verifyBusy=ref(false)
 const verifierPeers=computed(()=>nodes.value.filter(node=>['winrm','winrms'].includes(node.transport)))
 const policyEditor=ref(null),loadedPolicyId=ref(null),loadingPolicy=ref(false),draftPreview=ref(null),validating=ref(false),draftError=ref(''),draftNotice=ref(''),baseVersionId=ref(null),savedSignature=ref('')
 let selectionSequence=0,validationSequence=0,validationTimer
+function loadGovernanceDraft(graph){if(!editable.value)return;askConfirmation('Replace the current draft with this reviewed proposal? This does not deploy rules.',()=>{graphNodes.value=graph.nodes;edges.value=graph.edges;draftNotice.value='Review and simulate this proposal before saving or deploying.'})}
 const currentGraph=()=>graphDocument(graphNodes.value,edges.value)
 const graphSignature=computed(()=>JSON.stringify(currentGraph()))
 const dirty=computed(()=>!isLearningPreview.value&&graphSignature.value!==savedSignature.value)
@@ -230,6 +234,9 @@ function describeNode(node){return `${nodeLabel(node)} (${node.type})`}
 <p v-if="draftError" class="error-msg" role="alert">{{draftError}}</p>
 <p v-for="warning in draftPreview?.warnings||[]" :key="warning" class="editor-notice">{{warning}}</p>
 </section>
+<PolicyGovernance v-if="policyLoaded&&!isLearningPreview" :key="'governance-'+selected.id" :policy="selected" :rules="activeRules" :editable="editable&&!dirty" @draft="loadGovernanceDraft"/>
+<StagedDeployment v-if="policyLoaded&&!isLearningPreview" :key="'staging-'+selected.id" :policy="selected"/>
+<PolicySimulation v-if="policyLoaded&&!isLearningPreview" :key="selected.id" :policy="selected" :graph="currentGraph()" :base-version-id="baseVersionId" :nodes="nodes" :editable="editable"/>
 <section v-if="policyLoaded" class="panel glass rules-panel">
 <div class="panel-title">
 <div>

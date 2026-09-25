@@ -21,7 +21,8 @@ async function boundedJson(response){
   finally{await reader.cancel().catch(()=>{})}
   try{return JSON.parse(Buffer.concat(chunks).toString())}catch{throw new AzureError('invalid_response','Azure returned invalid JSON')}
 }
-export function azureClient(settings,{fetchImpl=fetch,sleep=delay,signal,budget=5000,onRequest=()=>{}}={}){
+export function azureClient(settings,{fetchImpl=fetch,sleep=delay,signal,budget=5000,onRequest=()=>{},tokenScope=audience}={}){
+  if(![audience,'https://storage.azure.com/.default'].includes(tokenScope))throw new AzureError('endpoint_rejected','Unsupported Azure token audience',400)
   validateCertificate(settings)
   let token=null,identity=null,requests=0
   const abort=()=>{if(signal?.aborted)throw new AzureError('cancelled','Discovery cancelled',409)}
@@ -38,11 +39,11 @@ export function azureClient(settings,{fetchImpl=fetch,sleep=delay,signal,budget=
           identity=new WorkloadIdentityCredential({tenantId:settings.tenantId,clientId:settings.clientId,tokenFilePath:process.env.AZURE_FEDERATED_TOKEN_FILE,authorityHost:'https://login.microsoftonline.com'})
         }
       }
-      try{const value=await identity.getToken(audience,{abortSignal:signal?AbortSignal.any([signal,AbortSignal.timeout(30000)]):AbortSignal.timeout(30000),forceRefresh:force});token={value:value.token,expires:value.expiresOnTimestamp}}
+      try{const value=await identity.getToken(tokenScope,{abortSignal:signal?AbortSignal.any([signal,AbortSignal.timeout(30000)]):AbortSignal.timeout(30000),forceRefresh:force});token={value:value.token,expires:value.expiresOnTimestamp}}
       catch{throw new AzureError('identity_unavailable','The selected Azure identity could not authenticate. Check identity assignment, federation and host configuration',409)}
     }else{
       const endpoint=`https://login.microsoftonline.com/${settings.tenantId}/oauth2/v2.0/token`
-      const form={grant_type:'client_credentials',client_id:settings.clientId,scope:audience}
+      const form={grant_type:'client_credentials',client_id:settings.clientId,scope:tokenScope}
       if(settings.authMethod==='secret')form.client_secret=settings.clientSecret
       else{form.client_assertion_type='urn:ietf:params:oauth:client-assertion-type:jwt-bearer';form.client_assertion=clientAssertion({clientId:settings.clientId,clientCertificate:settings.clientCertificatePem,clientPrivateKey:settings.clientPrivateKeyPem},endpoint)}
       const response=await fetchImpl(endpoint,{method:'POST',redirect:'error',headers:{'content-type':'application/x-www-form-urlencoded'},body:new URLSearchParams(form),signal:signal?AbortSignal.any([signal,AbortSignal.timeout(30000)]):AbortSignal.timeout(30000)})

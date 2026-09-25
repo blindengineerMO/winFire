@@ -11,6 +11,7 @@ WinFire Secure is an API-first control plane for host inventory, firewall visibi
 | [Installation and configuration](docs/INSTALLATION.md) | Native/systemd, Docker, Dokploy, environment settings, TLS/mTLS, bootstrap accounts, backups, upgrades and troubleshooting. |
 | [Operator guide](docs/USAGE.md) | Discovery, inventory, triage, groups, policy learning, events, mapping, administration and every interface route. |
 | [API usage and curl examples](docs/API.md) | Authentication, inventory queries, credentials, discovery, DHCP, groups, events, topology and JIT access. |
+| [Policy safety and traffic context](docs/POLICY_SAFETY.md) | Capability evidence, simulation, flow/syslog/VNet imports, application ownership and exception review. Includes explicit P1 delivery limitations and live validation gates. |
 | [Complete API route reference](docs/API_ROUTES.md) | Every registered API operation, authentication/permission gates, source handler links and published request schemas. |
 | [Internet connections](docs/INTERNET_CONNECTIONS.md) | Outside-LAN firewall observations, dual-stack CIDRs, PTR evidence, lifecycle, API filters and exports. |
 | [AI usage setup and operations](docs/AI_USAGE.md) | Reporter enrollment, REST/MCP OAuth or user keys, stdio, JS/Python/hooks/OTLP, evidence, retention and troubleshooting. |

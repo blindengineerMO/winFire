@@ -1,3 +1,4 @@
+import {policySafetySchemas,describePolicySafetyOperation} from './services/policySafetyOpenapi.js'
 import {protectionSchemas,describeProtectionOperation} from './services/protectionOpenapi.js'
 import {cloudSchemas,describeCloudOperation} from './cloud/openapi.js'
 import {userApiKeySchemas,describeUserApiKeyOperation} from './services/userApiKeysOpenapi.js'
@@ -169,6 +170,7 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
         describeCloudOperation(operation,method,path)
         describeUserApiKeyOperation(operation,method,path)
         describeProtectionOperation(operation,method,path)
+        describePolicySafetyOperation(operation,method,path)
         pathItem[method]=operation
       }
     }
@@ -183,6 +185,7 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
       ...cloudSchemas,
       ...userApiKeySchemas,
       ...protectionSchemas,
+      ...policySafetySchemas,
       ...internetConnectionSchemas,
       ...aiSchemas,
       PolicyGraph:{type:'object',required:['nodes'],properties:{nodes:{type:'array',items:{type:'object',required:['id','type'],properties:{id:{type:'string'},type:{type:'string',enum:['allow','deny','program','portGroup','addressGroup','profile','schedule','mfaGate']},position:{type:'object',properties:{x:{type:'number'},y:{type:'number'}}},data:{type:'object',additionalProperties:true}}}},edges:{type:'array',items:{type:'object',required:['id','source','target'],properties:{id:{type:'string'},source:{type:'string'},target:{type:'string'}}}}}},

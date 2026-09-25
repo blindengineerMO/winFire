@@ -44,6 +44,7 @@ export function rebuildMapping(req, res) {
   const events = all("SELECT e.node_id,e.event_id,COALESCE(e.action,p.action) action,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) srcIp,e.src_port srcPort,COALESCE(e.dst_ip,p.dst_ip) dstIp,COALESCE(e.dst_port,p.dst_port) dstPort,COALESCE(e.direction,p.direction) direction,COALESCE(e.program,p.program) program,COALESCE(e.event_type,p.event_type) eventType,e.event_time eventTime FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE (COALESCE(e.event_type,p.event_type)='firewall' OR e.event_id IN (5150,5151,5156,5157)) ORDER BY e.rowid")
   db.transaction(() => {
     run('DELETE FROM network_map_pairs')
+    run("DELETE FROM app_settings WHERE key='application_dependency_cursor'")
     for (const event of events) recordNetworkFlow(event.node_id, event, event.eventTime)
   })()
   audit(req.user.id, 'network-mapping.rebuild', 'network-map', 'global', null, {events: events.length})
