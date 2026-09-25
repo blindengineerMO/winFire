@@ -1,3 +1,4 @@
+import {protectionSchemas,describeProtectionOperation} from './services/protectionOpenapi.js'
 import {cloudSchemas,describeCloudOperation} from './cloud/openapi.js'
 import {userApiKeySchemas,describeUserApiKeyOperation} from './services/userApiKeysOpenapi.js'
 import {aiSchemas,describeAiOperation} from './ai/openapi.js'
@@ -167,19 +168,21 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
         describeAiOperation(operation,method,path)
         describeCloudOperation(operation,method,path)
         describeUserApiKeyOperation(operation,method,path)
+        describeProtectionOperation(operation,method,path)
         pathItem[method]=operation
       }
     }
   }
   addRoutes(apiRouter)
   addRoutes(agentRouter,'/agents')
-  for(const [prefix,router] of Object.entries(extraRouters))addRoutes(router,prefix?`/${prefix}`:'')
+  for(const [prefix,routers] of Object.entries(extraRouters))for(const router of Array.isArray(routers)?routers:[routers])addRoutes(router,prefix?`/${prefix}`:'')
   return {
     openapi:'3.1.0',info:{title:'WinFire Secure API',version:'0.1.0',description:'Control-plane operations use bearer tokens. Enrolled agent operations use client certificates.'},
     servers:[{url:'/api/v1'}],paths,
     components:{securitySchemes:{aiReporterBearer:{type:'http',scheme:'bearer',bearerFormat:'Reporter enrollment credential',description:'Node-scoped REST/stdio reporting credential. Cannot access operator or fleet routes. Remote MCP accepts OAuth with ai:report or a user-owned MCP reporting key.'},bearerAuth:{type:'http',scheme:'bearer',bearerFormat:'JWT or user API key',description:'User API keys (wfuk_) with api:read/api:write use the owner’s current permissions. Key administration requires a user-session JWT. MCP-only keys cannot authenticate these operator routes.'},internetDeviceBearer:{type:'http',scheme:'bearer',bearerFormat:'Internet device token'},mutualTLS:{type:'mutualTLS'},wefHmac:{type:'apiKey',in:'header',name:'X-WinFire-WEF-Token',description:'Node-scoped HMAC token derived from WEF_SHARED_SECRET. The receiver also accepts the token query parameter for Windows Subscription Manager compatibility.'}},schemas:{
       ...cloudSchemas,
       ...userApiKeySchemas,
+      ...protectionSchemas,
       ...internetConnectionSchemas,
       ...aiSchemas,
       PolicyGraph:{type:'object',required:['nodes'],properties:{nodes:{type:'array',items:{type:'object',required:['id','type'],properties:{id:{type:'string'},type:{type:'string',enum:['allow','deny','program','portGroup','addressGroup','profile','schedule','mfaGate']},position:{type:'object',properties:{x:{type:'number'},y:{type:'number'}}},data:{type:'object',additionalProperties:true}}}},edges:{type:'array',items:{type:'object',required:['id','source','target'],properties:{id:{type:'string'},source:{type:'string'},target:{type:'string'}}}}}},

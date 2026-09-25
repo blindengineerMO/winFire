@@ -47,4 +47,5 @@ const routes=[
 ]
 const router=createRouter({history:createWebHistory(),routes})
 router.beforeEach(to=>!to.meta.public&&!session.token?{path:'/login',query:{next:to.fullPath}}:to.path==='/login'&&session.token?'/':true)
+router.beforeEach(to=>to.path==='/admin'&&to.query.tab==='notifications'&&to.query.notificationTab==='ddos'?{path:'/logs',query:{tab:'ddos'},replace:true}:true)
 createApp(App).use(createPinia()).use(router).mount('#app')

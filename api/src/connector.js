@@ -1,3 +1,4 @@
+import {linuxDdos,validateDdosBlock} from './ddosFirewall.js'
 import {capabilityEvidence} from './services/capabilities.js'
 import {assertDirectManagement} from './services/networkBoundary.js'
 import {spawn} from 'node:child_process'
@@ -18,6 +19,7 @@ import {classifyOnboardingError,attachOnboardingError} from './onboardingErrors.
 import {recordCredentialAuthSuccess,recordCredentialAuthFailure} from './credentialHealth.js'
 import {collectLinuxFacts,collectLinuxRules,applyLinuxFirewall,testSshCredential,launchLinuxPortal} from './sshConnector.js'
 
+const ddosFunctions=fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../../packages/shared/ddosProtection.ps1'),'utf8')
 const timeoutMs = 40000
 const lsaRightsFunctions=fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../sidecar/lsa_rights.ps1'),'utf8')
 const firewallUserFunctions=fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../sidecar/firewall_user.ps1'),'utf8')
@@ -198,6 +200,7 @@ try {
     }
     ${breakGlassFunctions}
     ${jitAccessFunctions}
+    ${ddosFunctions}
     __WINFIRE_AGENT_DEPLOY__
     __WINFIRE_PROMPT_FUNCTIONS__
     __WINFIRE_SECURITY_PROCESS_OWNER__
@@ -310,6 +313,8 @@ try {
       'breakglass_start' { Start-WinFireBreakGlass $argsData }
       'breakglass_end' { End-WinFireBreakGlass $argsData }
       'jit_preflight' { Test-WinFireJitGate $argsData }
+      'ddos_start' { Invoke-WinFireDdos $argsData $false }
+      'ddos_end' { Invoke-WinFireDdos $argsData $true }
       'jit_start' { Start-WinFireJitAccess $argsData }
       'jit_end' { End-WinFireJitAccess $argsData }
       'audit_policy_enable' { $before=Get-WinFireAuditPolicy; if($before.successEnabled -and $before.failureEnabled){$before}else{try{auditpol /set '/subcategory:{0CCE9226-69AE-11D9-BED3-505054503030}' /success:enable /failure:enable | Out-Null; if($LASTEXITCODE -ne 0){throw "auditpol update failed with exit code $LASTEXITCODE"}; $after=Get-WinFireAuditPolicy; if(-not ($after.successEnabled -and $after.failureEnabled)){throw 'Audit policy readback did not confirm success and failure auditing'}; $after}catch{$cause=$_.Exception.Message; $successArg=if($before.successEnabled){'/success:enable'}else{'/success:disable'}; $failureArg=if($before.failureEnabled){'/failure:enable'}else{'/failure:disable'}; auditpol /set '/subcategory:{0CCE9226-69AE-11D9-BED3-505054503030}' $successArg $failureArg | Out-Null; if($LASTEXITCODE -ne 0){throw "Audit policy update failed: $cause; rollback failed with exit code $LASTEXITCODE"}; $restored=Get-WinFireAuditPolicy; if($restored.settingValue -ne $before.settingValue){throw "Audit policy update failed: $cause; rollback readback differs from prior state"}; throw "Audit policy update failed: $cause; prior state restored"}} }
@@ -469,9 +474,10 @@ export async function remote(node,operation,args={},options={}) {
 }
 async function remoteOperation(node,operation,args={},options={}) {
   assertDirectManagement(node)
+  if(operation==='ddos_start')validateDdosBlock(args)
   if(node.transport==='ssh'){
     if(['jit_preflight','jit_start','jit_end','prompt_session','security_session_logoff','rights','rights_change','wef_configure'].includes(operation))throw new Error('This operation requires an enrolled Windows agent')
-    if(!['auth','facts','all_rules','rules','apply','prompt_browser'].includes(operation))throw new Error('SSH transport supports Linux facts, firewall rules, and desktop MFA prompts only')
+    if(!['auth','facts','all_rules','rules','apply','prompt_browser','ddos_start','ddos_end'].includes(operation))throw new Error('SSH transport supports Linux facts, firewall rules, and desktop MFA prompts only')
     if(operation==='apply')assertManagementAccess(args.add||[])
     let lastError
     for(const credential of nodeCredential(node.id,options.credentialId)){
@@ -483,7 +489,7 @@ async function remoteOperation(node,operation,args={},options={}) {
           run("UPDATE nodes SET connection_mode='agentless',management_type='ssh',transport='ssh',agent_required=0,firewall_state=CASE WHEN firewall_state='enforcing' THEN firewall_state ELSE 'learning' END WHERE id=?",node.id)
           recordCredentialAuthSuccess({credentialId:credential.id,nodeId:node.id,transport:'ssh'});recordNodeSuccess(node.id,'ssh-authenticated');return result
         }
-        const result=operation==='facts'?await collectLinuxFacts(connection):operation==='apply'?await applyLinuxFirewall(connection,args):await collectLinuxRules(connection)
+        const result=operation.startsWith('ddos_')?await linuxDdos(connection,operation,args):operation==='facts'?await collectLinuxFacts(connection):operation==='apply'?await applyLinuxFirewall(connection,args):await collectLinuxRules(connection)
         if(operation==='facts'&&!result?.computer?.Name)throw new Error('SSH facts did not return the Linux host identity')
         if(!Array.isArray(result?.rules)&&['rules','all_rules'].includes(operation))throw new Error('SSH firewall inventory returned an invalid result')
         recordCredentialAuthSuccess({credentialId:credential.id,nodeId:node.id,transport:'ssh'});recordNodeSuccess(node.id,'ssh-authenticated');return result
@@ -576,7 +582,7 @@ async function remoteOperation(node,operation,args={},options={}) {
   let lastError
   for (const credential of nodeCredential(node.id,options.credentialId)) {
     const input={host,transport:node.transport||'winrm',osVersion:node.os_version||null,username:credential.username,password:credential.secret.password,operation,args}
-    const mutating=operation==='apply'||operation.startsWith('breakglass_')||operation==='jit_start'||operation==='jit_end'||operation==='prompt_browser'||operation==='rights_change'||operation==='audit_policy_enable'||operation==='agent_deploy'||operation==='security_session_logoff'||operation==='rpc_filter_apply'||operation==='rpc_filter_remove'||operation==='wef_configure'
+    const mutating=operation.startsWith('ddos_')||operation==='apply'||operation.startsWith('breakglass_')||operation==='jit_start'||operation==='jit_end'||operation==='prompt_browser'||operation==='rights_change'||operation==='audit_policy_enable'||operation==='agent_deploy'||operation==='security_session_logoff'||operation==='rpc_filter_apply'||operation==='rpc_filter_remove'||operation==='wef_configure'
     const attempts=mutating?1:2
     for(let attempt=0;attempt<attempts;attempt++){
       try {

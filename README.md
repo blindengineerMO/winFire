@@ -48,6 +48,8 @@ WinFire Secure is an API-first control plane for host inventory, firewall visibi
 
 - **Operations:** administration settings, TLS/agent PKI, branding, notifications, security automation, Internet extension visibility, retention/compaction, reporting and health endpoints.
 
+- **Administration → Notifications** includes ServiceNow incident destinations backed by the credential vault, delivery status/retries. **Activities → DDoS protection** contains event-based detection and protection policies. Detection-only is the default. Optional timed host blocks expire locally, release traffic, and recheck fresh telemetry before repeating. See [setup, API examples, supported hosts and operational limits](docs/NOTIFICATIONS_PROTECTION.md).
+
 **Capabilities depend on the transport, permissions and remote platform. SNMP tables vary by device/MIB. TTL hints are advisory. SSH source-desktop prompting is implemented, while the current agentless **portal grant target still requires WinRM/WinRMS**. See the supported-path table in the JIT MFA guide.**
 
 ## Quick start
@@ -174,5 +176,8 @@ The frontend route is `/` for Dashboard, `/inventory` for assets/groups/triage, 
 
 ## Azure/ARC Discovery
 ![ScreenShot16](assets/arcDiscovery.png)
+
+## DDOS Protection
+![ScreenShot17](assets/ddosProtect.png)
 
 ![Footer](assets/logoFooter.png)

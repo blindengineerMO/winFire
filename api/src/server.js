@@ -1,3 +1,4 @@
+import {runDdosCycle} from './services/ddos.js'
 import {processAzureWork} from './cloud/service.js'
 import {processAiWork,pruneAi} from './ai/observations.js'
 import {processInternetIndex} from './services/internetConnections.js'
@@ -212,6 +213,9 @@ const notificationTimer=setInterval(async()=>{
   finally{notificationsRunning=false}
 },30_000)
 notificationTimer.unref()
+const ddosTimer=setInterval(()=>runDdosCycle().catch(error=>console.error('DDoS evaluation failed:',error.message)),10000)
+ddosTimer.unref()
+setTimeout(()=>runDdosCycle().catch(error=>console.error('DDoS recovery failed:',error.message)),3000).unref()
 let jobsRunning=false
 let logPollRunning=false
 async function pollNodeLogs(){

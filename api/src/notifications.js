@@ -1,8 +1,9 @@
+import {deliverServiceNow} from './services/servicenow.js'
 import {db,all,one,run,id,now,parse,json} from './db.js'
 import {deliverAlert} from './mailer.js'
 
-export const categories=['policy_drift','verifier_failure','mfa_access_request','mfa_challenge_failure','agent_offline','node_unreachable','security_policy']
-export const channels=['in_app','email','webhook']
+export const categories=['policy_drift','verifier_failure','mfa_access_request','mfa_challenge_failure','agent_offline','node_unreachable','security_policy','ddos_attack']
+export const channels=['in_app','email','webhook','servicenow']
 export const preferenceKeys=categories.flatMap(category=>channels.map(channel=>`${category}.${channel}`))
 
 function enabled(preferences,category,channel){
@@ -19,7 +20,7 @@ export function emitNotification({eventKey,category,title,body,entityType=null,e
     for(const user of recipients){
       const preferences=parse(user.notification_prefs)||{}
       if(enabled(preferences,category,'in_app'))run('INSERT OR IGNORE INTO notifications(id,user_id,event_key,category,title,body,entity_type,entity_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)',id(),user.id,eventKey,category,title,body,entityType,entityId,now())
-      for(const channel of ['email','webhook']){
+      for(const channel of ['email','webhook','servicenow']){
         if(!enabled(preferences,category,channel))continue
         if(channel==='email'&&!user.email_verified)continue
         run('INSERT OR IGNORE INTO notification_deliveries(id,user_id,event_key,category,channel,recipient_email,title,body,status,next_attempt_at) VALUES(?,?,?,?,?,?,?,?,?,?)',id(),user.id,eventKey,category,channel,channel==='email'?user.email:null,title,body,'pending',now())
@@ -45,6 +46,8 @@ export async function deliverPendingNotifications(limit=25){
       if(item.channel==='email'){
         if(!process.env.SMTP_HOST)continue
         await deliverAlert(item.recipient_email,item.title,item.body)
+      }else if(item.channel==='servicenow'){
+        if(!await deliverServiceNow(item))continue
       }else{
         const target=webhookUrl()
         if(!target)continue
@@ -54,7 +57,7 @@ export async function deliverPendingNotifications(limit=25){
       run("UPDATE notification_deliveries SET status='sent',sent_at=?,last_error=NULL WHERE id=?",now(),item.id)
     }catch(error){
       const attempts=item.attempts+1
-      run('UPDATE notification_deliveries SET status=?,attempts=?,next_attempt_at=?,last_error=? WHERE id=?',attempts>=5?'failed':'pending',attempts,new Date(Date.now()+Math.min(60,2**attempts)*60_000).toISOString(),String(error.message).slice(0,500),item.id)
+      run('UPDATE notification_deliveries SET status=?,attempts=?,next_attempt_at=?,last_error=? WHERE id=?',attempts>=5?'failed':'pending',attempts,new Date(Date.now()+Math.min(60,2**attempts)*60_000).toISOString(),(item.channel==='servicenow'&&!String(error.message).startsWith('ServiceNow')?'ServiceNow connection failed; check DNS, TLS and connectivity':String(error.message).slice(0,500)),item.id)
     }
   }
   return due.length

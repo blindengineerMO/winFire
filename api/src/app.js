@@ -1,3 +1,4 @@
+import {protectionRoutes} from './routes/protection.js'
 import {saveAzureCredential,azureCredentialMetadata} from './cloud/service.js'
 import {nodeCoverage} from './services/capabilities.js'
 import {cloudRoutes} from './cloud/routes.js'
@@ -150,7 +151,7 @@ function normalizedNodeOs(node){
 }
 const safeJson=value=>{try{return parse(value)}catch{return null}}
 const publicNode=node=>node && ({...node,...normalizedNodeOs(node),failures:Number(node.failures),firstDiscoveredAt:node.first_discovered_at||null,lastManagedAt:node.last_managed_at||null,triageStatus:node.triage_status||'none',triageNote:node.triage_note||null,triageUpdatedAt:node.triage_updated_at||null,onboardingError:node.onboarding_error_code?onboardingErrorForCode(node.onboarding_error_code):null,virtualMachine:!!Number(node.virtual_machine),virtualMachineHostId:node.virtual_machine_host_id||null,virtualMachineDetails:safeJson(node.virtual_machine_details_json),classificationEvidence:safeJson(node.classification_evidence_json),dhcpLease:safeJson(node.dhcp_lease_json),passiveDeviceHint:node.passive_device_hint||null,passiveDeviceHintEvidence:safeJson(node.passive_device_hint_json),facts:safeJson(node.snapshot_json),ad:safeJson(node.ad_snapshot_json),training:latestTraining(node.id)||null,verification:latestVerification(node.id),managementVerification:managementVerification(node)})
-const canUseCredential=(user,credential)=>credential&&credential.type!=='azure'&&(user.role==='owner'||user.role==='admin'||credential.owner_user_id===user.id||credential.visibility==='team'&&credential.team_id&&credential.team_id===user.team_id||canWriteResource(user,'credential',credential))
+const canUseCredential=(user,credential)=>credential&&!['azure','servicenow'].includes(credential.type)&&(user.role==='owner'||user.role==='admin'||credential.owner_user_id===user.id||credential.visibility==='team'&&credential.team_id&&credential.team_id===user.team_id||canWriteResource(user,'credential',credential))
 const assignedNodeCredentials=nodeId=>all(`SELECT DISTINCT c.* FROM credentials c JOIN credential_assignments a ON a.credential_id=c.id WHERE a.node_id=? OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?) ORDER BY c.priority`,nodeId,nodeId)
 const assignedSnmpCredential=(nodeId,user)=>assignedNodeCredentials(nodeId).filter(credential=>['snmp-v2c','snmp-v3'].includes(credential.type)&&canUseCredential(user,credential))[0]||null
 const assignedEsxiCredentials=(nodeId,user)=>assignedNodeCredentials(nodeId).filter(credential=>credential.type==='esxi'&&canUseCredential(user,credential))
@@ -371,7 +372,7 @@ api.get('/agent-package/enroll.ps1',wrap(async(req,res)=>{
   catch(error){return res.status(503).json({error:error.message})}
   res.set('Cache-Control','private, no-store').type('text/plain').send(script)
 }))
-api.get('/openapi.json',(_req,res)=>res.json(buildOpenApi(api,agentRoutes,{internet:internetRoutes,mapping:mappingRoutes,ai:aiRoutes,'':cloudRoutes,'api-keys':apiKeyRoutes})))
+api.get('/openapi.json',(_req,res)=>res.json(buildOpenApi(api,agentRoutes,{internet:internetRoutes,mapping:mappingRoutes,ai:aiRoutes,'':[cloudRoutes,protectionRoutes],'api-keys':apiKeyRoutes})))
 const loginLimit=rateLimit({windowMs:15*60*1000,limit:Number(process.env.AUTH_RATE_LIMIT||20),standardHeaders:'draft-8',legacyHeaders:false})
 const publicMfaLimit=rateLimit({windowMs:15*60*1000,limit:10,standardHeaders:'draft-8',legacyHeaders:false})
 api.post('/auth/login',loginLimit,wrap(async(req,res)=>{
@@ -582,6 +583,7 @@ api.get('/nodes/:id/ai-usage',requireRole('auditor'),nodeAiUsage)
 api.use('/mapping',mappingRoutes)
 api.use(cloudRoutes)
 api.use('/api-keys',apiKeyRoutes)
+api.use(protectionRoutes)
 api.get('/settings/tls',requireRole('admin'),(_req,res)=>{
   const paths=tlsMaterialPaths(),files=Object.fromEntries(Object.entries(paths).map(([name,file])=>[name,{configured:fs.existsSync(file),source:process.env[name]?'environment':'administration',path:process.env[name]?null:file}]))
   res.json({httpsEnabled:Object.values(files).every(item=>item.configured),files,restartRequired:true})
@@ -1504,14 +1506,15 @@ api.get('/credentials/health',requireRole('editor'),(req,res)=>{
   res.json({notices,...credentialHealthConfig()})
 })
 api.get('/credentials',(req,res)=>res.json(visibleCredentials(req.user)))
-const credentialInputSchema=z.object({name:z.string().trim().min(1).max(120),type:z.enum(['local','domain','esxi','ssh','snmp-v2c','snmp-v3']),username:z.string().trim().max(255).default(''),password:z.string().max(4096).optional(),privateKey:z.string().max(32768).optional(),passphrase:z.string().max(4096).optional(),hostKeyFingerprint:z.string().trim().max(255).optional(),port:z.number().int().min(1).max(65535).optional(),community:z.string().max(255).optional(),securityLevel:z.enum(['noAuthNoPriv','authNoPriv','authPriv']).optional(),authProtocol:z.enum(['md5','sha','sha224','sha256','sha384','sha512']).optional(),authKey:z.string().max(4096).optional(),privProtocol:z.enum(['des','aes','aes256b','aes256r']).optional(),privKey:z.string().max(4096).optional(),visibility:z.enum(['private','team']).default('private'),teamId:z.string().optional(),priority:z.number().int().min(-100000).max(100000).default(100)}).superRefine((value,ctx)=>{
-  if(['local','domain','esxi'].includes(value.type)&&(!value.username||!value.password))ctx.addIssue({code:'custom',path:['password'],message:'Username and password are required for this credential'})
+const credentialInputSchema=z.object({name:z.string().trim().min(1).max(120),type:z.enum(['local','domain','esxi','ssh','snmp-v2c','snmp-v3','servicenow']),username:z.string().trim().max(255).default(''),password:z.string().max(4096).optional(),privateKey:z.string().max(32768).optional(),passphrase:z.string().max(4096).optional(),hostKeyFingerprint:z.string().trim().max(255).optional(),port:z.number().int().min(1).max(65535).optional(),community:z.string().max(255).optional(),securityLevel:z.enum(['noAuthNoPriv','authNoPriv','authPriv']).optional(),authProtocol:z.enum(['md5','sha','sha224','sha256','sha384','sha512']).optional(),authKey:z.string().max(4096).optional(),privProtocol:z.enum(['des','aes','aes256b','aes256r']).optional(),privKey:z.string().max(4096).optional(),visibility:z.enum(['private','team']).default('private'),teamId:z.string().optional(),priority:z.number().int().min(-100000).max(100000).default(100)}).superRefine((value,ctx)=>{
+  if(['local','domain','esxi','servicenow'].includes(value.type)&&(!value.username||!value.password))ctx.addIssue({code:'custom',path:['password'],message:'Username and password are required for this credential'})
   if(value.type==='ssh'&&(!value.username||(!value.password&&!value.privateKey)))ctx.addIssue({code:'custom',path:['password'],message:'SSH requires a username and password or private key'})
   if(value.type==='snmp-v2c'&&!value.community&&!value.password)ctx.addIssue({code:'custom',path:['community'],message:'SNMP v2c requires a community string'})
   if(value.type==='snmp-v3')try{normalizeSnmpSecret(value.type,value)}catch(error){ctx.addIssue({code:'custom',path:['username'],message:error.message})}
 })
 const sealedCredentialSecret=data=>['snmp-v2c','snmp-v3'].includes(data.type)?normalizeSnmpSecret(data.type,data):data.type==='ssh'?{password:data.password||null,privateKey:data.privateKey||null,passphrase:data.passphrase||null,hostKeyFingerprint:data.hostKeyFingerprint||null,port:data.port||22}:{password:data.password}
 api.post('/credentials',requireRole('editor'),(req,res)=>{
+  if(req.body.type==='servicenow'&&!['admin','owner'].includes(req.user.role))return res.status(403).json({error:'Administrator role required for ServiceNow credentials'})
   if(req.body?.type==='azure'){if(!['owner','admin'].includes(req.user.role))return res.status(403).json({error:'Administrator access is required for Azure discovery credentials'});const {type,...data}=req.body;return res.status(201).json(saveAzureCredential({...data,teamId:data.teamId||req.user.team_id||null},req.user.id))}
   const data=body(credentialInputSchema,req),credentialId=id(),username=data.type==='snmp-v2c'?(data.username||'community') : data.username
   run('INSERT INTO credentials(id,name,type,username,encrypted_blob,owner_user_id,visibility,team_id,priority) VALUES(?,?,?,?,?,?,?,?,?)',credentialId,data.name,data.type,username,seal(sealedCredentialSecret(data)),req.user.id,data.visibility,data.teamId||req.user.team_id||null,data.priority)
@@ -1763,6 +1766,7 @@ api.put('/nodes/:id/credentials',requireRole('editor'),wrap(async(req,res)=>{
   res.json({credentialIds:data.credentialIds,snmpPoll})
 }))
 api.delete('/nodes/:id',requireRole('admin'),(req,res)=>{
+  if(one('SELECT id FROM ddos_incidents WHERE node_id=? AND closed_at IS NULL',reqId(req)))return res.status(409).json({error:'Stop and release active DDoS protection before deleting this node'})
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
   const data=z.object({confirmed:z.boolean().optional(),confirmation:z.string().optional()}).parse(req.body||{})
   if((data.confirmed!==undefined||data.confirmation!==undefined)&&!data.confirmed&&data.confirmation!==node.hostname)return res.status(400).json({error:'Confirmation is required'})

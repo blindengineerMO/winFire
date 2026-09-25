@@ -1,7 +1,8 @@
 <script setup>
-import {useRoute} from 'vue-router'
-const route=useRoute()
-import {onMounted,onUnmounted,ref,computed,nextTick} from 'vue'
+import {useRoute,useRouter} from 'vue-router'
+const route=useRoute(),router=useRouter()
+import {onMounted,onUnmounted,ref,computed,nextTick,watch} from 'vue'
+import DdosProtection from '../components/DdosProtection.vue'
 import PageHeader from '../components/PageHeader.vue'
 import GlassWindow from '../components/GlassWindow.vue'
 import TransactionDetailsDialog from '../components/TransactionDetailsDialog.vue'
@@ -17,7 +18,8 @@ const filters=ref({nodeId:'',eventId:'',action:'',direction:'',srcIp:'',dstIp:''
 const hideLoopback=ref(true)
 const page=ref(1),pageSize=ref(100),total=ref(0),sortBy=ref('time'),sortDir=ref('desc')
 const error=ref(''),message=ref(''),loading=ref(false),duration=ref(24)
-const activeTab=ref('events'),eventType=ref('firewall')
+const validTab=tab=>['events','accounts','learning'].includes(tab)||tab==='ddos'&&canManageRules.value?tab:'events'
+const activeTab=ref(validTab(route.query.tab)),eventType=ref(activeTab.value==='accounts'?'logon':'firewall')
 let requestId=0
 let refreshTimer=null
 const pulling=ref(false)
@@ -36,6 +38,7 @@ function queryString(){
   return new URLSearchParams(Object.entries(query).filter(([,value])=>value!==''&&value!==null)).toString()
 }
 async function load(){
+  if(activeTab.value==='ddos')return
   const current=++requestId
   loading.value=true
   try{
@@ -47,7 +50,14 @@ async function load(){
 }
 function searchEvents(){page.value=1;load()}
 function clearFilters(){filters.value={nodeId:'',eventId:'',action:'',direction:'',srcIp:'',dstIp:'',port:'',program:'',account:'',protocol:'',challengeId:'',from:'',to:''};searchEvents()}
-function switchTab(tab){activeTab.value=tab;if(tab==='events'){eventType.value='firewall';page.value=1;load()}else if(tab==='accounts'){eventType.value='logon';page.value=1;load()}}
+function switchTab(tab){router.push({path:'/logs',query:{...route.query,tab}})}
+watch(()=>route.query.tab,value=>{
+  const tab=validTab(value);if(tab===activeTab.value)return
+  activeTab.value=tab;requestId++;loading.value=false;closeEventMenu()
+  if(tab==='ddos')return
+  if(tab==='events'||tab==='accounts'){eventType.value=tab==='accounts'?'logon':'firewall';page.value=1}
+  load()
+})
 function sort(key){if(sortBy.value===key)sortDir.value=sortDir.value==='asc'?'desc':'asc';else{sortBy.value=key;sortDir.value=key==='time'?'desc':'asc'}page.value=1;load()}
 function changePage(next){if(next<1||next>totalPages.value||loading.value)return;page.value=next;load()}
 async function startLearning(){if(!filters.value.nodeId)return;try{await api('/learning-sessions',{method:'POST',body:{nodeId:filters.value.nodeId,durationHours:Number(duration.value)}});await load()}catch(e){error.value=e.message}}
@@ -89,19 +99,20 @@ onUnmounted(()=>{window.removeEventListener('pointerdown',onPointer);window.remo
 
 <template>
   <div class="view">
-    <PageHeader eyebrow="OBSERVABILITY / EVENTS" title="Firewall events" description="Search collected traffic and train a policy from observed flows">
+    <PageHeader v-if="activeTab!=='ddos'" eyebrow="OBSERVABILITY / EVENTS" title="Firewall events" description="Search collected traffic and train a policy from observed flows">
       <button class="button secondary" :disabled="pulling||!nodes.some(node=>['winrm','winrms'].includes(node.transport)&&(filters.nodeId?node.id===filters.nodeId:true))" @click="pull"><i class="mdi mdi-download-network-outline"></i> {{pulling?'Pulling…':filters.nodeId?'Pull from node':'Pull from all nodes'}}</button>
       <button class="button primary" :disabled="loading" @click="load"><i class="mdi mdi-refresh"></i> Refresh</button>
     </PageHeader>
-    <div v-if="error" class="error-msg" role="alert">{{error}}</div>
-    <div v-if="message" class="success-msg">{{message}}</div>
-    <div class="metric-grid compact">
+    <div v-if="error&&activeTab!=='ddos'" class="error-msg" role="alert">{{error}}</div>
+    <div v-if="message&&activeTab!=='ddos'" class="success-msg">{{message}}</div>
+    <div v-if="activeTab!=='ddos'" class="metric-grid compact">
       <div class="metric glass"><div class="metric-top"><span>EVENTS MATCHING</span><i class="mdi mdi-text-box-search-outline"></i></div><strong>{{total}}</strong></div>
       <div class="metric glass"><div class="metric-top"><span>ALLOWED ON PAGE</span><i class="mdi mdi-check"></i></div><strong>{{totals.allowed}}</strong></div>
       <div class="metric glass"><div class="metric-top"><span>BLOCKED ON PAGE</span><i class="mdi mdi-cancel"></i></div><strong>{{totals.blocked}}</strong></div>
       <div class="metric glass"><div class="metric-top"><span>LEARNING SESSIONS</span><i class="mdi mdi-brain"></i></div><strong>{{sessions.length}}</strong></div>
     </div>
-    <nav class="view-tabs" aria-label="Firewall events sections"><button type="button" :class="{active:activeTab==='events'}" @click="switchTab('events')">Firewall events <span>{{eventType==='firewall'?total:'—'}}</span></button><button type="button" :class="{active:activeTab==='accounts'}" @click="switchTab('accounts')">Accounts <span>{{eventType==='logon'?total:'—'}}</span></button><button type="button" :class="{active:activeTab==='learning'}" @click="switchTab('learning')">Learning sessions <span>{{sessions.length}}</span></button></nav>
+    <nav class="view-tabs" role="tablist" aria-label="Activities sections"><button type="button" role="tab" :aria-selected="activeTab==='events'" :class="{active:activeTab==='events'}" @click="switchTab('events')">Firewall events <span>{{eventType==='firewall'?total:'—'}}</span></button><button type="button" role="tab" :aria-selected="activeTab==='accounts'" :class="{active:activeTab==='accounts'}" @click="switchTab('accounts')">Accounts <span>{{eventType==='logon'?total:'—'}}</span></button><button type="button" role="tab" :aria-selected="activeTab==='learning'" :class="{active:activeTab==='learning'}" @click="switchTab('learning')">Learning sessions <span>{{sessions.length}}</span></button><button v-if="canManageRules" type="button" role="tab" :aria-selected="activeTab==='ddos'" :class="{active:activeTab==='ddos'}" @click="switchTab('ddos')">DDoS protection</button></nav>
+    <section v-if="activeTab==='ddos'&&canManageRules" class="panel glass"><DdosProtection /></section>
     <section v-if="activeTab==='events'||activeTab==='accounts'" class="panel glass">
       <div class="panel-title"><div><span class="eyebrow">EVENT SEARCH</span><h2>{{activeTab==='accounts'?'Accounts logon and logoff':'Traffic log'}}</h2></div><div class="table-tools"><label class="page-size">Rows per page <select v-model.number="pageSize" @change="searchEvents"><option :value="25">25</option><option :value="50">50</option><option :value="100">100</option><option :value="200">200</option><option :value="500">500</option></select></label></div></div>
       <form class="log-filters" @submit.prevent="searchEvents">
