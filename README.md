@@ -43,6 +43,12 @@ WinFire Secure is an API-first control plane for host inventory, firewall visibi
 
 - **Events and mapping:** separate Firewall events and Accounts tables, transaction details and quick rule actions, classifier catalog/custom rules, exports/ignores, WEF/agent collection, topology graph, neighbors, top talkers and node/subnet/switch/time filters.
 
+- **Traffic evidence:** Activities → Traffic sources shows whether imported device/cloud traffic has a matching endpoint observation. Conflicting or ambiguous records remain separate. Mapping → Cloud context can assess retained security-group and route configuration for a selected flow; configuration results are kept separate from verified connectivity.
+
+- **Rule review:** Policy Studio → Rule lifecycle and templates can assess observed rule matches over the last day, with links to retained events and reported collection-health coverage. Missing traffic or collection gaps never establish that a rule is unused.
+
+- **Evidence delivery:** administrators can use Reports → exports to download scoped coverage evidence or schedule signed HTTPS deliveries to their own receiver. Snapshots include policy versions, capability freshness and recent apply/verifier outcomes. Destinations start disabled; delivery history shows failures and supports retries.
+
 - **Identity and JIT MFA:** TOTP or Entra portal requests, optional source-desktop browser prompts, scoped temporary Windows firewall grants, host-local expiry plus server cleanup, optional account-right baselines and audited fallback behavior.
 
 - **AI visibility:** metadata-only REST/MCP reporting, scoped reporter credentials, versioned provider catalog, uncertain network evidence, separate usage/traffic totals, node timelines and server-filtered AI Usage tables.
@@ -105,6 +111,31 @@ curl --fail-with-body --get "$BASE/nodes" -H "Authorization: Bearer $TOKEN" \
 ```
 
 See [API examples](docs/API.md) for refresh/logout, mutation payloads, discovery, mapping, DHCP import and MFA calls. Some older routes expose generic OpenAPI schemas; the complete route reference links to their exact handler validation.
+
+## Evidence exports and recovery
+
+In **Reports → exports**, select an inventory scope and add your HTTPS receiver. Copy the one-time signing secret into the receiver before enabling delivery. Choose the snapshot interval and any policy, drift, containment or connector events you want to receive. Saving a destination change cancels older pending deliveries; administrators can rotate the secret through the API. Use a receiver that validates signatures and handles repeated delivery IDs; see the [evidence export API reference](docs/API_ROUTES.md#evidence-exports) for integration settings.
+
+Evidence snapshots support up to 500 assets and 500 policies per scope. Large scopes must be split before export. Cloud-path assessment needs cloud configuration captured within the last 15 minutes. Rule-use coverage begins when upgraded agents report healthy, caught-up collection; older history does not gain coverage retroactively.
+
+For a complete recovery point, stop the API, keep your external vault/JWT secrets and deployment configuration in your secret backup system, then back up the data directory to a new location:
+
+```bash
+node scripts/backup-recovery.mjs backup --data-dir ./data --destination ../winfire-backup
+node scripts/backup-recovery.mjs verify --backup ../winfire-backup
+node scripts/backup-recovery.mjs restore --backup ../winfire-backup --destination ../winfire-restored
+```
+
+The destination's parent directory must exist; existing destinations and symbolic links are rejected. Backup files contain sensitive vault and certificate material; protect them as you protect the running data directory. Preserve external certificate paths, separately configured MIB storage, and external secrets as well. When `VAULT_MASTER_KEY` is supplied through the environment, supply the original key during restore; the tool does not export it. Restart the original API after the backup completes.
+
+Restore creates a separate data directory and requires recovery review before the API can start. Sessions and queued endpoint jobs are invalidated, existing grants are expired for cleanup, and scheduled discovery/security/export tasks are disabled. Review restored host transactions, account holds, break-glass state, host-local expiry, credentials, certificates, schedules and network scope on an isolated system before acknowledging:
+
+```bash
+node scripts/backup-recovery.mjs acknowledge --data-dir ../winfire-restored \
+  --confirmation 'REVIEWED RESTORED HOST STATE'
+```
+
+Then configure the API's `DATA_DIR` to the restored directory and re-enable reviewed schedules deliberately. Never start the original and restored controllers against the same fleet simultaneously. A restored database does not itself restore or prove endpoint firewall state.
 
 ## How JIT MFA functions
 

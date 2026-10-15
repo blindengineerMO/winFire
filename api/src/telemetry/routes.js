@@ -1,3 +1,4 @@
+import {cloudPath} from './cloudPath.js'
 import {receiverStatus} from './receiver.js'
 import {importVnetBlob,refreshCloudNetwork,cloudNetworkContext} from './vnet.js'
 import {Router} from 'express'
@@ -18,3 +19,5 @@ r.post('/discovery/azure/connections/:id/network-context',admin,async(req,res)=>
 r.get('/mapping/cloud-context',(req,res)=>res.json(cloudNetworkContext(req.query)))
 
 r.get('/telemetry/receiver-status',admin,(_req,res)=>res.json(receiverStatus))
+
+r.get('/mapping/cloud-path',(req,res)=>res.json(cloudPath(req.query)))

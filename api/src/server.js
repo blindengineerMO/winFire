@@ -1,3 +1,6 @@
+import {enqueueDueEvidence,deliverEvidence} from './services/evidenceExports.js'
+import {pruneCollectionCoverage} from './services/collectionCoverage.js'
+import {processTrafficCorrelations} from './telemetry/correlation.js'
 import {processContainment} from './services/containment.js'
 import {refreshMetadataSources,notifyDependencyChanges} from './services/applicationContext.js'
 import {processDeployments} from './services/stagedDeployment.js'
@@ -34,6 +37,11 @@ import {dueSnmpTargets,dueSnmpNodes,pollSnmpDiscoveryTarget,pollAssignedSnmpNode
 import {processPassiveDiscovery} from './passiveDiscovery.js'
 import {processDueDiscoverySchedules} from './networkDiscovery.js'
 
+if(one("SELECT value FROM app_settings WHERE key='recovery_review_required'")?.value==='true')throw new Error('Restored data is quarantined. Review host transactions and external configuration, then acknowledge recovery with scripts/backup-recovery.mjs before starting the API.')
+setInterval(()=>{try{processTrafficCorrelations()}catch(error){console.error('Traffic correlation:',error.message)}},10000).unref()
+
+setInterval(()=>{try{enqueueDueEvidence();deliverEvidence().catch(error=>console.error('Evidence delivery:',error.message))}catch(error){console.error('Evidence export:',error.message)}},30000).unref()
+
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..')
 const dist=path.join(root,'web/dist')
 await bootstrap()
@@ -49,7 +57,7 @@ const server=tls?https.createServer(tls,app):app
 const listener=server.listen(Number(process.env.PORT||3000),process.env.HOST||'0.0.0.0',()=>console.log(`WinFire ready on ${tls?'https':'http'}://localhost:${process.env.PORT||3000}`))
 setInterval(()=>{try{processSimulations()}catch(error){console.error('Policy simulation failed:',error.message)}},1000).unref()
 const telemetryReceivers=startTelemetryReceivers()
-setInterval(()=>{try{pruneTelemetry()}catch(error){console.error('Telemetry retention:',error.message)}},60000).unref()
+setInterval(()=>{try{pruneTelemetry();pruneCollectionCoverage()}catch(error){console.error('Telemetry retention:',error.message)}},60000).unref()
 setInterval(()=>{try{notifyExceptionReviews()}catch(error){console.error('Exception review sweep:',error.message)}},60000).unref()
 setInterval(()=>processDeployments().catch(error=>console.error('Staged deployment worker:',error.message)),2000).unref()
 setInterval(()=>{try{refreshMetadataSources();notifyDependencyChanges()}catch(error){console.error('Application context refresh:',error.message)}},60000).unref()

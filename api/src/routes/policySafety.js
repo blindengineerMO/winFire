@@ -1,3 +1,4 @@
+import {ruleUsage} from '../services/ruleUsage.js'
 import {containmentPreview,queueContainment,containments,containment,restoreContainment} from '../services/containment.js'
 import {deploymentPreview,queueDeployment,deployment,listDeployments,deploymentAction} from '../services/stagedDeployment.js'
 import {one} from '../db.js'
@@ -47,3 +48,5 @@ r.get('/containments/:id',requireRole('admin'),(req,res)=>res.json(containment(r
 r.post('/containments/:id/restore',requireRole('admin'),(req,res)=>res.json(restoreContainment(req.params.id,req.body.reason,req.user)))
 
 r.post('/nodes/:id/policy-context',requireRole('admin'),async(req,res)=>res.json(await capturePolicyContext(req.params.id,req.user)))
+
+r.get('/policies/:id/usage',(req,res)=>res.json(ruleUsage(req.params.id,req.query,req.user)))

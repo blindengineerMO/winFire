@@ -1,3 +1,4 @@
+import {evidenceSchemas,describeEvidenceOperation} from './services/evidenceOpenapi.js'
 import {policySafetySchemas,describePolicySafetyOperation} from './services/policySafetyOpenapi.js'
 import {protectionSchemas,describeProtectionOperation} from './services/protectionOpenapi.js'
 import {cloudSchemas,describeCloudOperation} from './cloud/openapi.js'
@@ -177,6 +178,7 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
         describeUserApiKeyOperation(operation,method,path)
         describeProtectionOperation(operation,method,path)
         describePolicySafetyOperation(operation,method,path)
+        describeEvidenceOperation(operation,method,path)
         pathItem[method]=operation
       }
     }
@@ -192,6 +194,7 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
       ...userApiKeySchemas,
       ...protectionSchemas,
       ...policySafetySchemas,
+      ...evidenceSchemas,
       ...internetConnectionSchemas,
       ...aiSchemas,
       LogEventPage:{type:'object',required:['items','total','page','pageSize','totalPages','hasMore','nextCursor'],properties:{items:{type:'array',maxItems:500,items:{type:'object',additionalProperties:true}},total:{type:['integer','null'],minimum:0},page:{type:'integer',minimum:1},pageSize:{type:'integer',minimum:1,maximum:500},totalPages:{type:['integer','null'],minimum:0},hasMore:{type:'boolean'},nextCursor:{type:['string','null']}}},

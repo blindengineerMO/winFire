@@ -1,3 +1,4 @@
+import {recordCollectionHealth} from '../services/collectionCoverage.js'
 import {capabilityEvidence} from '../services/capabilities.js'
 import express from 'express'
 import crypto from 'node:crypto'
@@ -117,6 +118,7 @@ agentRoutes.post('/:id/telemetry-health',requireAgent,(req,res)=>{
   const data=z.object({checkedAt:z.string().datetime({offset:true}),caughtUp:z.boolean(),successAuditEnabled:z.boolean().nullable()}).strict().parse(req.body)
   if(Math.abs(Date.now()-Date.parse(data.checkedAt))>5*60000)return res.status(400).json({error:'Telemetry health timestamp must be within five minutes of server time'})
   capabilityEvidence(req.agent.node_id,'events','agent-collector',{success:data.caughtUp&&data.successAuditEnabled===true,code:!data.caughtUp?'collection_backlog':data.successAuditEnabled===null?'audit_unknown':'audit_disabled',detail:data})
+  recordCollectionHealth(req.agent.node_id,req.agent.id,data.caughtUp&&data.successAuditEnabled===true)
   res.json({ok:true})
 })
 agentRoutes.post('/:id/events',requireAgent,(req,res)=>{

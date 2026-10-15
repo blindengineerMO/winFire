@@ -1,3 +1,4 @@
+import {evidenceRoutes} from './routes/evidence.js'
 import {searchLogEvents} from './logSearch.js'
 import {telemetryRoutes} from './telemetry/routes.js'
 import {policySafetyRoutes} from './routes/policySafety.js'
@@ -375,7 +376,7 @@ api.get('/agent-package/enroll.ps1',wrap(async(req,res)=>{
   catch(error){return res.status(503).json({error:error.message})}
   res.set('Cache-Control','private, no-store').type('text/plain').send(script)
 }))
-api.get('/openapi.json',(_req,res)=>res.json(buildOpenApi(api,agentRoutes,{internet:internetRoutes,mapping:mappingRoutes,ai:aiRoutes,'':[cloudRoutes,protectionRoutes,policySafetyRoutes,telemetryRoutes],'api-keys':apiKeyRoutes})))
+api.get('/openapi.json',(_req,res)=>res.json(buildOpenApi(api,agentRoutes,{internet:internetRoutes,mapping:mappingRoutes,ai:aiRoutes,'':[cloudRoutes,protectionRoutes,policySafetyRoutes,telemetryRoutes,evidenceRoutes],'api-keys':apiKeyRoutes})))
 const loginLimit=rateLimit({windowMs:15*60*1000,limit:Number(process.env.AUTH_RATE_LIMIT||20),standardHeaders:'draft-8',legacyHeaders:false})
 const publicMfaLimit=rateLimit({windowMs:15*60*1000,limit:10,standardHeaders:'draft-8',legacyHeaders:false})
 api.post('/auth/login',loginLimit,wrap(async(req,res)=>{
@@ -589,6 +590,7 @@ api.use('/api-keys',apiKeyRoutes)
 api.use(protectionRoutes)
 api.use(policySafetyRoutes)
 api.use(telemetryRoutes)
+api.use(evidenceRoutes)
 api.get('/settings/tls',requireRole('admin'),(_req,res)=>{
   const paths=tlsMaterialPaths(),files=Object.fromEntries(Object.entries(paths).map(([name,file])=>[name,{configured:fs.existsSync(file),source:process.env[name]?'environment':'administration',path:process.env[name]?null:file}]))
   res.json({httpsEnabled:Object.values(files).every(item=>item.configured),files,restartRequired:true})
@@ -604,7 +606,7 @@ api.put('/settings/tls/:kind',requireRole('admin'),(req,res)=>{
   if(!pemPattern.test(pem))return res.status(400).json({error:'Uploaded material is not a valid PEM certificate or private key'})
   if(process.env[target.key])return res.status(409).json({error:`${target.key} is configured by the deployment environment; change that path instead of uploading through the control plane`})
   try{if(target.begin==='CERTIFICATE')new crypto.X509Certificate(pem);else crypto.createPrivateKey({key:pem,format:'pem',passphrase:process.env[target.key==='TLS_KEY'?'TLS_KEY_PASSPHRASE':'AGENT_CA_PASSPHRASE']||undefined})}catch(error){return res.status(400).json({error:`TLS material could not be parsed: ${error.message}`})}
-  const file=tlsMaterialPaths()[target.key];fs.mkdirSync(path.dirname(file),{recursive:true,mode:0o700});fs.writeFileSync(file,pem,{mode:0o600});audit(req.user.id,'tls.material.upload','app-settings',target.key,null,{bytes:Buffer.byteLength(pem)})
+  const file=tlsMaterialPaths()[target.key];fs.mkdirSync(path.dirname(file),{recursive:true,mode:0o700});const temporary=file+'.'+crypto.randomUUID()+'.tmp';try{fs.writeFileSync(temporary,pem,{mode:0o600,flag:'wx'});fs.renameSync(temporary,file)}finally{fs.rmSync(temporary,{force:true})};audit(req.user.id,'tls.material.upload','app-settings',target.key,null,{bytes:Buffer.byteLength(pem)})
   res.json({ok:true,kind:req.params.kind,restartRequired:true})
 })
 const publicDiscoveryScan=scan=>({...scan,cidrs:parse(scan.cidrs_json)||[],results:parse(scan.results_json)||[],diff:parse(scan.diff_json)||{}})
@@ -1777,7 +1779,7 @@ api.delete('/nodes/:id',requireRole('admin'),(req,res)=>{
   if((data.confirmed!==undefined||data.confirmation!==undefined)&&!data.confirmed&&data.confirmation!==node.hostname)return res.status(400).json({error:'Confirmation is required'})
   if(node.ad_guid)return res.status(409).json({error:'This computer is managed by Active Directory and will be imported again. Remove it from the directory search scope first.'})
   if(one('SELECT id FROM agents WHERE node_id=? AND revoked_at IS NULL',node.id))return res.status(409).json({error:'Revoke the enrolled agent before removing this node'})
-  if(one("SELECT id FROM break_glass_sessions WHERE node_id=? AND status IN ('activating','activation-unknown','active','ending')",node.id))return res.status(409).json({error:'End break glass before removing this node'})
+  if(one("SELECT id FROM break_glass_sessions WHERE node_id=? AND status IN ('activating','activation-unknown','active','ending','recovery-review')",node.id))return res.status(409).json({error:'End break glass before removing this node'})
   if(one('SELECT id FROM identity_segments WHERE node_id=?',node.id))return res.status(409).json({error:'Remove identity segments for this node before deleting it'})
   if(one('SELECT id FROM policy_assignments WHERE node_id=? OR node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=?)',node.id,node.id))return res.status(409).json({error:'Remove policy assignments for this node and its groups before deleting it; managed firewall rules may still be present on the host'})
   db.transaction(()=>{
@@ -1951,14 +1953,14 @@ async function endBreakGlass(session,actorId=null,finalStatus='ended'){
 api.get('/nodes/:id/break-glass',requireRole('admin'),(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
   const sessions=all('SELECT * FROM break_glass_sessions WHERE node_id=? ORDER BY started_at DESC LIMIT 10',node.id).map(publicBreakGlass)
-  res.json({active:sessions.find(session=>['activating','activation-unknown','active','ending'].includes(session.status))||null,history:sessions})
+  res.json({active:sessions.find(session=>['activating','activation-unknown','active','ending','recovery-review'].includes(session.status))||null,history:sessions})
 })
 api.post('/nodes/:id/break-glass',requireRole('admin'),wrap(async(req,res)=>{
   const node=getNode(reqId(req));if(!node)return notFound(res,'Node')
   const data=body(z.object({durationMinutes:z.number().int().min(5).max(240),reason:z.string().trim().min(10).max(500),confirmed:z.boolean().optional(),confirmation:z.string().optional()}),req)
   if((data.confirmed!==undefined||data.confirmation!==undefined)&&!data.confirmed&&data.confirmation!=='OPEN FIREWALL')return res.status(400).json({error:'Confirmation is required'})
   if(node.connection_mode!=='agent'&&!['winrm','winrms'].includes(node.transport))return res.status(409).json({error:'Break glass requires WinRM or an enrolled agent'})
-  if(one("SELECT id FROM break_glass_sessions WHERE node_id=? AND status IN ('activating','activation-unknown','active','ending')",node.id))return res.status(409).json({error:'Break glass is already active or pending for this node'})
+  if(one("SELECT id FROM break_glass_sessions WHERE node_id=? AND status IN ('activating','activation-unknown','active','ending','recovery-review')",node.id))return res.status(409).json({error:'Break glass is already active or pending for this node'})
   const sessionId=id(),startedAt=now(),expiresAt=new Date(Date.now()+data.durationMinutes*60_000).toISOString()
   run("INSERT INTO break_glass_sessions(id,node_id,actor_user_id,reason,started_at,expires_at,status) VALUES(?,?,?,?,?,?,'activating')",sessionId,node.id,req.user.id,data.reason,startedAt,expiresAt)
   const applyRunId=id()
@@ -1991,7 +1993,7 @@ api.post('/nodes/:id/break-glass/end',requireRole('admin'),wrap(async(req,res)=>
   const {sessionId}=body(z.object({sessionId:z.string().uuid()}),req)
   const session=one('SELECT * FROM break_glass_sessions WHERE id=? AND node_id=?',sessionId,node.id)
   if(!session)return notFound(res,'Break-glass session')
-  if(!['activating','activation-unknown','active','ending'].includes(session.status))return res.status(409).json({error:'Break glass is not active'})
+  if(!['activating','activation-unknown','active','ending','recovery-review'].includes(session.status))return res.status(409).json({error:'Break glass is not active'})
   if(session.status==='activating'&&node.connection_mode==='agent'){
     const job=one('SELECT status FROM agent_jobs WHERE id=?',session.agent_job_id)
     if(job?.status==='queued'){
