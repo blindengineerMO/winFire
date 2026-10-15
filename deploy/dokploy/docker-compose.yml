@@ -60,8 +60,6 @@ services:
       context: ../..
       dockerfile: deploy/dokploy/ui.Dockerfile
     restart: unless-stopped
-    ports:
-      - "80"
     depends_on:
       api:
         condition: service_healthy

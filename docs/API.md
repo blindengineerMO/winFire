@@ -187,6 +187,10 @@ curl --fail-with-body --get "$BASE/mapping/arp" -H "Authorization: Bearer $TOKEN
 
 Logs also accept `nodeId`, `direction`, `program`, `challengeId`, `protocol`, `srcIp`, `dstIp`, `port`, `account`, `from`, `to`, `hideLoopback`. `eventType` is `firewall`, `logon`, or `all`; log page size maximum 500. Sort keys include time, node, eventId, action, direction, srcIp, dstIp, port, program, account.
 
+For large event histories, use `pagination=cursor&includeTotal=false&sortBy=time&pageSize=100`. The response contains `items`, `hasMore`, and `nextCursor`; `total` and `totalPages` are `null` when counting is disabled. To continue, pass `cursor=<nextCursor>` with the same filters, page size, and sort direction. Stop when `hasMore` is false. Cursors work with either time direction and break timestamp ties by event ID. They survive deletion of the last event on the previous page. Newer arrivals appear on refresh; this is a live traversal, not a frozen export snapshot.
+
+The Activities event/account tables use these count-free chunks and display the current page's row count. Previous revisits a saved page cursor; changing filters, page size, or sorting resets navigation. Other sort columns use offset paging with `includeTotal=false`. Existing API clients retain offset paging and exact totals by default; requesting an exact total still scans all matches. Narrow date/node filters for sparse searches or alternate sorts: contains searches across compacted fields can still require scanning history.
+
 Mapping filters are server-side and intersect before totals/paging. Subnet and switch must match the same endpoint; external peers are kept to show the traffic crossing that scope. See the generated reference for graph limits and full query descriptions.
 
 ## Directory, policy and reports

@@ -38,7 +38,7 @@ export function isExcludedFirewallEvent(event){
   return excluded.has(processBasename(event?.program))
 }
 
-export function isExcludedProcess(value){return excluded.has(processBasename(value))}
+export function isExcludedProcess(value){return excluded.size>0&&excluded.has(processBasename(value))}
 
 export function visibleFirewallEventSql(eventAlias='e',patternAlias='p'){
   const program=patternAlias?`COALESCE(${eventAlias}.program,${patternAlias}.program)`:`${eventAlias}.program`

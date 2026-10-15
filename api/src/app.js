@@ -1,3 +1,4 @@
+import {searchLogEvents} from './logSearch.js'
 import {telemetryRoutes} from './telemetry/routes.js'
 import {policySafetyRoutes} from './routes/policySafety.js'
 import {protectionRoutes} from './routes/protection.js'
@@ -2915,31 +2916,8 @@ api.post('/logon-rights/change',requireRole('admin'),wrap(async(req,res)=>{
 }))
 
 api.get('/logs/search',(req,res)=>{
-  const query=z.object({id:z.string().max(200).optional(),
-    nodeId:z.string().optional(),action:z.enum(['allow','block','success','failure','logon','logoff']).optional(),direction:z.enum(['in','out']).optional(),
-    program:z.string().max(1024).optional(),challengeId:z.string().max(128).optional(),
-    eventId:z.coerce.number().int().min(0).optional(),protocol:z.string().max(32).optional(),srcIp:z.string().max(128).optional(),dstIp:z.string().max(128).optional(),
-    port:z.coerce.number().int().min(1).max(65535).optional(),from:z.iso.datetime({local:true,offset:true}).optional(),to:z.iso.datetime({local:true,offset:true}).optional(),
-    eventType:z.enum(['firewall','logon','all']).default('all'),page:z.coerce.number().int().min(1).default(1),pageSize:z.coerce.number().int().min(1).max(500).default(100),
-    sortBy:z.enum(['time','node','eventId','action','direction','srcIp','dstIp','port','program','account']).default('time'),sortDir:z.enum(['asc','desc']).default('desc'),hideLoopback:z.enum(['true','false']).optional(),account:z.string().max(200).default('')
-  }).parse(req.query)
-  if(query.from&&query.to&&new Date(query.from)>new Date(query.to))return res.status(400).json({error:'From must be earlier than To'})
-  const filters=[visibleFirewallEventSql()],args=[]
-  if(query.id){filters.push('e.id=?');args.push(query.id)}
-  if(query.eventType==='logon')filters.push("(COALESCE(e.event_type,p.event_type)='logon' OR e.event_id IN (4624,4634))")
-  if(query.eventType==='firewall')filters.push("COALESCE(e.event_type,p.event_type,'firewall')<>'logon' AND (e.event_id IS NULL OR e.event_id NOT IN (4624,4634))")
-  for(const [key,column] of [['nodeId','e.node_id'],['direction','COALESCE(e.direction,p.direction)'],['challengeId','e.challenge_id'],['eventId','e.event_id'],['port','COALESCE(e.dst_port,p.dst_port)']])if(query[key]!==undefined){filters.push(`${column}=?`);args.push(query[key])}
-  if(query.action){if(query.action==='logon')filters.push('e.event_id=4624');else if(query.action==='logoff')filters.push('e.event_id=4634');else{filters.push('e.action=?');args.push(query.action)}}
-  for(const [key,column] of [['program','COALESCE(e.program,p.program)'],['protocol','COALESCE(e.protocol,p.protocol)'],['srcIp','COALESCE(e.src_ip,p.src_ip)'],['dstIp','COALESCE(e.dst_ip,p.dst_ip)']])if(query[key]){filters.push(`${column} LIKE ? ESCAPE '\\'`);args.push(`%${query[key].replace(/[\\%_]/g,'\\$&')}%`)}
-  if(query.account.trim()){const term=`%${query.account.trim().replace(/[\\%_]/g,'\\$&')}%`;filters.push("(e.account_sid LIKE ? ESCAPE '\\' OR COALESCE(ad.sam_account_name,ad.upn,'') LIKE ? ESCAPE '\\' OR COALESCE(la.qualified_name,'') LIKE ? ESCAPE '\\' OR COALESCE(sr.qualified_name,'') LIKE ? ESCAPE '\\')");args.push(term,term,term,term)}
-  if(query.from){filters.push('datetime(COALESCE(e.event_time,e.received_at))>=datetime(?)');args.push(query.from)}
-  if(query.to){filters.push('datetime(COALESCE(e.event_time,e.received_at))<=datetime(?)');args.push(query.to)}
-  if((query.hideLoopback===undefined?observabilitySettings().hideLoopbackEvents:query.hideLoopback==='true'))filters.push("NOT ((COALESCE(e.src_ip,p.src_ip,'') LIKE '127.%' OR COALESCE(e.src_ip,p.src_ip,'') IN ('::1','0:0:0:0:0:0:0:1')) AND (COALESCE(e.dst_ip,p.dst_ip,'') LIKE '127.%' OR COALESCE(e.dst_ip,p.dst_ip,'') IN ('::1','0:0:0:0:0:0:0:1')))")
-  const where=filters.length?'WHERE '+filters.join(' AND '):''
-  const sortColumns={time:'julianday(COALESCE(e.event_time,e.received_at))',node:'n.hostname COLLATE NOCASE',eventId:'e.event_id',action:'e.action COLLATE NOCASE',direction:'COALESCE(e.direction,p.direction) COLLATE NOCASE',srcIp:'COALESCE(e.src_ip,p.src_ip) COLLATE NOCASE',dstIp:'COALESCE(e.dst_ip,p.dst_ip) COLLATE NOCASE',port:'COALESCE(e.dst_port,p.dst_port)',program:'COALESCE(e.program,p.program) COLLATE NOCASE',account:'COALESCE(ad.sam_account_name,ad.upn,la.qualified_name,sr.qualified_name,e.account_sid) COLLATE NOCASE'}
-  const fromSql=`FROM log_events e LEFT JOIN nodes n ON n.id=e.node_id LEFT JOIN node_facts f ON f.node_id=e.node_id LEFT JOIN event_patterns p ON p.id=e.pattern_id LEFT JOIN directory_users ad ON ad.sid=e.account_sid LEFT JOIN local_accounts la ON la.node_id=e.node_id AND la.sid=e.account_sid AND la.missing=0 LEFT JOIN sid_resolutions sr ON sr.node_id=e.node_id AND sr.sid=e.account_sid ${where}`
-  const total=one(`SELECT COUNT(*) AS count ${fromSql}`,...args).count
-  const items=all(`SELECT e.*,COALESCE(e.protocol,p.protocol) protocol,COALESCE(e.src_ip,p.src_ip) src_ip,e.src_port,COALESCE(e.dst_ip,p.dst_ip) dst_ip,COALESCE(e.dst_port,p.dst_port) dst_port,COALESCE(e.direction,p.direction) direction,COALESCE(e.program,p.program) program,COALESCE(e.event_type,p.event_type) event_type,n.ip node_ip,f.snapshot_json node_snapshot_json,COALESCE(ad.sam_account_name,ad.upn,la.qualified_name,sr.qualified_name) account_name ${fromSql} ORDER BY ${sortColumns[query.sortBy]} ${query.sortDir.toUpperCase()}, e.id DESC LIMIT ? OFFSET ?`,...args,query.pageSize,(query.page-1)*query.pageSize).map(event=>{
+  const result=searchLogEvents(db,req.query,{hideLoopback:observabilitySettings().hideLoopbackEvents})
+  const items=result.items.map(event=>{
     const sourceIp=event.src_ip||(event.direction==='out'?event.node_ip:null),destinationIp=event.dst_ip||(event.direction==='in'?event.node_ip:null)
     const classification=classifyNetworkFlow({node:{ip:event.node_ip,snapshot_json:event.node_snapshot_json},sourceIp,destinationIp,protocol:event.protocol,sourcePort:event.src_port,destinationPort:event.dst_port,program:event.program})
     const account=event.account_name?event.account_name:event.account_sid?accountName(event.node_id,event.account_sid).accountName:null
@@ -2947,7 +2925,7 @@ api.get('/logs/search',(req,res)=>{
     const action=Number(publicEvent.event_id)===4624?'logon':Number(publicEvent.event_id)===4634?'logoff':publicEvent.action
     return {...publicEvent,action,protocol:normalizeNetworkProtocol(publicEvent.protocol),account_name:account,traffic_service:classification.service,traffic_class:classification.trafficClass,traffic_scope:classification.scope,traffic_reason:classification.reason}
   })
-  res.json({items,total,page:query.page,pageSize:query.pageSize,totalPages:Math.ceil(total/query.pageSize)})
+  res.json({...result,items})
 })
 const publicEventExport=destination=>({id:destination.id,name:destination.name,kind:destination.kind,endpoint:destination.endpoint,hasToken:!!destination.token_blob,createdAt:destination.created_at,updatedAt:destination.updated_at})
 api.get('/event-export/destinations',requireRole('admin'),(_req,res)=>res.json(all('SELECT * FROM event_export_destinations ORDER BY name').map(publicEventExport)))

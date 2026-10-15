@@ -18,53 +18,62 @@ const canManageRules=computed(()=>['owner','admin'].includes(session.user?.role)
 const selectedIds=ref([]),destinations=ref([]),exportDestinationId=ref(''),exportBusy=ref(false)
 const filters=ref({nodeId:'',eventId:'',action:'',direction:'',srcIp:String(route.query.srcIp||''),dstIp:String(route.query.dstIp||''),port:'',program:'',account:'',protocol:'',challengeId:'',from:'',to:''})
 const hideLoopback=ref(true)
-const page=ref(1),pageSize=ref(100),total=ref(0),sortBy=ref('time'),sortDir=ref('desc')
+const page=ref(1),pageSize=ref(100),hasMore=ref(false),pageCursors=ref([null]),sortBy=ref('time'),sortDir=ref('desc')
 const error=ref(''),message=ref(''),loading=ref(false),duration=ref(24)
 const validTab=tab=>['events','accounts','learning','traffic-sources'].includes(tab)||['ddos','containment'].includes(tab)&&canManageRules.value?tab:'events'
 const activeTab=ref(validTab(route.query.tab)),eventType=ref(activeTab.value==='accounts'?'logon':'firewall')
 let requestId=0
-let refreshTimer=null
+let refreshTimer=null,loadController=null,searchScope=''
 const pulling=ref(false)
-const totalPages=computed(()=>Math.max(1,Math.ceil(total.value/pageSize.value)))
-const firstRow=computed(()=>total.value?(page.value-1)*pageSize.value+1:0)
-const lastRow=computed(()=>Math.min(page.value*pageSize.value,total.value))
+const firstRow=computed(()=>events.value.length?(page.value-1)*pageSize.value+1:0)
+const lastRow=computed(()=>events.value.length?(page.value-1)*pageSize.value+events.value.length:0)
 const totals=computed(()=>({allowed:events.value.filter(e=>e.action==='allow').length,blocked:events.value.filter(e=>e.action==='block').length}))
 const activeAuto=computed(()=>sessions.value.some(session=>session.node_id===filters.value.nodeId&&session.mode==='auto'&&session.status==='active'))
 const nodeName=id=>nodes.value.find(node=>node.id===id)?.hostname||id?.slice(0,8)||'—'
 const serviceLabel=value=>String(value||'Unidentified').split(/\r?\n/,1)[0].trim()||'Unidentified'
 const serviceDetails=event=>[event.traffic_service,event.traffic_reason].filter(Boolean).join(' — ')||'Service could not be identified from the observed traffic'
 const columns=[{key:'time',label:'Time'},{key:'node',label:'Node'},{key:'eventId',label:'Event'},{key:'action',label:'Action'},{key:'direction',label:'Direction'},{key:'srcIp',label:'Source'},{key:'dstIp',label:'Destination'},{key:'port',label:'Port'},{key:'service',label:'Service',sortable:false},{key:'program',label:'Program'},{key:'account',label:'Account'}]
-function queryString(){
-  const query={...(route.query.event?{id:String(route.query.event)}:{}),eventType:eventType.value,page:page.value,pageSize:pageSize.value,sortBy:sortBy.value,sortDir:sortDir.value,hideLoopback:hideLoopback.value,...filters.value}
+function queryString(targetPage){
+  const query={...(route.query.event?{id:String(route.query.event)}:{}),eventType:eventType.value,page:targetPage,pagination:sortBy.value==='time'?'cursor':'offset',includeTotal:false,...(sortBy.value==='time'&&pageCursors.value[targetPage-1]?{cursor:pageCursors.value[targetPage-1]}:{}),pageSize:pageSize.value,sortBy:sortBy.value,sortDir:sortDir.value,hideLoopback:hideLoopback.value,...filters.value}
   for(const key of ['from','to'])if(query[key])query[key]=new Date(query[key]).toISOString()
   return new URLSearchParams(Object.entries(query).filter(([,value])=>value!==''&&value!==null)).toString()
 }
-async function load(){
+function resetPages(){page.value=1;pageCursors.value=[null];hasMore.value=false}
+async function load(targetPage=page.value){
   if(['ddos','containment','traffic-sources'].includes(activeTab.value))return
+  // A click handler can supply a MouseEvent; only explicit page numbers navigate.
+  if(!Number.isInteger(targetPage))targetPage=page.value
+  const scope=JSON.stringify([route.query.event,eventType.value,pageSize.value,sortBy.value,sortDir.value,hideLoopback.value,filters.value])
+  if(scope!==searchScope){searchScope=scope;resetPages();targetPage=1}
   const current=++requestId
+  loadController?.abort();loadController=new AbortController()
   loading.value=true
   try{
-    const [result,loadedSessions]=await Promise.all([api(`/logs/search?${queryString()}`),api('/learning-sessions')])
+    const result=await api(`/logs/search?${queryString(targetPage)}`,{signal:loadController.signal})
     if(current!==requestId)return
-    events.value=result.items;total.value=result.total;sessions.value=loadedSessions;error.value=''
-  }catch(e){if(current===requestId)error.value=e.message}
+    events.value=result.items;hasMore.value=result.hasMore;page.value=targetPage
+    pageCursors.value=pageCursors.value.slice(0,targetPage)
+    pageCursors.value[targetPage]=result.nextCursor
+    error.value=''
+  }catch(e){if(current===requestId&&e.name!=='AbortError')error.value=e.message}
   finally{if(current===requestId)loading.value=false}
 }
-function searchEvents(){page.value=1;load()}
+async function loadSessions(){try{sessions.value=await api('/learning-sessions')}catch(e){error.value=e.message}}
+function searchEvents(){resetPages();events.value=[];load(1)}
 function clearFilters(){filters.value={nodeId:'',eventId:'',action:'',direction:'',srcIp:'',dstIp:'',port:'',program:'',account:'',protocol:'',challengeId:'',from:'',to:''};searchEvents()}
 function switchTab(tab){router.push({path:'/logs',query:{...route.query,tab}})}
 watch(()=>route.query.tab,value=>{
   const tab=validTab(value);if(tab===activeTab.value)return
-  activeTab.value=tab;requestId++;loading.value=false;closeEventMenu()
+  activeTab.value=tab;requestId++;loadController?.abort();loading.value=false;closeEventMenu()
   if(['ddos','containment','traffic-sources'].includes(tab))return
-  if(tab==='events'||tab==='accounts'){eventType.value=tab==='accounts'?'logon':'firewall';page.value=1}
+  if(tab==='events'||tab==='accounts'){eventType.value=tab==='accounts'?'logon':'firewall';resetPages()}
   load()
 })
-function sort(key){if(sortBy.value===key)sortDir.value=sortDir.value==='asc'?'desc':'asc';else{sortBy.value=key;sortDir.value=key==='time'?'desc':'asc'}page.value=1;load()}
-function changePage(next){if(next<1||next>totalPages.value||loading.value)return;page.value=next;load()}
-async function startLearning(){if(!filters.value.nodeId)return;try{await api('/learning-sessions',{method:'POST',body:{nodeId:filters.value.nodeId,durationHours:Number(duration.value)}});await load()}catch(e){error.value=e.message}}
-async function finalize(session){try{const result=await api(`/learning-sessions/${session.id}/finalize`,{method:'POST',body:{}});message.value=`Proposal generated with ${result.ruleCount} rules. Review it in Policy Studio before approval.`;await load()}catch(e){error.value=e.message}}
-async function approve(session){try{const result=await api(`/learning-sessions/${session.id}/approve`,{method:'POST',body:{}});message.value=result.status==='enforced'?'Learned policy applied':result.status==='applying'?'Policy queued for agent application':'Policy apply failed; review the run before retrying';await load()}catch(e){error.value=e.message}}
+function sort(key){if(sortBy.value===key)sortDir.value=sortDir.value==='asc'?'desc':'asc';else{sortBy.value=key;sortDir.value=key==='time'?'desc':'asc'}searchEvents()}
+function changePage(next){if(next<1||next>page.value+1||(next>page.value&&!hasMore.value)||loading.value)return;load(next)}
+async function startLearning(){if(!filters.value.nodeId)return;try{await api('/learning-sessions',{method:'POST',body:{nodeId:filters.value.nodeId,durationHours:Number(duration.value)}});await loadSessions()}catch(e){error.value=e.message}}
+async function finalize(session){try{const result=await api(`/learning-sessions/${session.id}/finalize`,{method:'POST',body:{}});message.value=`Proposal generated with ${result.ruleCount} rules. Review it in Policy Studio before approval.`;await loadSessions()}catch(e){error.value=e.message}}
+async function approve(session){try{const result=await api(`/learning-sessions/${session.id}/approve`,{method:'POST',body:{}});message.value=result.status==='enforced'?'Learned policy applied':result.status==='applying'?'Policy queued for agent application':'Policy apply failed; review the run before retrying';await loadSessions()}catch(e){error.value=e.message}}
 async function pull(){
   const targets=nodes.value.filter(node=>['winrm','winrms'].includes(node.transport)&&(filters.value.nodeId?node.id===filters.value.nodeId:true))
   if(!targets.length)return
@@ -76,7 +85,7 @@ async function pull(){
       catch(cause){failures.push(`${node.hostname}: ${cause.message}`)}
     }
     message.value=`Collected ${inserted} new events from ${targets.length-failures.length} node${targets.length-failures.length===1?'':'s'}.`
-    page.value=1;await load()
+    resetPages();await load(1)
     if(failures.length)error.value=[error.value,failures.join(' · ')].filter(Boolean).join(' · ')
   }finally{pulling.value=false}
 }
@@ -89,14 +98,14 @@ function openEventDetails(event){detailEvent.value={...event,node_name:nodeName(
 function createRuleFromDetails(action){const event=detailEvent.value;if(!event)return;detailOpen.value=false;beginRule(event,action)}
 async function ignoreFromDetails(){const event=detailEvent.value;if(!event)return;detailOpen.value=false;await ignoreTraffic(event)}
 function canIgnoreTraffic(event){return !!event&&([5150,5151,5156,5157].includes(Number(event.event_id))||event.event_type==='firewall')}
-async function ignoreTraffic(event){if(!canIgnoreTraffic(event))return;ignoreBusy.value=true;error.value='';try{await api(`/logs/${event.id}/ignore-traffic`,{method:'POST'});message.value='Traffic ignore rule saved. Matching events are now hidden and future matches will not be stored.';closeEventMenu();page.value=1;await load()}catch(cause){error.value=cause.message}finally{ignoreBusy.value=false}}
+async function ignoreTraffic(event){if(!canIgnoreTraffic(event))return;ignoreBusy.value=true;error.value='';try{await api(`/logs/${event.id}/ignore-traffic`,{method:'POST'});message.value='Traffic ignore rule saved. Matching events are now hidden and future matches will not be stored.';closeEventMenu();resetPages();await load(1)}catch(cause){error.value=cause.message}finally{ignoreBusy.value=false}}
 async function addRule(){if(!ruleEvent.value)return;ruleBusy.value=true;error.value='';try{const result=await api(`/logs/${ruleEvent.value.id}/rule`,{method:'POST',body:{action:ruleAction.value,...(rulePolicyId.value==='personal'?{}:{policyId:rulePolicyId.value})}});ruleOpen.value=false;message.value=`Rule saved to policy version ${result.versionNo}. An administrator can sync it from the top bar.`;policies.value=await api('/policies')}catch(e){error.value=e.message}finally{ruleBusy.value=false}}
 function toggleSelected(event){selectedIds.value=selectedIds.value.includes(event.id)?selectedIds.value.filter(id=>id!==event.id):[...selectedIds.value,event.id]}
 function togglePage(){const ids=events.value.map(event=>event.id),allSelected=ids.every(id=>selectedIds.value.includes(id));selectedIds.value=allSelected?selectedIds.value.filter(id=>!ids.includes(id)):[...new Set([...selectedIds.value,...ids])]}
 async function sendSelected(){if(!exportDestinationId.value||!selectedIds.value.length)return;exportBusy.value=true;error.value='';message.value='';try{const result=await api('/event-export/send',{method:'POST',body:{destinationId:exportDestinationId.value,eventIds:selectedIds.value}});message.value=`Sent ${result.sent} selected events to ${destinations.value.find(item=>item.id===exportDestinationId.value)?.name||'destination'}`;selectedIds.value=[]}catch(cause){error.value=cause.message}finally{exportBusy.value=false}}
-onMounted(async()=>{window.addEventListener('pointerdown',onPointer);window.addEventListener('keydown',onMenuKey);refreshTimer=window.setInterval(()=>{if(document.visibilityState==='visible'&&page.value===1&&!loading.value&&!pulling.value)load()},30000);try{const [loadedNodes,loadedPolicies,display]=await Promise.all([api('/nodes'),api('/policies'),api('/settings/logs-display')]);nodes.value=loadedNodes;policies.value=loadedPolicies;hideLoopback.value=display.hideLoopbackEvents;if(canManageRules.value)destinations.value=await api('/event-export/destinations');await load()}catch(e){error.value=e.message}})
+onMounted(async()=>{window.addEventListener('pointerdown',onPointer);window.addEventListener('keydown',onMenuKey);refreshTimer=window.setInterval(()=>{if(document.visibilityState==='visible'&&page.value===1&&!loading.value&&!pulling.value){load();loadSessions()}},30000);try{const [loadedNodes,loadedPolicies,display]=await Promise.all([api('/nodes'),api('/policies'),api('/settings/logs-display')]);nodes.value=loadedNodes;policies.value=loadedPolicies;hideLoopback.value=display.hideLoopbackEvents;await Promise.all([load(),loadSessions(),...(canManageRules.value?[api('/event-export/destinations').then(items=>{destinations.value=items})]:[])])}catch(e){error.value=e.message}})
 function onMenuKey(event){if(event.key==='Escape')closeEventMenu()}
-onUnmounted(()=>{window.removeEventListener('pointerdown',onPointer);window.removeEventListener('keydown',onMenuKey);if(refreshTimer)window.clearInterval(refreshTimer)})
+onUnmounted(()=>{requestId++;loadController?.abort();window.removeEventListener('pointerdown',onPointer);window.removeEventListener('keydown',onMenuKey);if(refreshTimer)window.clearInterval(refreshTimer)})
 </script>
 
 <template>
@@ -108,12 +117,12 @@ onUnmounted(()=>{window.removeEventListener('pointerdown',onPointer);window.remo
     <div v-if="error&&!['ddos','containment','traffic-sources'].includes(activeTab)" class="error-msg" role="alert">{{error}}</div>
     <div v-if="message&&!['ddos','containment','traffic-sources'].includes(activeTab)" class="success-msg">{{message}}</div>
     <div v-if="!['ddos','containment','traffic-sources'].includes(activeTab)" class="metric-grid compact">
-      <div class="metric glass"><div class="metric-top"><span>EVENTS MATCHING</span><i class="mdi mdi-text-box-search-outline"></i></div><strong>{{total}}</strong></div>
+      <div class="metric glass"><div class="metric-top"><span>EVENTS ON PAGE</span><i class="mdi mdi-text-box-search-outline"></i></div><strong>{{events.length}}</strong></div>
       <div class="metric glass"><div class="metric-top"><span>ALLOWED ON PAGE</span><i class="mdi mdi-check"></i></div><strong>{{totals.allowed}}</strong></div>
       <div class="metric glass"><div class="metric-top"><span>BLOCKED ON PAGE</span><i class="mdi mdi-cancel"></i></div><strong>{{totals.blocked}}</strong></div>
       <div class="metric glass"><div class="metric-top"><span>LEARNING SESSIONS</span><i class="mdi mdi-brain"></i></div><strong>{{sessions.length}}</strong></div>
     </div>
-    <nav class="view-tabs" role="tablist" aria-label="Activities sections"><button type="button" role="tab" :aria-selected="activeTab==='events'" :class="{active:activeTab==='events'}" @click="switchTab('events')">Firewall events <span>{{eventType==='firewall'?total:'—'}}</span></button><button type="button" role="tab" :aria-selected="activeTab==='accounts'" :class="{active:activeTab==='accounts'}" @click="switchTab('accounts')">Accounts <span>{{eventType==='logon'?total:'—'}}</span></button><button type="button" role="tab" :aria-selected="activeTab==='learning'" :class="{active:activeTab==='learning'}" @click="switchTab('learning')">Learning sessions <span>{{sessions.length}}</span></button><button v-if="canManageRules" type="button" role="tab" :aria-selected="activeTab==='ddos'" :class="{active:activeTab==='ddos'}" @click="switchTab('ddos')">DDoS protection</button><button type="button" role="tab" :aria-selected="activeTab==='traffic-sources'" :class="{active:activeTab==='traffic-sources'}" @click="switchTab('traffic-sources')">Traffic sources</button><button v-if="canManageRules" type="button" role="tab" :aria-selected="activeTab==='containment'" :class="{active:activeTab==='containment'}" @click="switchTab('containment')">Incident containment</button></nav>
+    <nav class="view-tabs" role="tablist" aria-label="Activities sections"><button type="button" role="tab" :aria-selected="activeTab==='events'" :class="{active:activeTab==='events'}" @click="switchTab('events')">Firewall events <span>{{eventType==='firewall'?events.length:'—'}}</span></button><button type="button" role="tab" :aria-selected="activeTab==='accounts'" :class="{active:activeTab==='accounts'}" @click="switchTab('accounts')">Accounts <span>{{eventType==='logon'?events.length:'—'}}</span></button><button type="button" role="tab" :aria-selected="activeTab==='learning'" :class="{active:activeTab==='learning'}" @click="switchTab('learning')">Learning sessions <span>{{sessions.length}}</span></button><button v-if="canManageRules" type="button" role="tab" :aria-selected="activeTab==='ddos'" :class="{active:activeTab==='ddos'}" @click="switchTab('ddos')">DDoS protection</button><button type="button" role="tab" :aria-selected="activeTab==='traffic-sources'" :class="{active:activeTab==='traffic-sources'}" @click="switchTab('traffic-sources')">Traffic sources</button><button v-if="canManageRules" type="button" role="tab" :aria-selected="activeTab==='containment'" :class="{active:activeTab==='containment'}" @click="switchTab('containment')">Incident containment</button></nav>
     <IncidentContainment v-if="activeTab==='containment'&&canManageRules"/><TrafficSources v-if="activeTab==='traffic-sources'"/><section v-if="activeTab==='ddos'&&canManageRules" class="panel glass"><DdosProtection /></section>
     <section v-if="activeTab==='events'||activeTab==='accounts'" class="panel glass">
       <div class="panel-title"><div><span class="eyebrow">EVENT SEARCH</span><h2>{{activeTab==='accounts'?'Accounts logon and logoff':'Traffic log'}}</h2></div><div class="table-tools"><label class="page-size">Rows per page <select v-model.number="pageSize" @change="searchEvents"><option :value="25">25</option><option :value="50">50</option><option :value="100">100</option><option :value="200">200</option><option :value="500">500</option></select></label></div></div>
@@ -145,7 +154,7 @@ onUnmounted(()=>{window.removeEventListener('pointerdown',onPointer);window.remo
         <tr v-for="event in events" :key="event.id" tabindex="0" class="transaction-row" @click="openEventDetails(event)" @keydown.enter="openEventDetails(event)" @contextmenu="openEventMenu($event,event)" @keydown.shift.f10="openEventMenu($event,event)"><td v-if="canManageRules"><input type="checkbox" :checked="selectedIds.includes(event.id)" :aria-label="`Select event ${event.event_id} at ${event.event_time||event.received_at}`" @click.stop @change="toggleSelected(event)"></td><td>{{new Date(event.event_time||event.received_at).toLocaleString()}}</td><td class="mono">{{nodeName(event.node_id)}}</td><td>{{event.event_id}}</td><td><span class="status" :class="event.action">{{event.action}}</span></td><td>{{event.direction||'—'}}</td><td class="mono">{{event.src_ip||'—'}}</td><td class="mono">{{event.dst_ip||'—'}}</td><td class="mono">{{event.dst_port||'—'}}</td><td class="service-cell" :title="serviceDetails(event)" :aria-label="serviceDetails(event)"><strong>{{serviceLabel(event.traffic_service)}}</strong></td><td class="mono">{{event.program||'—'}}</td><td class="mono" :title="event.account_sid||''">{{event.account_name||event.account_sid||'—'}}</td><td v-if="canManageRules"><button class="icon-button event-menu-trigger" :aria-label="`Actions for event ${event.event_id}`" @click.stop="openEventMenu($event,event)"><i class="mdi mdi-dots-vertical"></i></button></td></tr>
         <tr v-if="!events.length"><td :colspan="canManageRules?13:11" class="empty-table">{{loading?'Loading events…':'No events found. Pull the Windows Security log or adjust filters.'}}</td></tr>
       </tbody></table></div>
-      <div class="event-pagination" role="navigation" aria-label="Firewall events pages"><span>Showing {{firstRow}}–{{lastRow}} of {{total}}</span><div><button type="button" class="button small secondary" :disabled="page<=1||loading" @click="changePage(page-1)">Previous</button><span>Page {{page}} of {{totalPages}}</span><button type="button" class="button small secondary" :disabled="page>=totalPages||loading" @click="changePage(page+1)">Next</button></div></div>
+      <div class="event-pagination" role="navigation" aria-label="Firewall events pages"><span>Showing {{firstRow}}–{{lastRow}} · {{hasMore?'More events available':'End of results'}}</span><div><button type="button" class="button small secondary" :disabled="page<=1||loading" @click="changePage(page-1)">Previous</button><span>Page {{page}}</span><button type="button" class="button small secondary" :disabled="!hasMore||loading" @click="changePage(page+1)">Next</button></div></div>
     </section>
     <section v-if="activeTab==='learning'" class="panel glass"><div class="panel-title"><div><span class="eyebrow">POLICY DISCOVERY</span><h2>Learning sessions</h2></div><div class="table-tools"><input v-model.number="duration" type="number" min="1" max="720" aria-label="Duration in hours" style="width:90px"><span class="hint">hours</span><button class="button small secondary" :disabled="!filters.nodeId" @click="startLearning">{{activeAuto?'Switch to manual review':'Start manual learning'}}</button></div></div><div v-for="session in sessions" :key="session.id" class="history-row"><div><strong>{{nodeName(session.node_id)}}</strong><small>{{session.mode==='auto'?'Automatic':'Manual review'}} · {{session.status}} · ends {{new Date(session.ends_at).toLocaleString()}}</small><small v-if="session.last_error" class="danger-text">{{session.last_error}}</small></div><router-link v-if="session.generated_policy_id" class="button small secondary" :to="{path:'/policies',query:{policyId:session.generated_policy_id}}">Review policy</router-link><button v-if="session.status==='active'&&session.mode!=='auto'" class="button small secondary" @click="finalize(session)">Generate proposal</button><button v-if="['review','apply-failed'].includes(session.status)" class="button small primary" @click="approve(session)">{{session.mode==='auto'?'Retry apply':'Approve and apply'}}</button></div><div v-if="!sessions.length" class="empty-side">No learning sessions yet.</div></section>
     <div v-if="eventContext" ref="eventContextEl" class="event-context-menu" role="menu" :style="{left:`${eventContext.x}px`,top:`${eventContext.y}px`}" @contextmenu.prevent><strong>Event {{eventContext.event.event_id}} · {{nodeName(eventContext.event.node_id)}}</strong><button role="menuitem" :disabled="ignoreBusy||!canIgnoreTraffic(eventContext.event)" @click="ignoreTraffic(eventContext.event)"><i class="mdi mdi-filter-off-outline"></i> Ignore like traffic</button><button role="menuitem" :disabled="!canRule(eventContext.event)" @click="beginRule(eventContext.event,'allow')"><i class="mdi mdi-check-circle-outline"></i> Add allow rule…</button><button role="menuitem" :disabled="!canRule(eventContext.event)" @click="beginRule(eventContext.event,'block')"><i class="mdi mdi-cancel"></i> Add reject rule…</button></div>

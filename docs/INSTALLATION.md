@@ -200,6 +200,18 @@ For explicit `.env` loading in development: `node --env-file=.env --watch api/sr
 - **No firewall events:** verify host audit policy, event delivery and exclusions. An empty table alone does not mean no traffic occurred.
 - **No agent mTLS:** verify the certificate reaches the native TLS listener, not an HTTP-only proxy.
 
+### Large event histories
+
+Migration `118_event_search_indexes` adds indexes matching chronological event searches, including node, action, and Windows event-ID scopes. It runs automatically at API startup; allow extra time and disk space for the one-time index build on an existing large database. Events are retained. The API refreshes SQLite planner statistics with bounded `PRAGMA optimize` at startup and daily. Keep one API writer and persistent SQLite storage as described above.
+
+Activities retrieves 100 rows at a time by default, without counting or loading the full history. It selects the page before joining node snapshots and account details. Chronological navigation seeks from the last timestamp and ID, so later pages avoid growing offsets. Exact counts remain available through the API; alternate sorts and broad contains filters can still scan many events. Apply a node and date range when investigating a narrow slice of history.
+
+Run `npm run test:logs:scale` for a disposable, one-million-row retrieval benchmark comparing the previous count-and-sort path with indexed chunks, including a cursor 90% through history. Set `LOG_BENCHMARK_ROWS` to adjust the fixture size. This benchmark does not open the operator database and excludes ingestion/background indexing from the measurements.
+
+Validation on a local isolated backup containing 1,558,791 events returned the first 100 firewall rows in 11.6 ms and the next page in 3.7 ms; the four-index build took about six seconds. These are database retrieval measurements, excluding HTTP transfer, classification and browser rendering. Hardware, storage, filters and data distribution affect results.
+
+The implementation follows SQLite's guidance on [scrolling windows and row values](https://sqlite.org/rowvalue.html#scrolling_window_queries), [indexes for searching and sorting](https://sqlite.org/queryplanner.html), and [bounded planner-statistics maintenance](https://sqlite.org/lang_analyze.html#periodically_run_pragma_optimize_).
+
 ### Internet connection DNS and backfill
 
 Migration 103 creates the retained connection index and external-peer cache. The API server runs bounded backfill and reverse-DNS workers automatically. Configure local IPv4/IPv6 CIDRs in Server config. `INTERNET_DNS_SERVERS`, `INTERNET_DNS_POSITIVE_HOURS`, `INTERNET_DNS_NEGATIVE_HOURS`, `INTERNET_DNS_TIMEOUT_MS`, `INTERNET_DNS_CONCURRENCY` and `INTERNET_PEER_RETENTION_DAYS` control optional DNS behavior. See [defaults, limits and lifecycle](INTERNET_CONNECTIONS.md). Restart the API after environment changes.

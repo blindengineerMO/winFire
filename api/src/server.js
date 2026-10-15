@@ -18,7 +18,7 @@ import https from 'node:https'
 import {app,runVerification,runDriftCheck,pullLogs,pullRecentLogs,processDueTraining,processDueBreakGlass,processDuePolicySync,processDuePolicySchedules,processDueAdAccountHolds,syncDirectory,onboardPendingNodes} from './app.js'
 import {processSecurityAutomations} from './securityAutomations.js'
 import {bootstrap,ensureBootstrapAdmin} from './security.js'
-import {all,one,run,now,audit} from './db.js'
+import {db,all,one,run,now,audit} from './db.js'
 import {agentTlsOptions,tlsMaterialPaths} from './agentPki.js'
 import {sweepAgentHealth} from './agentHealth.js'
 import {collectFacts} from './connector.js'
@@ -208,6 +208,7 @@ async function sweepDns(){
 setTimeout(sweepDns,5000).unref()
 const dnsTimer=setInterval(sweepDns,15*60_000)
 dnsTimer.unref()
+setInterval(()=>{try{db.pragma('optimize')}catch(error){console.error('Database statistics:',error.message)}},24*60*60*1000).unref()
 const compactionTimer=setInterval(()=>runCompactionIfDue(),5*60*1000)
 compactionTimer.unref()
 setTimeout(()=>runCompactionIfDue(),10_000).unref()

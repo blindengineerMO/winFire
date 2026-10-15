@@ -13,7 +13,7 @@ export const mappingService = {
   findRepresentativeEvent: row => {
     const nodeId=row.direction==='in'?row.destination_node_id:row.source_node_id
     if(!nodeId||!['in','out'].includes(row.direction)||!row.source_ip||!row.destination_ip)return Promise.resolve(null)
-    const query=new URLSearchParams({eventType:'firewall',nodeId,direction:row.direction,srcIp:row.source_ip,dstIp:row.destination_ip,page:'1',pageSize:'25',hideLoopback:'false'})
+    const query=new URLSearchParams({eventType:'firewall',nodeId,direction:row.direction,srcIp:row.source_ip,dstIp:row.destination_ip,pagination:'cursor',includeTotal:'false',pageSize:'25',hideLoopback:'false'})
     if(row.destination_port)query.set('port',String(row.destination_port))
     return api(`/logs/search?${query}`).then(result=>result.items.find(event=>String(event.protocol||'').toUpperCase()===String(row.protocol||'').toUpperCase())||result.items[0]||null)
   },

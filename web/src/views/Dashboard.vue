@@ -9,7 +9,7 @@ import {api} from '../services/api.js'
 const chartAccessibility={id:'winfire-chart-accessibility',afterInit(chart,_args,options){chart.canvas.setAttribute('aria-label',options?.label||'Data chart')}}
 ChartJS.register(ArcElement,BarElement,CategoryScale,LinearScale,Tooltip,Legend,chartAccessibility)
 const stats=ref(null),coverage=ref([]),events=ref([]),error=ref('')
-onMounted(async()=>{try{const [dashboard,loadedCoverage,recent]=await Promise.all([api('/reports/dashboard'),api('/reports/coverage'),api('/logs/search?pageSize=6')]);stats.value=dashboard;coverage.value=loadedCoverage;events.value=recent.items}catch(e){error.value=e.message}})
+onMounted(async()=>{try{const [dashboard,loadedCoverage,recent]=await Promise.all([api('/reports/dashboard'),api('/reports/coverage'),api('/logs/search?pageSize=6&pagination=cursor&includeTotal=false')]);stats.value=dashboard;coverage.value=loadedCoverage;events.value=recent.items}catch(e){error.value=e.message}})
 const donutOptions={responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom',labels:{color:'#aab8c8',boxWidth:10}},'winfire-chart-accessibility':{label:'Fleet policy coverage chart'}},cutout:'75%'}
 const barOptions={responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},'winfire-chart-accessibility':{label:'Top denied ports chart'}},scales:{x:{ticks:{color:'#8494a8'},grid:{display:false}},y:{ticks:{color:'#8494a8'},grid:{color:'#26354a'}}}}
 </script>

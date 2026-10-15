@@ -84,6 +84,7 @@ const requestSchemas={
 }
 
 const responseSchemas={
+  'GET /logs/search':'LogEventPage',
   'POST /policies/{id}/preview':'PolicyDraftPreview',
   'GET /internet/connections':'InternetConnectionPage',
   'GET /internet/connections/summary':'InternetConnectionSummary',
@@ -130,6 +131,11 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
           }
         }
         if(routeKey==='POST /policies/{id}/preview')operation.description='Read-only draft compilation with inherited scopes, assignment conflicts, management-access protection and warnings. Creates no version and changes no host.'
+        if(routeKey==='GET /logs/search'){
+          operation.description='Search retained events. For large histories use pagination=cursor, sortBy=time and includeTotal=false. Pass nextCursor with unchanged filters/page size/sort direction to continue. total and totalPages are null when counting is disabled. Offset paging and exact counts remain the defaults. Cursor traversal is live, not a snapshot.'
+          const fields={id:{type:'string',maxLength:200},nodeId:{type:'string'},eventType:{type:'string',enum:['firewall','logon','all'],default:'all'},eventId:{type:'integer',minimum:0},action:{type:'string',enum:['allow','block','success','failure','logon','logoff']},direction:{type:'string',enum:['in','out']},program:{type:'string',maxLength:1024},challengeId:{type:'string',maxLength:128},protocol:{type:'string',maxLength:32},srcIp:{type:'string',maxLength:128},dstIp:{type:'string',maxLength:128},port:{type:'integer',minimum:1,maximum:65535},account:{type:'string',maxLength:200},from:{type:'string',format:'date-time'},to:{type:'string',format:'date-time'},hideLoopback:{type:'boolean'},pagination:{type:'string',enum:['offset','cursor'],default:'offset'},cursor:{type:'string',maxLength:2048},includeTotal:{type:'boolean',default:true},page:{type:'integer',minimum:1,default:1},pageSize:{type:'integer',minimum:1,maximum:500,default:100},sortBy:{type:'string',enum:['time','node','eventId','action','direction','srcIp','dstIp','port','program','account'],default:'time'},sortDir:{type:'string',enum:['asc','desc'],default:'desc'}}
+          operation.parameters.push(...Object.entries(fields).map(([name,schema])=>({name,in:'query',schema})))
+        }
         if(routeKey==='POST /policies/{id}/versions'){operation.description='Save an immutable policy graph version. Supply baseVersionId (null for the initial version) to reject stale drafts with 409. Saving does not deploy.';operation.responses={201:jsonResponse,409:errorResponse,default:errorResponse}}
         if(path.startsWith('/internet/connections')||path.startsWith('/internet/peers/')){
           operation.description=path.startsWith('/internet/connections')?'Retained firewall observations outside the completed local-CIDR boundary revision. PTR is reverse-DNS evidence, not a requested website. Default direction is outbound. Counts and exports use identical filters. Pending reclassification retains the previous complete revision.':'Read reverse-DNS evidence/history or enqueue a coalesced refresh. No inventory asset is created; resolve requires editor permission and is rate limited.'
@@ -188,6 +194,7 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
       ...policySafetySchemas,
       ...internetConnectionSchemas,
       ...aiSchemas,
+      LogEventPage:{type:'object',required:['items','total','page','pageSize','totalPages','hasMore','nextCursor'],properties:{items:{type:'array',maxItems:500,items:{type:'object',additionalProperties:true}},total:{type:['integer','null'],minimum:0},page:{type:'integer',minimum:1},pageSize:{type:'integer',minimum:1,maximum:500},totalPages:{type:['integer','null'],minimum:0},hasMore:{type:'boolean'},nextCursor:{type:['string','null']}}},
       PolicyGraph:{type:'object',required:['nodes'],properties:{nodes:{type:'array',items:{type:'object',required:['id','type'],properties:{id:{type:'string'},type:{type:'string',enum:['allow','deny','program','portGroup','addressGroup','profile','schedule','mfaGate']},position:{type:'object',properties:{x:{type:'number'},y:{type:'number'}}},data:{type:'object',additionalProperties:true}}}},edges:{type:'array',items:{type:'object',required:['id','source','target'],properties:{id:{type:'string'},source:{type:'string'},target:{type:'string'}}}}}},
       PolicyDraftRequest:{type:'object',required:['graph'],properties:{graph:{$ref:'#/components/schemas/PolicyGraph'}}},
       PolicyVersionRequest:{type:'object',required:['graph'],properties:{graph:{$ref:'#/components/schemas/PolicyGraph'},comment:{type:'string'},baseVersionId:{type:['string','null'],description:'The saved version on which the draft is based; null for a policy with no saved version.'}}},

@@ -20,6 +20,8 @@ await migrationClient.destroy()
 export const db = new Database(path.join(dataDir, 'winfire.db'))
 db.pragma('journal_mode = WAL')
 db.pragma('foreign_keys = ON')
+// Bounded statistics collection; SQLite 3.46+ limits optimize work on large DBs.
+db.pragma('optimize = 0x10002')
 refreshProcessExclusions(db)
 db.function('winfire_excluded_process',value=>Number(isExcludedProcess(value)))
 refreshTrafficIgnores(db)

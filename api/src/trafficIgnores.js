@@ -37,6 +37,7 @@ function normalizedEvent(event){
   try{return normalizeTrafficIgnore(event)}catch{return null}
 }
 export function isIgnoredFirewallEvent(event){
+  if(!rules.length)return false
   const candidate=normalizedEvent(event)
   if(!candidate)return false
   return rules.some(rule=>fields.every(field=>rule[field]===null||rule[field]===candidate[field]))

@@ -28,6 +28,7 @@
     "docs:api": "node scripts/generate-api-docs.mjs",
     "test:ai": "node --test api/tests/ai_*.test.js",
     "test:ai:scale": "node scripts/benchmark-ai-usage.mjs",
+    "test:logs:scale": "node scripts/benchmark-log-search.mjs",
     "test:ai:ui": "npm run build && bash scripts/verify-ai-ui.sh"
   },
   "dependencies": {
