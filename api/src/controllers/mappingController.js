@@ -1,6 +1,6 @@
 import {z} from 'zod'
 import {db, all, one, run, audit} from '../db.js'
-import {mappingRows, arpRows, topologyGraph, recordNetworkFlow} from '../services/networkMapping.js'
+import {mappingRows, mappingTopTalkers, arpRows, topologyGraph, recordNetworkFlow} from '../services/networkMapping.js'
 
 import {mappingFilterOptions, subnetMatcher} from '../services/mappingScope.js'
 
@@ -17,6 +17,7 @@ const orderedDates = value => !value.from || !value.to || Date.parse(value.from)
 const dateOrderError = {message:'From must be before To',path:['to']}
 const querySchema = scopeSchema.extend({
   page: z.coerce.number().int().min(1).default(1),
+  includeTalkers:z.enum(['true','false']).default('true').transform(value=>value==='true'),
   pageSize: z.coerce.number().int().min(10).max(500).default(100)
 }).refine(orderedDates,dateOrderError)
 
@@ -28,6 +29,10 @@ function parseQuery(schema, query) {
 
 export function listMapping(req, res) {
   res.json(mappingRows(parseQuery(querySchema,req.query)))
+}
+
+export function listTalkers(req,res){
+  res.json({items:mappingTopTalkers(parseQuery(scopeSchema.refine(orderedDates,dateOrderError),req.query))})
 }
 
 export function listArp(req, res) {
@@ -51,4 +56,7 @@ export function rebuildMapping(req, res) {
   res.json({ok: true, events: events.length, rows: one('SELECT COUNT(*) count FROM network_map_pairs').count})
 }
 
-export function listFilterOptions(req, res) { res.json(mappingFilterOptions()) }
+export function listFilterOptions(req,res){
+  const {includeNodes}=parseQuery(z.object({includeNodes:z.enum(['true','false']).default('false').transform(value=>value==='true')}),req.query)
+  res.json(mappingFilterOptions({includeNodes}))
+}

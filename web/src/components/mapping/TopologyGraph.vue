@@ -8,7 +8,8 @@ const width=1100
 const positions=computed(()=>{
   const nodes=props.graph.nodes||[]
   const infrastructure=nodes.filter(node=>['switch','router','firewall','hypervisor'].includes(node.role))
-  const endpoints=nodes.filter(node=>!infrastructure.includes(node))
+  const infrastructureIds=new Set(infrastructure.map(node=>node.id))
+  const endpoints=nodes.filter(node=>!infrastructureIds.has(node.id))
   const result=new Map()
   const placeRow=(items,y)=>items.forEach((node,index)=>result.set(node.id,{x:(index+1)*width/(items.length+1),y}))
   placeRow(infrastructure,120)
@@ -36,7 +37,7 @@ function adjust(delta){zoom.value=Math.max(.65,Math.min(1.7,Number((zoom.value+d
     </div>
     <p v-if="graph.scope?.subnet||graph.scope?.switchId" class="mapping-note">Highlighted devices match {{graph.scope.subnet||'all subnets'}}{{graph.scope.switchName ? ` through ${graph.scope.switchName}` : ''}}. Connected peers remain visible for context.</p>
     <div class="topology-legend"><span v-if="graph.scope?.subnet||graph.scope?.switchId"><i class="legend-mark scope-legend"></i> Matches filter</span><span><i class="legend-mark role-host"></i> Hosts</span><span><i class="legend-mark role-switch"></i> Switches</span><span><i class="legend-mark role-router"></i> Routers</span><span><i class="legend-mark role-firewall"></i> Firewalls</span><span><i class="legend-mark role-hypervisor"></i> Hypervisors</span><span><i class="legend-line edge-link"></i> ARP / SNMP</span><span><i class="legend-line edge-traffic"></i> Traffic</span></div>
-    <p v-if="graph.truncated" class="mapping-note">This view is bounded for responsive rendering. Narrow the node filter to inspect a larger topology in sections.</p>
+    <p v-if="graph.truncated" class="mapping-note">This view is bounded for responsive rendering. Narrow the node, switch or time filters to inspect a larger topology in sections.</p>
   </section>
 </template>
 

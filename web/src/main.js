@@ -2,23 +2,23 @@ import {createApp} from 'vue'
 import {createPinia} from 'pinia'
 import {createRouter,createWebHistory} from 'vue-router'
 import App from './App.vue'
-import Dashboard from './views/Dashboard.vue'
-import Inventory from './views/Inventory.vue'
-import Directory from './views/Directory.vue'
-import Policies from './views/Policies.vue'
-import Reports from './views/Reports.vue'
-import Logs from './views/Logs.vue'
-import Identity from './views/Identity.vue'
-import MfaPrompt from './views/MfaPrompt.vue'
-import Administration from './views/Administration.vue'
-import Login from './views/Login.vue'
-import AcceptInvite from './views/AcceptInvite.vue'
-import VerifyEmail from './views/VerifyEmail.vue'
-import EnrollAuthenticator from './views/EnrollAuthenticator.vue'
-import Tools from './views/Tools.vue'
-import Internet from './views/Internet.vue'
-import AiUsage from './views/AiUsage.vue'
-import Mapping from './views/Mapping.vue'
+const Dashboard=()=>import('./views/Dashboard.vue')
+const Inventory=()=>import('./views/Inventory.vue')
+const Directory=()=>import('./views/Directory.vue')
+const Policies=()=>import('./views/Policies.vue')
+const Reports=()=>import('./views/Reports.vue')
+const Logs=()=>import('./views/Logs.vue')
+const Identity=()=>import('./views/Identity.vue')
+const MfaPrompt=()=>import('./views/MfaPrompt.vue')
+const Administration=()=>import('./views/Administration.vue')
+const Login=()=>import('./views/Login.vue')
+const AcceptInvite=()=>import('./views/AcceptInvite.vue')
+const VerifyEmail=()=>import('./views/VerifyEmail.vue')
+const EnrollAuthenticator=()=>import('./views/EnrollAuthenticator.vue')
+const Tools=()=>import('./views/Tools.vue')
+const Internet=()=>import('./views/Internet.vue')
+const AiUsage=()=>import('./views/AiUsage.vue')
+const Mapping=()=>import('./views/Mapping.vue')
 import {session} from './services/api.js'
 import '@mdi/font/css/materialdesignicons.css'
 import './styles.scss'

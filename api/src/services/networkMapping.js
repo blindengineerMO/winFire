@@ -1,7 +1,7 @@
 import {scopeCidrs,effectiveCidrs,outsideLocal,inLocalCidrs,inventoryEligibleIp,boundaryState} from './networkBoundary.js'
 import {isIP} from 'node:net'
 import {mappingScope, mappingFlowWhere} from './mappingScope.js'
-import {all, one, run, id, now} from '../db.js'
+import {db, all, one, run, id, now} from '../db.js'
 import {resolveClassifierService,resolveProcessService,classifierRuleSuppresses} from './classifierRules.js'
 
 const ipv4 = value => String(value || '').trim().split('/')[0]
@@ -392,7 +392,7 @@ export function recordArpEntries(nodeId, entries, source = 'agent') {
   return saved
 }
 
-export function mappingRows({page = 1, pageSize = 100, ...options} = {}) {
+export function mappingRows({page = 1, pageSize = 100, includeTalkers = true, ...options} = {}) {
   const {where, args} = mappingFlowWhere(options)
   const total = one(`SELECT COUNT(*) count FROM network_map_pairs m ${where}`, ...args)?.count || 0
   const safePage = Math.max(1, Number(page) || 1), safeSize = Math.min(500, Math.max(10, Number(pageSize) || 100))
@@ -423,8 +423,12 @@ export function mappingRows({page = 1, pageSize = 100, ...options} = {}) {
       classification_reason: classification.reason,
     }
   })
-  const topTalkers = all(`SELECT node_id,hostname,SUM(connections) connections FROM (SELECT source_node_id node_id,COALESCE(sn.hostname,source_ip) hostname,connection_count connections FROM network_map_pairs m LEFT JOIN nodes sn ON sn.id=m.source_node_id ${where} UNION ALL SELECT destination_node_id,COALESCE(dn.hostname,destination_ip),connection_count FROM network_map_pairs m LEFT JOIN nodes dn ON dn.id=m.destination_node_id ${where}) GROUP BY node_id,hostname ORDER BY connections DESC LIMIT 20`, ...args, ...args)
-  return {scopeBoundary:boundaryState(),rows, topTalkers, total: Number(total), page: safePage, pageSize: safeSize, pages: Math.ceil(Number(total) / safeSize)}
+  return {scopeBoundary:boundaryState(),rows,...(includeTalkers?{topTalkers:mappingTopTalkers(options)}:{}),total:Number(total),page:safePage,pageSize:safeSize,pages:Math.ceil(Number(total)/safeSize)}
+}
+
+export function mappingTopTalkers(options={}){
+  const {where,args}=mappingFlowWhere(options)
+  return all(`SELECT node_id,hostname,SUM(connections) connections FROM (SELECT source_node_id node_id,COALESCE(sn.hostname,source_ip) hostname,connection_count connections FROM network_map_pairs m LEFT JOIN nodes sn ON sn.id=m.source_node_id ${where} UNION ALL SELECT destination_node_id,COALESCE(dn.hostname,destination_ip),connection_count FROM network_map_pairs m LEFT JOIN nodes dn ON dn.id=m.destination_node_id ${where}) GROUP BY node_id,hostname ORDER BY connections DESC,node_id,hostname LIMIT 20`,...args,...args)
 }
 
 /**
@@ -479,9 +483,9 @@ export function topologyGraph({nodeId = null, maxNodes = 300, maxEdges = 700, ..
     graphEdges.set(key, {id:`edge:${graphEdges.size + 1}`,source,target,kind,observations:Number(metadata.observations || 1),weight:Number(metadata.weight || 1),port:metadata.port || null,label:metadata.label || null})
   }
 
-  inventory.forEach(addAsset)
+  if(nodeId)addAsset(byId.get(nodeId))
   const flowRows = all(`SELECT m.* FROM network_map_pairs m ${where}
-    ORDER BY m.connection_count DESC,m.map_key LIMIT 3001`, ...args)
+    ORDER BY m.connection_count DESC,m.last_seen_at DESC,m.map_key LIMIT 3001`, ...args)
   for (const row of flowRows.slice(0,3000)) {
     const source = addAsset(byId.get(row.source_node_id) || byIp.get(normalizedIp(row.source_ip))) || addPeer(row.source_ip)
     const target = addAsset(byId.get(row.destination_node_id) || byIp.get(normalizedIp(row.destination_ip))) || addPeer(row.destination_ip)
@@ -510,19 +514,32 @@ export function topologyGraph({nodeId = null, maxNodes = 300, maxEdges = 700, ..
     const mac = String(node.mac_address || '').replace(/[^0-9a-f]/gi,'').toLowerCase()
     if (mac && (!nodeId || node.id === nodeId) && (!scope.active || scope.matches(node.ip,node.id))) {
       if (!arpByMac.has(mac)) arpByMac.set(mac, [])
-      if (!arpByMac.get(mac).some(item => item.target === `asset:${node.id}`)) arpByMac.get(mac).push({target: addAsset(node)})
+      if (!arpByMac.get(mac).some(item => item.target === `asset:${node.id}`)) arpByMac.get(mac).push({target:`asset:${node.id}`})
     }
   }
   const snapshotFilters = [], snapshotArgs = []
   if (options.from) { snapshotFilters.push('datetime(collected_at)>=datetime(?)'); snapshotArgs.push(options.from) }
   if (options.to) { snapshotFilters.push('datetime(collected_at)<=datetime(?)'); snapshotArgs.push(options.to) }
-  const snapshots = all(`SELECT node_id,state_json FROM network_table_snapshots ${snapshotFilters.length ? `WHERE ${snapshotFilters.join(' AND ')}` : ''} ORDER BY collected_at DESC`, ...snapshotArgs)
-  for (const snapshot of snapshots) {
+  // Bound both row count and JSON size; one oversized switch snapshot must not
+  // stall the event loop. A truncated result explicitly asks for narrower scope.
+  // Rank lightweight IDs first; do not carry wide JSON through the SQL sorter.
+  // Then hydrate one bounded document at a time with a local primary-key seek.
+  const snapshots = all(`SELECT node_id
+    FROM network_table_snapshots ${snapshotFilters.length ? `WHERE ${snapshotFilters.join(' AND ')}` : ''} ORDER BY (node_id=?) DESC,collected_at DESC,node_id LIMIT 101`,...snapshotArgs,options.switchId||nodeId||'')
+  const snapshotState=db.prepare('SELECT CASE WHEN length(CAST(state_json AS BLOB))<=1048576 THEN state_json END state_json FROM network_table_snapshots WHERE node_id=?')
+  let snapshotTruncated=snapshots.length>100,forwardingEntries=0,snapshotBytes=0
+  snapshots: for (const {node_id} of snapshots.slice(0,100)) {
+    const snapshot={node_id,...snapshotState.get(node_id)}
+    if(!snapshot.state_json){snapshotTruncated=true;continue}
+    snapshotBytes+=Buffer.byteLength(snapshot.state_json)
+    if(snapshotBytes>10*1024*1024){snapshotTruncated=true;break}
     const source = addAsset(byId.get(snapshot.node_id)); if (!source) continue
     let state = {}; try { state = JSON.parse(snapshot.state_json || '{}') || {} } catch {}
     for (const entry of Array.isArray(state.macPorts) ? state.macPorts : []) {
+      if(++forwardingEntries>50000){snapshotTruncated=true;break snapshots}
       const mac = String(entry.mac || '').replace(/[^0-9a-f]/gi,'').toLowerCase()
       for (const match of arpByMac.get(mac) || []) {
+        if(match.target.startsWith('asset:'))addAsset(byId.get(match.target.slice(6)))
         const targetNode = graphNodes.get(match.target)
         if (scope.active && !scope.matches(byId.get(snapshot.node_id)?.ip, snapshot.node_id) && !scope.matches(targetNode?.address, targetNode?.id?.slice(6))) continue
         const port = entry.port == null ? null : String(entry.port)
@@ -537,7 +554,7 @@ export function topologyGraph({nodeId = null, maxNodes = 300, maxEdges = 700, ..
   const nodes = candidateNodes.slice(0,maxNodes)
   const allowed = new Set(nodes.map(node => node.id))
   const boundedEdges = edges.filter(edge => allowed.has(edge.source) && allowed.has(edge.target))
-  return {nodes,edges:boundedEdges,scope:scope.summary,generatedAt:now(),truncated:flowRows.length>3000||arpRowsForGraph.length>5000||candidateNodes.length>nodes.length||graphEdges.size>edges.length,sources:sourceCounts,nodeCount:nodes.length,edgeCount:boundedEdges.length}
+  return {nodes,edges:boundedEdges,scope:scope.summary,generatedAt:now(),truncated:snapshotTruncated||flowRows.length>3000||arpRowsForGraph.length>5000||candidateNodes.length>nodes.length||graphEdges.size>edges.length,sources:sourceCounts,nodeCount:nodes.length,edgeCount:boundedEdges.length}
 }
 
 export function arpRows(nodeId = null, limit = 500, options = {}) {

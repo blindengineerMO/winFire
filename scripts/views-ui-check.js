@@ -1,0 +1,57 @@
+async page=>{
+  const base=await page.evaluate(()=>location.origin),errors=[],requests=[]
+  page.on('pageerror',error=>errors.push(error.message))
+  page.on('console',message=>{if(message.type()==='error')errors.push(message.text())})
+  page.on('request',request=>{if(request.url().includes('/api/v1/mapping'))requests.push(new URL(request.url()).pathname+new URL(request.url()).search)})
+  await page.evaluate(async()=>{
+    const data=await (await fetch('/api/v1/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:'views-ui@example.test',password:'Views-fixture-only-123'})})).json()
+    localStorage.setItem('winfire_access',data.accessToken);localStorage.setItem('winfire_refresh',data.refreshToken);localStorage.setItem('winfire_user',JSON.stringify(data.user))
+  })
+  let releaseTraffic
+  const trafficGate=new Promise(resolve=>{releaseTraffic=resolve})
+  await page.route('**/api/v1/reports/dashboard?section=traffic',async route=>{await trafficGate;await route.continue()})
+  await page.setViewportSize({width:1440,height:1000})
+  await page.goto(base+'/')
+  await page.getByRole('heading',{name:'System Overview',exact:true}).waitFor()
+  if(!await page.getByText('Loading traffic totals…',{exact:true}).count())throw Error('Fleet summary waited for traffic analytics')
+  releaseTraffic()
+  await page.getByLabel('Top denied ports chart').waitFor({state:'attached'})
+  await page.unroute('**/api/v1/reports/dashboard?section=traffic')
+  await page.screenshot({path:'output/playwright/performance-dashboard-desktop.png',fullPage:true})
+  requests.length=0
+  await page.goto(base+'/mapping?tab=topology')
+  await page.getByRole('img',{name:'Network topology graph'}).waitFor()
+  if(requests.some(url=>/\/mapping\?(?!.*filter-options)|\/arp|\/talkers/.test(url)))throw Error('Topology loaded hidden mapping tables: '+requests.join(','))
+  if(requests.filter(url=>url.startsWith('/api/v1/mapping/topology')).length!==1)throw Error('Topology was requested more than once')
+  await page.getByRole('tab',{name:/Connections/}).click()
+  await page.locator('.mapping-row').first().waitFor()
+  await page.waitForFunction(()=>document.querySelectorAll('.mapping-row').length===100)
+  const topologyCount=requests.filter(url=>url.startsWith('/api/v1/mapping/topology')).length
+  await page.getByRole('button',{name:'Next',exact:true}).click()
+  await page.waitForFunction(()=>document.querySelectorAll('.mapping-row').length===19)
+  if(requests.filter(url=>url.startsWith('/api/v1/mapping/topology')).length!==topologyCount)throw Error('Pagination recomputed topology')
+  if(requests.filter(url=>url.startsWith('/api/v1/mapping?')).some(url=>!url.includes('includeTalkers=false')))throw Error('Pagination requested hidden talker aggregation')
+  await page.getByRole('tab',{name:/Most active nodes/}).click()
+  await page.getByRole('cell',{name:'Fixture node 0',exact:true}).waitFor()
+  await page.getByRole('tab',{name:/Neighbors/}).click()
+  await page.getByRole('cell',{name:'10.42.0.2',exact:true}).waitFor()
+  await page.getByRole('tab',{name:/Topology/}).click()
+  await page.getByRole('img',{name:'Network topology graph'}).waitFor()
+  if(requests.filter(url=>url.startsWith('/api/v1/mapping/topology')).length!==topologyCount)throw Error('Returning to cached topology fetched it again')
+  await page.screenshot({path:'output/playwright/performance-topology-desktop.png',fullPage:true})
+  await page.getByLabel('Filter by subnet').fill('10.42.0.0/24')
+  await page.getByRole('button',{name:'Apply filters',exact:true}).click()
+  await page.getByRole('img',{name:'Network topology graph'}).waitFor()
+  for(const width of [768,390]){
+    await page.setViewportSize({width,height:900})
+    if(width<700)await page.waitForFunction(()=>document.querySelector('.enterprise-side').getBoundingClientRect().right<=0)
+    if(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1))throw Error('Viewport overflow at '+width)
+    await page.screenshot({path:`output/playwright/performance-topology-${width}.png`,fullPage:true})
+  }
+  await page.goto(base+'/')
+  await page.getByRole('heading',{name:'System Overview',exact:true}).waitFor()
+  if(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1))throw Error('Dashboard viewport overflow')
+  await page.screenshot({path:'output/playwright/performance-dashboard-mobile.png',fullPage:true})
+  if(errors.length)throw Error(errors.join('\n'))
+  return {dashboardProgressive:true,topologyLazy:true,paginationRequestsOnlyPairs:true,tabCache:true,viewports:[1440,768,390],browserErrors:errors.length,requests}
+}

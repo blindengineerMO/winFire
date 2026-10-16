@@ -112,6 +112,14 @@ curl --fail-with-body --get "$BASE/nodes" -H "Authorization: Bearer $TOKEN" \
 
 See [API examples](docs/API.md) for refresh/logout, mutation payloads, discovery, mapping, DHCP import and MFA calls. Some older routes expose generic OpenAPI schemas; the complete route reference links to their exact handler validation.
 
+## Responsive dashboards and larger fleets
+
+The dashboard displays fleet status and recent events while traffic charts finish loading. When the dashboard loads, denied-port totals can use a snapshot up to 10 seconds old. Reload to see updated totals. Changing process exclusions or traffic ignore rules invalidates that snapshot for the next request. Set `DASHBOARD_TRAFFIC_CACHE_SECONDS` to a value from `0` to `60` and restart the API to change that interval. `0` disables reuse of completed traffic totals.
+
+Mapping loads connections, topology, most active nodes and neighbors when you open their tabs. Changing connection pages does not reload the graph. A dash in a summary card means that section has not been loaded yet. Refresh reloads the active tab. For larger networks, use node, subnet, switch and time filters; the topology indicates when its display or observation limits have been reached.
+
+Pages load their own application code as needed, and the supplied web container caches versioned assets and compresses scripts and styles. After an upgrade, reload an already-open browser tab. Database upgrades may take longer on the first start while new indexes are built; allow additional disk space and follow the backup guidance below.
+
 ## Evidence exports and recovery
 
 In **Reports → exports**, select an inventory scope and add your HTTPS receiver. Copy the one-time signing secret into the receiver before enabling delivery. Choose the snapshot interval and any policy, drift, containment or connector events you want to receive. Saving a destination change cancels older pending deliveries; administrators can rotate the secret through the API. Use a receiver that validates signatures and handles repeated delivery IDs; see the [evidence export API reference](docs/API_ROUTES.md#evidence-exports) for integration settings.

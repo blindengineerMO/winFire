@@ -4,10 +4,11 @@ const filterQuery = (filters={}) => new URLSearchParams(Object.entries(filters).
 
 export const mappingService = {
   listNodes: () => api('/nodes'),
-  filterOptions: () => api('/mapping/filter-options'),
-  listPairs: filters => api(`/mapping?${filterQuery(filters)}`),
-  listArp: filters => api(`/mapping/arp?${filterQuery(filters)}`),
-  listTopology: filters => api(`/mapping/topology?${filterQuery(filters)}`),
+  filterOptions: options => api('/mapping/filter-options?includeNodes=true',options),
+  listPairs: (filters,options) => api(`/mapping?${filterQuery(filters)}`,options),
+  listTalkers: (filters,options) => api(`/mapping/talkers?${filterQuery(filters)}`,options),
+  listArp: (filters,options) => api(`/mapping/arp?${filterQuery(filters)}`,options),
+  listTopology: (filters,options) => api(`/mapping/topology?${filterQuery(filters)}`,options),
   rebuild: () => api('/mapping/rebuild', {method: 'POST'}),
   collectArp: nodeId => api(`/nodes/${nodeId}/arp/collect`, {method: 'POST'}),
   findRepresentativeEvent: row => {

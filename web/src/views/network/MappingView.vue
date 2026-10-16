@@ -1,9 +1,9 @@
 <script setup>
 import {useRoute} from 'vue-router'
 const route=useRoute()
-import {computed, onMounted, ref} from 'vue'
+import {computed,defineAsyncComponent,onMounted,onUnmounted,ref,shallowRef,watch} from 'vue'
 import PageHeader from '../../components/PageHeader.vue'
-import TrafficContext from '../../components/mapping/TrafficContext.vue'
+const TrafficContext=defineAsyncComponent(()=>import('../../components/mapping/TrafficContext.vue'))
 import MappingFilters from '../../components/mapping/MappingFilters.vue'
 import MappingPairsTable from '../../components/mapping/MappingPairsTable.vue'
 import TopTalkersTable from '../../components/mapping/TopTalkersTable.vue'
@@ -13,13 +13,14 @@ import GlassWindow from '../../components/GlassWindow.vue'
 import TransactionDetailsDialog from '../../components/TransactionDetailsDialog.vue'
 import {api,session} from '../../services/api.js'
 import {mappingService} from '../../services/mapping.js'
+import {createMappingLoader} from '../../services/mappingLoader.js'
 
 const activeTab=ref(['pairs','topology','talkers','neighbors','applications','cloud'].includes(route.query.tab)?route.query.tab:'pairs')
-const rows=ref([]),topTalkers=ref([]),arp=ref([]),topology=ref({nodes:[],edges:[],nodeCount:0,edgeCount:0}),nodes=ref([]),policies=ref([])
+const rows=shallowRef([]),topTalkers=shallowRef([]),arp=shallowRef([]),topology=shallowRef({nodes:[],edges:[],nodeCount:0,edgeCount:0}),nodes=ref([]),policies=ref([])
 const emptyFilters=()=>({nodeId:'',external:'',trafficClass:'',subnet:'',switchId:'',from:'',to:''})
 const draft=ref({...emptyFilters(),nodeId:String(route.query.nodeId||'')}),applied=ref({...emptyFilters(),nodeId:String(route.query.nodeId||'')}),filterOptions=ref({switches:[],subnets:[]})
 const nodeId=computed(()=>applied.value.nodeId)
-const page=ref(1),pageSize=ref(100),pages=ref(1),total=ref(0)
+const page=ref(1),pageSize=ref(100),pages=ref(1),total=ref(null),neighborsLoaded=ref(false)
 const loading=ref(false),error=ref(''),message=ref(''),topologySelectedId=ref('')
 const selectedNode=computed(()=>nodes.value.find(node=>node.id===nodeId.value))
 const canManageRules=computed(()=>['owner','admin'].includes(session.user?.role))
@@ -29,19 +30,36 @@ const groupPolicies=computed(()=>policies.value.filter(policy=>policy.origin!=='
 const canRule=event=>!!event&&['in','out'].includes(event.direction)&&['TCP','UDP'].includes(event.protocol)&&Number(event.dst_port)>0&&!!(event.direction==='in'?event.src_ip:event.dst_ip)
 const canIgnore=event=>!!event&&([5150,5151,5156,5157].includes(Number(event.event_id))||event.event_type==='firewall')
 
-let loadSequence=0
-async function load(){
-  const sequence=++loadSequence
-  loading.value=true;error.value=''
-  try{
-    const filters={...applied.value}
-    for(const key of ['from','to'])if(filters[key])filters[key]=new Date(filters[key]).toISOString()
-    const [result,arpResult,topologyResult]=await Promise.all([mappingService.listPairs({...filters,page:page.value,pageSize:pageSize.value}),mappingService.listArp(filters),mappingService.listTopology(filters)])
-    if(sequence!==loadSequence)return
-    rows.value=result.rows;topTalkers.value=result.topTalkers;pages.value=Math.max(result.pages,1);total.value=result.total;arp.value=arpResult.items;topology.value=topologyResult
-  }catch(cause){if(sequence===loadSequence){error.value=cause.message;rows.value=[];topTalkers.value=[];arp.value=[];topology.value={nodes:[],edges:[]};total.value=0;pages.value=1}}
-  finally{if(sequence===loadSequence)loading.value=false}
+const loader=createMappingLoader(mappingService,{
+  setLoading:value=>{loading.value=value},
+  onError:cause=>{error.value=cause.message},
+  commit:(tab,result)=>{
+    if(tab==='pairs'){rows.value=result.rows;pages.value=Math.max(result.pages,1);total.value=result.total}
+    else if(tab==='talkers')topTalkers.value=result.items
+    else if(tab==='neighbors'){arp.value=result.items;neighborsLoaded.value=true}
+    else if(tab==='topology')topology.value=result
+  }
+})
+function load(force=true){
+  error.value=''
+  const filters={...applied.value}
+  for(const key of ['from','to'])if(filters[key]){
+    const date=new Date(filters[key])
+    if(!Number.isFinite(date.getTime())){error.value='Enter a valid date range';return}
+    filters[key]=date.toISOString()
+  }
+  return loader.load(activeTab.value,filters,{page:page.value,pageSize:pageSize.value,force})
 }
+const metadataController=new AbortController()
+let metadataLoaded=false
+async function loadMetadata(){
+  if(metadataLoaded||['applications','cloud'].includes(activeTab.value))return
+  metadataLoaded=true
+  try{const result=await mappingService.filterOptions({signal:metadataController.signal});nodes.value=result.nodes;filterOptions.value=result}
+  catch(cause){metadataLoaded=false;if(cause.name!=='AbortError')error.value=cause.message}
+}
+watch(activeTab,()=>{loadMetadata();load(false)})
+onUnmounted(()=>{loader.dispose();metadataController.abort()})
 async function collectArp(){
   if(!nodeId.value)return
   message.value=''
@@ -50,35 +68,35 @@ async function collectArp(){
 }
 async function rebuild(){
   message.value='';error.value=''
-  try{const result=await mappingService.rebuild();message.value=`Rebuilt ${result.rows} mapping pair${result.rows===1?'':'s'} from ${result.events} events.`;await load()}
+  try{const result=await mappingService.rebuild();loader.invalidate();message.value=`Rebuilt ${result.rows} mapping pair${result.rows===1?'':'s'} from ${result.events} events.`;await load()}
   catch(cause){error.value=cause.message}
 }
 function changeFilter(){
   if(draft.value.from&&draft.value.to&&new Date(draft.value.from)>new Date(draft.value.to)){error.value='From must be before To';return}
-  applied.value={...draft.value,subnet:draft.value.subnet.trim()};page.value=1;topologySelectedId.value='';load()
+  applied.value={...draft.value,subnet:draft.value.subnet.trim()};page.value=1;topologySelectedId.value='';loader.invalidate();rows.value=[];topTalkers.value=[];arp.value=[];neighborsLoaded.value=false;total.value=null;topology.value={nodes:[],edges:[]};load()
 }
 function clearFilters(){draft.value=emptyFilters();changeFilter()}
 function next(delta){page.value=Math.min(pages.value,Math.max(1,page.value+delta));load()}
 function openTransaction(row){selectedRow.value=row;representativeEvent.value=null;detailOpen.value=true;detailLoading.value=true;mappingService.findRepresentativeEvent(row).then(event=>{representativeEvent.value=event}).catch(cause=>{error.value=cause.message}).finally(()=>{detailLoading.value=false})}
 function selectTopologyNode(node){const assetId=node.id.startsWith('asset:')?node.id.slice(6):'';if(assetId&&nodes.value.some(item=>item.id===assetId)){draft.value={...applied.value,nodeId:assetId};changeFilter()}topologySelectedId.value=node.id}
-function beginRule(action){if(!representativeEvent.value)return;ruleAction.value=action;rulePolicyId.value='personal';ruleOpen.value=true;detailOpen.value=false}
+async function beginRule(action){if(!representativeEvent.value)return;ruleAction.value=action;rulePolicyId.value='personal';ruleOpen.value=true;detailOpen.value=false;if(!policies.value.length)try{policies.value=await api('/policies',{signal:metadataController.signal})}catch(cause){if(cause.name!=='AbortError')error.value=cause.message}}
 async function addRule(){if(!representativeEvent.value)return;ruleBusy.value=true;error.value='';try{const result=await mappingService.createRule(representativeEvent.value.id,ruleAction.value,rulePolicyId.value);message.value=`Rule saved to policy version ${result.versionNo}. An administrator can sync it from the top bar.`;ruleOpen.value=false}catch(cause){error.value=cause.message}finally{ruleBusy.value=false}}
-async function ignoreTransaction(){if(!representativeEvent.value)return;ignoreBusy.value=true;error.value='';try{await mappingService.ignoreEvent(representativeEvent.value.id);message.value='Traffic ignore rule saved. Matching events are now hidden and future matches will not be stored.';detailOpen.value=false;await load()}catch(cause){error.value=cause.message}finally{ignoreBusy.value=false}}
-onMounted(async()=>{try{[nodes.value,policies.value,filterOptions.value]=await Promise.all([mappingService.listNodes(),api('/policies'),mappingService.filterOptions()]);await load()}catch(cause){error.value=cause.message}})
+async function ignoreTransaction(){if(!representativeEvent.value)return;ignoreBusy.value=true;error.value='';try{await mappingService.ignoreEvent(representativeEvent.value.id);loader.invalidate();message.value='Traffic ignore rule saved. Matching events are now hidden and future matches will not be stored.';detailOpen.value=false;await load()}catch(cause){error.value=cause.message}finally{ignoreBusy.value=false}}
+onMounted(()=>{loadMetadata();load(false)})
 </script>
 
 <template>
   <div class="view mapping-view">
     <PageHeader v-if="!['applications','cloud'].includes(activeTab)" eyebrow="VISIBILITY / NETWORK MAP" title="Network mapping" description="Correlate observed traffic into internal node pairs, external connections and top talkers">
-      <div class="page-actions"><button class="button secondary" @click="rebuild"><i class="mdi mdi-database-refresh-outline"></i> Rebuild map</button><button class="button primary" :disabled="loading" @click="load"><i class="mdi mdi-refresh"></i> Refresh</button></div>
+      <div class="page-actions"><button class="button secondary" @click="rebuild"><i class="mdi mdi-database-refresh-outline"></i> Rebuild map</button><button class="button primary" :disabled="loading" @click="load()"><i class="mdi mdi-refresh"></i> Refresh</button></div>
     </PageHeader>
     <div v-if="error" class="error-msg">{{error}}</div><div v-if="message" class="success-msg">{{message}}</div>
-    <div v-if="!['applications','cloud'].includes(activeTab)" class="metric-grid"><div class="metric glass"><div class="metric-top"><span>MAPPED PAIRS</span><i class="mdi mdi-vector-link"></i></div><strong>{{total}}</strong><small>Observed connection patterns</small></div><div class="metric glass"><div class="metric-top"><span>TOP TALKER</span><i class="mdi mdi-swap-vertical"></i></div><strong>{{topTalkers[0]?.hostname||'—'}}</strong><small>{{topTalkers[0]?.connections||0}} connections</small></div><div class="metric glass"><div class="metric-top"><span>ARP ENTRIES</span><i class="mdi mdi-lan-connect"></i></div><strong>{{arp.length}}</strong><small>{{selectedNode?.hostname||'All managed nodes'}}</small></div><div class="metric glass"><div class="metric-top"><span>PAGE</span><i class="mdi mdi-table-large"></i></div><strong>{{page}}<span>/{{pages}}</span></strong><small>Rows {{pageSize}} per page</small></div></div>
+    <div v-if="!['applications','cloud'].includes(activeTab)" class="metric-grid"><div class="metric glass"><div class="metric-top"><span>MAPPED PAIRS</span><i class="mdi mdi-vector-link"></i></div><strong>{{total??'—'}}</strong><small>Observed connection patterns</small></div><div class="metric glass"><div class="metric-top"><span>TOP TALKER</span><i class="mdi mdi-swap-vertical"></i></div><strong>{{topTalkers[0]?.hostname||'—'}}</strong><small>{{topTalkers.length?`${topTalkers[0].connections} connections`:'Open Most active nodes'}}</small></div><div class="metric glass"><div class="metric-top"><span>ARP ENTRIES</span><i class="mdi mdi-lan-connect"></i></div><strong>{{neighborsLoaded?arp.length:'—'}}</strong><small>{{selectedNode?.hostname||'All managed nodes'}}</small></div><div class="metric glass"><div class="metric-top"><span>PAGE</span><i class="mdi mdi-table-large"></i></div><strong>{{page}}<span>/{{pages}}</span></strong><small>Rows {{pageSize}} per page</small></div></div>
 
     <MappingFilters v-if="!['applications','cloud'].includes(activeTab)" v-model="draft" :nodes="nodes" :switches="filterOptions.switches" :subnets="filterOptions.subnets" :busy="loading" @apply="changeFilter" @reset="clearFilters" />
     <nav class="view-tabs" aria-label="Network mapping sections" role="tablist">
-      <button type="button" role="tab" :aria-selected="activeTab==='pairs'" :class="{active:activeTab==='pairs'}" @click="activeTab='pairs'"><i class="mdi mdi-vector-link"></i> Connections <span>{{total}}</span></button>
-      <button type="button" role="tab" :aria-selected="activeTab==='topology'" :class="{active:activeTab==='topology'}" @click="activeTab='topology';load()"><i class="mdi mdi-graph-outline"></i> Topology <span>{{topology.nodeCount||0}}</span></button>
+      <button type="button" role="tab" :aria-selected="activeTab==='pairs'" :class="{active:activeTab==='pairs'}" @click="activeTab='pairs'"><i class="mdi mdi-vector-link"></i> Connections <span v-if="total!==null">{{total}}</span></button>
+      <button type="button" role="tab" :aria-selected="activeTab==='topology'" :class="{active:activeTab==='topology'}" @click="activeTab='topology'"><i class="mdi mdi-graph-outline"></i> Topology <span>{{topology.nodeCount||0}}</span></button>
       <button type="button" role="tab" :aria-selected="activeTab==='talkers'" :class="{active:activeTab==='talkers'}" @click="activeTab='talkers'"><i class="mdi mdi-swap-vertical"></i> Most active nodes <span>{{topTalkers.length}}</span></button>
       <button type="button" role="tab" :aria-selected="activeTab==='neighbors'" :class="{active:activeTab==='neighbors'}" @click="activeTab='neighbors'"><i class="mdi mdi-lan-connect"></i> Neighbors <span>{{arp.length}}</span></button>
       <button type="button" role="tab" :aria-selected="activeTab==='applications'" :class="{active:activeTab==='applications'}" @click="activeTab='applications'">Applications</button>
@@ -87,11 +105,11 @@ onMounted(async()=>{try{[nodes.value,policies.value,filterOptions.value]=await P
     <TrafficContext v-if="['applications','cloud'].includes(activeTab)" :key="activeTab" :kind="activeTab"/>
 
     <section v-if="activeTab==='pairs'" class="mapping-tab" role="tabpanel">
-      <section class="panel glass"><div class="panel-title"><div><span class="eyebrow">CONNECTION GRAPH</span><h2>Node pairs and analyzed traffic</h2></div></div><MappingPairsTable :rows="rows" :loading="loading" :total="total" :page="page" :pages="pages" @previous="next(-1)" @next="next(1)" @select="openTransaction" /></section>
+      <section class="panel glass"><div class="panel-title"><div><span class="eyebrow">CONNECTION GRAPH</span><h2>Node pairs and analyzed traffic</h2></div></div><MappingPairsTable :rows="rows" :loading="loading" :total="total??0" :page="page" :pages="pages" @previous="next(-1)" @next="next(1)" @select="openTransaction" /></section>
     </section>
-    <section v-else-if="activeTab==='topology'" class="mapping-tab" role="tabpanel"><TopologyGraph :graph="topology" :selected-id="topologySelectedId" @select="selectTopologyNode" /></section>
-    <section v-else-if="activeTab==='talkers'" class="mapping-tab" role="tabpanel"><TopTalkersTable :talkers="topTalkers" /><p class="mapping-note">Top talkers are calculated from the observed connection pairs and include both managed nodes and external peers.</p></section>
-    <section v-else-if="activeTab==='neighbors'" class="mapping-tab" role="tabpanel"><ArpSnapshotTable :entries="arp" :node-selected="!!nodeId" @collect="collectArp" /></section>
+    <section v-else-if="activeTab==='topology'" class="mapping-tab" role="tabpanel"><p v-if="loading" role="status" class="empty-table">Loading topology…</p><TopologyGraph v-else :graph="topology" :selected-id="topologySelectedId" @select="selectTopologyNode" /></section>
+    <section v-else-if="activeTab==='talkers'" class="mapping-tab" role="tabpanel"><p v-if="loading" role="status" class="empty-table">Loading most active nodes…</p><TopTalkersTable v-else :talkers="topTalkers" /><p class="mapping-note">Top talkers are calculated from the observed connection pairs and include both managed nodes and external peers.</p></section>
+    <section v-else-if="activeTab==='neighbors'" class="mapping-tab" role="tabpanel"><p v-if="loading" role="status" class="empty-table">Loading neighbors…</p><ArpSnapshotTable v-else :entries="arp" :node-selected="!!nodeId" @collect="collectArp" /></section>
     <TransactionDetailsDialog v-model="detailOpen" :transaction="selectedRow" title="Network transaction details" :can-allow="canManageRules&&canRule(representativeEvent)" :can-deny="canManageRules&&canRule(representativeEvent)" :can-ignore="canManageRules&&canIgnore(representativeEvent)" :loading-actions="detailLoading" :busy="ruleBusy||ignoreBusy" @allow="beginRule('allow')" @deny="beginRule('block')" @ignore="ignoreTransaction" />
     <GlassWindow v-model="ruleOpen" title="Create rule from network transaction" width="560px"><div v-if="representativeEvent" class="form-grid"><p>{{representativeEvent.direction==='in'?'Inbound':'Outbound'}} {{representativeEvent.protocol}} {{representativeEvent.dst_port}} · {{representativeEvent.direction==='in'?representativeEvent.src_ip:representativeEvent.dst_ip}}</p><label>Action<select v-model="ruleAction"><option value="allow">Allow</option><option value="block">Reject</option></select></label><label>Policy<select v-model="rulePolicyId"><option value="personal">{{representativeEvent.node_name||representativeEvent.node_id}} personal policy</option><option v-for="policy in groupPolicies" :key="policy.id" :value="policy.id">{{policy.name}} · group/global</option></select></label><p class="muted">The rule is staged in a new version. It will reach enforced nodes when an administrator syncs policies.</p><div class="form-actions"><button class="button secondary" @click="ruleOpen=false">Cancel</button><button class="button primary" :disabled="ruleBusy" @click="addRule">{{ruleBusy?'Saving…':'Create rule'}}</button></div></div></GlassWindow>
   </div>

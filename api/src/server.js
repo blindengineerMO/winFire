@@ -25,7 +25,7 @@ import {db,all,one,run,now,audit} from './db.js'
 import {agentTlsOptions,tlsMaterialPaths} from './agentPki.js'
 import {sweepAgentHealth} from './agentHealth.js'
 import {collectFacts} from './connector.js'
-import {pruneOldEvents,refreshDueDns,runCompactionIfDue} from './maintenance.js'
+import {pruneOldEvents,refreshDueDns,runCompactionInBackground} from './maintenance.js'
 import {deliverPendingNotifications} from './notifications.js'
 import {sweepLoopbackBaseline} from './loopbackBaseline.js'
 import {revokeExpiredGrants} from './mfaPortal.js'
@@ -47,8 +47,10 @@ const dist=path.join(root,'web/dist')
 await bootstrap()
 await ensureBootstrapAdmin()
 if(fs.existsSync(dist)){
-  app.use(express.static(dist))
-  app.get(/^(?!\/api\/).*/,(_req,res)=>res.sendFile(path.join(dist,'index.html')))
+  app.use(express.static(dist,{setHeaders:(res,file)=>{
+    res.setHeader('Cache-Control',file.startsWith(path.join(dist,'assets')+path.sep)?'public, max-age=31536000, immutable':'no-cache')
+  }}))
+  app.get(/^(?!\/(?:api|assets)\/).*/,(_req,res)=>{res.set('Cache-Control','no-cache');res.sendFile(path.join(dist,'index.html'))})
 }
 const tlsPaths=tlsMaterialPaths(),tlsSettings=Object.values(tlsPaths).map(file=>fs.existsSync(file)?file:null)
 if(tlsSettings.some(Boolean)&&!tlsSettings.every(Boolean))throw new Error('TLS certificate, key, agent CA certificate and agent CA key must all be configured together')
@@ -217,9 +219,17 @@ setTimeout(sweepDns,5000).unref()
 const dnsTimer=setInterval(sweepDns,15*60_000)
 dnsTimer.unref()
 setInterval(()=>{try{db.pragma('optimize')}catch(error){console.error('Database statistics:',error.message)}},24*60*60*1000).unref()
-const compactionTimer=setInterval(()=>runCompactionIfDue(),5*60*1000)
+let compactionRunning=false
+async function sweepCompaction(){
+  if(compactionRunning)return
+  compactionRunning=true
+  try{await runCompactionInBackground()}
+  catch(error){console.error('Event compaction:',error.message)}
+  finally{compactionRunning=false}
+}
+const compactionTimer=setInterval(sweepCompaction,5*60*1000)
 compactionTimer.unref()
-setTimeout(()=>runCompactionIfDue(),10_000).unref()
+setTimeout(sweepCompaction,10_000).unref()
 const timer=setInterval(()=>{pruneOldEvents();run('DELETE FROM mfa_entra_flows WHERE expires_at<?',now());run("DELETE FROM mfa_prompt_events WHERE datetime(created_at)<datetime('now','-7 days')")},60*60*1000)
 timer.unref()
 setTimeout(()=>expireMfaChallenges(),10_000).unref()

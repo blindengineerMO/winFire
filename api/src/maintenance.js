@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import {setImmediate as yieldToRequests} from 'node:timers/promises'
 import {db,all,one,run,id,now} from './db.js'
 import {lookupDns} from './connector.js'
 import {dynamicNodeGroupIntervalMinutes} from './dynamicNodeGroups.js'
@@ -10,7 +11,7 @@ export function observabilitySettings() {
 }
 
 export function compactDueEvents(at=new Date(),limit=2000){
-  const events=all('SELECT id,action,protocol,src_ip,dst_ip,dst_port,direction,program,event_type FROM log_events WHERE pattern_id IS NULL ORDER BY received_at,id LIMIT ?',limit)
+  const events=all('SELECT id,action,protocol,src_ip,dst_ip,dst_port,direction,program,event_type FROM log_events INDEXED BY idx_logs_uncompacted WHERE pattern_id IS NULL ORDER BY received_at,id LIMIT ?',limit)
   db.transaction(()=>{
     for(const event of events){
       const values=[event.action,event.protocol,event.src_ip,event.dst_ip,event.dst_port,event.direction,event.program,event.event_type]
@@ -35,6 +36,17 @@ export function runCompactionIfDue(at=new Date(),batchSize=2000,maxBatches=10){
   }
   if(!remaining)run("UPDATE app_settings SET value=? WHERE key='event_compact_last_at'",at.toISOString())
   return {due:true,processed,remaining}
+}
+
+export async function runCompactionInBackground(at=new Date(),batchSize=500,maxBatches=40){
+  let processed=0,result={due:false,processed:0,remaining:false}
+  for(let batch=0;batch<maxBatches;batch++){
+    result=runCompactionIfDue(at,batchSize,1)
+    processed+=result.processed
+    if(!result.remaining)break
+    await yieldToRequests()
+  }
+  return {...result,processed}
 }
 
 export function pruneOldEvents(at=new Date()) {

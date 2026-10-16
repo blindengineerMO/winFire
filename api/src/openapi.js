@@ -151,11 +151,16 @@ export function buildOpenApi(apiRouter,agentRouter,extraRouters={}){
           if(routeKey==='POST /discovery/dhcp/import')operation.responses={201:jsonResponse,default:errorResponse}
           if(path==='/discovery/dhcp/imports')operation.parameters.push(...Object.entries({page:{type:'integer',minimum:1,default:1},pageSize:{type:'integer',minimum:1,maximum:100,default:25}}).map(([name,schema])=>({name,in:'query',schema})))
         }
-        if (method==='get' && ['/mapping','/mapping/topology','/mapping/arp'].includes(path)) {
+        if(method==='get'&&path==='/reports/dashboard'){
+          operation.description='Fleet summary with compact coverage counts. summary omits expensive event analytics; traffic returns deniedPorts and generatedAt from a read-only worker. Traffic totals may be cached for DASHBOARD_TRAFFIC_CACHE_SECONDS (default 10, 0–60); process exclusions and traffic ignore changes invalidate immediately. All sections require operator authentication.'
+          operation.parameters.push({name:'section',in:'query',schema:{type:'string',enum:['all','summary','traffic'],default:'all'}})
+        }
+        if(method==='get'&&path==='/mapping/filter-options')operation.parameters.push({name:'includeNodes',in:'query',schema:{type:'string',enum:['true','false'],default:'false'},description:'Include compact local-node picker records (id, hostname, ip), without node facts or policy payloads.'})
+        if (method==='get' && ['/mapping','/mapping/topology','/mapping/arp','/mapping/talkers'].includes(path)) {
           operation.description='Subnet and switch criteria must match the same endpoint. Connections retain peers outside that scope. Switch membership uses observed ARP and current forwarding MACs, including inventory MAC correlation; it is not proof of direct physical attachment. Neighbor links use node, subnet, switch and date criteria; traffic scope and class apply to flow edges only.'
           const fields={nodeId:{type:'string'},subnet:{type:'string',description:'IPv4 or IPv6 CIDR; host bits are allowed.'},switchId:{type:'string',description:'Inventory ID of a switch.'},from:{type:'string',format:'date-time'},to:{type:'string',format:'date-time'}}
           if(path!=='/mapping/arp')Object.assign(fields,{external:{type:'string',enum:['0','1']},trafficClass:{type:'string'}})
-          if(path==='/mapping')Object.assign(fields,{page:{type:'integer',minimum:1,default:1},pageSize:{type:'integer',minimum:10,maximum:500,default:100}})
+          if(path==='/mapping')Object.assign(fields,{includeTalkers:{type:'string',enum:['true','false'],default:'true'},page:{type:'integer',minimum:1,default:1},pageSize:{type:'integer',minimum:10,maximum:500,default:100}})
           if(path==='/mapping/topology')Object.assign(fields,{maxNodes:{type:'integer',minimum:20,maximum:500,default:300},maxEdges:{type:'integer',minimum:20,maximum:1000,default:700}})
           if(path==='/mapping/arp')fields.limit={type:'integer',minimum:1,maximum:2000,default:500}
           operation.parameters.push(...Object.entries(fields).map(([name,schema])=>({name,in:'query',required:false,schema})))

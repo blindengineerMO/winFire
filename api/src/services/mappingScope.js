@@ -1,15 +1,24 @@
-import {subnetMatcher,configuredCidrs,effectiveCidrs} from './networkBoundary.js'
+import {subnetMatcher,configuredCidrs,effectiveCidrs,isLocalAssetNode} from './networkBoundary.js'
 export {subnetMatcher} from './networkBoundary.js'
 import {db, all, one} from '../db.js'
 
 const address = value => String(value || '').trim().split('%')[0].toLowerCase()
 const mac = value => String(value || '').replace(/[^a-f0-9]/gi, '').toLowerCase()
-db.function('winfire_mapping_subnet', {deterministic: true}, (ip, cidr) => Number(subnetMatcher(cidr)(ip)))
+const subnetResults=new Map()
+db.function('winfire_mapping_subnet',{deterministic:true},(ip,cidr)=>{
+  const key=JSON.stringify([ip,cidr])
+  if(subnetResults.has(key))return subnetResults.get(key)
+  const result=Number(subnetMatcher(cidr)(ip))
+  if(subnetResults.size>=8192)subnetResults.clear()
+  subnetResults.set(key,result)
+  return result
+})
 db.function('winfire_mapping_mac', {deterministic: true}, mac)
 
-export function mappingFilterOptions() {
+export function mappingFilterOptions({includeNodes=false}={}) {
   const cidrs=configuredCidrs()
   return {
+    ...(includeNodes?{nodes:all('SELECT id,hostname,ip,scope_id FROM nodes ORDER BY hostname,id').filter(isLocalAssetNode).map(({scope_id,...node})=>node)}:{}),
     subnets: [...new Set(cidrs.map(value => String(value).trim()).filter(value => { try { subnetMatcher(value); return true } catch { return false } }))],
     switches: all("SELECT id,hostname,ip FROM nodes WHERE device_type='switch' ORDER BY hostname,id")
   }

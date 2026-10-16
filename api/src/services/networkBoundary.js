@@ -84,4 +84,12 @@ export function boundaryState(){
 export const effectiveCidrs=()=>boundaryState().effectiveCidrs
 db.function('winfire_ip',{deterministic:true},canonicalIp)
 db.function('winfire_subnet',{deterministic:true},(ip,cidr)=>Number(subnetMatcher(cidr)(ip)))
-db.function('winfire_outside',{deterministic:true},(ip,cidrs)=>Number(outsideLocal(ip,JSON.parse(cidrs))))
+let lastBoundary=null,parsedBoundary=[],outsideResults=new Map()
+db.function('winfire_outside',{deterministic:true},(ip,cidrs)=>{
+  if(cidrs!==lastBoundary){lastBoundary=cidrs;parsedBoundary=JSON.parse(cidrs);outsideResults.clear()}
+  if(outsideResults.has(ip))return outsideResults.get(ip)
+  const result=Number(outsideLocal(ip,parsedBoundary))
+  if(outsideResults.size>=8192)outsideResults.clear()
+  outsideResults.set(ip,result)
+  return result
+})

@@ -1,3 +1,5 @@
+import {dashboardTraffic} from './services/dashboardTraffic.js'
+import {reportCoverage,driftSummaryByNode} from './services/reportCoverage.js'
 import {evidenceRoutes} from './routes/evidence.js'
 import {searchLogEvents} from './logSearch.js'
 import {telemetryRoutes} from './telemetry/routes.js'
@@ -2425,18 +2427,6 @@ api.post('/verifier/runs',requireRole('editor'),wrap(async(req,res)=>{
 api.get('/verifier/runs/:id',(req,res)=>{const result=one('SELECT * FROM verifier_runs WHERE id=?',reqId(req));if(!result)return notFound(res,'Verifier run');const visible=readablePolicyIds(req.user),results=all('SELECT * FROM verifier_results WHERE run_id=?',result.id).filter(row=>visible.has(row.policy_id));if(!results.length&&result.requested_by!==req.user.id&&!['owner','admin'].includes(req.user.role))return notFound(res,'Verifier run');res.json({...result,results})})
 api.get('/verifier/results',(req,res)=>{const visible=readablePolicyIds(req.user);res.json(all('SELECT * FROM verifier_results ORDER BY run_at DESC LIMIT 500').filter(row=>visible.has(row.policy_id)))})
 
-function driftSummaryByNode() {
-  const assignments=all(`SELECT DISTINCT a.policy_id,COALESCE(a.node_id,m.node_id) node_id FROM policy_assignments a LEFT JOIN node_group_members m ON m.group_id=a.node_group_id WHERE COALESCE(a.node_id,m.node_id) IS NOT NULL`)
-  const latest=all(`SELECT d.node_id,d.policy_id,d.status FROM policy_drift_checks d JOIN policies p ON p.id=d.policy_id AND p.current_version_id=d.version_id WHERE d.rowid=(SELECT d2.rowid FROM policy_drift_checks d2 WHERE d2.node_id=d.node_id AND d2.policy_id=d.policy_id AND d2.version_id=d.version_id ORDER BY datetime(d2.checked_at) DESC,d2.rowid DESC LIMIT 1)`)
-  const byPair=new Map(latest.map(row=>[`${row.node_id}:${row.policy_id}`,row.status]))
-  const byNode=new Map()
-  for(const assignment of assignments){
-    const statuses=byNode.get(assignment.node_id)||[]
-    statuses.push(byPair.get(`${assignment.node_id}:${assignment.policy_id}`)||'unchecked')
-    byNode.set(assignment.node_id,statuses)
-  }
-  return new Map([...byNode].map(([nodeId,statuses])=>[nodeId,statuses.includes('drift')?'drift':statuses.includes('unknown')?'unknown':statuses.includes('pending')?'pending':statuses.includes('unchecked')?'unchecked':'in-sync']))
-}
 function report(name,user=null) {
   if(name==='inventory')return all(`SELECT n.id,n.hostname,n.fqdn,n.ip,n.scope_id,n.os_name,n.os_version,n.os_build,n.status,n.last_seen_at,n.connection_mode,n.inventory_source,n.ad_enabled,n.ad_missing,n.firewall_state,f.snapshot_json,f.collected_at,(SELECT status FROM policy_apply_runs WHERE node_id=n.id AND policy_id IS NOT NULL ORDER BY started_at DESC,rowid DESC LIMIT 1) last_apply_status,(SELECT finished_at FROM policy_apply_runs WHERE node_id=n.id AND policy_id IS NOT NULL ORDER BY started_at DESC,rowid DESC LIMIT 1) last_apply_at,(SELECT status FROM verifier_results WHERE node_id=n.id ORDER BY run_at DESC,rowid DESC LIMIT 1) last_verify_status FROM nodes n LEFT JOIN node_facts f ON f.node_id=n.id ORDER BY n.hostname`).filter(isLocalAssetNode).map(({snapshot_json,...row})=>{
     const facts=parse(snapshot_json)||{}
@@ -2451,10 +2441,7 @@ function report(name,user=null) {
     const forwardMismatch=!!(row.ip&&forward.length&&!forward.some(address=>address.address===row.ip))
     return {id:row.id,hostname:row.hostname,fqdn:row.fqdn,ip:row.ip,forward_addresses:forward.map(address=>address.address).join(', '),reverse_names:reverse.join(', '),ptr_missing:ptrMissing,ptr_mismatch:ptrMismatch,forward_mismatch:forwardMismatch,mismatch:ptrMissing||ptrMismatch||forwardMismatch,checked_at:row.checked_at}
   })
-  if(name==='coverage'){
-    const drift=driftSummaryByNode()
-    return all(`SELECT n.id,n.hostname,n.ip,n.scope_id,n.status,COUNT(DISTINCT a.policy_id) AS policy_count,(SELECT status FROM policy_apply_runs WHERE node_id=n.id AND policy_id IS NOT NULL ORDER BY started_at DESC LIMIT 1) AS last_apply_status,(SELECT passed FROM verifier_results WHERE node_id=n.id ORDER BY run_at DESC LIMIT 1) AS last_verify_passed FROM nodes n LEFT JOIN policy_assignments a ON a.node_id=n.id OR a.node_group_id IN (SELECT group_id FROM node_group_members WHERE node_id=n.id) GROUP BY n.id ORDER BY n.hostname`).filter(isLocalAssetNode).map(row=>({...row,drift_status:drift.get(row.id)||null}))
-  }
+  if(name==='coverage')return reportCoverage()
   if(name==='verification'){
     const visible=user?readablePolicyIds(user):null
     return all(`SELECT n.hostname,p.id AS policy_id,p.name AS policy,COALESCE(v.hostname,'Control plane') AS vantage,r.port,r.proto,r.expected,r.actual,r.status,r.reason,r.managed_rule_present,r.probe_source_ip,r.probe_source_port,r.firewall_event_record_id,r.firewall_event_time,r.firewall_event_filter_origin,r.run_at FROM verifier_results r LEFT JOIN nodes n ON n.id=r.node_id LEFT JOIN nodes v ON v.id=r.vantage_node_id LEFT JOIN policies p ON p.id=r.policy_id ORDER BY r.run_at DESC LIMIT 1000`).filter(row=>!visible||visible.has(row.policy_id)).map(({policy_id,...row})=>row)
@@ -2476,19 +2463,23 @@ function exportReport(req,res,name,data) {
   res.json(data)
 }
 for(const name of ['inventory','dns','coverage','compliance','verification'])api.get(`/reports/${name}`,(req,res)=>exportReport(req,res,name,report(name,req.user)))
-api.get('/reports/dashboard',(_req,res)=>{
+api.get('/reports/dashboard',wrap(async(req,res)=>{
+  const {section}=z.object({section:z.enum(['all','summary','traffic']).default('all')}).parse(req.query)
+  res.set('Cache-Control','private, no-store')
+  if(section==='traffic')return res.json(await dashboardTraffic())
   const localNodes=all('SELECT id,ip,status,scope_id FROM nodes').filter(isLocalAssetNode),localIds=new Set(localNodes.map(node=>node.id)),total=localNodes.length,reachable=localNodes.filter(node=>node.status==='reachable').length
   const policies=one('SELECT COUNT(*) n FROM policies').n, failed=one("SELECT COUNT(*) n FROM policy_apply_runs WHERE status='failed' AND policy_id IS NOT NULL").n
   const checks=one('SELECT COUNT(passed) n,COALESCE(SUM(passed),0) passed,COUNT(*)-COUNT(passed) inconclusive FROM verifier_results')
   const agentCutoff=new Date(Date.now()-120_000).toISOString()
   const agents=localIds.size?one('SELECT COUNT(*) total,COALESCE(SUM(CASE WHEN a.revoked_at IS NULL AND a.last_checkin_at>=? THEN 1 ELSE 0 END),0) online FROM agents a JOIN nodes n ON n.id=a.node_id WHERE n.id IN ('+Array.from(localIds).map(()=>'?').join(',')+')',agentCutoff,...Array.from(localIds)):{total:0,online:0}
-  const denied=all(`SELECT COALESCE(e.dst_port,p.dst_port) dst_port,COUNT(*) count FROM log_events e LEFT JOIN event_patterns p ON p.id=e.pattern_id WHERE e.action='block' AND ${visibleFirewallEventSql()} GROUP BY COALESCE(e.dst_port,p.dst_port) ORDER BY count DESC LIMIT 6`)
   const verifierTrend=all("SELECT date(run_at) day,COUNT(passed) decisive,SUM(CASE WHEN passed=1 THEN 1 ELSE 0 END) passed FROM verifier_results WHERE datetime(run_at)>=datetime('now','-14 days') GROUP BY date(run_at) ORDER BY day").map(row=>({day:row.day,decisive:row.decisive,passRate:row.decisive?Math.round(row.passed/row.decisive*100):null}))
   const mfaTrend=all("SELECT date(resolved_at) day,SUM(CASE WHEN status='approved' THEN 1 ELSE 0 END) approved,SUM(CASE WHEN status='denied' THEN 1 ELSE 0 END) denied FROM mfa_challenges WHERE datetime(resolved_at)>=datetime('now','-14 days') GROUP BY date(resolved_at) ORDER BY day")
   const coverage=report('coverage').filter(row=>localIds.has(row.id))
   const compliant=coverage.filter(row=>row.policy_count>0&&row.drift_status==='in-sync'&&row.last_apply_status==='success'&&row.last_verify_passed===1).length
-  res.json({totalNodes:total,reachableNodes:reachable,agentsOnline:agents.online,agentsOffline:agents.total-agents.online,policies,failedApplies:failed,verifierPassRate:checks.n?Math.round(checks.passed/checks.n*100):null,verifierInconclusive:checks.inconclusive,deniedPorts:denied,compliantNodes:compliant,fleetCompliancePct:total?Math.round(compliant/total*100):null,verifierTrend,mfaTrend})
-})
+  const traffic=section==='all'?await dashboardTraffic():{deniedPorts:[]}
+  const coverageSummary={assigned:coverage.filter(row=>row.policy_count>0).length,uncovered:coverage.filter(row=>row.policy_count===0).length,drift:coverage.filter(row=>row.drift_status==='drift').length}
+  res.json({coverageSummary,trafficGeneratedAt:traffic.generatedAt||null,totalNodes:total,reachableNodes:reachable,agentsOnline:agents.online,agentsOffline:agents.total-agents.online,policies,failedApplies:failed,verifierPassRate:checks.n?Math.round(checks.passed/checks.n*100):null,verifierInconclusive:checks.inconclusive,deniedPorts:traffic.deniedPorts,compliantNodes:compliant,fleetCompliancePct:total?Math.round(compliant/total*100):null,verifierTrend,mfaTrend})
+}))
 
 api.get('/identity/learning-preview',(req,res)=>{
   const query=z.object({nodeId:z.uuid().optional(),days:z.coerce.number().int().min(1).max(90).default(30)}).parse(req.query)

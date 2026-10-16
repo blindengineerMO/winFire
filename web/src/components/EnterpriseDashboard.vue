@@ -1,9 +1,9 @@
 <script setup>
 import {computed} from 'vue'
-const props=defineProps({stats:{type:Object,required:true},coverage:{type:Array,required:true}})
-const assigned=computed(()=>props.coverage.filter(node=>node.policy_count>0).length)
-const uncovered=computed(()=>props.coverage.length-assigned.value)
-const drift=computed(()=>props.coverage.filter(node=>node.drift_status==='drift').length)
+const props=defineProps({stats:{type:Object,required:true},coverageSummary:{type:Object,required:true}})
+const assigned=computed(()=>props.coverageSummary.assigned)
+const uncovered=computed(()=>props.coverageSummary.uncovered)
+const drift=computed(()=>props.coverageSummary.drift)
 const assignedPct=computed(()=>props.stats.totalNodes?Math.round(assigned.value/props.stats.totalNodes*100):0)
 const uncoveredPct=computed(()=>props.stats.totalNodes?100-assignedPct.value:0)
 const reachablePct=computed(()=>props.stats.totalNodes?Math.round(props.stats.reachableNodes/props.stats.totalNodes*100):0)
